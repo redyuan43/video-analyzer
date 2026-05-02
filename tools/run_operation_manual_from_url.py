@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vibevoice-url", default=DEFAULT_VIBEVOICE_URL, help="Remote GPU VibeVoice ASR endpoint")
     parser.add_argument("--ocr-base-url", default=DEFAULT_OCR_URL, help="DotsMOCR OpenAI-compatible base URL")
     parser.add_argument("--llm-base-url", default="http://127.0.0.1:1234/v1")
-    parser.add_argument("--vision-model", default="sayanything-hauhaucs-aggressive@?")
+    parser.add_argument("--vision-model", default="qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive@?")
     parser.add_argument("--text-model", default="redhatai_qwen3.6-35b-a3b-nvfp4")
     parser.add_argument("--cookies-from-browser", help="Forward to yt-dlp, e.g. chrome, chromium, firefox, brave")
     parser.add_argument("--cookies", help="Forward cookies.txt to yt-dlp")

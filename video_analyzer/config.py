@@ -119,7 +119,7 @@ class Config:
         if self.config.get("task") == "operation_manual" and not args.client:
             manual_config = self.config.setdefault("operation_manual", {})
             llm_base_url = manual_config.get("llm_base_url", "http://127.0.0.1:1234/v1")
-            vision_model = manual_config.get("vision_model", "sayanything-hauhaucs-aggressive@?")
+            vision_model = manual_config.get("vision_model", "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive@?")
             self.config["clients"]["default"] = "openai_api"
             self.config["clients"]["openai_api"]["api_url"] = llm_base_url
             self.config["clients"]["openai_api"]["api_key"] = self.config["clients"]["openai_api"].get("api_key") or "0"

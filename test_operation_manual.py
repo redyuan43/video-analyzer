@@ -88,13 +88,19 @@ class OperationManualTests(unittest.TestCase):
         self.assertEqual(config.get("clients")["default"], "openai_api")
         self.assertEqual(config.get("clients")["openai_api"]["api_key"], "0")
         self.assertEqual(config.get("clients")["openai_api"]["api_url"], "http://127.0.0.1:1234/v1")
-        self.assertEqual(config.get("clients")["openai_api"]["model"], "sayanything-hauhaucs-aggressive@?")
+        self.assertEqual(
+            config.get("clients")["openai_api"]["model"],
+            "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive@?",
+        )
         self.assertEqual(config.get("asr")["provider"], "auto")
         self.assertEqual(config.get("asr")["strategy"], "balanced")
         self.assertEqual(config.get("asr")["vibevoice"]["remote_urls"], [])
         self.assertEqual(config.get("asr")["vibevoice"]["deep_remote_urls"][1], "http://192.168.100.236:8003/api/asr/transcribe")
         self.assertTrue(config.get("asr")["vibevoice"]["use_native_chunking"])
-        self.assertEqual(config.get("ocr")["fallback_model"], "sayanything-hauhaucs-aggressive@?")
+        self.assertEqual(
+            config.get("ocr")["fallback_model"],
+            "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive@?",
+        )
 
     def test_url_runner_builds_page_context_markdown(self):
         info = {

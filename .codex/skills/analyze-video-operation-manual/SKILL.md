@@ -14,7 +14,7 @@ Run the `video-analyzer` operation-manual pipeline end to end from either an onl
 - ASR: VibeVoice on edge only by default: `http://192.168.100.236:8003/api/asr/transcribe`.
 - OCR: DotsMOCR on spark: `http://192.168.100.169:8000/v1`.
 - LM Studio: `http://127.0.0.1:1234/v1`.
-- Vision model: `sayanything-hauhaucs-aggressive@?`.
+- Vision model: `qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive@?`.
 - Text model: `redhatai_qwen3.6-35b-a3b-nvfp4`.
 - Do not start VibeVoice on spark for normal 7-8 minute videos; spark is reserved for OCR unless the user explicitly asks otherwise.
 - Do not use AGX/Qwen3-ASR unless the user explicitly asks for a fast ASR endpoint.
@@ -54,7 +54,7 @@ Run the `video-analyzer` operation-manual pipeline end to end from either an onl
      --ocr-provider auto \
      --ocr-base-url http://192.168.100.169:8000/v1 \
      --llm-base-url http://127.0.0.1:1234/v1 \
-     --vision-model 'sayanything-hauhaucs-aggressive@?' \
+     --vision-model 'qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive@?' \
      --text-model redhatai_qwen3.6-35b-a3b-nvfp4 \
      --max-frames 24 \
      --keep-frames \
@@ -72,4 +72,3 @@ Run the `video-analyzer` operation-manual pipeline end to end from either an onl
 ## Reporting
 
 Return the manual path, analysis path, ASR provider/elapsed time, OCR success count, visual frame count, and any quality warnings. Keep it concise.
-
