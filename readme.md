@@ -206,6 +206,7 @@ Local video workflow:
 The workflow combines:
 
 - page metadata and description downloaded with `yt-dlp`
+- subtitles and selected comments packaged into `page_context.md` for URL runs
 - VibeVoice ASR for long-form speech transcription
 - adaptive keyframe extraction for screen recordings
 - DotsMOCR OCR for screen text
@@ -217,6 +218,11 @@ Typical outputs are written under the run directory:
 - `operation_manual.md` — illustrated manual for humans
 - `analysis.json` — structured evidence, transcript, OCR, visual events, and review metadata
 - `manual_assets/` and `frames/` — screenshots referenced by the manual
+
+For URL inputs, the download folder also keeps `description.md`, `page_context.md`,
+`subtitles/`, `comments.json`, and `comments.md`. Subtitles are treated as
+timeline/speech evidence; comments are low-confidence community supplements and
+should not become main operation steps unless confirmed by stronger evidence.
 
 ## Output
 

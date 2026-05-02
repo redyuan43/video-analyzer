@@ -71,12 +71,15 @@ Rules:
 - If several screenshots belong together, use a compact Markdown table with images side by side.
 - Add a small Mermaid flowchart near the overview when the video has a clear workflow.
 - Include timestamps as evidence for important steps.
-- Separate facts observed in video/OCR/ASR from page-description context.
-- If OCR, visual analysis, and ASR disagree, mark the item as "需复核" and do not invent details.
+- Separate facts observed in video/OCR/ASR from page context.
+- Evidence priority: OCR/VL frame evidence > author subtitles > VibeVoice ASR > automatic subtitles > page description/metadata > pinned or uploader comments > ordinary comments.
+- If subtitles and ASR disagree, mark the item as "需复核" unless OCR/VL evidence clearly resolves it.
+- Treat comments as low-confidence supplemental context. Put comment-only material in "社区补充/常见问题"; do not use comments alone to create deterministic operation steps, commands, or parameters.
+- If OCR, visual analysis, ASR, subtitles, and page context disagree, mark the item as "需复核" and do not invent details.
 - Preserve exact commands, parameters, file names, URLs, UI labels, and model names.
 {asr_rules}
 
-Page description/context:
+Page context evidence package:
 {page_context}
 
 Transcript:
@@ -98,7 +101,8 @@ Return Markdown with these sections:
 4. 图文操作步骤
 5. 关键参数和命令
 6. 常见分支/错误/验证方式
-7. 需复核项
+7. 社区补充/常见问题
+8. 需复核项
 """.strip()
 
 

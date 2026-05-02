@@ -121,6 +121,71 @@ class OperationManualTests(unittest.TestCase):
         self.assertIn("00:00:00 - 00:00:30: 开始", text)
         self.assertIn("Hermes, Android", text)
 
+    def test_url_runner_builds_page_context_bundle_with_subtitles_and_comments(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            video_dir = Path(temp_dir)
+            (video_dir / "download.zh-CN.vtt").write_text(
+                "\n".join(
+                    [
+                        "WEBVTT",
+                        "",
+                        "00:00:01.000 --> 00:00:03.000",
+                        "<c>打开终端输入 install.sh</c>",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            info = {
+                "title": "Hermes Bridge",
+                "id": "BV123",
+                "uploader": "tester",
+                "description": "安装命令和视频简介",
+                "subtitles": {"zh-CN": [{"ext": "vtt"}]},
+                "comments": [
+                    {"author": "tester", "text": "置顶补充：新版入口在 Settings", "author_is_uploader": True},
+                    {"author": "viewer", "text": "普通评论里说旧版本按钮不同", "like_count": 9},
+                ],
+            }
+            args = argparse.Namespace(
+                include_subtitles=True,
+                include_comments=True,
+                subtitle_langs="zh-CN,zh,en",
+                max_comments=1,
+            )
+
+            bundle = run_operation_manual_from_url.build_page_context_bundle(
+                info,
+                "https://example.test/video",
+                run_operation_manual_from_url.build_context_markdown(info, "https://example.test/video"),
+                video_dir,
+                args,
+            )
+
+            self.assertIn("Evidence weights for manual generation", bundle["markdown"])
+            self.assertIn("author subtitles", bundle["markdown"])
+            self.assertIn("打开终端输入 install.sh", bundle["markdown"])
+            self.assertIn("置顶补充", bundle["markdown"])
+            self.assertNotIn("普通评论里说旧版本按钮不同", bundle["markdown"])
+            self.assertTrue((video_dir / "subtitles" / "download.zh-CN.vtt").exists())
+            self.assertTrue((video_dir / "comments.json").exists())
+            self.assertEqual(bundle["metadata"]["subtitles"]["language"], "zh-CN")
+            self.assertEqual(bundle["metadata"]["comments"]["selected_count"], 1)
+
+    def test_url_runner_cleans_json3_subtitles_with_timestamps(self):
+        payload = {
+            "events": [
+                {
+                    "tStartMs": 1200,
+                    "dDurationMs": 1800,
+                    "segs": [{"utf8": "点击"}, {"utf8": "安装按钮"}],
+                }
+            ]
+        }
+
+        text = run_operation_manual_from_url.clean_json3_subtitles(json.dumps(payload, ensure_ascii=False))
+
+        self.assertIn("[00:00:01 - 00:00:03] 点击安装按钮", text)
+
     def test_url_runner_defaults_to_edge_vibevoice_and_spark_ocr(self):
         args = argparse.Namespace(
             python=".venv/bin/python",
@@ -430,11 +495,13 @@ class OperationManualTests(unittest.TestCase):
             frame_assets={0: "manual_assets/frame_000.jpg"},
         )
 
-        self.assertIn("Page description/context", prompt)
+        self.assertIn("Page context evidence package", prompt)
         self.assertIn("Frame evidence", prompt)
         self.assertIn("manual_assets/frame_000.jpg", prompt)
         self.assertIn("ASR strategy evidence", prompt)
         self.assertIn("VibeVoice", prompt)
+        self.assertIn("author subtitles", prompt)
+        self.assertIn("社区补充/常见问题", prompt)
         self.assertIn("Do not append a large screenshot gallery", prompt)
         self.assertIn("Screenshots must be real Markdown images", prompt)
         self.assertIn("Never write screenshot paths as plain text", prompt)

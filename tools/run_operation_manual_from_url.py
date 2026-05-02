@@ -24,6 +24,7 @@ DEFAULT_VIBEVOICE_URL = "http://192.168.100.236:8003/api/asr/transcribe"
 DEFAULT_OCR_URL = "http://192.168.100.169:8000/v1"
 DEFAULT_OUTPUT_ROOT = Path("downloads/url-videos")
 DEFAULT_RUN_NAME = "operation-manual"
+DEFAULT_SUBTITLE_LANGS = "zh-CN,zh-Hans,zh,en"
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,6 +45,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--download-only", action="store_true", help="Only download video and page context")
     parser.add_argument("--keep-existing", action="store_true", help="Reuse existing video/context if present")
     parser.add_argument("--no-keep-frames", action="store_true", help="Do not keep extracted frames after analysis")
+    parser.add_argument(
+        "--include-subtitles",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Download and include author/automatic subtitles in page_context.md",
+    )
+    parser.add_argument(
+        "--include-comments",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Download and include selected low-trust comments in page_context.md",
+    )
+    parser.add_argument("--max-comments", type=int, default=30, help="Maximum selected comments to include")
+    parser.add_argument("--subtitle-langs", default=DEFAULT_SUBTITLE_LANGS, help="Comma-separated subtitle language priority")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
     parser.add_argument("--python", default=sys.executable, help="Python executable used to run video_analyzer.cli")
     return parser.parse_args()
@@ -62,16 +77,26 @@ def main() -> int:
 
     video_path = video_dir / "video.mp4"
     info_path = video_dir / "info.json"
-    context_path = video_dir / "description.md"
-    if args.keep_existing and video_path.exists() and context_path.exists():
+    description_path = video_dir / "description.md"
+    page_context_path = video_dir / "page_context.md"
+    if args.keep_existing and video_path.exists() and page_context_path.exists():
         print(f"[download] reusing {video_path}")
     else:
         download_video(args.url, video_dir, args)
         materialize_download(video_dir, video_path)
+        info = load_downloaded_info(video_dir) or info
         info_path.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
-        context_path.write_text(build_context_markdown(info, args.url), encoding="utf-8")
+        description_text = build_context_markdown(info, args.url)
+        description_path.write_text(description_text, encoding="utf-8")
+        page_context = build_page_context_bundle(info, args.url, description_text, video_dir, args)
+        page_context_path.write_text(page_context["markdown"], encoding="utf-8")
+        (video_dir / "page_context.json").write_text(
+            json.dumps(page_context["metadata"], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         print(f"[download] video: {video_path}")
-        print(f"[download] context: {context_path}")
+        print(f"[download] description: {description_path}")
+        print(f"[download] context: {page_context_path}")
 
     if args.download_only:
         return 0
@@ -80,7 +105,7 @@ def main() -> int:
     if run_dir.exists():
         shutil.rmtree(run_dir)
 
-    command = build_analyzer_command(args, video_path, context_path, run_dir)
+    command = build_analyzer_command(args, video_path, page_context_path, run_dir)
     print("[analyze] " + " ".join(shell_quote(part) for part in command))
     subprocess.run(command, check=True)
     analysis_path = run_dir / "analysis.json"
@@ -111,9 +136,6 @@ def download_video(url: str, video_dir: Path, args: argparse.Namespace) -> None:
         "--no-playlist",
         "--write-info-json",
         "--write-description",
-        "--write-auto-subs",
-        "--sub-langs",
-        "zh.*,en.*",
         "--merge-output-format",
         "mp4",
         "-f",
@@ -122,8 +144,21 @@ def download_video(url: str, video_dir: Path, args: argparse.Namespace) -> None:
         str(video_dir / "download.%(ext)s"),
         url,
     ]
+    if args.include_subtitles:
+        command.extend(["--write-subs", "--write-auto-subs", "--sub-langs", subtitle_langs_for_ytdlp(args.subtitle_langs)])
+    if args.include_comments:
+        command.append("--write-comments")
     add_cookie_args(command, args)
     subprocess.run(command, check=True)
+
+
+def load_downloaded_info(video_dir: Path) -> dict[str, Any] | None:
+    for path in sorted(video_dir.glob("download*.info.json")):
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+    return None
 
 
 def add_cookie_args(command: list[str], args: argparse.Namespace) -> None:
@@ -175,6 +210,302 @@ def build_context_markdown(info: dict[str, Any], url: str) -> str:
     if tags:
         lines.extend(["## Tags", "", ", ".join(str(tag) for tag in tags), ""])
     return "\n".join(lines).strip() + "\n"
+
+
+def build_page_context_bundle(
+    info: dict[str, Any],
+    url: str,
+    description_text: str,
+    video_dir: Path,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    subtitles = collect_subtitles(video_dir, info, args)
+    comments = collect_comments(video_dir, info, args)
+    markdown = build_page_context_markdown(info, url, description_text, subtitles, comments)
+    metadata = {
+        "context_file": str(video_dir / "page_context.md"),
+        "description_file": str(video_dir / "description.md"),
+        "subtitles": subtitles["metadata"],
+        "comments": comments["metadata"],
+    }
+    return {"markdown": markdown, "metadata": metadata}
+
+
+def collect_subtitles(video_dir: Path, info: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    metadata = {"enabled": bool(args.include_subtitles), "success": False, "diagnostics": []}
+    if not args.include_subtitles:
+        metadata["diagnostics"].append("subtitle collection disabled by CLI")
+        return {"markdown": "", "metadata": metadata}
+
+    files = [path for path in video_dir.glob("download.*") if path.suffix.lower() in {".vtt", ".srt", ".json3"}]
+    if not files:
+        metadata["diagnostics"].append("yt-dlp did not produce subtitle files")
+        return {"markdown": "", "metadata": metadata}
+
+    preferred = parse_csv(args.subtitle_langs)
+    chosen = choose_subtitle_file(files, preferred, info)
+    text = clean_subtitle_file(chosen)
+    subtitles_dir = video_dir / "subtitles"
+    subtitles_dir.mkdir(exist_ok=True)
+    raw_path = subtitles_dir / chosen.name
+    text_path = subtitles_dir / f"{chosen.stem}.cleaned.txt"
+    shutil.copy2(chosen, raw_path)
+    text_path.write_text(text, encoding="utf-8")
+
+    language = infer_subtitle_lang(chosen)
+    source = infer_subtitle_source(language, info)
+    metadata.update(
+        {
+            "success": bool(text.strip()),
+            "language": language,
+            "source": source,
+            "raw_file": str(raw_path),
+            "text_file": str(text_path),
+            "available_files": [path.name for path in files],
+            "text_length": len(text),
+        }
+    )
+    if not text.strip():
+        metadata["diagnostics"].append(f"subtitle file was empty after cleanup: {chosen.name}")
+    markdown = "\n".join(
+        [
+            "## Subtitles",
+            "",
+            f"- Evidence weight: {'author subtitles' if source == 'author' else 'automatic subtitles'}",
+            f"- Language: {language}",
+            f"- Source file: {raw_path.name}",
+            "",
+            trim_text(text, 12000) if text.strip() else "_No usable subtitle text._",
+            "",
+        ]
+    )
+    return {"markdown": markdown, "metadata": metadata}
+
+
+def collect_comments(video_dir: Path, info: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    metadata = {"enabled": bool(args.include_comments), "success": False, "diagnostics": [], "selected_count": 0}
+    if not args.include_comments:
+        metadata["diagnostics"].append("comment collection disabled by CLI")
+        return {"markdown": "", "metadata": metadata}
+
+    raw_comments = info.get("comments") or []
+    if not isinstance(raw_comments, list) or not raw_comments:
+        metadata["diagnostics"].append("yt-dlp did not return comments; the platform may block comments or require login")
+        return {"markdown": "", "metadata": metadata}
+
+    selected = select_comments(raw_comments, max(0, args.max_comments), info)
+    comments_json = video_dir / "comments.json"
+    comments_md = video_dir / "comments.md"
+    comments_json.write_text(json.dumps(selected, ensure_ascii=False, indent=2), encoding="utf-8")
+    markdown = build_comments_markdown(selected)
+    comments_md.write_text(markdown, encoding="utf-8")
+    metadata.update(
+        {
+            "success": bool(selected),
+            "available_count": len(raw_comments),
+            "selected_count": len(selected),
+            "json_file": str(comments_json),
+            "markdown_file": str(comments_md),
+        }
+    )
+    if not selected:
+        metadata["diagnostics"].append("comments were present but max-comments or filtering selected none")
+    return {"markdown": markdown, "metadata": metadata}
+
+
+def build_page_context_markdown(
+    info: dict[str, Any],
+    url: str,
+    description_text: str,
+    subtitles: dict[str, Any],
+    comments: dict[str, Any],
+) -> str:
+    diagnostics = []
+    diagnostics.extend(subtitles["metadata"].get("diagnostics", []))
+    diagnostics.extend(comments["metadata"].get("diagnostics", []))
+    lines = [
+        f"# Page Context Evidence: {info.get('title') or 'Video'}",
+        "",
+        "Evidence weights for manual generation:",
+        "- OCR/VL frame evidence is highest confidence for visible operations.",
+        "- Author subtitles are high-confidence timeline/speech evidence.",
+        "- VibeVoice ASR is high-confidence semantic audio evidence.",
+        "- Automatic subtitles are medium-confidence and can contain recognition errors.",
+        "- Page description and metadata are contextual evidence.",
+        "- Pinned/uploader comments are low-confidence supplemental evidence.",
+        "- Ordinary comments are lowest-confidence and must stay in community notes or FAQ unless confirmed elsewhere.",
+        "",
+        "## Metadata Summary",
+        "",
+        f"- URL: {url}",
+        f"- Platform ID: {info.get('id') or info.get('display_id') or ''}",
+        f"- Uploader: {info.get('uploader') or info.get('channel') or ''}",
+        f"- Upload date: {info.get('upload_date') or ''}",
+        f"- Duration: {info.get('duration') or ''}",
+        "",
+        "## Original Description",
+        "",
+        description_text.strip(),
+        "",
+    ]
+    if subtitles["markdown"]:
+        lines.extend([subtitles["markdown"].strip(), ""])
+    else:
+        lines.extend(["## Subtitles", "", "_No usable subtitles collected._", ""])
+    if comments["markdown"]:
+        lines.extend([comments["markdown"].strip(), ""])
+    else:
+        lines.extend(["## Comments", "", "_No usable comments collected._", ""])
+    if diagnostics:
+        lines.extend(["## Diagnostics", ""])
+        lines.extend(f"- {item}" for item in diagnostics)
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
+def choose_subtitle_file(files: list[Path], preferred: list[str], info: dict[str, Any]) -> Path:
+    def score(path: Path) -> tuple[int, int, str]:
+        lang = infer_subtitle_lang(path)
+        source_rank = 0 if infer_subtitle_source(lang, info) == "author" else 1
+        lang_rank = next((idx for idx, wanted in enumerate(preferred) if lang == wanted or lang.startswith(wanted)), len(preferred))
+        return (source_rank, lang_rank, path.name)
+
+    return sorted(files, key=score)[0]
+
+
+def infer_subtitle_lang(path: Path) -> str:
+    parts = path.name.split(".")
+    if len(parts) >= 3 and parts[0] == "download":
+        return ".".join(parts[1:-1])
+    return path.stem
+
+
+def infer_subtitle_source(language: str, info: dict[str, Any]) -> str:
+    subtitles = info.get("subtitles") or {}
+    automatic = info.get("automatic_captions") or {}
+    if language in subtitles:
+        return "author"
+    if language in automatic:
+        return "automatic"
+    return "unknown"
+
+
+def clean_subtitle_file(path: Path) -> str:
+    suffix = path.suffix.lower()
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    if suffix == ".json3":
+        return clean_json3_subtitles(text)
+    return clean_text_subtitles(text)
+
+
+def clean_json3_subtitles(text: str) -> str:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return ""
+    lines = []
+    for event in payload.get("events", []):
+        body = "".join(seg.get("utf8", "") for seg in event.get("segs", [])).strip()
+        if not body:
+            continue
+        start_ms = event.get("tStartMs", 0)
+        end_ms = start_ms + event.get("dDurationMs", 0)
+        lines.append(f"[{format_seconds_ms(start_ms)} - {format_seconds_ms(end_ms)}] {body}")
+    return "\n".join(lines).strip() + "\n"
+
+
+def clean_text_subtitles(text: str) -> str:
+    lines = []
+    pending_time = ""
+    pending_text = []
+    for raw_line in text.splitlines():
+        line = strip_subtitle_tags(raw_line.strip())
+        if not line or line.isdigit() or line in {"WEBVTT", "Kind: captions", "Language: en"}:
+            if pending_time and pending_text:
+                lines.append(f"[{pending_time}] {' '.join(pending_text)}")
+            pending_time = ""
+            pending_text = []
+            continue
+        if "-->" in line:
+            if pending_time and pending_text:
+                lines.append(f"[{pending_time}] {' '.join(pending_text)}")
+            pending_time = line
+            pending_text = []
+            continue
+        if pending_time:
+            pending_text.append(line)
+    if pending_time and pending_text:
+        lines.append(f"[{pending_time}] {' '.join(pending_text)}")
+    return "\n".join(lines).strip() + "\n"
+
+
+def strip_subtitle_tags(text: str) -> str:
+    text = re.sub(r"<[^>]+>", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def select_comments(comments: list[dict[str, Any]], max_comments: int, info: dict[str, Any]) -> list[dict[str, Any]]:
+    uploader = str(info.get("uploader") or info.get("channel") or "").strip()
+
+    def enrich(comment: dict[str, Any]) -> dict[str, Any]:
+        author = str(comment.get("author") or "").strip()
+        category = "ordinary"
+        if comment.get("is_pinned") or comment.get("pinned"):
+            category = "pinned"
+        elif comment.get("author_is_uploader") or (uploader and author == uploader):
+            category = "uploader"
+        return {
+            "category": category,
+            "author": author,
+            "text": str(comment.get("text") or "").strip(),
+            "like_count": comment.get("like_count") or 0,
+            "timestamp": comment.get("timestamp"),
+            "id": comment.get("id"),
+            "raw": comment,
+        }
+
+    enriched = [item for item in (enrich(comment) for comment in comments) if item["text"]]
+    category_rank = {"pinned": 0, "uploader": 1, "ordinary": 2}
+    enriched.sort(key=lambda item: (category_rank.get(item["category"], 9), -int(item.get("like_count") or 0)))
+    return enriched[:max_comments]
+
+
+def build_comments_markdown(comments: list[dict[str, Any]]) -> str:
+    lines = [
+        "## Comments",
+        "",
+        "Evidence weight: low. Use comments only for community supplements, FAQ, pinned/uploader clarifications, or version-change clues.",
+        "",
+    ]
+    for comment in comments:
+        lines.extend(
+            [
+                f"### {comment['category']} comment by {comment.get('author') or 'unknown'}",
+                "",
+                f"- Likes: {comment.get('like_count') or 0}",
+                f"- Timestamp: {comment.get('timestamp') or ''}",
+                "",
+                trim_text(comment.get("text") or "", 1000),
+                "",
+            ]
+        )
+    return "\n".join(lines).strip() + "\n"
+
+
+def parse_csv(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def subtitle_langs_for_ytdlp(value: str) -> str:
+    langs = parse_csv(value)
+    return ",".join(langs) if langs else DEFAULT_SUBTITLE_LANGS
+
+
+def trim_text(text: str, max_chars: int) -> str:
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "\n\n[truncated]"
 
 
 def build_analyzer_command(args: argparse.Namespace, video_path: Path, context_path: Path, run_dir: Path) -> list[str]:
@@ -261,6 +592,14 @@ def format_seconds(value: Any) -> str:
     except (TypeError, ValueError):
         return ""
     return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+
+
+def format_seconds_ms(value: Any) -> str:
+    try:
+        seconds = int(float(value) / 1000)
+    except (TypeError, ValueError):
+        seconds = 0
+    return format_seconds(seconds)
 
 
 def shell_quote(value: str) -> str:

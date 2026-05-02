@@ -65,6 +65,26 @@ def create_client(config: Config):
     else:
         raise ValueError(f"Unknown client type: {client_type}")
 
+
+def read_page_context_metadata(context_file: str, page_context: str) -> dict:
+    metadata = {
+        "context_file": context_file,
+        "text_length": len(page_context or ""),
+    }
+    if not context_file:
+        return metadata
+    sidecar = Path(context_file).with_name("page_context.json")
+    if not sidecar.exists():
+        return metadata
+    try:
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    except Exception as exc:
+        metadata["diagnostics"] = [f"failed to read page_context.json: {exc}"]
+        return metadata
+    metadata.update(payload)
+    metadata["text_length"] = len(page_context or "")
+    return metadata
+
 def main():
     parser = argparse.ArgumentParser(description="Analyze video using Vision models")
     parser.add_argument("video_path", type=str, help="Path to the video file")
@@ -135,6 +155,7 @@ def main():
         ocr_events = []
         task = config.get("task", "describe")
         page_context = ""
+        page_context_metadata = {"context_file": "", "text_length": 0}
         
         # Stage 1: Frame and Audio Processing
         if args.start_stage <= 1:
@@ -255,6 +276,7 @@ def main():
                 logger.info("Generating operation manual...")
                 manual_config = config.get("operation_manual", {})
                 page_context = read_context_file(config.get("context_file", ""))
+                page_context_metadata = read_page_context_metadata(config.get("context_file", ""), page_context)
                 text_model = manual_config.get("text_model") or model
                 frame_assets = prepare_frame_assets(frames, output_dir)
                 operation_manual = generate_operation_manual(
@@ -312,6 +334,7 @@ def main():
                 "asr_strategy": config.get("asr", {}).get("strategy"),
                 "context_file": config.get("context_file"),
                 "page_description": page_context,
+                "page_context": page_context_metadata,
                 "whisper_model": config.get("audio", {}).get("whisper_model"),
                 "frames_per_minute": config.get("frames", {}).get("per_minute"),
                 "duration_processed": config.get("duration"),

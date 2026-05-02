@@ -36,7 +36,8 @@ tools/run_operation_manual_from_url.sh "https://www.bilibili.com/video/BVxxxx"
 ```
 
 The one-command runner downloads the video, saves the page metadata and
-description to `description.md`, then runs the full operation-manual pipeline.
+description to `description.md`, collects subtitles/comments when available,
+builds `page_context.md`, then runs the full operation-manual pipeline.
 Defaults match the current stable local setup: VibeVoice ASR on edge
 `http://192.168.100.236:8003/api/asr/transcribe`, DotsMOCR OCR on spark
 `http://192.168.100.169:8000/v1`, and LM Studio on `127.0.0.1:1234`.
@@ -52,6 +53,13 @@ tools/run_operation_manual_from_url.sh "URL" --max-frames 48
 
 # Only download video and page context.
 tools/run_operation_manual_from_url.sh "URL" --download-only
+
+# Disable low-trust community comments, or tune the comment budget.
+tools/run_operation_manual_from_url.sh "URL" --no-include-comments
+tools/run_operation_manual_from_url.sh "URL" --max-comments 10
+
+# Override subtitle language priority.
+tools/run_operation_manual_from_url.sh "URL" --subtitle-langs zh-CN,zh-Hans,zh,en
 ```
 
 For an existing local video:
@@ -113,6 +121,19 @@ The output directory contains:
 - `manual_assets/`: screenshots embedded inside the manual.
 - `frames/`: extracted keyframes when `--keep-frames` is used.
 - `audio.wav`: extracted audio when `--keep-frames` is used.
+
+For URL runs, the download directory also contains page context artifacts:
+
+- `description.md`: the original page metadata and description from `yt-dlp`.
+- `subtitles/`: raw subtitle files plus cleaned timestamped text when subtitles are available.
+- `comments.json`: selected raw comment records.
+- `comments.md`: cleaned low-trust comment notes.
+- `page_context.md`: the final context evidence package passed through `--context-file`.
+- `page_context.json`: diagnostics and metadata recorded into `analysis.json.metadata.page_context`.
+
+Subtitle and comment collection are best-effort. Missing subtitles, blocked
+comments, insufficient cookies, or platform limits are recorded in
+`page_context.md` diagnostics and do not stop the video/OCR/ASR/VL pipeline.
 
 The user-facing manual should be written as a readable "overview -> illustrated
 steps -> checks/caveats" document. Full screenshot dumps belong in
@@ -231,6 +252,26 @@ anchor in addition to VibeVoice.
 Use `--asr-provider remote_http`, `--asr-provider vibevoice`, or another
 provider only when you want to force one provider and bypass strategy fusion.
 
+## Page Context Evidence Policy
+
+URL runs pass `page_context.md` to the manual generator instead of the older
+single-purpose `description.md`. The generator should weigh evidence in this
+order:
+
+- OCR/VL frame evidence: highest confidence for visible operations.
+- Author subtitles: high-confidence speech/timeline evidence.
+- VibeVoice ASR: high-confidence semantic audio evidence.
+- Automatic subtitles: useful but may contain recognition errors.
+- Page description and metadata: contextual evidence.
+- Pinned or uploader comments: low-confidence supplemental evidence.
+- Ordinary comments: lowest-confidence community notes.
+
+When subtitles and ASR conflict, mark the claim as `需复核` unless OCR/VL
+evidence clearly resolves it. Comment-only information belongs in
+`社区补充/常见问题`; it should not create deterministic operation steps,
+commands, or parameters unless supported by video, OCR, ASR, subtitles, or page
+description.
+
 ## Current Real Sample Command
 
 The Bilibili sample used during validation:
@@ -268,12 +309,14 @@ When an agent is asked to generate a manual:
 2. Confirm remote ASR endpoint health if using `remote_http`.
 3. Run the CLI with `--task operation_manual`.
 4. Use a page/context file when the video page description contains important
-   URLs, install commands, or release notes.
-5. Inspect `analysis.json` metadata for frame count, ASR success, OCR statuses,
+   URLs, install commands, release notes, subtitles, or useful uploader comments.
+5. For URL runs, prefer `page_context.md` over `description.md`.
+6. Inspect `analysis.json` metadata for frame count, ASR success, OCR statuses,
    and model names.
-6. Inspect `operation_manual.md` for step-level images, not just text.
-7. Inspect `manual_evidence.md` only when verifying uncertain claims.
-8. If the manual is text-heavy or screenshots are appended as a gallery, fix the
+7. Inspect `analysis.json.metadata.page_context` for subtitle/comment diagnostics.
+8. Inspect `operation_manual.md` for step-level images, not just text.
+9. Inspect `manual_evidence.md` only when verifying uncertain claims.
+10. If the manual is text-heavy or screenshots are appended as a gallery, fix the
    generation/post-processing before reporting completion.
 
 ## Quality Notes

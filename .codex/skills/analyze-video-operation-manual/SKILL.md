@@ -1,6 +1,6 @@
 ---
 name: analyze-video-operation-manual
-description: Use when the user says to analyze a video, 分析视频, 生成视频操作手册, or gives a YouTube/Bilibili URL or local video path and wants the full video-analyzer operation-manual pipeline run end-to-end. Downloads URL videos, captures page description, uses edge VibeVoice ASR, spark DotsMOCR OCR, LM Studio VL/text models, and returns operation_manual.md plus analysis.json.
+description: Use when the user says to analyze a video, 分析视频, 生成视频操作手册, or gives a YouTube/Bilibili URL or local video path and wants the full video-analyzer operation-manual pipeline run end-to-end. Downloads URL videos, captures page context including description/subtitles/selected comments, uses edge VibeVoice ASR, spark DotsMOCR OCR, LM Studio VL/text models, and returns operation_manual.md plus analysis.json.
 ---
 
 # Analyze Video Operation Manual
@@ -10,6 +10,8 @@ Run the `video-analyzer` operation-manual pipeline end to end from either an onl
 ## Default Runtime Policy
 
 - URL input: use `tools/run_operation_manual_from_url.sh`.
+- URL context: default to `page_context.md`, which combines description,
+  metadata, subtitles, and selected comments.
 - Local file input: call `.venv/bin/python -m video_analyzer.cli` directly.
 - ASR: VibeVoice on edge only by default: `http://192.168.100.236:8003/api/asr/transcribe`.
 - OCR: DotsMOCR on spark: `http://192.168.100.169:8000/v1`.
@@ -40,6 +42,8 @@ Run the `video-analyzer` operation-manual pipeline end to end from either an onl
    tools/run_operation_manual_from_url.sh "URL" --cookies-from-browser chrome
    tools/run_operation_manual_from_url.sh "URL" --max-frames 48
    tools/run_operation_manual_from_url.sh "URL" --download-only
+   tools/run_operation_manual_from_url.sh "URL" --no-include-comments
+   tools/run_operation_manual_from_url.sh "URL" --subtitle-langs zh-CN,zh-Hans,zh,en
    ```
 
 4. For local video input, create or reuse a context file if provided by the user, then run:
@@ -64,6 +68,8 @@ Run the `video-analyzer` operation-manual pipeline end to end from either an onl
 5. Verify completion before reporting:
    - `analysis.json` exists.
    - `operation_manual.md` or `operation_manual.quality_failed.md` exists.
+   - URL runs have `page_context.md`; `analysis.json.metadata.page_context`
+     records subtitle/comment success or diagnostics.
    - `operation_manual.quality_review` has no errors, or report the quality-failed path clearly.
    - `ocr_events` count matches extracted frames and most/all statuses are `ok`.
    - `visual_events` are non-empty.
@@ -72,3 +78,10 @@ Run the `video-analyzer` operation-manual pipeline end to end from either an onl
 ## Reporting
 
 Return the manual path, analysis path, ASR provider/elapsed time, OCR success count, visual frame count, and any quality warnings. Keep it concise.
+
+## Evidence Policy
+
+Use evidence in this order: OCR/VL frame evidence, author subtitles, VibeVoice
+ASR, automatic subtitles, page description/metadata, pinned or uploader
+comments, ordinary comments. Comments are low-confidence; keep comment-only
+information in community supplements or FAQ, not main deterministic steps.
