@@ -175,6 +175,49 @@ video-analyzer video.mp4 \
     --whisper-model large
 ```
 
+### Operation Manual Workflow
+
+For installation tutorials, software walkthroughs, web configuration demos,
+IDE/terminal recordings, plugin introductions, and lecture-style videos, the
+`operation_manual` task turns a video URL or local video into an illustrated
+human-readable manual.
+
+![Operation manual workflow](docs/operation-manual-workflow.png)
+
+One-command URL workflow:
+
+```bash
+tools/run_operation_manual_from_url.sh "https://www.bilibili.com/video/BVxxxx"
+```
+
+Local video workflow:
+
+```bash
+.venv/bin/python -m video_analyzer.cli video.mp4 \
+    --task operation_manual \
+    --output output/manual-run \
+    --asr-provider vibevoice \
+    --ocr-provider auto \
+    --llm-base-url http://127.0.0.1:1234/v1 \
+    --manual-language zh-CN \
+    --keep-frames
+```
+
+The workflow combines:
+
+- page metadata and description downloaded with `yt-dlp`
+- VibeVoice ASR for long-form speech transcription
+- adaptive keyframe extraction for screen recordings
+- DotsMOCR OCR for screen text
+- LM Studio vision/text models for frame understanding and manual synthesis
+- a quality gate that checks screenshots, step evidence, and review warnings
+
+Typical outputs are written under the run directory:
+
+- `operation_manual.md` — illustrated manual for humans
+- `analysis.json` — structured evidence, transcript, OCR, visual events, and review metadata
+- `manual_assets/` and `frames/` — screenshots referenced by the manual
+
 ## Output
 
 The tool generates a JSON file (`output\analysis.json`) containing:
