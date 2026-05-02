@@ -11,7 +11,7 @@ from .frame import VideoProcessor
 from .prompt import PromptLoader
 from .analyzer import VideoAnalyzer
 from .audio_processor import AudioProcessor, AudioTranscript
-from .asr_providers import extract_audio_to_wav, transcribe_with_provider
+from .asr_providers import ASRStrategyResult, extract_audio_to_wav, transcribe_with_provider_result, transcribe_with_strategy
 from .clients.ollama import OllamaClient
 from .clients.generic_openai_api import GenericOpenAIAPIClient
 from .manual import embed_step_images, generate_operation_manual, prepare_frame_assets, read_context_file, write_frame_evidence_index
@@ -90,6 +90,9 @@ def main():
     parser.add_argument("--ocr-provider", choices=["auto", "dots_mocr_vllm", "openai_vision", "none"], help="OCR provider")
     parser.add_argument("--ocr-base-url", type=str, help="OCR OpenAI-compatible base URL or auto")
     parser.add_argument("--asr-provider", choices=["auto", "remote_http", "capswriter_http", "vibevoice", "faster_whisper", "none"], help="ASR provider")
+    parser.add_argument("--asr-strategy", choices=["fast", "balanced", "deep"], help="Dual-ASR strategy for operation manuals")
+    parser.add_argument("--vibevoice-url", action="append", help="Remote GPU VibeVoice ASR endpoint; can be provided multiple times")
+    parser.add_argument("--allow-local-vibevoice", action="store_true", help="Allow local VibeVoice subprocess fallback")
     parser.add_argument("--context-file", type=str, help="Extra page/video context file")
     args = parser.parse_args()
 
@@ -117,6 +120,7 @@ def main():
     
     try:
         transcript = None
+        asr_result = None
         frames = []
         frame_analyses = []
         video_description = None
@@ -141,7 +145,18 @@ def main():
                 logger.info("Transcribing audio...")
                 asr_config = config.get("asr", {})
                 provider = asr_config.get("provider", "faster_whisper")
-                if provider == "faster_whisper":
+                use_asr_strategy = task == "operation_manual" and args.asr_provider is None and provider == "auto"
+                if use_asr_strategy:
+                    asr_result = transcribe_with_strategy(
+                        strategy=asr_config.get("strategy", "balanced"),
+                        audio_path=audio_path,
+                        language=config.get("audio", {}).get("language", ""),
+                        whisper_model=config.get("audio", {}).get("whisper_model", "medium"),
+                        device=config.get("audio", {}).get("device", "cpu"),
+                        vibevoice_config=asr_config.get("vibevoice", {}),
+                    )
+                    transcript = asr_result.transcript
+                elif provider == "faster_whisper":
                     audio_processor = AudioProcessor(
                         language=config.get("audio", {}).get("language", ""),
                         model_size_or_path=config.get("audio", {}).get("whisper_model", "medium"),
@@ -149,13 +164,21 @@ def main():
                     )
                     transcript = audio_processor.transcribe(audio_path)
                 else:
-                    transcript = transcribe_with_provider(
+                    asr_result = transcribe_with_provider_result(
                         provider=provider,
                         audio_path=audio_path,
                         language=config.get("audio", {}).get("language", ""),
                         whisper_model=config.get("audio", {}).get("whisper_model", "medium"),
                         device=config.get("audio", {}).get("device", "cpu"),
                         vibevoice_config=asr_config.get("vibevoice", {}),
+                    )
+                    transcript = asr_result.transcript
+                if asr_result is None:
+                    asr_result = ASRStrategyResult(
+                        strategy=f"provider:{provider}",
+                        transcript=transcript,
+                        fast_transcript=transcript,
+                        providers_run=[] if provider == "none" else [provider],
                     )
                 if transcript is None:
                     logger.warning("Could not generate reliable transcript. Proceeding with video analysis only.")
@@ -233,6 +256,7 @@ def main():
                     frame_analyses=frame_analyses,
                     frames=frames,
                     transcript=transcript,
+                    asr_metadata=asr_result.to_metadata() if asr_result else {},
                     ocr_events=ocr_events,
                     page_context=page_context,
                     language=config.get("manual_language", "zh-CN"),
@@ -267,6 +291,7 @@ def main():
                 "text_model": config.get("operation_manual", {}).get("text_model"),
                 "ocr_provider": config.get("ocr", {}).get("provider"),
                 "asr_provider": config.get("asr", {}).get("provider"),
+                "asr_strategy": config.get("asr", {}).get("strategy"),
                 "context_file": config.get("context_file"),
                 "page_description": page_context,
                 "whisper_model": config.get("audio", {}).get("whisper_model"),
@@ -282,6 +307,7 @@ def main():
                 "text": transcript.text if transcript else None,
                 "segments": transcript.segments if transcript else None
             } if transcript else None,
+            "asr": asr_result.to_metadata() if asr_result else None,
             "ocr_events": [event.to_dict() for event in ocr_events],
             "visual_events": frame_analyses,
             "manual_steps": operation_manual,

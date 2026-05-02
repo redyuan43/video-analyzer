@@ -26,6 +26,7 @@ def build_operation_manual_prompt(
     frame_analyses: List[Dict[str, Any]],
     frames: List[Frame],
     transcript: Optional[AudioTranscript],
+    asr_metadata: Optional[Dict[str, Any]],
     ocr_events: List[OCREvent],
     page_context: str,
     language: str,
@@ -53,6 +54,8 @@ def build_operation_manual_prompt(
 
     transcript_text = transcript.text if transcript else ""
     transcript_segments = json.dumps(transcript.segments, ensure_ascii=False, indent=2) if transcript else "[]"
+    asr_metadata_text = json.dumps(asr_metadata or {}, ensure_ascii=False, indent=2)
+    asr_rules = _build_asr_rules(asr_metadata or {})
 
     return f"""
 You are converting an installation or operation video into a precise operating manual.
@@ -63,12 +66,15 @@ Rules:
 - Use a user-facing "总-分-总" structure: first explain the video's overall structure, then present illustrated steps, then end with checks and caveats.
 - Put screenshots directly inside the relevant steps. Do not append a large screenshot gallery at the end.
 - For each major step, choose 1 to 4 representative frame images from the provided Markdown image paths. Use adjacent images when they clarify before/after or multiple UI states.
+- Screenshots must be real Markdown images, for example `![12s screenshot](manual_assets/frame_003.jpg)`.
+- Never write screenshot paths as plain text, code spans, or table text such as `manual_assets/frame_003.jpg`.
 - If several screenshots belong together, use a compact Markdown table with images side by side.
 - Add a small Mermaid flowchart near the overview when the video has a clear workflow.
 - Include timestamps as evidence for important steps.
 - Separate facts observed in video/OCR/ASR from page-description context.
 - If OCR, visual analysis, and ASR disagree, mark the item as "需复核" and do not invent details.
 - Preserve exact commands, parameters, file names, URLs, UI labels, and model names.
+{asr_rules}
 
 Page description/context:
 {page_context}
@@ -78,6 +84,9 @@ Transcript:
 
 Transcript segments:
 {transcript_segments}
+
+ASR strategy evidence:
+{asr_metadata_text}
 
 Frame evidence:
 {chr(10).join(frame_notes)}
@@ -93,12 +102,33 @@ Return Markdown with these sections:
 """.strip()
 
 
+def _build_asr_rules(asr_metadata: Dict[str, Any]) -> str:
+    fast_summary = asr_metadata.get("fast_transcript") or {}
+    deep_summary = asr_metadata.get("deep_transcript") or {}
+    has_deep = bool(deep_summary.get("text_length"))
+    has_fast = bool(fast_summary.get("text_length"))
+    if has_deep and has_fast:
+        return "\n".join(
+            [
+                "- Use merged ASR as the main transcript. When fast ASR and VibeVoice disagree,",
+                "  prefer VibeVoice for terminology and chapter meaning, but prefer fast ASR",
+                "  segments for timestamps.",
+                "- Treat ASR disagreements as uncertainty candidates first; resolve them only",
+                "  when OCR, visual evidence, page context, or nearby frames support a clear answer.",
+            ]
+        )
+    if has_deep:
+        return "- Use VibeVoice ASR as long-context audio evidence, but avoid inventing timestamps it did not provide."
+    return "- Use the transcript as ASR evidence and rely on frame timestamps for visual evidence."
+
+
 def generate_operation_manual(
     client: LLMClient,
     text_model: str,
     frame_analyses: List[Dict[str, Any]],
     frames: List[Frame],
     transcript: Optional[AudioTranscript],
+    asr_metadata: Optional[Dict[str, Any]],
     ocr_events: List[OCREvent],
     page_context: str,
     language: str,
@@ -109,6 +139,7 @@ def generate_operation_manual(
         frame_analyses=frame_analyses,
         frames=frames,
         transcript=transcript,
+        asr_metadata=asr_metadata,
         ocr_events=ocr_events,
         page_context=page_context,
         language=language,
@@ -183,7 +214,7 @@ def write_frame_evidence_index(
 def embed_step_images(manual_text: str, frames: List[Frame], frame_assets: Dict[int, str]) -> str:
     """Insert compact screenshot strips into step sections based on nearby timestamps."""
     if not frames or not frame_assets:
-        return manual_text
+        return _render_asset_references(manual_text)
 
     lines = manual_text.splitlines()
     result = []
@@ -198,12 +229,65 @@ def embed_step_images(manual_text: str, frames: List[Frame], frame_assets: Dict[
                 section_lines.append(lines[j])
                 j += 1
             section_text = "\n".join([line, *section_lines])
-            if "manual_assets/" not in section_text:
+            if not _has_rendered_asset_image(section_text):
                 strip = _build_step_image_strip(section_text, frames, frame_assets)
                 if strip:
                     result.extend(["", *strip, ""])
         i += 1
-    return "\n".join(result).rstrip() + "\n"
+    return _render_asset_references("\n".join(result)).rstrip() + "\n"
+
+
+def review_operation_manual_markdown(manual_text: str) -> List[Dict[str, str]]:
+    issues: List[Dict[str, str]] = []
+    raw_assets = re.findall(r"(?<!!\[[^\]]{0,80}\]\()(?<!\()manual_assets/frame_\d+\.(?:jpg|jpeg|png|webp)", manual_text)
+    if raw_assets:
+        issues.append(
+            {
+                "severity": "error",
+                "code": "raw_asset_path",
+                "message": "Manual contains screenshot asset paths that are not rendered as Markdown images.",
+            }
+        )
+
+    step_sections = re.findall(r"(?ms)^### .*?步骤.*?(?=^### |^## |\Z)", manual_text)
+    for index, section in enumerate(step_sections, start=1):
+        if "manual_assets/" in section and not _has_rendered_asset_image(section):
+            issues.append(
+                {
+                    "severity": "error",
+                    "code": "step_asset_not_rendered",
+                    "message": f"Step section {index} references screenshots but does not render them as Markdown images.",
+                }
+            )
+        elif "manual_assets/" not in section:
+            issues.append(
+                {
+                    "severity": "warning",
+                    "code": "step_missing_screenshot",
+                    "message": f"Step section {index} has no screenshot evidence.",
+                }
+            )
+    return issues
+
+
+def _has_rendered_asset_image(text: str) -> bool:
+    return bool(re.search(r"!\[[^\]]*\]\(manual_assets/[^)]+\)", text))
+
+
+def _render_asset_references(manual_text: str) -> str:
+    """Convert model-emitted asset paths into real Markdown images."""
+    pattern = re.compile(r"`?(manual_assets/frame_\d+\.(?:jpg|jpeg|png|webp))`?")
+
+    def replace(match: re.Match[str]) -> str:
+        start = match.start()
+        path = match.group(1)
+        prefix = manual_text[max(0, start - 3):start]
+        if prefix.endswith("]("):
+            return match.group(0)
+        label = Path(path).stem
+        return f"![{label}]({path})"
+
+    return pattern.sub(replace, manual_text)
 
 
 def _build_step_image_strip(section_text: str, frames: List[Frame], frame_assets: Dict[int, str]) -> List[str]:

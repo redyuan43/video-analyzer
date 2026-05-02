@@ -34,7 +34,8 @@ class Config:
         2. Fall back to default config (default_config.json)
         """
         try:
-            if self.user_config.exists():
+            self.loaded_user_config = self.user_config.exists()
+            if self.loaded_user_config:
                 logger.debug(f"Loading user config from {self.user_config}")
                 with open(self.user_config) as f:
                     self.config = json.load(f)
@@ -91,6 +92,13 @@ class Config:
                     self.config.setdefault("ocr", {})["base_url"] = value
                 elif key == "asr_provider":
                     self.config.setdefault("asr", {})["provider"] = value
+                elif key == "asr_strategy":
+                    self.config.setdefault("asr", {})["strategy"] = value
+                elif key == "allow_local_vibevoice":
+                    if value:
+                        self.config.setdefault("asr", {}).setdefault("vibevoice", {})["allow_local"] = True
+                elif key == "vibevoice_url":
+                    self.config.setdefault("asr", {}).setdefault("vibevoice", {})["deep_remote_urls"] = value
                 elif key == "model":
                     client = self.config["clients"]["default"]
                     self.config["clients"][client]["model"] = value
@@ -117,7 +125,8 @@ class Config:
             self.config["clients"]["openai_api"]["api_url"] = llm_base_url
             self.config["clients"]["openai_api"]["api_key"] = self.config["clients"]["openai_api"].get("api_key") or "0"
             self.config["clients"]["openai_api"]["model"] = vision_model
-            if not getattr(args, "asr_provider", None):
+            user_config_asr_provider = self.loaded_user_config and "provider" in self.config.get("asr", {})
+            if not getattr(args, "asr_provider", None) and not user_config_asr_provider:
                 self.config.setdefault("asr", {})["provider"] = "auto"
 
     def save_user_config(self):

@@ -35,7 +35,7 @@ Run from the repository root:
   --task operation_manual \
   --output output/manual-run \
   --context-file optional-page-description.md \
-  --asr-provider remote_http \
+  --asr-strategy balanced \
   --ocr-provider auto \
   --max-frames 24 \
   --keep-frames \
@@ -47,6 +47,9 @@ Recommended current local model setup:
 - Vision / VL model: `sayanything-hauhaucs-aggressive@?`
 - Text/manual model: `redhatai_qwen3.6-35b-a3b-nvfp4`
 - LLM endpoint: `http://127.0.0.1:1234/v1`
+- ASR strategy: `balanced` by default for operation manuals. It uses remote
+  HTTP ASR for fast timestamps and runs VibeVoice when the audio is long or the
+  fast transcript is not enough.
 - Remote ASR endpoint: `http://edge.taild500c8.ts.net:8001/api/asr/transcribe`
 - OCR order: spark DotsMOCR vLLM first, then other shared endpoints, then local
   LM Studio vision OCR fallback
@@ -145,16 +148,38 @@ Recommended policy:
 
 ## ASR Policy
 
-ASR provider order for manual generation should prefer remote or stronger
-models:
+Manual generation uses strategy-level ASR by default:
 
-1. `remote_http`: remote ASR service on edge/spark when reachable.
-2. `vibevoice`: local VibeVoice script fallback.
-3. `capswriter_http`: local HTTP fallback.
-4. `faster_whisper`: final local fallback.
+- `--asr-strategy fast`: run remote HTTP ASR only. Use this for quick
+  iteration and smoke tests.
+- `--asr-strategy balanced`: run remote HTTP ASR first, then run VibeVoice only
+  when the audio is long or the fast transcript looks too weak. This is the
+  default for `operation_manual`. If both remote HTTP and VibeVoice fail, it
+  falls back to CapsWriter HTTP and then `faster_whisper`.
+- `--asr-strategy deep`: run both remote HTTP ASR and VibeVoice. Use this for
+  final manuals where long-audio terminology and chapter consistency matter.
 
-Use `--asr-provider remote_http` when you specifically want the remote service.
-Use `--asr-provider auto` when you want the fallback chain.
+remote HTTP ASR is treated as the timestamp anchor. VibeVoice is treated as the
+long-context semantic pass: it helps correct terminology, infer chapter
+structure, and resolve audio-related uncertainties. When both are available, the
+merged transcript keeps remote HTTP timestamps and uses VibeVoice text for
+higher-quality wording and terminology.
+
+VibeVoice is remote-GPU first. By default the tool tries configured
+`vibevoice.deep_remote_urls`, such as a spark/edge GPU service, and will not
+silently start the local VibeVoice subprocess. This prevents accidental long CPU
+or inefficient local ROCm runs. Local VibeVoice is allowed only with
+`--allow-local-vibevoice`.
+
+Example remote VibeVoice override:
+
+```bash
+--asr-strategy deep \
+--vibevoice-url http://spark-31d6.taild500c8.ts.net:8002/api/asr/transcribe
+```
+
+Use `--asr-provider remote_http`, `--asr-provider vibevoice`, or another
+provider only when you want to force one provider and bypass strategy fusion.
 
 ## Current Real Sample Command
 
@@ -164,9 +189,9 @@ The Bilibili sample used during validation:
 .venv/bin/python -m video_analyzer.cli \
   downloads/test-videos/BV12moMBrELB/video.mp4 \
   --task operation_manual \
-  --output downloads/test-videos/BV12moMBrELB/run-final-av1-remoteasr-sayanything-24f \
+  --output downloads/test-videos/BV12moMBrELB/run-adaptive-vibevoice-deep \
   --context-file downloads/test-videos/BV12moMBrELB/description.md \
-  --asr-provider remote_http \
+  --asr-strategy deep \
   --ocr-provider auto \
   --max-frames 24 \
   --keep-frames \
@@ -178,7 +203,8 @@ Validated characteristics:
 - source video codec: AV1
 - source frames: about 4,956
 - extracted keyframes: 24
-- ASR: remote HTTP success
+- ASR: `deep` mode runs remote HTTP for timestamps and VibeVoice for
+  long-context terminology and chapter consistency
 - OCR events: 24 successful events
 - user manual: `operation_manual.md`
 - full evidence: `manual_evidence.md`
