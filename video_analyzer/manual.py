@@ -239,10 +239,20 @@ def embed_step_images(manual_text: str, frames: List[Frame], frame_assets: Dict[
 
 def review_operation_manual_markdown(manual_text: str) -> List[Dict[str, str]]:
     issues: List[Dict[str, str]] = []
+    code_span_images = re.findall(r"`\s*!\[[^\]]*\]\(manual_assets/[^)]+\)\s*`", manual_text)
+    if code_span_images:
+        issues.append(
+            {
+                "severity": "error",
+                "code": "image_in_code_span",
+                "message": "Manual contains Markdown images wrapped in code spans, so screenshots will not render.",
+            }
+        )
+
     raw_assets = []
     for match in re.finditer(r"manual_assets/frame_\d+\.(?:jpg|jpeg|png|webp)", manual_text):
         preceding_line = manual_text[manual_text.rfind("\n", 0, match.start()) + 1:match.start()]
-        if not re.search(r"!\[[^\]]*\]\($", preceding_line):
+        if not re.search(r"(^|[^`])!\[[^\]]*\]\($", preceding_line):
             raw_assets.append(match.group(0))
     if raw_assets:
         issues.append(
@@ -275,11 +285,16 @@ def review_operation_manual_markdown(manual_text: str) -> List[Dict[str, str]]:
 
 
 def _has_rendered_asset_image(text: str) -> bool:
-    return bool(re.search(r"!\[[^\]]*\]\(manual_assets/[^)]+\)", text))
+    return bool(re.search(r"(^|[^`])!\[[^\]]*\]\(manual_assets/[^)]+\)", text))
 
 
 def _render_asset_references(manual_text: str) -> str:
     """Convert model-emitted asset paths into real Markdown images."""
+    manual_text = re.sub(
+        r"`\s*(!\[[^\]]*\]\(manual_assets/[^)]+\))\s*`",
+        r"\1",
+        manual_text,
+    )
     pattern = re.compile(r"`?(manual_assets/frame_\d+\.(?:jpg|jpeg|png|webp))`?")
 
     def replace(match: re.Match[str]) -> str:

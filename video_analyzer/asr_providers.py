@@ -1,10 +1,12 @@
 import logging
 import subprocess
+import tempfile
 import time
 import wave
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import requests
 
@@ -17,23 +19,20 @@ from .audio_processor import AudioProcessor, AudioTranscript
 
 logger = logging.getLogger(__name__)
 
-VIBEVOICE_PYTHONS = [
-    Path("/home/ivan/github/VibeVoice/.venv-vvasr4bit/bin/python"),
-    Path("/home/ivan/github/VibeVoice/.venv-rocm71/bin/python"),
-]
-VIBEVOICE_SCRIPT = Path("/home/ivan/github/VibeVoice/demo/vibevoice_asr_inference_from_file.py")
-VIBEVOICE_MODEL = "microsoft/VibeVoice-ASR"
 CAPSWRITER_URL = "http://127.0.0.1:8001/api/asr/transcribe"
 REMOTE_VIBEVOICE_URLS = [
-    "http://spark-31d6.taild500c8.ts.net:8002/api/asr/transcribe",
-    "http://edge.taild500c8.ts.net:8002/api/asr/transcribe",
+    "http://192.168.100.169:8002/api/asr/transcribe",
+    "http://192.168.100.236:8003/api/asr/transcribe",
 ]
 REMOTE_ASR_URLS = [
-    "http://edge.taild500c8.ts.net:8001/api/asr/transcribe",
-    "http://spark-31d6.taild500c8.ts.net:8001/api/asr/transcribe",
+    "http://192.168.100.117:8001/api/asr/transcribe",
+    "http://127.0.0.1:8001/api/asr/transcribe",
+    "http://192.168.100.169:8001/api/asr/transcribe",
+    "http://192.168.100.131:8001/api/asr/transcribe",
 ]
 
 DEEP_ASR_MIN_SECONDS = 180.0
+VIBEVOICE_DISTRIBUTED_MIN_SECONDS = 420.0
 
 
 @dataclass
@@ -96,14 +95,22 @@ def extract_audio_to_wav(video_path: Path, output_dir: Path) -> Optional[Path]:
         return audio_path
 
 
-def transcribe_with_http_asr(audio_path: Path, url: str, hotword: str = "") -> Optional[AudioTranscript]:
+def transcribe_with_http_asr(
+    audio_path: Path,
+    url: str,
+    hotword: str = "",
+    extra_data: Optional[Dict[str, object]] = None,
+) -> Optional[AudioTranscript]:
     try:
+        form_data = {"hotword": hotword}
+        if extra_data:
+            form_data.update({key: str(value) for key, value in extra_data.items() if value is not None})
         with audio_path.open("rb") as audio_file:
             response = requests.post(
                 url,
                 files={"audio": (audio_path.name, audio_file, "audio/wav")},
-                data={"hotword": hotword},
-                timeout=900,
+                data=form_data,
+                timeout=(30, 900),
             )
         response.raise_for_status()
         payload = response.json()
@@ -134,98 +141,83 @@ def transcribe_with_remote_http(audio_path: Path, urls: Optional[list[str]] = No
     return None
 
 
-def transcribe_with_vibevoice_remote(audio_path: Path, urls: Optional[list[str]] = None) -> Optional[AudioTranscript]:
+def transcribe_with_vibevoice_remote(
+    audio_path: Path,
+    urls: Optional[list[str]] = None,
+    options: Optional[Dict[str, object]] = None,
+) -> Optional[AudioTranscript]:
     urls = [url for url in (REMOTE_VIBEVOICE_URLS if urls is None else urls) if url]
     if not urls:
         logger.warning("No remote GPU VibeVoice endpoint is configured")
         return None
-    transcript = transcribe_with_remote_http(audio_path, urls)
-    if transcript:
-        transcript.segments = transcript.segments or []
-        transcript.segments.append({"provider": "vibevoice_remote"})
-    return transcript
+    options = options or {}
+    duration = _wav_duration(audio_path)
+    distributed_min_seconds = float(options.get("distributed_min_seconds") or VIBEVOICE_DISTRIBUTED_MIN_SECONDS)
+    if len(urls) > 1 and duration >= distributed_min_seconds:
+        transcript = transcribe_with_vibevoice_distributed(audio_path, urls, options)
+        if transcript and transcript.text.strip():
+            return transcript
+    for url in urls:
+        transcript = transcribe_with_http_asr(audio_path, url, extra_data=options)
+        if transcript and transcript.text.strip():
+            transcript.segments = transcript.segments or []
+            transcript.segments.append({"provider": "vibevoice_remote", "provider_url": url})
+            return transcript
+    return None
 
 
-def _vibevoice_python_candidates(config: Dict[str, str]) -> list[Path]:
-    configured_python = config.get("python")
-    if configured_python:
-        return [Path(configured_python).expanduser()]
-    return VIBEVOICE_PYTHONS
+def transcribe_with_vibevoice_distributed(
+    audio_path: Path,
+    urls: list[str],
+    options: Optional[Dict[str, object]] = None,
+) -> Optional[AudioTranscript]:
+    """Split long audio across remote VibeVoice workers on different machines."""
+    options = options or {}
+    duration = _wav_duration(audio_path)
+    if not duration:
+        return None
+    worker_count = min(len(urls), max(1, int(options.get("distributed_workers") or len(urls))))
+    active_urls = urls[:worker_count]
+    logger.info("Running distributed VibeVoice ASR across %d endpoints", len(active_urls))
+    with tempfile.TemporaryDirectory(prefix="vibevoice_distributed_") as temp_dir:
+        chunks = _split_audio_evenly(audio_path, Path(temp_dir), worker_count, duration)
+        if not chunks:
+            return None
+        results: list[Tuple[int, float, Optional[AudioTranscript], str]] = []
+        request_options = dict(options)
+        request_options["use_native_chunking"] = False
+        request_options.pop("distributed_min_seconds", None)
+        request_options.pop("distributed_workers", None)
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(
+                    _transcribe_vibevoice_worker,
+                    chunk_path,
+                    active_urls[index],
+                    start_seconds,
+                    request_options,
+                ): (index, start_seconds, active_urls[index])
+                for index, (chunk_path, start_seconds) in enumerate(chunks)
+            }
+            for future in as_completed(futures):
+                index, start_seconds, url = futures[future]
+                try:
+                    results.append((index, start_seconds, future.result(), url))
+                except Exception as exc:
+                    logger.warning("Distributed VibeVoice worker failed for %s: %s", url, exc)
+                    results.append((index, start_seconds, None, url))
+        return _merge_distributed_vibevoice_results(results)
 
 
 def transcribe_with_vibevoice(audio_path: Path, config: Optional[Dict[str, str]] = None) -> Optional[AudioTranscript]:
     config = config or {}
     remote_urls = config["deep_remote_urls"] if "deep_remote_urls" in config else None
-    remote_transcript = transcribe_with_vibevoice_remote(audio_path, remote_urls)
-    if remote_transcript and remote_transcript.text.strip():
-        return remote_transcript
-
-    if not config.get("allow_local", False):
-        logger.warning("Local VibeVoice is disabled; configure a remote GPU VibeVoice endpoint or pass --allow-local-vibevoice")
-        return None
-
-    python_candidates = [path for path in _vibevoice_python_candidates(config) if path.exists()]
-    if not python_candidates or not VIBEVOICE_SCRIPT.exists():
-        logger.warning("VibeVoice ASR environment is not available")
-        return None
-
-    failures = []
-    for python_path in python_candidates:
-        command = [
-            str(python_path),
-            str(VIBEVOICE_SCRIPT),
-            "--model_path",
-            config.get("model_path", VIBEVOICE_MODEL),
-            "--audio_files",
-            str(audio_path),
-            "--batch_size",
-            "1",
-            "--temperature",
-            "0",
-            "--num_beams",
-            "1",
-            "--attn_implementation",
-            config.get("attn_implementation", "auto"),
-        ]
-        if config.get("device"):
-            command.extend(["--device", config["device"]])
-
-        try:
-            result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=3600)
-        except subprocess.CalledProcessError as exc:
-            stderr = (exc.stderr or "").strip()
-            stdout = (exc.stdout or "").strip()
-            failures.append(f"{python_path}: exit {exc.returncode}; stderr={stderr[-2000:]}; stdout={stdout[-1000:]}")
-            logger.warning("VibeVoice ASR failed with %s: %s", python_path, failures[-1])
-            continue
-        except Exception as exc:
-            failures.append(f"{python_path}: {exc}")
-            logger.warning("VibeVoice ASR failed with %s: %s", python_path, exc)
-            continue
-
-        raw = result.stdout.strip()
-        text = _extract_vibevoice_text(raw)
-        if not text:
-            text = raw
-        return AudioTranscript(text=text, segments=[{"raw_output": raw}], language="unknown")
-
-    logger.warning("All VibeVoice ASR candidates failed: %s", failures)
-    return None
-
-
-def _extract_vibevoice_text(raw: str) -> str:
-    lines = []
-    capture = False
-    for line in raw.splitlines():
-        stripped = line.strip()
-        if stripped == "--- Raw Output ---":
-            capture = True
-            continue
-        if capture and stripped.startswith("--- Structured Output"):
-            break
-        if capture and stripped and not stripped.startswith("="):
-            lines.append(stripped)
-    return "\n".join(lines).strip()
+    options = {
+        "use_native_chunking": config.get("use_native_chunking", True),
+        "distributed_min_seconds": config.get("distributed_min_seconds", VIBEVOICE_DISTRIBUTED_MIN_SECONDS),
+        "distributed_workers": config.get("distributed_workers"),
+    }
+    return transcribe_with_vibevoice_remote(audio_path, remote_urls, options=options)
 
 
 def transcribe_with_provider(
@@ -256,7 +248,7 @@ def transcribe_with_provider_result(
 ) -> ASRStrategyResult:
     vibevoice_config = vibevoice_config or {}
     result = ASRStrategyResult(strategy=f"provider:{provider}", transcript=None)
-    providers = ["remote_http", "vibevoice", "capswriter_http", "faster_whisper"] if provider == "auto" else [provider]
+    providers = ["vibevoice", "remote_http", "capswriter_http", "faster_whisper"] if provider == "auto" else [provider]
     for candidate in providers:
         if candidate == "none":
             result.merge_notes.append("ASR disabled by provider:none")
@@ -350,9 +342,8 @@ def transcribe_with_strategy(
             )
         else:
             result.merge_notes.append("balanced skipped VibeVoice: fast transcript was sufficient for this audio length")
-        needs_fallback = (
-            not _has_transcript_text(result.fast_transcript)
-            or (fast_is_weak and not _has_transcript_text(result.deep_transcript))
+        needs_fallback = not _has_transcript_text(result.deep_transcript) and (
+            not _has_transcript_text(result.fast_transcript) or fast_is_weak
         )
         if needs_fallback:
             result.fast_transcript = _timed_transcribe(
@@ -361,9 +352,8 @@ def transcribe_with_strategy(
                 lambda: transcribe_with_capswriter(audio_path),
             )
             fast_is_weak = _is_weak_fast_transcript(result.fast_transcript, _wav_duration(audio_path))
-        needs_fallback = (
-            not _has_transcript_text(result.fast_transcript)
-            or (fast_is_weak and not _has_transcript_text(result.deep_transcript))
+        needs_fallback = not _has_transcript_text(result.deep_transcript) and (
+            not _has_transcript_text(result.fast_transcript) or fast_is_weak
         )
         if needs_fallback:
             result.fast_transcript = _timed_transcribe(
@@ -461,6 +451,102 @@ def _split_deep_text(text: str) -> List[str]:
 
     pattern = r"[^。！？.!?\n]+[。！？.!?]?|[^\n]+"
     return [part.strip() for part in re.findall(pattern, text.strip()) if part.strip()]
+
+
+def _split_audio_evenly(audio_path: Path, output_dir: Path, parts: int, duration: float) -> List[Tuple[Path, float]]:
+    chunks: List[Tuple[Path, float]] = []
+    for index in range(parts):
+        start = duration * index / parts
+        end = duration * (index + 1) / parts
+        chunk_path = output_dir / f"chunk_{index:03d}.wav"
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                f"{start:.3f}",
+                "-to",
+                f"{end:.3f}",
+                "-i",
+                str(audio_path),
+                "-vn",
+                "-acodec",
+                "pcm_s16le",
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "-y",
+                str(chunk_path),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        chunks.append((chunk_path, start))
+    return chunks
+
+
+def _transcribe_vibevoice_worker(
+    chunk_path: Path,
+    url: str,
+    start_seconds: float,
+    options: Dict[str, object],
+) -> Optional[AudioTranscript]:
+    transcript = transcribe_with_http_asr(chunk_path, url, extra_data=options)
+    if not transcript:
+        return None
+    shifted_segments = []
+    for segment in transcript.segments or []:
+        shifted = dict(segment)
+        _shift_segment_time(shifted, "start", start_seconds)
+        _shift_segment_time(shifted, "end", start_seconds)
+        _shift_segment_time(shifted, "start_time", start_seconds)
+        _shift_segment_time(shifted, "end_time", start_seconds)
+        shifted["provider_url"] = url
+        shifted["chunk_offset_seconds"] = start_seconds
+        shifted_segments.append(shifted)
+    if not shifted_segments:
+        shifted_segments = [{"provider_url": url, "chunk_offset_seconds": start_seconds, "text": transcript.text}]
+    return AudioTranscript(text=transcript.text, segments=shifted_segments, language=transcript.language)
+
+
+def _merge_distributed_vibevoice_results(
+    results: list[Tuple[int, float, Optional[AudioTranscript], str]],
+) -> Optional[AudioTranscript]:
+    successful = [(index, start, transcript, url) for index, start, transcript, url in results if _has_transcript_text(transcript)]
+    if not successful:
+        return None
+    successful.sort(key=lambda item: item[0])
+    text = "\n".join(transcript.text.strip() for _index, _start, transcript, _url in successful if transcript and transcript.text).strip()
+    segments: List[Dict[str, object]] = []
+    for index, start, transcript, url in successful:
+        for segment in transcript.segments or []:
+            item = dict(segment)
+            item.setdefault("provider", "vibevoice_remote_distributed")
+            item.setdefault("provider_url", url)
+            item.setdefault("chunk_index", index)
+            item.setdefault("chunk_offset_seconds", start)
+            segments.append(item)
+    segments.append(
+        {
+            "provider": "vibevoice_remote_distributed",
+            "provider_urls": [url for _index, _start, _transcript, url in successful],
+            "chunk_count": len(successful),
+        }
+    )
+    language = next((transcript.language for _index, _start, transcript, _url in successful if transcript and transcript.language), "unknown")
+    return AudioTranscript(text=text, segments=segments, language=language)
+
+
+def _shift_segment_time(segment: Dict[str, object], key: str, offset: float) -> None:
+    if key not in segment or segment[key] is None:
+        return
+    try:
+        segment[key] = float(segment[key]) + offset
+    except (TypeError, ValueError):
+        return
 
 
 def _should_run_deep_asr(audio_path: Path, fast_transcript: Optional[AudioTranscript]) -> bool:

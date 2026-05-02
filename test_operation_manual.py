@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import argparse
+import importlib.util
+import json
 import tempfile
 import unittest
 import wave
@@ -8,6 +10,7 @@ from unittest.mock import Mock, patch
 
 from video_analyzer.config import Config
 from video_analyzer.analyzer import VideoAnalyzer
+from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient
 from video_analyzer.manual import (
     build_operation_manual_prompt,
     embed_step_images,
@@ -16,15 +19,24 @@ from video_analyzer.manual import (
     write_frame_evidence_index,
 )
 from video_analyzer.asr_providers import (
+    REMOTE_ASR_URLS,
+    REMOTE_VIBEVOICE_URLS,
     merge_asr_transcripts,
     transcribe_with_provider,
     transcribe_with_provider_result,
     transcribe_with_remote_http,
+    transcribe_with_vibevoice_remote,
     transcribe_with_strategy,
     transcribe_with_vibevoice,
 )
-from video_analyzer.ocr import DotsMOCRVLLMProvider, run_ocr
+from video_analyzer.ocr import DOTS_MOCR_ENDPOINTS, DotsMOCRVLLMProvider, run_ocr
 from video_analyzer.audio_processor import AudioTranscript
+
+RUNNER_PATH = Path(__file__).resolve().parent / "tools" / "run_operation_manual_from_url.py"
+RUNNER_SPEC = importlib.util.spec_from_file_location("run_operation_manual_from_url", RUNNER_PATH)
+run_operation_manual_from_url = importlib.util.module_from_spec(RUNNER_SPEC)
+assert RUNNER_SPEC and RUNNER_SPEC.loader
+RUNNER_SPEC.loader.exec_module(run_operation_manual_from_url)
 
 try:
     import cv2
@@ -66,8 +78,8 @@ class OperationManualTests(unittest.TestCase):
             ocr_base_url=None,
             asr_provider=None,
             asr_strategy=None,
+            remote_asr_url=None,
             vibevoice_url=None,
-            allow_local_vibevoice=False,
             context_file=None,
         )
         config = Config("config")
@@ -79,7 +91,79 @@ class OperationManualTests(unittest.TestCase):
         self.assertEqual(config.get("clients")["openai_api"]["model"], "sayanything-hauhaucs-aggressive@?")
         self.assertEqual(config.get("asr")["provider"], "auto")
         self.assertEqual(config.get("asr")["strategy"], "balanced")
+        self.assertEqual(config.get("asr")["vibevoice"]["remote_urls"], [])
+        self.assertEqual(config.get("asr")["vibevoice"]["deep_remote_urls"][1], "http://192.168.100.236:8003/api/asr/transcribe")
+        self.assertTrue(config.get("asr")["vibevoice"]["use_native_chunking"])
         self.assertEqual(config.get("ocr")["fallback_model"], "sayanything-hauhaucs-aggressive@?")
+
+    def test_url_runner_builds_page_context_markdown(self):
+        info = {
+            "title": "Hermes Bridge",
+            "id": "BV123",
+            "uploader": "tester",
+            "upload_date": "20260502",
+            "duration": 90,
+            "description": "安装命令和视频简介",
+            "chapters": [{"start_time": 0, "end_time": 30, "title": "开始"}],
+            "tags": ["Hermes", "Android"],
+        }
+
+        text = run_operation_manual_from_url.build_context_markdown(info, "https://example.test/video")
+
+        self.assertIn("# Hermes Bridge", text)
+        self.assertIn("安装命令和视频简介", text)
+        self.assertIn("00:00:00 - 00:00:30: 开始", text)
+        self.assertIn("Hermes, Android", text)
+
+    def test_url_runner_defaults_to_edge_vibevoice_and_spark_ocr(self):
+        args = argparse.Namespace(
+            python=".venv/bin/python",
+            vibevoice_url="http://192.168.100.236:8003/api/asr/transcribe",
+            ocr_base_url="http://192.168.100.169:8000/v1",
+            llm_base_url="http://127.0.0.1:1234/v1",
+            vision_model="sayanything-hauhaucs-aggressive@?",
+            text_model="redhatai_qwen3.6-35b-a3b-nvfp4",
+            manual_language="zh-CN",
+            max_frames=24,
+            log_level="INFO",
+            duration=None,
+            no_keep_frames=False,
+        )
+
+        command = run_operation_manual_from_url.build_analyzer_command(
+            args,
+            Path("video.mp4"),
+            Path("description.md"),
+            Path("run"),
+        )
+
+        self.assertIn("--asr-provider", command)
+        self.assertIn("vibevoice", command)
+        self.assertIn("http://192.168.100.236:8003/api/asr/transcribe", command)
+        self.assertIn("http://192.168.100.169:8000/v1", command)
+
+    def test_url_runner_rejects_unsafe_run_name_before_delete(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            parent = Path(temp_dir) / "video"
+            parent.mkdir()
+
+            with self.assertRaises(ValueError):
+                run_operation_manual_from_url.safe_child_dir(parent, "/tmp/delete-me")
+
+            safe = run_operation_manual_from_url.safe_child_dir(parent, "../delete-me")
+            self.assertEqual(safe, (parent / "delete-me").resolve())
+            self.assertIn(parent.resolve(), safe.parents)
+
+    def test_url_runner_reports_quality_failed_manual_path_from_analysis(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            analysis_path = Path(temp_dir) / "analysis.json"
+            manual_path = Path(temp_dir) / "operation_manual.quality_failed.md"
+            analysis_path.write_text(
+                json.dumps({"operation_manual": {"manual_path": str(manual_path)}}),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(run_operation_manual_from_url.read_manual_path(analysis_path), manual_path)
 
     def test_operation_manual_preserves_user_configured_asr_provider(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -133,6 +217,8 @@ class OperationManualTests(unittest.TestCase):
                 ocr_base_url=None,
                 asr_provider=None,
                 asr_strategy=None,
+                remote_asr_url=None,
+                vibevoice_url=None,
                 context_file=None,
             )
 
@@ -141,7 +227,7 @@ class OperationManualTests(unittest.TestCase):
 
             self.assertEqual(config.get("asr")["provider"], "vibevoice")
 
-    def test_vibevoice_cli_options_configure_remote_and_local_opt_in(self):
+    def test_vibevoice_cli_options_configure_fast_and_deep_remote_urls(self):
         args = argparse.Namespace(
             video_path="video.mp4",
             config="config",
@@ -170,16 +256,74 @@ class OperationManualTests(unittest.TestCase):
             ocr_base_url=None,
             asr_provider=None,
             asr_strategy="deep",
+            remote_asr_url=["http://agx/asr"],
             vibevoice_url=["http://spark/vibevoice"],
-            allow_local_vibevoice=True,
             context_file=None,
         )
         config = Config("config")
         config.update_from_args(args)
 
         vibevoice = config.get("asr")["vibevoice"]
+        self.assertEqual(vibevoice["remote_urls"], ["http://agx/asr"])
         self.assertEqual(vibevoice["deep_remote_urls"], ["http://spark/vibevoice"])
-        self.assertTrue(vibevoice["allow_local"])
+
+    def test_openai_client_uses_reasoning_content_when_content_is_empty(self):
+        client = GenericOpenAIAPIClient("0", "http://127.0.0.1:1234/v1", max_retries=1)
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning_content": "截图里显示终端安装命令。",
+                    }
+                }
+            ]
+        }
+
+        with patch("video_analyzer.clients.generic_openai_api.requests.post", return_value=response):
+            result = client.generate(
+                prompt="describe",
+                image_path=None,
+                model="vision",
+                temperature=0.0,
+                num_predict=32,
+            )
+
+        self.assertEqual(result["response"], "截图里显示终端安装命令。")
+        self.assertEqual(result["response_source"], "reasoning_content")
+
+    def test_openai_client_rejects_reasoning_content_fallback_for_public_endpoint(self):
+        client = GenericOpenAIAPIClient("key", "https://api.example.com/v1", max_retries=1)
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning_content": "private reasoning",
+                    }
+                }
+            ]
+        }
+
+        with patch("video_analyzer.clients.generic_openai_api.requests.post", return_value=response):
+            with self.assertRaises(Exception) as raised:
+                client.generate(prompt="describe", model="vision")
+
+        self.assertIn("reasoning_content fallback is only allowed", str(raised.exception))
+
+    def test_dots_mocr_default_endpoints_prefer_lan_before_localhost(self):
+        self.assertEqual(DOTS_MOCR_ENDPOINTS[0], "http://192.168.100.169:8000/v1")
+        self.assertEqual(DOTS_MOCR_ENDPOINTS[1], "http://192.168.100.131:8000/v1")
+
+    def test_asr_default_endpoints_use_lan_not_tailscale(self):
+        self.assertEqual(REMOTE_ASR_URLS[0], "http://192.168.100.117:8001/api/asr/transcribe")
+        self.assertEqual(REMOTE_VIBEVOICE_URLS[0], "http://192.168.100.169:8002/api/asr/transcribe")
+        self.assertEqual(REMOTE_VIBEVOICE_URLS[1], "http://192.168.100.236:8003/api/asr/transcribe")
+        self.assertFalse(any("taild500c8" in url for url in [*REMOTE_ASR_URLS, *REMOTE_VIBEVOICE_URLS]))
 
     def test_ocr_provider_parses_dots_mocr_json(self):
         if cv2 is None:
@@ -363,6 +507,22 @@ class OperationManualTests(unittest.TestCase):
         self.assertIn("![frame_000](manual_assets/frame_000.jpg)", updated)
         self.assertNotIn("`manual_assets/frame_000.jpg`", updated)
 
+    def test_code_span_images_are_unwrapped_to_rendered_images(self):
+        frames = [Mock(number=0, timestamp=3.0)]
+        assets = {0: "manual_assets/frame_000.jpg"}
+        manual = "\n".join(
+            [
+                "# 手册",
+                "### 步骤 1：截图",
+                "`![入口截图](manual_assets/frame_000.jpg)`",
+            ]
+        )
+
+        updated = embed_step_images(manual, frames, assets)
+
+        self.assertIn("![入口截图](manual_assets/frame_000.jpg)", updated)
+        self.assertNotIn("`![入口截图](manual_assets/frame_000.jpg)`", updated)
+
     def test_operation_manual_review_flags_raw_asset_paths(self):
         manual = "\n".join(
             [
@@ -377,6 +537,19 @@ class OperationManualTests(unittest.TestCase):
         issues = review_operation_manual_markdown(manual)
 
         self.assertIn("raw_asset_path", {issue["code"] for issue in issues})
+
+    def test_operation_manual_review_flags_code_span_images(self):
+        manual = "\n".join(
+            [
+                "# 手册",
+                "### 步骤 1：打开页面",
+                "`![入口截图](manual_assets/frame_000.jpg)`",
+            ]
+        )
+
+        issues = review_operation_manual_markdown(manual)
+
+        self.assertIn("image_in_code_span", {issue["code"] for issue in issues})
 
     def test_operation_manual_review_accepts_rendered_step_images(self):
         manual = "\n".join(
@@ -417,39 +590,39 @@ class OperationManualTests(unittest.TestCase):
         self.assertNotIn("Frame 4", formatted)
         self.assertLess(len(formatted), 2600)
 
-    def test_vibevoice_empty_python_config_uses_known_environment(self):
-        audio_path = Mock()
-        audio_path.__fspath__ = Mock(return_value="/tmp/audio.wav")
-        with patch("video_analyzer.asr_providers.VIBEVOICE_PYTHONS", [Path("/env/bin/python")]), patch(
-            "video_analyzer.asr_providers.VIBEVOICE_SCRIPT", Path("/script.py")
-        ), patch("video_analyzer.asr_providers.Path.exists", return_value=True), patch(
-            "video_analyzer.asr_providers.subprocess.run"
-        ) as run:
-            run.return_value.stdout = "--- Raw Output ---\nhello\n--- Structured Output (0 segments) ---"
-            transcript = transcribe_with_provider(
-                provider="vibevoice",
-                audio_path=Path("/tmp/audio.wav"),
-                language="",
-                whisper_model="medium",
-                device="cpu",
-                vibevoice_config={"python": "", "allow_local": True, "deep_remote_urls": []},
-            )
-
-        self.assertEqual(transcript.text, "hello")
-        self.assertEqual(run.call_args[0][0][0], "/env/bin/python")
-
-    def test_vibevoice_defaults_to_remote_and_blocks_local_subprocess(self):
+    def test_vibevoice_defaults_to_remote_only(self):
         audio_path = Path(tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name)
         audio_path.write_bytes(b"RIFF")
 
         with patch("video_analyzer.asr_providers.transcribe_with_vibevoice_remote", return_value=None) as remote, patch(
             "video_analyzer.asr_providers.subprocess.run"
         ) as run:
-            transcript = transcribe_with_vibevoice(audio_path, {"allow_local": False, "deep_remote_urls": ["http://spark/vibevoice"]})
+            transcript = transcribe_with_vibevoice(audio_path, {"deep_remote_urls": ["http://spark/vibevoice"]})
 
         self.assertIsNone(transcript)
         remote.assert_called_once()
         run.assert_not_called()
+        audio_path.unlink()
+
+    def test_balanced_uses_successful_vibevoice_without_qwen_asr_fallback(self):
+        audio_path = Path(tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name)
+        with wave.open(str(audio_path), "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(16000)
+            wav_file.writeframes(b"\x00\x00" * 16000 * 240)
+        deep = AudioTranscript(text="vibevoice reliable text", segments=[{"start_time": 0.0, "end_time": 1.0}], language="zh")
+
+        with patch("video_analyzer.asr_providers.transcribe_with_remote_http", return_value=None), patch(
+            "video_analyzer.asr_providers.transcribe_with_vibevoice", return_value=deep
+        ), patch("video_analyzer.asr_providers.transcribe_with_capswriter") as capswriter, patch(
+            "video_analyzer.asr_providers.AudioProcessor"
+        ) as processor:
+            result = transcribe_with_strategy("balanced", audio_path, "", "medium", "cpu", {"remote_urls": []})
+
+        self.assertEqual(result.transcript.text, "vibevoice reliable text")
+        capswriter.assert_not_called()
+        processor.assert_not_called()
         audio_path.unlink()
 
     def test_vibevoice_remote_success_avoids_local_subprocess(self):
@@ -460,7 +633,7 @@ class OperationManualTests(unittest.TestCase):
         with patch("video_analyzer.asr_providers.transcribe_with_vibevoice_remote", return_value=remote_transcript), patch(
             "video_analyzer.asr_providers.subprocess.run"
         ) as run:
-            transcript = transcribe_with_vibevoice(audio_path, {"allow_local": False, "deep_remote_urls": ["http://spark/vibevoice"]})
+            transcript = transcribe_with_vibevoice(audio_path, {"deep_remote_urls": ["http://spark/vibevoice"]})
 
         self.assertEqual(transcript.text, "remote vibe")
         run.assert_not_called()
@@ -471,10 +644,13 @@ class OperationManualTests(unittest.TestCase):
         audio_path.write_bytes(b"RIFF")
 
         with patch("video_analyzer.asr_providers.transcribe_with_vibevoice_remote", return_value=None) as remote:
-            transcript = transcribe_with_vibevoice(audio_path, {"allow_local": False, "deep_remote_urls": ["http://spark/vibevoice"]})
+            transcript = transcribe_with_vibevoice(audio_path, {"deep_remote_urls": ["http://spark/vibevoice"]})
 
         self.assertIsNone(transcript)
-        remote.assert_called_once_with(audio_path, ["http://spark/vibevoice"])
+        remote.assert_called_once()
+        self.assertEqual(remote.call_args.args[0], audio_path)
+        self.assertEqual(remote.call_args.args[1], ["http://spark/vibevoice"])
+        self.assertTrue(remote.call_args.kwargs["options"]["use_native_chunking"])
         audio_path.unlink()
 
     def test_remote_http_asr_uses_first_successful_endpoint(self):
@@ -495,6 +671,59 @@ class OperationManualTests(unittest.TestCase):
         self.assertEqual(transcript.text, "远程识别文本")
         self.assertEqual(post.call_args_list[0].args[0], "http://spark/asr")
         self.assertEqual(post.call_args_list[1].args[0], "http://edge/asr")
+        self.assertEqual(post.call_args_list[0].kwargs["timeout"], (30, 900))
+        audio_path.unlink()
+
+    def test_vibevoice_enables_native_chunking_without_owning_policy(self):
+        audio_path = Path(tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name)
+        audio_path.write_bytes(b"RIFF")
+        ok = Mock()
+        ok.raise_for_status.return_value = None
+        ok.json.return_value = {
+            "success": True,
+            "text": "native chunk text",
+            "language": "zh",
+            "segments": [{"mode": "chunk_reconcile"}],
+        }
+
+        with patch("video_analyzer.asr_providers.requests.post", return_value=ok) as post:
+            transcript = transcribe_with_vibevoice(
+                audio_path,
+                {
+                    "deep_remote_urls": ["http://spark/vibevoice"],
+                },
+            )
+
+        self.assertEqual(transcript.text, "native chunk text")
+        self.assertEqual(post.call_args.kwargs["data"]["use_native_chunking"], "True")
+        self.assertNotIn("chunk_parallel_workers", post.call_args.kwargs["data"])
+        self.assertNotIn("chunk_duration_sec", post.call_args.kwargs["data"])
+        audio_path.unlink()
+
+    def test_vibevoice_distributes_long_audio_across_remote_workers(self):
+        audio_path = Path(tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name)
+        with wave.open(str(audio_path), "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(16000)
+            wav_file.writeframes(b"\x00\x00" * 16000 * 500)
+        spark = AudioTranscript(text="spark half", segments=[{"start_time": 1.0, "end_time": 2.0, "text": "spark half"}], language="zh")
+        edge = AudioTranscript(text="edge half", segments=[{"start_time": 1.0, "end_time": 2.0, "text": "edge half"}], language="zh")
+
+        with patch("video_analyzer.asr_providers._split_audio_evenly") as split_audio, patch(
+            "video_analyzer.asr_providers.transcribe_with_http_asr", side_effect=[spark, edge]
+        ) as post:
+            split_audio.return_value = [(Path("spark.wav"), 0.0), (Path("edge.wav"), 250.0)]
+            transcript = transcribe_with_vibevoice_remote(
+                audio_path,
+                ["http://spark/vibevoice", "http://edge/vibevoice"],
+                {"use_native_chunking": True, "distributed_min_seconds": 420, "distributed_workers": 2},
+            )
+
+        self.assertEqual(transcript.text, "spark half\nedge half")
+        self.assertEqual({call.args[1] for call in post.call_args_list}, {"http://spark/vibevoice", "http://edge/vibevoice"})
+        self.assertTrue(all(call.kwargs["extra_data"]["use_native_chunking"] is False for call in post.call_args_list))
+        self.assertIn(251.0, [segment.get("start_time") for segment in transcript.segments])
         audio_path.unlink()
 
     def test_remote_http_empty_url_list_disables_builtin_endpoints(self):
@@ -519,8 +748,7 @@ class OperationManualTests(unittest.TestCase):
             result = transcribe_with_provider_result("auto", audio_path, "", "medium", "cpu", {})
 
         self.assertEqual(result.transcript.text, "vibe text")
-        self.assertEqual(result.providers_run, ["remote_http", "vibevoice"])
-        self.assertIn("remote_http produced no transcript", result.failures)
+        self.assertEqual(result.providers_run, ["vibevoice"])
         capswriter.assert_not_called()
         audio_path.unlink()
 
@@ -679,7 +907,7 @@ class OperationManualTests(unittest.TestCase):
         audio_path.unlink()
 
     def test_screen_keyframes_keep_static_and_changed_ui(self):
-        if cv2 is None:
+        if cv2 is None or VideoProcessor is None:
             self.skipTest("opencv-python is not installed")
         with tempfile.TemporaryDirectory() as temp_dir:
             video_path = Path(temp_dir) / "screen.mp4"
@@ -706,6 +934,8 @@ class OperationManualTests(unittest.TestCase):
             self.assertTrue(all(frame.path.exists() for frame in frames))
 
     def test_density_budget_keeps_coverage_and_high_change_frames(self):
+        if VideoProcessor is None:
+            self.skipTest("opencv-python is not installed")
         with tempfile.TemporaryDirectory() as temp_dir:
             processor = VideoProcessor(Path(temp_dir) / "video.mp4", Path(temp_dir) / "frames", "model")
             candidates = [

@@ -94,11 +94,10 @@ class Config:
                     self.config.setdefault("asr", {})["provider"] = value
                 elif key == "asr_strategy":
                     self.config.setdefault("asr", {})["strategy"] = value
-                elif key == "allow_local_vibevoice":
-                    if value:
-                        self.config.setdefault("asr", {}).setdefault("vibevoice", {})["allow_local"] = True
                 elif key == "vibevoice_url":
                     self.config.setdefault("asr", {}).setdefault("vibevoice", {})["deep_remote_urls"] = value
+                elif key == "remote_asr_url":
+                    self.config.setdefault("asr", {}).setdefault("vibevoice", {})["remote_urls"] = value
                 elif key == "model":
                     client = self.config["clients"]["default"]
                     self.config["clients"][client]["model"] = value

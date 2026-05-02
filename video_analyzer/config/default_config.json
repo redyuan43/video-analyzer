@@ -68,19 +68,14 @@
         "provider": "faster_whisper",
         "strategy": "balanced",
         "vibevoice": {
-            "python": "",
-            "model_path": "microsoft/VibeVoice-ASR",
-            "device": "",
-            "attn_implementation": "auto",
-            "allow_local": false,
             "deep_remote_urls": [
-                "http://spark-31d6.taild500c8.ts.net:8002/api/asr/transcribe",
-                "http://edge.taild500c8.ts.net:8002/api/asr/transcribe"
+                "http://192.168.100.169:8002/api/asr/transcribe",
+                "http://192.168.100.236:8003/api/asr/transcribe"
             ],
-            "remote_urls": [
-                "http://edge.taild500c8.ts.net:8001/api/asr/transcribe",
-                "http://spark-31d6.taild500c8.ts.net:8001/api/asr/transcribe"
-            ]
+            "use_native_chunking": true,
+            "distributed_min_seconds": 420,
+            "distributed_workers": 2,
+            "remote_urls": []
         }
     },
     "keep_frames": false,

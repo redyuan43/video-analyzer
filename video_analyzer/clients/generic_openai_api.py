@@ -2,6 +2,8 @@ import requests
 import json
 import time
 import re
+import ipaddress
+from urllib.parse import urlparse
 from typing import Optional, Dict, Any, Tuple
 from .llm_client import LLMClient
 import logging
@@ -82,10 +84,21 @@ class GenericOpenAIAPIClient(LLMClient):
                         raise Exception("No choices in response")
                         
                     message = json_response['choices'][0].get('message', {})
-                    if not message or 'content' not in message:
+                    if not message:
                         raise Exception("No content in response message")
-                        
-                    return {"response": message['content']}
+
+                    content = message.get("content")
+                    source = "content"
+                    if not content and message.get("reasoning_content") and self._allows_reasoning_content_fallback():
+                        content = self._clean_reasoning_content(message.get("reasoning_content", ""))
+                        source = "reasoning_content"
+                        logger.warning("API response content was empty; using reasoning_content fallback")
+                    elif not content and message.get("reasoning_content"):
+                        raise Exception("Response content is empty; reasoning_content fallback is only allowed for local/LAN endpoints")
+                    if content is None:
+                        raise Exception("No content in response message")
+
+                    return {"response": content, "response_source": source}
                     
                 except json.JSONDecodeError:
                     raise Exception(f"Invalid JSON response: {response.text}")
@@ -113,6 +126,22 @@ class GenericOpenAIAPIClient(LLMClient):
                 logger.warning(f"Request failed (attempt {attempt + 1}/{self.max_retries}): {str(e)}")
                 logger.warning(f"Waiting {wait_time} seconds before retry")
                 time.sleep(wait_time)
+
+    def _allows_reasoning_content_fallback(self) -> bool:
+        parsed = urlparse(self.base_url)
+        host = parsed.hostname or ""
+        if host in {"localhost", "127.0.0.1", "::1"}:
+            return True
+        try:
+            address = ipaddress.ip_address(host)
+            return address.is_private or address.is_loopback
+        except ValueError:
+            return host.endswith(".local") or host.endswith(".lan")
+
+    @staticmethod
+    def _clean_reasoning_content(text: str) -> str:
+        text = re.sub(r"</?think>", "", text, flags=re.IGNORECASE)
+        return text.strip()
 
     def _handle_streaming_response(self, response: requests.Response) -> Dict[Any, Any]:
         """Handle streaming response from API.

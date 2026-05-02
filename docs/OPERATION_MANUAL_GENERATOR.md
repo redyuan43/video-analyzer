@@ -28,7 +28,33 @@ missing steps.
 
 ## Quick Start
 
-Run from the repository root:
+For YouTube, Bilibili, or any URL supported by `yt-dlp`, run from the
+repository root:
+
+```bash
+tools/run_operation_manual_from_url.sh "https://www.bilibili.com/video/BVxxxx"
+```
+
+The one-command runner downloads the video, saves the page metadata and
+description to `description.md`, then runs the full operation-manual pipeline.
+Defaults match the current stable local setup: VibeVoice ASR on edge
+`http://192.168.100.236:8003/api/asr/transcribe`, DotsMOCR OCR on spark
+`http://192.168.100.169:8000/v1`, and LM Studio on `127.0.0.1:1234`.
+
+Useful URL-runner variants:
+
+```bash
+# Use browser cookies for Bilibili/YouTube login or age-gated content.
+tools/run_operation_manual_from_url.sh "URL" --cookies-from-browser chrome
+
+# Spend more VL/OCR budget on dense tutorials.
+tools/run_operation_manual_from_url.sh "URL" --max-frames 48
+
+# Only download video and page context.
+tools/run_operation_manual_from_url.sh "URL" --download-only
+```
+
+For an existing local video:
 
 ```bash
 .venv/bin/python -m video_analyzer.cli VIDEO.mp4 \
@@ -47,12 +73,14 @@ Recommended current local model setup:
 - Vision / VL model: `sayanything-hauhaucs-aggressive@?`
 - Text/manual model: `redhatai_qwen3.6-35b-a3b-nvfp4`
 - LLM endpoint: `http://127.0.0.1:1234/v1`
-- ASR strategy: `balanced` by default for operation manuals. It uses remote
-  HTTP ASR for fast timestamps and runs VibeVoice when the audio is long or the
-  fast transcript is not enough.
-- Remote ASR endpoint: `http://edge.taild500c8.ts.net:8001/api/asr/transcribe`
-- OCR order: spark DotsMOCR vLLM first, then other shared endpoints, then local
-  LM Studio vision OCR fallback
+- ASR strategy: `balanced` by default for operation manuals. The default path
+  is remote GPU VibeVoice only; fast remote HTTP ASR endpoints are used only
+  when explicitly configured with `--remote-asr-url`.
+- VibeVoice endpoints: spark `http://192.168.100.169:8002/api/asr/transcribe`
+  and edge `http://192.168.100.236:8003/api/asr/transcribe`; do not use
+  Tailscale addresses for normal LAN runs.
+- OCR order: spark DotsMOCR vLLM over LAN first, then other shared endpoints,
+  then local LM Studio vision OCR fallback.
 
 Current OCR deployment:
 
@@ -63,7 +91,7 @@ Current OCR deployment:
 | Container | `dots-mocr-vllm` |
 | Image | `vllm/vllm-openai:v0.17.1-cu130` |
 | Model path | `/workspace/dots.mocr/weights/DotsMOCR` |
-| API base URL | `http://spark-31d6.taild500c8.ts.net:8000/v1` |
+| API base URL | `http://192.168.100.169:8000/v1` or `http://192.168.100.131:8000/v1` |
 | Served model name | `model` |
 | max_model_len | `16384` |
 
@@ -151,32 +179,54 @@ Recommended policy:
 Manual generation uses strategy-level ASR by default:
 
 - `--asr-strategy fast`: run remote HTTP ASR only. Use this for quick
-  iteration and smoke tests.
-- `--asr-strategy balanced`: run remote HTTP ASR first, then run VibeVoice only
-  when the audio is long or the fast transcript looks too weak. This is the
-  default for `operation_manual`. If both remote HTTP and VibeVoice fail, it
-  falls back to CapsWriter HTTP and then `faster_whisper`.
-- `--asr-strategy deep`: run both remote HTTP ASR and VibeVoice. Use this for
+  iteration and smoke tests when a fast ASR endpoint was explicitly configured.
+- `--asr-strategy balanced`: use VibeVoice when no fast transcript exists, when
+  the audio is long, or when the fast transcript looks too weak. This is the
+  default for `operation_manual`. If VibeVoice succeeds, the tool does not fall
+  back to Qwen3-ASR/CapsWriter just to manufacture a second transcript.
+- `--asr-strategy deep`: run VibeVoice and, when `--remote-asr-url` is
+  configured, also run remote HTTP ASR for timestamp anchoring. Use this for
   final manuals where long-audio terminology and chapter consistency matter.
 
-remote HTTP ASR is treated as the timestamp anchor. VibeVoice is treated as the
-long-context semantic pass: it helps correct terminology, infer chapter
-structure, and resolve audio-related uncertainties. When both are available, the
-merged transcript keeps remote HTTP timestamps and uses VibeVoice text for
-higher-quality wording and terminology.
+When explicitly configured, remote HTTP ASR is treated as the timestamp anchor.
+VibeVoice is treated as the long-context semantic pass: it helps correct
+terminology, infer chapter structure, and resolve audio-related uncertainties.
+When both are available, the merged transcript keeps remote HTTP timestamps and
+uses VibeVoice text for higher-quality wording and terminology.
 
-VibeVoice is remote-GPU first. By default the tool tries configured
-`vibevoice.deep_remote_urls`, such as a spark/edge GPU service, and will not
-silently start the local VibeVoice subprocess. This prevents accidental long CPU
-or inefficient local ROCm runs. Local VibeVoice is allowed only with
-`--allow-local-vibevoice`.
+VibeVoice is remote-GPU only. The tool tries configured
+`vibevoice.deep_remote_urls`, such as a spark/edge GPU service, and never starts
+a local VibeVoice subprocess. This prevents accidental long CPU or inefficient
+local ROCm runs.
+
+Balanced mode is VibeVoice-first by default. If VibeVoice fails to produce text,
+the tool may still fall back to CapsWriter HTTP or `faster_whisper` so a manual
+can be generated with an explicit ASR warning. For a strict no-Qwen/no-CapsWriter
+run, force `--asr-provider vibevoice`.
+
+There are two different kinds of VibeVoice parallelism:
+
+- **Remote service chunking:** the VibeVoice HTTP wrapper can call VibeVoice's
+  native meeting workflow on one machine. Keep
+  `VIBEVOICE_CHUNK_PARALLEL_WORKERS=1` on a single GB10-class device unless you
+  have verified memory headroom. Setting it to `2` starts two model-loading
+  worker processes on the same host and can overload the machine.
+- **Distributed workers:** for long audio and multiple `--vibevoice-url`
+  endpoints, `video-analyzer` splits the audio timeline across endpoints, for
+  example spark handles one slice and edge handles another. Each remote request
+  uses `use_native_chunking=false` so every machine runs only one VibeVoice
+  model instance.
 
 Example remote VibeVoice override:
 
 ```bash
 --asr-strategy deep \
---vibevoice-url http://spark-31d6.taild500c8.ts.net:8002/api/asr/transcribe
+--vibevoice-url http://192.168.100.169:8002/api/asr/transcribe \
+--vibevoice-url http://192.168.100.236:8003/api/asr/transcribe
 ```
+
+Add `--remote-asr-url ...` only when you intentionally want a fast timestamp
+anchor in addition to VibeVoice.
 
 Use `--asr-provider remote_http`, `--asr-provider vibevoice`, or another
 provider only when you want to force one provider and bypass strategy fusion.
@@ -203,8 +253,9 @@ Validated characteristics:
 - source video codec: AV1
 - source frames: about 4,956
 - extracted keyframes: 24
-- ASR: `deep` mode runs remote HTTP for timestamps and VibeVoice for
-  long-context terminology and chapter consistency
+- ASR: `deep` mode runs VibeVoice for long-context terminology and chapter
+  consistency; it uses remote HTTP timestamps only when `--remote-asr-url` is
+  configured
 - OCR events: 24 successful events
 - user manual: `operation_manual.md`
 - full evidence: `manual_evidence.md`

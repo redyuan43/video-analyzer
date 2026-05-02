@@ -98,8 +98,8 @@ def main():
     parser.add_argument("--ocr-base-url", type=str, help="OCR OpenAI-compatible base URL or auto")
     parser.add_argument("--asr-provider", choices=["auto", "remote_http", "capswriter_http", "vibevoice", "faster_whisper", "none"], help="ASR provider")
     parser.add_argument("--asr-strategy", choices=["fast", "balanced", "deep"], help="Dual-ASR strategy for operation manuals")
+    parser.add_argument("--remote-asr-url", action="append", help="Remote fast ASR endpoint; can be provided multiple times")
     parser.add_argument("--vibevoice-url", action="append", help="Remote GPU VibeVoice ASR endpoint; can be provided multiple times")
-    parser.add_argument("--allow-local-vibevoice", action="store_true", help="Allow local VibeVoice subprocess fallback")
     parser.add_argument("--context-file", type=str, help="Extra page/video context file")
     args = parser.parse_args()
 
@@ -278,6 +278,11 @@ def main():
                 operation_manual["quality_review"] = review_operation_manual_markdown(
                     operation_manual.get("response", "")
                 )
+                operation_manual["quality_gate_passed"] = not any(
+                    issue.get("severity") == "error" for issue in operation_manual["quality_review"]
+                )
+                manual_filename = "operation_manual.md" if operation_manual["quality_gate_passed"] else "operation_manual.quality_failed.md"
+                operation_manual["manual_path"] = str(output_dir / manual_filename)
                 for issue in operation_manual["quality_review"]:
                     level = logging.ERROR if issue.get("severity") == "error" else logging.WARNING
                     logger.log(level, "Operation manual quality issue [%s]: %s", issue.get("code"), issue.get("message"))
@@ -346,9 +351,13 @@ def main():
             logger.info(video_description.get("response", "No description generated"))
 
         if operation_manual:
-            manual_path = output_dir / "operation_manual.md"
+            quality_passed = operation_manual.get("quality_gate_passed", True)
+            manual_path = Path(operation_manual.get("manual_path", output_dir / ("operation_manual.md" if quality_passed else "operation_manual.quality_failed.md")))
             manual_path.write_text(operation_manual.get("response", ""), encoding="utf-8")
-            logger.info("Operation manual saved to %s", manual_path)
+            if quality_passed:
+                logger.info("Operation manual saved to %s", manual_path)
+            else:
+                logger.error("Operation manual failed quality gate; saved review artifact to %s", manual_path)
         
         if not config.get("keep_frames"):
             cleanup_files(output_dir)
