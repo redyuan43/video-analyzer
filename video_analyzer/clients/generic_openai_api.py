@@ -61,8 +61,13 @@ class GenericOpenAIAPIClient(LLMClient):
         # Try request with retries
         for attempt in range(self.max_retries):
             try:
-                response = requests.post(self.generate_url, headers=headers, json=data)
-                response.raise_for_status()
+                response = requests.post(self.generate_url, headers=headers, json=data, timeout=180)
+                if response.status_code >= 400:
+                    detail = response.text[:1000]
+                    raise requests.exceptions.HTTPError(
+                        f"{response.status_code} {detail}",
+                        response=response,
+                    )
                 
                 # Parse successful response
                 try:
@@ -91,6 +96,9 @@ class GenericOpenAIAPIClient(LLMClient):
                 
                 # Get wait time based on error
                 wait_time = RATE_LIMIT_WAIT_TIME
+                if isinstance(e, requests.exceptions.HTTPError) and 400 <= e.response.status_code < 500 and e.response.status_code != 429:
+                    raise Exception(f"An error occurred: {str(e)}")
+
                 if isinstance(e, requests.exceptions.HTTPError) and e.response.status_code == 429:
                     # Try to get wait time from Retry-After header
                     if 'Retry-After' in e.response.headers:

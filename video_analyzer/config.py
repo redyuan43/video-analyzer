@@ -3,7 +3,7 @@ from pathlib import Path
 import json
 from typing import Any
 import logging
-import pkg_resources
+from importlib import resources
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +19,7 @@ class Config:
         # If not found, fallback to package's default config
         if not self.default_config.exists():
             try:
-                default_config_path = pkg_resources.resource_filename('video_analyzer', 'config/default_config.json')
+                default_config_path = resources.files('video_analyzer').joinpath('config', 'default_config.json')
                 self.default_config = Path(default_config_path)
                 logger.debug(f"Using packaged default config from {self.default_config}")
             except Exception as e:
@@ -62,6 +62,8 @@ class Config:
             if value is not None:  # Only update if argument was provided
                 if key == "client":
                     self.config["clients"]["default"] = value
+                elif key == "output":
+                    self.config["output_dir"] = value
                 elif key == "ollama_url":
                     self.config["clients"]["ollama"]["url"] = value
                 elif key == "api_key":
@@ -71,6 +73,24 @@ class Config:
                         self.config["clients"]["default"] = "openai_api"
                 elif key == "api_url":
                     self.config["clients"]["openai_api"]["api_url"] = value
+                elif key == "llm_base_url":
+                    self.config.setdefault("operation_manual", {})["llm_base_url"] = value
+                    self.config["clients"]["openai_api"]["api_url"] = value
+                    self.config["clients"]["openai_api"]["api_key"] = self.config["clients"]["openai_api"].get("api_key") or "0"
+                    if not args.client:
+                        self.config["clients"]["default"] = "openai_api"
+                elif key == "vision_model":
+                    self.config.setdefault("operation_manual", {})["vision_model"] = value
+                    self.config["clients"]["openai_api"]["model"] = value
+                    self.config.setdefault("ocr", {})["fallback_model"] = value
+                elif key == "text_model":
+                    self.config.setdefault("operation_manual", {})["text_model"] = value
+                elif key == "ocr_provider":
+                    self.config.setdefault("ocr", {})["provider"] = value
+                elif key == "ocr_base_url":
+                    self.config.setdefault("ocr", {})["base_url"] = value
+                elif key == "asr_provider":
+                    self.config.setdefault("asr", {})["provider"] = value
                 elif key == "model":
                     client = self.config["clients"]["default"]
                     self.config["clients"][client]["model"] = value
@@ -88,6 +108,17 @@ class Config:
                     self.config["clients"]["temperature"] = value
                 elif key not in ["start_stage", "max_frames"]:  # Ignore these as they're command-line only
                     self.config[key] = value
+
+        if self.config.get("task") == "operation_manual" and not args.client:
+            manual_config = self.config.setdefault("operation_manual", {})
+            llm_base_url = manual_config.get("llm_base_url", "http://127.0.0.1:1234/v1")
+            vision_model = manual_config.get("vision_model", "sayanything-hauhaucs-aggressive@?")
+            self.config["clients"]["default"] = "openai_api"
+            self.config["clients"]["openai_api"]["api_url"] = llm_base_url
+            self.config["clients"]["openai_api"]["api_key"] = self.config["clients"]["openai_api"].get("api_key") or "0"
+            self.config["clients"]["openai_api"]["model"] = vision_model
+            if not getattr(args, "asr_provider", None):
+                self.config.setdefault("asr", {})["provider"] = "auto"
 
     def save_user_config(self):
         """Save current configuration to user config file."""
@@ -110,6 +141,8 @@ def get_client(config: Config) -> dict:
     elif client_type == "openai_api":
         api_key = client_config.get("api_key")
         api_url = client_config.get("api_url")
+        if not api_key and api_url and "127.0.0.1" in api_url:
+            api_key = "0"
         if not api_key:
             raise ValueError("API key is required when using OpenAI API client")
         if not api_url:

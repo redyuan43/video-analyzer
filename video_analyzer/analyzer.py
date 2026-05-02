@@ -7,6 +7,10 @@ from .audio_processor import AudioTranscript
 
 logger = logging.getLogger(__name__)
 
+MAX_PREVIOUS_FRAME_CONTEXT = 3
+MAX_PREVIOUS_ANALYSIS_CHARS = 700
+MAX_OCR_EVIDENCE_CHARS = 2000
+
 class VideoAnalyzer:
     def __init__(self, client: LLMClient, model: str, prompt_loader: PromptLoader, temperature: float, user_prompt: str = ""):
         """Initialize the VideoAnalyzer.
@@ -43,22 +47,33 @@ class VideoAnalyzer:
             return ""
             
         formatted_analyses = []
-        for i, analysis in enumerate(self.previous_analyses):
+        start_index = max(0, len(self.previous_analyses) - MAX_PREVIOUS_FRAME_CONTEXT)
+        for i, analysis in enumerate(self.previous_analyses[start_index:], start=start_index):
+            text = analysis.get('response', 'No analysis available')
+            if len(text) > MAX_PREVIOUS_ANALYSIS_CHARS:
+                text = text[:MAX_PREVIOUS_ANALYSIS_CHARS] + "\n[truncated]"
             formatted_analysis = (
                 f"Frame {i}\n"
-                f"{analysis.get('response', 'No analysis available')}\n"
+                f"{text}\n"
             )
             formatted_analyses.append(formatted_analysis)
             
         return "\n".join(formatted_analyses)
 
-    def analyze_frame(self, frame: Frame) -> Dict[str, Any]:
+    def analyze_frame(self, frame: Frame, ocr_text: str = "") -> Dict[str, Any]:
         """Analyze a single frame using the LLM."""
         # Replace {PREVIOUS_FRAMES} token with formatted previous analyses
         # Replace tokens in the prompt template
         prompt = self.frame_prompt.replace("{PREVIOUS_FRAMES}", self._format_previous_analyses())
         prompt = prompt.replace("{prompt}", self._format_user_prompt())
         prompt = f"{prompt}\nThis is frame {frame.number} captured at {frame.timestamp:.2f} seconds."
+        if ocr_text:
+            if len(ocr_text) > MAX_OCR_EVIDENCE_CHARS:
+                ocr_text = ocr_text[:MAX_OCR_EVIDENCE_CHARS] + "\n[truncated]"
+            prompt = (
+                f"{prompt}\n\nOCR evidence from this frame follows. Treat it as hard evidence "
+                f"for visible UI text, commands, labels, and filenames:\n{ocr_text}"
+            )
         
         try:
             response = self.client.generate(

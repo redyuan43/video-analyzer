@@ -3,8 +3,11 @@ from pathlib import Path
 from typing import Optional, Dict, List, Any
 from dataclasses import dataclass
 import subprocess
-import torch
-from pydub import AudioSegment
+
+try:
+    from pydub import AudioSegment
+except ModuleNotFoundError:
+    AudioSegment = None
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -88,6 +91,8 @@ class AudioProcessor:
             # If error is not about missing audio, try pydub as fallback
             logger.info("Falling back to pydub for audio extraction...")
             try:
+                if AudioSegment is None:
+                    raise RuntimeError("pydub is not installed")
                 video = AudioSegment.from_file(str(video_path))
                 audio = video.set_channels(1).set_frame_rate(16000)
                 audio.export(str(audio_path), format="wav")

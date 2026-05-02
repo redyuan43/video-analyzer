@@ -1,7 +1,7 @@
 from pathlib import Path
 import logging
 from typing import List, Dict
-import pkg_resources
+from importlib import resources
 
 logger = logging.getLogger(__name__)
 
@@ -12,34 +12,30 @@ class PromptLoader:
         self.prompts = prompts
 
     def _find_prompt_file(self, prompt_path: str) -> Path:
-        """Find prompt file in package resources, package directory, or user directory."""
-        # First try package resources (works for both install modes)
+        """Find prompt file in user directory, package resources, or package directory."""
+        if self.prompt_dir:
+            user_path = Path(self.prompt_dir).expanduser()
+            if user_path.is_absolute():
+                full_path = user_path / prompt_path
+            else:
+                full_path = Path.cwd() / user_path / prompt_path
+
+            if full_path.exists():
+                return full_path
+
+        # Then try package resources (works for both install modes)
         try:
-            package_path = pkg_resources.resource_filename('video_analyzer', f'prompts/{prompt_path}')
+            package_path = resources.files('video_analyzer').joinpath('prompts', prompt_path)
             if Path(package_path).exists():
                 return Path(package_path)
         except Exception as e:
-            logger.debug(f"Could not find package prompt via pkg_resources: {e}")
+            logger.debug(f"Could not find package prompt via importlib.resources: {e}")
 
         # Try package directory (for development mode)
         pkg_root = Path(__file__).parent
         pkg_path = pkg_root / 'prompts' / prompt_path
         if pkg_path.exists():
             return pkg_path
-
-        # Finally try user-specified directory if provided
-        if self.prompt_dir:
-            user_path = Path(self.prompt_dir).expanduser()
-            # Try absolute path
-            if user_path.is_absolute():
-                full_path = user_path / prompt_path
-                if full_path.exists():
-                    return full_path
-            else:
-                # Try relative to current directory
-                cwd_path = Path.cwd() / self.prompt_dir / prompt_path
-                if cwd_path.exists():
-                    return cwd_path
 
         raise FileNotFoundError(
             f"Prompt file not found in package resources, package directory, or user directory ({self.prompt_dir})"

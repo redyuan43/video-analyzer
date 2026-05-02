@@ -1,4 +1,7 @@
 {
+    "task": "describe",
+    "manual_language": "zh-CN",
+    "context_file": "",
     "clients": {
         "default": "ollama",
         "temperature": 0.0,
@@ -11,6 +14,20 @@
             "model": "meta-llama/llama-3.2-11b-vision-instruct",
             "api_url": "https://openrouter.ai/api/v1"
         }
+    },
+    "operation_manual": {
+        "llm_base_url": "http://127.0.0.1:1234/v1",
+        "vision_model": "sayanything-hauhaucs-aggressive@?",
+        "text_model": "redhatai_qwen3.6-35b-a3b-nvfp4"
+    },
+    "ocr": {
+        "provider": "auto",
+        "base_url": "auto",
+        "model": "model",
+        "prompt_mode": "prompt_scene_spotting",
+        "fallback_base_url": "http://127.0.0.1:1234/v1",
+        "fallback_model": "sayanything-hauhaucs-aggressive@?",
+        "fallback_api_key": "0"
     },
     "prompt_dir": "prompts",
     "prompts": [
@@ -46,6 +63,19 @@
         "language_confidence_threshold": 0.8,
         "language": "en",
         "device": "cpu"
+    },
+    "asr": {
+        "provider": "faster_whisper",
+        "vibevoice": {
+            "python": "",
+            "model_path": "microsoft/VibeVoice-ASR",
+            "device": "",
+            "attn_implementation": "auto",
+            "remote_urls": [
+                "http://edge.taild500c8.ts.net:8001/api/asr/transcribe",
+                "http://spark-31d6.taild500c8.ts.net:8001/api/asr/transcribe"
+            ]
+        }
     },
     "keep_frames": false,
     "prompt": ""

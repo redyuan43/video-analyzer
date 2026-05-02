@@ -13,6 +13,7 @@ A video analysis tool that combines vision models like Llama's 11B vision model 
   - [Quick Start](#quick-start)
   - [Sample Output](#sample-output)
   - [Complete Usage Guide](docs/USAGES.md)
+  - [Operation Manual Generator](docs/OPERATION_MANUAL_GENERATOR.md)
 - [Design](#design)
   - [Detailed Design Documentation](docs/DESIGN.md)
 - [Project Structure](#project-structure)
@@ -152,6 +153,8 @@ For detailed information about the project's design and implementation, includin
 ## Usage
 
 For detailed usage instructions and all available options, see [docs/USAGES.md](docs/USAGES.md).
+For operation/tutorial videos that should become illustrated manuals, see
+[docs/OPERATION_MANUAL_GENERATOR.md](docs/OPERATION_MANUAL_GENERATOR.md).
 
 ### Quick Start
 

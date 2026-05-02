@@ -5,16 +5,17 @@ import logging
 import shutil
 import sys
 from typing import Optional
-import torch
-import torch.backends.mps
 
 from .config import Config, get_client, get_model
 from .frame import VideoProcessor
 from .prompt import PromptLoader
 from .analyzer import VideoAnalyzer
 from .audio_processor import AudioProcessor, AudioTranscript
+from .asr_providers import extract_audio_to_wav, transcribe_with_provider
 from .clients.ollama import OllamaClient
 from .clients.generic_openai_api import GenericOpenAIAPIClient
+from .manual import embed_step_images, generate_operation_manual, prepare_frame_assets, read_context_file, write_frame_evidence_index
+from .ocr import run_ocr
 
 # Initialize logger at module level
 logger = logging.getLogger(__name__)
@@ -81,6 +82,15 @@ def main():
     parser.add_argument("--language", type=str, default=None)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--temperature", type=float, help="Temperature for LLM generation")
+    parser.add_argument("--task", choices=["describe", "operation_manual"], help="Analysis task")
+    parser.add_argument("--manual-language", type=str, help="Language for operation manual output")
+    parser.add_argument("--llm-base-url", type=str, help="OpenAI-compatible base URL for local LLMs")
+    parser.add_argument("--vision-model", type=str, help="Vision model used for frame analysis")
+    parser.add_argument("--text-model", type=str, help="Text model used for manual generation")
+    parser.add_argument("--ocr-provider", choices=["auto", "dots_mocr_vllm", "openai_vision", "none"], help="OCR provider")
+    parser.add_argument("--ocr-base-url", type=str, help="OCR OpenAI-compatible base URL or auto")
+    parser.add_argument("--asr-provider", choices=["auto", "remote_http", "capswriter_http", "vibevoice", "faster_whisper", "none"], help="ASR provider")
+    parser.add_argument("--context-file", type=str, help="Extra page/video context file")
     args = parser.parse_args()
 
     # Set up logging with specified level
@@ -110,21 +120,16 @@ def main():
         frames = []
         frame_analyses = []
         video_description = None
+        operation_manual = None
+        ocr_events = []
+        task = config.get("task", "describe")
+        page_context = ""
         
         # Stage 1: Frame and Audio Processing
         if args.start_stage <= 1:
-            # Initialize audio processor and extract transcript, the AudioProcessor accept following parameters that can be set in config.json:
-            # language (str): Language code for audio transcription (default: None)
-            # whisper_model (str): Whisper model size or path (default: "medium")
-            # device (str): Device to use for audio processing (default: "cpu")
-            logger.debug("Initializing audio processing...")
-            audio_processor = AudioProcessor(language=config.get("audio", {}).get("language", ""), 
-                                             model_size_or_path=config.get("audio", {}).get("whisper_model", "medium"),
-                                             device=config.get("audio", {}).get("device", "cpu"))
-            
             logger.info("Extracting audio from video...")
             try:
-                audio_path = audio_processor.extract_audio(video_path, output_dir)
+                audio_path = extract_audio_to_wav(video_path, output_dir)
             except Exception as e:
                 logger.error(f"Error extracting audio: {e}")
                 audio_path = None
@@ -134,7 +139,24 @@ def main():
                 transcript = None
             else:
                 logger.info("Transcribing audio...")
-                transcript = audio_processor.transcribe(audio_path)
+                asr_config = config.get("asr", {})
+                provider = asr_config.get("provider", "faster_whisper")
+                if provider == "faster_whisper":
+                    audio_processor = AudioProcessor(
+                        language=config.get("audio", {}).get("language", ""),
+                        model_size_or_path=config.get("audio", {}).get("whisper_model", "medium"),
+                        device=config.get("audio", {}).get("device", "cpu"),
+                    )
+                    transcript = audio_processor.transcribe(audio_path)
+                else:
+                    transcript = transcribe_with_provider(
+                        provider=provider,
+                        audio_path=audio_path,
+                        language=config.get("audio", {}).get("language", ""),
+                        whisper_model=config.get("audio", {}).get("whisper_model", "medium"),
+                        device=config.get("audio", {}).get("device", "cpu"),
+                        vibevoice_config=asr_config.get("vibevoice", {}),
+                    )
                 if transcript is None:
                     logger.warning("Could not generate reliable transcript. Proceeding with video analysis only.")
             
@@ -144,11 +166,41 @@ def main():
                 output_dir / "frames", 
                 model
             )
-            frames = processor.extract_keyframes(
-                frames_per_minute=config.get("frames", {}).get("per_minute", 60),
-                duration=config.get("duration"),
-                max_frames=args.max_frames
-            )
+            if task == "operation_manual":
+                frames = processor.extract_screen_keyframes(
+                    frames_per_minute=config.get("frames", {}).get("per_minute", 60),
+                    duration=config.get("duration"),
+                    max_frames=args.max_frames,
+                )
+            else:
+                frames = processor.extract_keyframes(
+                    frames_per_minute=config.get("frames", {}).get("per_minute", 60),
+                    duration=config.get("duration"),
+                    max_frames=args.max_frames
+                )
+
+            if task == "operation_manual":
+                logger.info("Running OCR on extracted frames...")
+                ocr_config = config.get("ocr", {})
+                ocr_events = run_ocr(
+                    frames=frames,
+                    provider=ocr_config.get("provider", "auto"),
+                    base_url=ocr_config.get("base_url", "auto"),
+                    model=ocr_config.get("model", "model"),
+                    prompt_mode=ocr_config.get("prompt_mode", "prompt_scene_spotting"),
+                    fallback_base_url=ocr_config.get(
+                        "fallback_base_url",
+                        config.get("operation_manual", {}).get("llm_base_url"),
+                    ),
+                    fallback_model=ocr_config.get(
+                        "fallback_model",
+                        config.get("operation_manual", {}).get("vision_model"),
+                    ),
+                    fallback_api_key=ocr_config.get(
+                        "fallback_api_key",
+                        config.get("clients", {}).get("openai_api", {}).get("api_key", "0"),
+                    ),
+                )
             
         # Stage 2: Frame Analysis
         if args.start_stage <= 2:
@@ -161,22 +213,62 @@ def main():
                 config.get("prompt", "")
             )
             frame_analyses = []
+            ocr_by_frame = {event.frame_number: event for event in ocr_events}
             for frame in frames:
-                analysis = analyzer.analyze_frame(frame)
+                ocr_text = ocr_by_frame.get(frame.number).text if frame.number in ocr_by_frame else ""
+                analysis = analyzer.analyze_frame(frame, ocr_text=ocr_text)
                 frame_analyses.append(analysis)
                 
         # Stage 3: Video Reconstruction
         if args.start_stage <= 3:
-            logger.info("Reconstructing video description...")
-            video_description = analyzer.reconstruct_video(
-                frame_analyses, frames, transcript
-            )
+            if task == "operation_manual":
+                logger.info("Generating operation manual...")
+                manual_config = config.get("operation_manual", {})
+                page_context = read_context_file(config.get("context_file", ""))
+                text_model = manual_config.get("text_model") or model
+                frame_assets = prepare_frame_assets(frames, output_dir)
+                operation_manual = generate_operation_manual(
+                    client=client,
+                    text_model=text_model,
+                    frame_analyses=frame_analyses,
+                    frames=frames,
+                    transcript=transcript,
+                    ocr_events=ocr_events,
+                    page_context=page_context,
+                    language=config.get("manual_language", "zh-CN"),
+                    temperature=config.get("clients", {}).get("temperature", 0.2),
+                    frame_assets=frame_assets,
+                )
+                operation_manual["response"] = embed_step_images(
+                    operation_manual.get("response", ""),
+                    frames,
+                    frame_assets,
+                )
+                evidence_path = write_frame_evidence_index(
+                    frames=frames,
+                    output_dir=output_dir,
+                    ocr_events=ocr_events,
+                    frame_analyses=frame_analyses,
+                    frame_assets=frame_assets,
+                )
+                operation_manual["evidence_path"] = str(evidence_path)
+            else:
+                logger.info("Reconstructing video description...")
+                video_description = analyzer.reconstruct_video(
+                    frame_analyses, frames, transcript
+                )
         
         output_dir.mkdir(parents=True, exist_ok=True)
         results = {
             "metadata": {
+                "task": task,
                 "client": config.get("clients", {}).get("default"),
                 "model": model,
+                "text_model": config.get("operation_manual", {}).get("text_model"),
+                "ocr_provider": config.get("ocr", {}).get("provider"),
+                "asr_provider": config.get("asr", {}).get("provider"),
+                "context_file": config.get("context_file"),
+                "page_description": page_context,
                 "whisper_model": config.get("audio", {}).get("whisper_model"),
                 "frames_per_minute": config.get("frames", {}).get("per_minute"),
                 "duration_processed": config.get("duration"),
@@ -190,12 +282,19 @@ def main():
                 "text": transcript.text if transcript else None,
                 "segments": transcript.segments if transcript else None
             } if transcript else None,
+            "ocr_events": [event.to_dict() for event in ocr_events],
+            "visual_events": frame_analyses,
+            "manual_steps": operation_manual,
+            "uncertainties": [
+                event.to_dict() for event in ocr_events if event.status != "ok"
+            ],
             "frame_analyses": frame_analyses,
-            "video_description": video_description
+            "video_description": video_description,
+            "operation_manual": operation_manual
         }
         
-        with open(output_dir / "analysis.json", "w") as f:
-            json.dump(results, f, indent=2)
+        with open(output_dir / "analysis.json", "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
             
         logger.info("\nTranscript:")
         if transcript:
@@ -206,6 +305,11 @@ def main():
         if video_description:
             logger.info("\nVideo Description:")
             logger.info(video_description.get("response", "No description generated"))
+
+        if operation_manual:
+            manual_path = output_dir / "operation_manual.md"
+            manual_path.write_text(operation_manual.get("response", ""), encoding="utf-8")
+            logger.info("Operation manual saved to %s", manual_path)
         
         if not config.get("keep_frames"):
             cleanup_files(output_dir)
