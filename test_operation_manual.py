@@ -8,7 +8,13 @@ from unittest.mock import Mock, patch
 
 from video_analyzer.config import Config
 from video_analyzer.analyzer import VideoAnalyzer
-from video_analyzer.manual import build_operation_manual_prompt, embed_step_images, prepare_frame_assets, write_frame_evidence_index
+from video_analyzer.manual import (
+    build_operation_manual_prompt,
+    embed_step_images,
+    prepare_frame_assets,
+    review_operation_manual_markdown,
+    write_frame_evidence_index,
+)
 from video_analyzer.asr_providers import (
     merge_asr_transcripts,
     transcribe_with_provider,
@@ -280,6 +286,8 @@ class OperationManualTests(unittest.TestCase):
         self.assertIn("ASR strategy evidence", prompt)
         self.assertIn("VibeVoice", prompt)
         self.assertIn("Do not append a large screenshot gallery", prompt)
+        self.assertIn("Screenshots must be real Markdown images", prompt)
+        self.assertIn("Never write screenshot paths as plain text", prompt)
         self.assertIn("Mermaid flowchart", prompt)
         self.assertIn("需复核", prompt)
 
@@ -354,6 +362,49 @@ class OperationManualTests(unittest.TestCase):
 
         self.assertIn("![frame_000](manual_assets/frame_000.jpg)", updated)
         self.assertNotIn("`manual_assets/frame_000.jpg`", updated)
+
+    def test_operation_manual_review_flags_raw_asset_paths(self):
+        manual = "\n".join(
+            [
+                "# 手册",
+                "### 步骤 1：打开页面",
+                "| 截图 | 说明 |",
+                "| --- | --- |",
+                "| `manual_assets/frame_000.jpg` | 页面入口 |",
+            ]
+        )
+
+        issues = review_operation_manual_markdown(manual)
+
+        self.assertIn("raw_asset_path", {issue["code"] for issue in issues})
+
+    def test_operation_manual_review_accepts_rendered_step_images(self):
+        manual = "\n".join(
+            [
+                "# 手册",
+                "### 步骤 1：打开页面",
+                "![入口截图](manual_assets/frame_000.jpg)",
+                "按页面提示继续。",
+            ]
+        )
+
+        issues = review_operation_manual_markdown(manual)
+
+        self.assertNotIn("raw_asset_path", {issue["code"] for issue in issues})
+        self.assertNotIn("step_asset_not_rendered", {issue["code"] for issue in issues})
+
+    def test_operation_manual_review_warns_when_step_has_no_screenshot(self):
+        manual = "\n".join(
+            [
+                "# 手册",
+                "### 步骤 1：打开页面",
+                "按页面提示继续。",
+            ]
+        )
+
+        issues = review_operation_manual_markdown(manual)
+
+        self.assertIn("step_missing_screenshot", {issue["code"] for issue in issues})
 
     def test_frame_context_is_bounded_for_many_frames(self):
         analyzer = VideoAnalyzer.__new__(VideoAnalyzer)

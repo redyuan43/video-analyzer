@@ -239,7 +239,11 @@ def embed_step_images(manual_text: str, frames: List[Frame], frame_assets: Dict[
 
 def review_operation_manual_markdown(manual_text: str) -> List[Dict[str, str]]:
     issues: List[Dict[str, str]] = []
-    raw_assets = re.findall(r"(?<!!\[[^\]]{0,80}\]\()(?<!\()manual_assets/frame_\d+\.(?:jpg|jpeg|png|webp)", manual_text)
+    raw_assets = []
+    for match in re.finditer(r"manual_assets/frame_\d+\.(?:jpg|jpeg|png|webp)", manual_text):
+        preceding_line = manual_text[manual_text.rfind("\n", 0, match.start()) + 1:match.start()]
+        if not re.search(r"!\[[^\]]*\]\($", preceding_line):
+            raw_assets.append(match.group(0))
     if raw_assets:
         issues.append(
             {

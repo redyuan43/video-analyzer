@@ -14,7 +14,14 @@ from .audio_processor import AudioProcessor, AudioTranscript
 from .asr_providers import ASRStrategyResult, extract_audio_to_wav, transcribe_with_provider_result, transcribe_with_strategy
 from .clients.ollama import OllamaClient
 from .clients.generic_openai_api import GenericOpenAIAPIClient
-from .manual import embed_step_images, generate_operation_manual, prepare_frame_assets, read_context_file, write_frame_evidence_index
+from .manual import (
+    embed_step_images,
+    generate_operation_manual,
+    prepare_frame_assets,
+    read_context_file,
+    review_operation_manual_markdown,
+    write_frame_evidence_index,
+)
 from .ocr import run_ocr
 
 # Initialize logger at module level
@@ -268,6 +275,12 @@ def main():
                     frames,
                     frame_assets,
                 )
+                operation_manual["quality_review"] = review_operation_manual_markdown(
+                    operation_manual.get("response", "")
+                )
+                for issue in operation_manual["quality_review"]:
+                    level = logging.ERROR if issue.get("severity") == "error" else logging.WARNING
+                    logger.log(level, "Operation manual quality issue [%s]: %s", issue.get("code"), issue.get("message"))
                 evidence_path = write_frame_evidence_index(
                     frames=frames,
                     output_dir=output_dir,
