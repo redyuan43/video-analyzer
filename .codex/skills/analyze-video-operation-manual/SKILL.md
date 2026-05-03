@@ -13,11 +13,8 @@ Run the `video-analyzer` operation-manual pipeline end to end from either an onl
 - URL context: default to `page_context.md`, which combines description,
   metadata, subtitles, and selected comments.
 - Local file input: call `.venv/bin/python -m video_analyzer.cli` directly.
-- ASR: VibeVoice on edge only by default: `http://192.168.100.236:8003/api/asr/transcribe`.
-- OCR: DotsMOCR on spark: `http://192.168.100.169:8000/v1`.
-- LM Studio: `http://127.0.0.1:1234/v1`.
-- Vision model: `qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive@?`.
-- Text model: `redhatai_qwen3.6-35b-a3b-nvfp4`.
+- Runtime profile: use `local_lan` from `video_analyzer/config/default_config.json`; put machine-specific overrides in `config/config.json`.
+- The profile owns ASR URL, OCR URL, LM Studio URL, vision model, text model, subtitle languages, comment budget, and multi-doc defaults.
 - Do not start VibeVoice on spark for normal 7-8 minute videos; spark is reserved for OCR unless the user explicitly asks otherwise.
 - Do not use AGX/Qwen3-ASR unless the user explicitly asks for a fast ASR endpoint.
 
@@ -33,7 +30,7 @@ Run the `video-analyzer` operation-manual pipeline end to end from either an onl
 3. For URL input, run:
 
    ```bash
-   tools/run_operation_manual_from_url.sh "URL"
+   tools/run_operation_manual_from_url.sh "URL" --profile local_lan
    ```
 
    Useful options:
@@ -44,6 +41,12 @@ Run the `video-analyzer` operation-manual pipeline end to end from either an onl
    tools/run_operation_manual_from_url.sh "URL" --download-only
    tools/run_operation_manual_from_url.sh "URL" --no-include-comments
    tools/run_operation_manual_from_url.sh "URL" --subtitle-langs zh-CN,zh-Hans,zh,en
+   ```
+
+   After the manual run, optional multi-document analysis can be generated with:
+
+   ```bash
+   tools/run_multidoc_analysis.sh RUN_DIR --profile local_lan
    ```
 
 4. For local video input, create or reuse a context file if provided by the user, then run:

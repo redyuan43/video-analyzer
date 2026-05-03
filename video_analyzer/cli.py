@@ -4,8 +4,8 @@ import json
 import logging
 import shutil
 import sys
-from typing import Optional
 
+from .artifacts import write_json, write_orin_artifacts, write_transcript_markdown
 from .config import Config, get_client, get_model
 from .frame import VideoProcessor
 from .prompt import PromptLoader
@@ -84,112 +84,6 @@ def read_page_context_metadata(context_file: str, page_context: str) -> dict:
     metadata.update(payload)
     metadata["text_length"] = len(page_context or "")
     return metadata
-
-
-def write_transcript_markdown(transcript: Optional[AudioTranscript], path: Path) -> Optional[Path]:
-    if not transcript:
-        return None
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [
-        "# Transcript",
-        "",
-        f"- Language: {transcript.language or ''}",
-        f"- Segments: {len(transcript.segments or [])}",
-        "",
-    ]
-    segments = transcript.segments or []
-    if segments:
-        for segment in segments:
-            text = str(segment.get("text") or segment.get("raw_output") or "").strip()
-            if not text:
-                continue
-            start = segment.get("start_time", segment.get("start"))
-            end = segment.get("end_time", segment.get("end"))
-            if start is not None or end is not None:
-                lines.append(f"- [{format_timestamp(start)} - {format_timestamp(end)}] {text}")
-            else:
-                lines.append(f"- {text}")
-    elif transcript.text:
-        lines.extend(["## Full Text", "", transcript.text])
-    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
-    return path
-
-
-def format_timestamp(value: object) -> str:
-    try:
-        seconds = int(float(value or 0))
-    except (TypeError, ValueError):
-        seconds = 0
-    return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
-
-
-def write_orin_artifacts(output_dir: Path, results: dict, page_context: str) -> Path:
-    """Archive raw/intermediate evidence without changing the public outputs."""
-    orin_dir = output_dir / "orin"
-    orin_dir.mkdir(parents=True, exist_ok=True)
-
-    metadata = results.get("metadata") or {}
-    transcript = results.get("transcript")
-    asr = results.get("asr")
-    ocr_events = results.get("ocr_events") or []
-    visual_events = results.get("visual_events") or []
-    frame_analyses = results.get("frame_analyses") or []
-
-    write_json(orin_dir / "metadata.json", metadata)
-    if page_context:
-        (orin_dir / "page_context.md").write_text(page_context, encoding="utf-8")
-    if transcript:
-        write_json(orin_dir / "transcript.json", transcript)
-        write_transcript_markdown(
-            AudioTranscript(
-                text=transcript.get("text") or "",
-                segments=transcript.get("segments") or [],
-                language=metadata.get("audio_language") or "",
-            ),
-            orin_dir / "transcript.md",
-        )
-    if asr:
-        write_json(orin_dir / "asr.json", asr)
-    if ocr_events:
-        write_json(orin_dir / "ocr_events.json", ocr_events)
-        for index, event in enumerate(ocr_events):
-            write_json(orin_dir / f"ocr_event_{index:03d}.json", event)
-    if visual_events:
-        write_json(orin_dir / "visual_events.json", visual_events)
-        for index, event in enumerate(visual_events):
-            write_json(orin_dir / f"visual_event_{index:03d}.json", event)
-    if frame_analyses:
-        write_json(orin_dir / "frame_analyses.json", frame_analyses)
-        for index, analysis in enumerate(frame_analyses):
-            write_json(orin_dir / f"frame_analysis_{index:03d}.json", analysis)
-
-    copy_page_context_sources(metadata.get("page_context") or {}, orin_dir)
-    return orin_dir
-
-
-def copy_page_context_sources(page_context_metadata: dict, orin_dir: Path) -> None:
-    source_paths = [
-        page_context_metadata.get("description_file"),
-        (page_context_metadata.get("comments") or {}).get("json_file"),
-        (page_context_metadata.get("comments") or {}).get("selected_json_file"),
-        (page_context_metadata.get("comments") or {}).get("markdown_file"),
-        (page_context_metadata.get("subtitles") or {}).get("raw_file"),
-        (page_context_metadata.get("subtitles") or {}).get("text_file"),
-    ]
-    for value in source_paths:
-        if not value:
-            continue
-        source = Path(value)
-        if not source.exists() or not source.is_file():
-            continue
-        target = orin_dir / source.name
-        if target.resolve() == source.resolve():
-            continue
-        shutil.copy2(source, target)
-
-
-def write_json(path: Path, payload: object) -> None:
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def main():

@@ -38,9 +38,9 @@ tools/run_operation_manual_from_url.sh "https://www.bilibili.com/video/BVxxxx"
 The one-command runner downloads the video, saves the page metadata and
 description to `description.md`, collects subtitles/comments when available,
 builds `page_context.md`, then runs the full operation-manual pipeline.
-Defaults match the current stable local setup: VibeVoice ASR on edge
-`http://192.168.100.236:8003/api/asr/transcribe`, DotsMOCR OCR on spark
-`http://192.168.100.169:8000/v1`, and LM Studio on `127.0.0.1:1234`.
+Defaults come from the `local_lan` runtime profile in
+`video_analyzer/config/default_config.json`. Put local overrides in
+`config/config.json` rather than editing scripts.
 
 Useful URL-runner variants:
 
@@ -62,6 +62,28 @@ tools/run_operation_manual_from_url.sh "URL" --max-comments 10
 tools/run_operation_manual_from_url.sh "URL" --subtitle-langs zh-CN,zh-Hans,zh,en
 ```
 
+To switch or customize endpoints/models, use a runtime profile:
+
+```json
+{
+  "active_runtime_profile": "local_lan",
+  "runtime_profiles": {
+    "local_lan": {
+      "llm_base_url": "http://127.0.0.1:1234/v1",
+      "vision_model": "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive@?",
+      "text_model": "redhatai_qwen3.6-35b-a3b-nvfp4",
+      "vibevoice_url": "http://192.168.100.236:8003/api/asr/transcribe",
+      "ocr_base_url": "http://192.168.100.169:8000/v1",
+      "max_comments": 30,
+      "subtitle_langs": "zh-CN,zh-Hans,zh,en"
+    }
+  }
+}
+```
+
+Both URL and multi-document runners accept `--profile local_lan`. Command-line
+arguments still override the profile for one-off runs.
+
 For an existing local video:
 
 ```bash
@@ -78,9 +100,8 @@ For an existing local video:
 
 Recommended current local model setup:
 
-- Vision / VL model: `sayanything-hauhaucs-aggressive@?`
-- Text/manual model: `redhatai_qwen3.6-35b-a3b-nvfp4`
-- LLM endpoint: `http://127.0.0.1:1234/v1`
+- Vision / VL model, text model, LLM endpoint, VibeVoice URL, OCR URL, subtitle
+  languages, and comment budget are managed by the active runtime profile.
 - ASR strategy: `balanced` by default for operation manuals. The default path
   is remote GPU VibeVoice only; fast remote HTTP ASR endpoints are used only
   when explicitly configured with `--remote-asr-url`.

@@ -221,22 +221,21 @@ def embed_step_images(manual_text: str, frames: List[Frame], frame_assets: Dict[
         return _render_asset_references(manual_text)
 
     lines = manual_text.splitlines()
+    step_count = sum(1 for line in lines if line.startswith("### ") and "步骤" in line)
     result = []
     i = 0
     while i < len(lines):
         line = lines[i]
-        result.append(line)
         if line.startswith("### ") and "步骤" in line:
             section_lines = []
             j = i + 1
             while j < len(lines) and not lines[j].startswith("### ") and not lines[j].startswith("## "):
                 section_lines.append(lines[j])
                 j += 1
-            section_text = "\n".join([line, *section_lines])
-            if not _has_rendered_asset_image(section_text):
-                strip = _build_step_image_strip(section_text, frames, frame_assets)
-                if strip:
-                    result.extend(["", *strip, ""])
+            result.extend(_remap_step_section_images([line, *section_lines], frames, frame_assets, step_count))
+            i = j
+            continue
+        result.append(line)
         i += 1
     return _render_asset_references("\n".join(result)).rstrip() + "\n"
 
@@ -277,6 +276,14 @@ def review_operation_manual_markdown(manual_text: str) -> List[Dict[str, str]]:
                     "message": f"Step section {index} references screenshots but does not render them as Markdown images.",
                 }
             )
+        elif _has_rendered_asset_image(section) and _section_image_time_mismatch(section):
+            issues.append(
+                {
+                    "severity": "warning",
+                    "code": "step_image_time_mismatch",
+                    "message": f"Step section {index} contains screenshots whose frame timestamps appear outside the step evidence window.",
+                }
+            )
         elif "manual_assets/" not in section:
             issues.append(
                 {
@@ -290,6 +297,93 @@ def review_operation_manual_markdown(manual_text: str) -> List[Dict[str, str]]:
 
 def _has_rendered_asset_image(text: str) -> bool:
     return bool(re.search(r"(^|[^`])!\[[^\]]*\]\(manual_assets/[^)]+\)", text))
+
+
+def _remap_step_section_images(
+    section_lines: List[str],
+    frames: List[Frame],
+    frame_assets: Dict[int, str],
+    step_count: int,
+) -> List[str]:
+    section_text = "\n".join(section_lines)
+    selected = _select_section_frames(section_text, frames, step_count)
+    selected = [frame for frame in selected if frame.number in frame_assets][:4]
+    if not selected:
+        return section_lines
+
+    image_numbers = _extract_asset_frame_numbers(section_text)
+    selected_numbers = {frame.number for frame in selected}
+    should_replace = not image_numbers or any(number not in selected_numbers for number in image_numbers)
+    if not should_replace:
+        return section_lines
+
+    cleaned = _remove_step_image_blocks(section_lines)
+    strip = _build_step_image_strip_from_frames(selected, frame_assets)
+    if not strip:
+        return cleaned
+    return [cleaned[0], "", *strip, "", *cleaned[1:]]
+
+
+def _extract_asset_frame_numbers(text: str) -> List[int]:
+    return [
+        int(match.group(1))
+        for match in re.finditer(r"manual_assets/frame_(\d+)\.(?:jpg|jpeg|png|webp)", text)
+    ]
+
+
+def _remove_step_image_blocks(lines: List[str]) -> List[str]:
+    cleaned: List[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("|"):
+            j = i
+            table_lines = []
+            while j < len(lines) and lines[j].startswith("|"):
+                table_lines.append(lines[j])
+                j += 1
+            if "manual_assets/" in "\n".join(table_lines):
+                cleaned_table = _clean_asset_images_from_table(table_lines)
+                if cleaned_table:
+                    cleaned.extend(cleaned_table)
+                i = j
+                continue
+        if "manual_assets/" in line:
+            i += 1
+            continue
+        cleaned.append(line)
+        i += 1
+    return _collapse_blank_lines(cleaned)
+
+
+def _collapse_blank_lines(lines: List[str]) -> List[str]:
+    result: List[str] = []
+    for line in lines:
+        if line == "" and result and result[-1] == "":
+            continue
+        result.append(line)
+    while len(result) > 1 and result[-1] == "":
+        result.pop()
+    return result
+
+
+def _clean_asset_images_from_table(lines: List[str]) -> List[str]:
+    cleaned = [_clean_asset_images_from_line(line) for line in lines]
+    body = "\n".join(cleaned)
+    meaningful = re.sub(r"\|", " ", body)
+    meaningful = re.sub(r":?-{3,}:?", " ", meaningful)
+    meaningful = re.sub(r"\b\d{1,5}s\b", " ", meaningful)
+    meaningful = re.sub(r"\s+", "", meaningful)
+    if not meaningful:
+        return []
+    return cleaned
+
+
+def _clean_asset_images_from_line(line: str) -> str:
+    line = re.sub(r"!\[[^\]]*\]\(manual_assets/frame_\d+\.(?:jpg|jpeg|png|webp)\)", "", line)
+    line = re.sub(r"\s*(?:→|->|=>)\s*(?=\|)", " ", line)
+    line = re.sub(r"(?<=\|)\s*(?:→|->|=>)\s*", " ", line)
+    return re.sub(r"\s+", " ", line).strip()
 
 
 def _render_asset_references(manual_text: str) -> str:
@@ -319,6 +413,10 @@ def _build_step_image_strip(section_text: str, frames: List[Frame], frame_assets
     if not selected:
         return []
 
+    return _build_step_image_strip_from_frames(selected, frame_assets)
+
+
+def _build_step_image_strip_from_frames(selected: List[Frame], frame_assets: Dict[int, str]) -> List[str]:
     headers = [f"{frame.timestamp:.0f}s" for frame in selected]
     separators = ["---" for _ in selected]
     images = [
@@ -332,11 +430,10 @@ def _build_step_image_strip(section_text: str, frames: List[Frame], frame_assets
     ]
 
 
-def _select_section_frames(section_text: str, frames: List[Frame]) -> List[Frame]:
-    timestamps = [int(minutes) * 60 + int(seconds) for minutes, seconds in _TIMESTAMP_RE.findall(section_text)]
-    if timestamps:
-        start = max(min(timestamps) - 3, 0)
-        end = max(timestamps) + 3
+def _select_section_frames(section_text: str, frames: List[Frame], step_count: int | None = None) -> List[Frame]:
+    window = _extract_section_time_window(section_text)
+    if window:
+        start, end = window
         matches = [frame for frame in frames if start <= frame.timestamp <= end]
         if matches:
             return _spread_frames(matches, max_count=4)
@@ -345,10 +442,79 @@ def _select_section_frames(section_text: str, frames: List[Frame]) -> List[Frame
     if not step_match:
         return []
     step_index = max(int(step_match.group(1)) - 1, 0)
-    bucket_size = max(len(frames) // 4, 1)
+    bucket_count = max(step_count or 4, 1)
+    bucket_size = max((len(frames) + bucket_count - 1) // bucket_count, 1)
     start_index = min(step_index * bucket_size, len(frames) - 1)
-    end_index = len(frames) if step_index >= 3 else min(start_index + bucket_size, len(frames))
+    end_index = len(frames) if step_index >= bucket_count - 1 else min(start_index + bucket_size, len(frames))
     return _spread_frames(frames[start_index:end_index], max_count=4)
+
+
+def _extract_section_time_window(section_text: str) -> tuple[float, float] | None:
+    section_text = _strip_existing_asset_images(section_text)
+    timestamps: List[float] = []
+
+    for start_text, end_text in _TIMESTAMP_RANGE_RE.findall(section_text):
+        start = _parse_timestamp_text(start_text)
+        end = _parse_timestamp_text(end_text)
+        if start is not None and end is not None:
+            return (max(min(start, end) - 3, 0), max(start, end) + 3)
+
+    for value in _SECONDS_RE.findall(section_text):
+        timestamps.append(float(value))
+
+    for value in _TIMESTAMP_RE.findall(section_text):
+        parsed = _parse_timestamp_text(value)
+        if parsed is not None:
+            timestamps.append(parsed)
+
+    if not timestamps:
+        return None
+    if len(timestamps) == 1:
+        timestamp = timestamps[0]
+        return (max(timestamp - 3, 0), timestamp + 3)
+    return (max(min(timestamps) - 3, 0), max(timestamps) + 3)
+
+
+def _strip_existing_asset_images(section_text: str) -> str:
+    return re.sub(
+        r"!\[[^\]]*\]\(manual_assets/frame_\d+\.(?:jpg|jpeg|png|webp)\)",
+        "",
+        section_text,
+    )
+
+
+def _parse_timestamp_text(text: str) -> float | None:
+    parts = [part for part in text.strip().split(":") if part != ""]
+    if len(parts) == 2:
+        minutes, seconds = parts
+        return int(minutes) * 60 + int(seconds)
+    if len(parts) == 3:
+        hours, minutes, seconds = parts
+        return int(hours) * 3600 + int(minutes) * 60 + int(seconds)
+    return None
+
+
+def _section_image_time_mismatch(section_text: str) -> bool:
+    window = _extract_section_time_window(section_text)
+    if not window:
+        return False
+    start, end = window
+    for timestamp in _extract_image_alt_timestamps(section_text):
+        if timestamp < start or timestamp > end:
+            return True
+    return False
+
+
+def _extract_image_alt_timestamps(section_text: str) -> List[float]:
+    timestamps = []
+    for alt_text in re.findall(r"!\[([^\]]*)\]\(manual_assets/frame_\d+\.(?:jpg|jpeg|png|webp)\)", section_text):
+        for value in _SECONDS_RE.findall(alt_text):
+            timestamps.append(float(value))
+        for value in _TIMESTAMP_RE.findall(alt_text):
+            parsed = _parse_timestamp_text(value)
+            if parsed is not None:
+                timestamps.append(parsed)
+    return timestamps
 
 
 def _spread_frames(frames: List[Frame], max_count: int) -> List[Frame]:
@@ -361,4 +527,8 @@ def _spread_frames(frames: List[Frame], max_count: int) -> List[Frame]:
     return [frames[index] for index in indexes]
 
 
-_TIMESTAMP_RE = re.compile(r"\[(\d{1,2}):(\d{2})\]")
+_TIMESTAMP_RANGE_RE = re.compile(
+    r"\[?(\d{1,2}:\d{2}(?::\d{2})?)\]?\s*(?:-|~|–|—|至|到)\s*\[?(\d{1,2}:\d{2}(?::\d{2})?)\]?"
+)
+_TIMESTAMP_RE = re.compile(r"(?<!\d)(\d{1,2}:\d{2}(?::\d{2})?)(?!\d)")
+_SECONDS_RE = re.compile(r"(?<!\d)(\d{1,5})\s*s\b")

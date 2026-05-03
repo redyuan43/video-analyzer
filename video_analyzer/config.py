@@ -30,19 +30,22 @@ class Config:
 
     def load_config(self):
         """Load configuration from JSON file with cascade:
-        1. Try user config (config.json)
-        2. Fall back to default config (default_config.json)
+        1. Load default config (default_config.json)
+        2. Merge user config (config.json) as an override when present
         """
         try:
             self.loaded_user_config = self.user_config.exists()
+            logger.debug(f"Loading default config from {self.default_config}")
+            with open(self.default_config) as f:
+                default_config = json.load(f)
             if self.loaded_user_config:
                 logger.debug(f"Loading user config from {self.user_config}")
                 with open(self.user_config) as f:
-                    self.config = json.load(f)
+                    user_config = json.load(f)
+                self.config = deep_merge(default_config, user_config)
             else:
-                logger.debug(f"No user config found, loading default config from {self.default_config}")
-                with open(self.default_config) as f:
-                    self.config = json.load(f)
+                logger.debug("No user config found, using default config")
+                self.config = default_config
                     
             # Ensure prompts is a list
             if not isinstance(self.config.get("prompts", []), list):
@@ -56,6 +59,10 @@ class Config:
     def get(self, key: str, default: Any = None) -> Any:
         """Get configuration value with optional default."""
         return self.config.get(key, default)
+
+    def get_runtime_profile(self, profile_name: str | None = None) -> dict[str, Any]:
+        """Return a named runtime profile for local endpoint/model defaults."""
+        return get_runtime_profile(self.config, profile_name)
 
     def update_from_args(self, args: argparse.Namespace):
         """Update configuration with command line arguments."""
@@ -118,8 +125,9 @@ class Config:
 
         if self.config.get("task") == "operation_manual" and not args.client:
             manual_config = self.config.setdefault("operation_manual", {})
-            llm_base_url = manual_config.get("llm_base_url", "http://127.0.0.1:1234/v1")
-            vision_model = manual_config.get("vision_model", "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive@?")
+            profile = self.get_runtime_profile(getattr(args, "profile", None))
+            llm_base_url = manual_config.get("llm_base_url") or profile.get("llm_base_url", "http://127.0.0.1:1234/v1")
+            vision_model = manual_config.get("vision_model") or profile.get("vision_model", "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive@?")
             self.config["clients"]["default"] = "openai_api"
             self.config["clients"]["openai_api"]["api_url"] = llm_base_url
             self.config["clients"]["openai_api"]["api_key"] = self.config["clients"]["openai_api"].get("api_key") or "0"
@@ -138,6 +146,26 @@ class Config:
         except Exception as e:
             logger.error(f"Error saving user config: {e}")
             raise
+
+
+def deep_merge(base: Any, override: Any) -> Any:
+    """Recursively merge dictionaries while replacing non-dict values."""
+    if isinstance(base, dict) and isinstance(override, dict):
+        merged = dict(base)
+        for key, value in override.items():
+            merged[key] = deep_merge(merged.get(key), value)
+        return merged
+    return override
+
+
+def get_runtime_profile(config: dict[str, Any], profile_name: str | None = None) -> dict[str, Any]:
+    profiles = config.get("runtime_profiles") or {}
+    name = profile_name or config.get("active_runtime_profile") or "local_lan"
+    profile = profiles.get(name)
+    if profile is None:
+        available = ", ".join(sorted(profiles)) or "(none)"
+        raise ValueError(f"Unknown runtime profile '{name}'. Available profiles: {available}")
+    return dict(profile)
 
 def get_client(config: Config) -> dict:
     """Get the appropriate client configuration based on configuration."""

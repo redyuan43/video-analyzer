@@ -108,6 +108,62 @@ class OperationManualTests(unittest.TestCase):
             "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive@?",
         )
 
+    def test_runtime_profile_merges_user_config_and_allows_cli_defaults(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_dir = Path(temp_dir)
+            (config_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "active_runtime_profile": "lab",
+                        "runtime_profiles": {
+                            "lab": {
+                                "llm_base_url": "http://lab.local/v1",
+                                "text_model": "lab-text",
+                                "vibevoice_url": "http://lab.local/asr",
+                                "ocr_base_url": "http://lab.local/ocr",
+                            }
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            config = Config(str(config_dir))
+            profile = config.get_runtime_profile()
+
+            self.assertEqual(profile["llm_base_url"], "http://lab.local/v1")
+            self.assertEqual(profile["text_model"], "lab-text")
+            self.assertEqual(profile["vibevoice_url"], "http://lab.local/asr")
+            self.assertEqual(profile["ocr_base_url"], "http://lab.local/ocr")
+            self.assertIn("local_lan", config.get("runtime_profiles"))
+
+            args = argparse.Namespace(
+                config=str(config_dir),
+                profile=None,
+                output_root=None,
+                run_name=None,
+                max_frames=None,
+                manual_language=None,
+                vibevoice_url=None,
+                ocr_base_url=None,
+                llm_base_url=None,
+                vision_model=None,
+                text_model=None,
+                include_subtitles=None,
+                include_comments=None,
+                max_comments=None,
+                subtitle_langs=None,
+            )
+
+            run_operation_manual_from_url.apply_runtime_profile(args)
+
+            self.assertEqual(args.llm_base_url, "http://lab.local/v1")
+            self.assertEqual(args.text_model, "lab-text")
+            self.assertEqual(args.vibevoice_url, "http://lab.local/asr")
+            self.assertEqual(args.ocr_base_url, "http://lab.local/ocr")
+            self.assertEqual(args.output_root, "downloads/url-videos")
+
     def test_url_runner_builds_page_context_markdown(self):
         info = {
             "title": "Hermes Bridge",
@@ -702,6 +758,55 @@ class OperationManualTests(unittest.TestCase):
         self.assertIn("manual_assets/frame_002.jpg", first_step)
         self.assertIn("| 3s |", first_step)
 
+    def test_step_images_replace_model_images_outside_step_bucket(self):
+        frames = [Mock(number=i, timestamp=float(i * 10)) for i in range(10)]
+        assets = {i: f"manual_assets/frame_{i:03d}.jpg" for i in range(10)}
+        manual = "\n".join(
+            [
+                "# 手册",
+                "### 步骤 1：前半段",
+                "| 说明 | 图 |",
+                "| --- | --- |",
+                "| 错图 | ![90s / Frame 9](manual_assets/frame_009.jpg) |",
+                "操作说明。",
+                "### 步骤 2：后半段",
+                "操作说明。",
+            ]
+        )
+
+        updated = embed_step_images(manual, frames, assets)
+
+        first_step = updated.split("### 步骤 2")[0]
+        self.assertNotIn("manual_assets/frame_009.jpg", first_step)
+        self.assertIn("| 说明 | 图 |", first_step)
+        self.assertIn("| 错图 |", first_step)
+        self.assertIn("manual_assets/frame_000.jpg", first_step)
+        self.assertIn("manual_assets/frame_004.jpg", first_step)
+
+    def test_step_images_use_plain_time_range_to_select_frames(self):
+        frames = [
+            Mock(number=0, timestamp=90.0),
+            Mock(number=1, timestamp=100.0),
+            Mock(number=2, timestamp=160.0),
+            Mock(number=3, timestamp=266.0),
+            Mock(number=4, timestamp=300.0),
+        ]
+        assets = {i: f"manual_assets/frame_{i:03d}.jpg" for i in range(5)}
+        manual = "\n".join(
+            [
+                "# 手册",
+                "### 步骤 1：Ralph 方案（01:40-04:26）",
+                "![旧图](manual_assets/frame_000.jpg)",
+                "操作说明。",
+            ]
+        )
+
+        updated = embed_step_images(manual, frames, assets)
+
+        self.assertNotIn("manual_assets/frame_000.jpg", updated)
+        self.assertIn("manual_assets/frame_001.jpg", updated)
+        self.assertIn("manual_assets/frame_003.jpg", updated)
+
     def test_asset_paths_are_rendered_as_markdown_images(self):
         frames = [Mock(number=0, timestamp=3.0)]
         assets = {0: "manual_assets/frame_000.jpg"}
@@ -791,6 +896,19 @@ class OperationManualTests(unittest.TestCase):
         issues = review_operation_manual_markdown(manual)
 
         self.assertIn("step_missing_screenshot", {issue["code"] for issue in issues})
+
+    def test_operation_manual_review_warns_for_image_time_mismatch(self):
+        manual = "\n".join(
+            [
+                "# 手册",
+                "### 步骤 1：操作（00:10-00:20）",
+                "![90s / Frame 9](manual_assets/frame_009.jpg)",
+            ]
+        )
+
+        issues = review_operation_manual_markdown(manual)
+
+        self.assertIn("step_image_time_mismatch", {issue["code"] for issue in issues})
 
     def test_frame_context_is_bounded_for_many_frames(self):
         analyzer = VideoAnalyzer.__new__(VideoAnalyzer)
