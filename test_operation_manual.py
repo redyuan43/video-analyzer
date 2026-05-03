@@ -710,11 +710,39 @@ class OperationManualTests(unittest.TestCase):
     def test_run_ocr_reports_unavailable_once(self):
         frames = [Mock(number=0, timestamp=0.0), Mock(number=1, timestamp=1.0)]
         with patch("video_analyzer.ocr.requests.get", side_effect=RuntimeError("offline")) as get:
-            events = run_ocr(frames, "auto", "http://ocr.test/v1", "model", "prompt_scene_spotting")
+            events = run_ocr(
+                frames,
+                "auto",
+                "http://ocr.test/v1",
+                "model",
+                "prompt_scene_spotting",
+                warmup_timeout_seconds=0,
+            )
 
         self.assertEqual(len(events), 2)
         self.assertEqual(events[0].status, "unavailable")
         self.assertEqual(get.call_count, 1)
+
+    def test_dots_mocr_probe_waits_for_cold_start(self):
+        first = RuntimeError("cold start")
+        second = RuntimeError("still loading")
+        ready = Mock()
+        ready.raise_for_status.return_value = None
+        provider = DotsMOCRVLLMProvider(
+            base_url="http://ocr.test/v1",
+            probe_timeout_seconds=5,
+            warmup_timeout_seconds=180,
+            warmup_retry_interval_seconds=5,
+        )
+
+        with patch("video_analyzer.ocr.requests.get", side_effect=[first, second, ready]) as get, patch(
+            "video_analyzer.ocr.time.monotonic", side_effect=[0, 5, 10, 15, 110]
+        ), patch("video_analyzer.ocr.time.sleep") as sleep:
+            selected = provider.probe()
+
+        self.assertEqual(selected, "http://ocr.test/v1")
+        self.assertEqual(get.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
 
     def test_run_ocr_falls_back_to_openai_vision(self):
         if cv2 is None:
@@ -748,6 +776,7 @@ class OperationManualTests(unittest.TestCase):
                 "prompt_scene_spotting",
                 fallback_base_url="http://127.0.0.1:1234/v1",
                 fallback_model="qwen/qwen3-vl-30b",
+                warmup_timeout_seconds=0,
             )
 
         self.assertEqual(events[0].status, "ok")

@@ -2,6 +2,7 @@ import base64
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -87,26 +88,52 @@ class DotsMOCRVLLMProvider:
         model: str = "model",
         prompt_mode: str = "prompt_scene_spotting",
         timeout: int = 120,
+        probe_timeout_seconds: float = 5,
+        warmup_timeout_seconds: float = 180,
+        warmup_retry_interval_seconds: float = 5,
     ):
         self.base_url = base_url
         self.model = model
         self.prompt_mode = prompt_mode
         self.timeout = timeout
+        self.probe_timeout_seconds = probe_timeout_seconds
+        self.warmup_timeout_seconds = warmup_timeout_seconds
+        self.warmup_retry_interval_seconds = warmup_retry_interval_seconds
         self.selected_base_url: Optional[str] = None
         self.diagnostics: List[Dict[str, str]] = []
 
     def probe(self) -> Optional[str]:
         endpoints = DOTS_MOCR_ENDPOINTS if self.base_url == "auto" else [self.base_url]
         self.diagnostics = []
-        for endpoint in endpoints:
-            normalized = endpoint.rstrip("/")
-            try:
-                response = requests.get(f"{normalized}/models", timeout=5)
-                response.raise_for_status()
-                self.selected_base_url = normalized
-                return normalized
-            except Exception as exc:
-                self.diagnostics.append({"endpoint": normalized, "error": str(exc)})
+        started = time.monotonic()
+        deadline = started + max(0, self.warmup_timeout_seconds)
+        attempt = 0
+        while True:
+            attempt += 1
+            for endpoint in endpoints:
+                normalized = endpoint.rstrip("/")
+                try:
+                    response = requests.get(f"{normalized}/models", timeout=self.probe_timeout_seconds)
+                    response.raise_for_status()
+                    elapsed = time.monotonic() - started
+                    self.selected_base_url = normalized
+                    if elapsed > self.probe_timeout_seconds:
+                        logger.info("DotsMOCR endpoint ready after %.1fs: %s", elapsed, normalized)
+                    return normalized
+                except Exception as exc:
+                    self.diagnostics.append({"endpoint": normalized, "attempt": str(attempt), "error": str(exc)})
+
+            now = time.monotonic()
+            if now >= deadline:
+                break
+            sleep_seconds = min(self.warmup_retry_interval_seconds, max(0, deadline - now))
+            logger.info(
+                "DotsMOCR endpoint not ready after %.1fs; waiting %.1fs for cold start before retry %s",
+                now - started,
+                sleep_seconds,
+                attempt + 1,
+            )
+            time.sleep(sleep_seconds)
         return None
 
     def analyze_frame(self, frame: Frame) -> OCREvent:
@@ -290,6 +317,9 @@ def run_ocr(
     fallback_base_url: Optional[str] = None,
     fallback_model: Optional[str] = None,
     fallback_api_key: str = "0",
+    probe_timeout_seconds: float = 5,
+    warmup_timeout_seconds: float = 180,
+    warmup_retry_interval_seconds: float = 5,
 ) -> List[OCREvent]:
     if provider == "none":
         return []
@@ -308,9 +338,16 @@ def run_ocr(
             return _unavailable_events(frames, f"OpenAI-compatible OCR endpoint is not reachable: {fallback_base_url}")
         return [fallback.analyze_frame(frame) for frame in frames]
 
-    dots = DotsMOCRVLLMProvider(base_url=base_url, model=model, prompt_mode=prompt_mode)
+    dots = DotsMOCRVLLMProvider(
+        base_url=base_url,
+        model=model,
+        prompt_mode=prompt_mode,
+        probe_timeout_seconds=probe_timeout_seconds,
+        warmup_timeout_seconds=warmup_timeout_seconds,
+        warmup_retry_interval_seconds=warmup_retry_interval_seconds,
+    )
     if not dots.probe():
-        error = f"No DotsMOCR vLLM endpoint is reachable: {dots.diagnostics}"
+        error = f"DotsMOCR vLLM endpoint was not ready after {warmup_timeout_seconds}s: {dots.diagnostics}"
         if provider == "auto" and fallback_base_url and fallback_model:
             logger.warning("%s Falling back to OpenAI-compatible vision OCR.", error)
             fallback = OpenAICompatibleVisionOCRProvider(

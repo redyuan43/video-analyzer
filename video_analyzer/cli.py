@@ -255,6 +255,9 @@ def main():
                         "fallback_api_key",
                         config.get("clients", {}).get("openai_api", {}).get("api_key", "0"),
                     ),
+                    probe_timeout_seconds=ocr_config.get("probe_timeout_seconds", 5),
+                    warmup_timeout_seconds=ocr_config.get("warmup_timeout_seconds", 180),
+                    warmup_retry_interval_seconds=ocr_config.get("warmup_retry_interval_seconds", 5),
                 )
             
         # Stage 2: Frame Analysis
