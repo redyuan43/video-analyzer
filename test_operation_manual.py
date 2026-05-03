@@ -168,8 +168,61 @@ class OperationManualTests(unittest.TestCase):
             self.assertNotIn("普通评论里说旧版本按钮不同", bundle["markdown"])
             self.assertTrue((video_dir / "subtitles" / "download.zh-CN.vtt").exists())
             self.assertTrue((video_dir / "comments.json").exists())
+            self.assertTrue((video_dir / "selected_comments.json").exists())
             self.assertEqual(bundle["metadata"]["subtitles"]["language"], "zh-CN")
             self.assertEqual(bundle["metadata"]["comments"]["selected_count"], 1)
+            self.assertEqual(
+                len(json.loads((video_dir / "comments.json").read_text(encoding="utf-8"))),
+                2,
+            )
+            self.assertEqual(
+                len(json.loads((video_dir / "selected_comments.json").read_text(encoding="utf-8"))),
+                1,
+            )
+
+    def test_cli_writes_timestamped_transcript_markdown(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            transcript = AudioTranscript(
+                text="hello world",
+                segments=[{"start_time": 1.2, "end_time": 3.8, "text": "hello world"}],
+                language="en",
+            )
+
+            path = Path(temp_dir) / "transcript.md"
+            from video_analyzer.cli import write_transcript_markdown
+
+            write_transcript_markdown(transcript, path)
+
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("# Transcript", text)
+            self.assertIn("[00:00:01 - 00:00:03] hello world", text)
+
+    def test_cli_archives_raw_artifacts_under_orin(self):
+        from video_analyzer.cli import write_orin_artifacts
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            results = {
+                "metadata": {"audio_language": "zh", "page_context": {}},
+                "transcript": {
+                    "text": "原文",
+                    "segments": [{"start_time": 0.0, "end_time": 2.0, "text": "原文"}],
+                },
+                "asr": {"provider": "vibevoice"},
+                "ocr_events": [{"frame_number": 0, "text": "按钮"}],
+                "visual_events": [{"response": "shows button"}],
+                "frame_analyses": [{"response": "shows button"}],
+            }
+
+            orin_dir = write_orin_artifacts(output_dir, results, "page context")
+
+            self.assertEqual(orin_dir, output_dir / "orin")
+            self.assertTrue((orin_dir / "metadata.json").exists())
+            self.assertTrue((orin_dir / "transcript.md").exists())
+            self.assertTrue((orin_dir / "asr.json").exists())
+            self.assertTrue((orin_dir / "ocr_event_000.json").exists())
+            self.assertTrue((orin_dir / "frame_analysis_000.json").exists())
+            self.assertIn("page context", (orin_dir / "page_context.md").read_text(encoding="utf-8"))
 
     def test_url_runner_cleans_json3_subtitles_with_timestamps(self):
         payload = {

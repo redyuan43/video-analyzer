@@ -295,8 +295,10 @@ def collect_comments(video_dir: Path, info: dict[str, Any], args: argparse.Names
 
     selected = select_comments(raw_comments, max(0, args.max_comments), info)
     comments_json = video_dir / "comments.json"
+    selected_comments_json = video_dir / "selected_comments.json"
     comments_md = video_dir / "comments.md"
-    comments_json.write_text(json.dumps(selected, ensure_ascii=False, indent=2), encoding="utf-8")
+    comments_json.write_text(json.dumps(raw_comments, ensure_ascii=False, indent=2), encoding="utf-8")
+    selected_comments_json.write_text(json.dumps(selected, ensure_ascii=False, indent=2), encoding="utf-8")
     markdown = build_comments_markdown(selected)
     comments_md.write_text(markdown, encoding="utf-8")
     metadata.update(
@@ -305,6 +307,7 @@ def collect_comments(video_dir: Path, info: dict[str, Any], args: argparse.Names
             "available_count": len(raw_comments),
             "selected_count": len(selected),
             "json_file": str(comments_json),
+            "selected_json_file": str(selected_comments_json),
             "markdown_file": str(comments_md),
         }
     )
