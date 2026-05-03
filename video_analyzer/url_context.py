@@ -149,6 +149,7 @@ def main() -> int:
     else:
         print(f"[done] manual: not found under {run_dir}")
     print(f"[done] analysis: {analysis_path}")
+    print(f"[done] run_dir: {run_dir.resolve()}")
     return 0
 
 

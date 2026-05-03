@@ -31,6 +31,7 @@ from video_analyzer.asr_providers import (
 )
 from video_analyzer.ocr import DOTS_MOCR_ENDPOINTS, DotsMOCRVLLMProvider, run_ocr
 from video_analyzer.audio_processor import AudioTranscript
+from video_analyzer.doc_chat import ask_video_docs, build_doc_chat_prompt, load_video_docs
 
 RUNNER_PATH = Path(__file__).resolve().parent / "tools" / "run_operation_manual_from_url.py"
 RUNNER_SPEC = importlib.util.spec_from_file_location("run_operation_manual_from_url", RUNNER_PATH)
@@ -310,6 +311,88 @@ class OperationManualTests(unittest.TestCase):
             (run_dir / "analysis.json").write_text("{}", encoding="utf-8")
             with self.assertRaises(FileNotFoundError):
                 run_multidoc_analysis.run_multidoc_analysis(run_dir)
+
+    def test_video_docs_chat_loads_sources_and_builds_prompt(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            (run_dir / "orin").mkdir()
+            (run_dir / "operation_manual.md").write_text("# 手册\n\n点击按钮。", encoding="utf-8")
+            (run_dir / "transcript.md").write_text("- [00:00:01 - 00:00:03] 作者说明按钮用途", encoding="utf-8")
+            (run_dir / "manual_evidence.md").write_text("frame_012 OCR: 设置", encoding="utf-8")
+            (run_dir / "orin" / "comments.md").write_text("普通评论：可能旧版本不同", encoding="utf-8")
+
+            bundle = load_video_docs(run_dir)
+            prompt = build_doc_chat_prompt(bundle, "按钮在哪里？", [])
+
+            self.assertEqual(len(bundle["sources"]), 4)
+            self.assertIn("manual_evidence", prompt)
+            self.assertIn("comments/comment-only", prompt)
+            self.assertIn("按钮在哪里？", prompt)
+
+    def test_video_docs_chat_loads_analysis_json_without_markdown_sidecars(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            (run_dir / "analysis.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": {"title": "Demo"},
+                        "transcript": {"text": "按钮在右上角"},
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            bundle = load_video_docs(run_dir)
+            prompt = build_doc_chat_prompt(bundle, "按钮在哪里？", [])
+
+            self.assertEqual([source["name"] for source in bundle["sources"]], ["analysis_json"])
+            self.assertIn("## Source: analysis_json", prompt)
+            self.assertIn("analysis.json 是结构化聚合产物", prompt)
+            self.assertIn("Path: ", prompt)
+
+    def test_video_docs_chat_asks_with_mock_client(self):
+        class FakeClient:
+            def generate(self, **kwargs):
+                self.prompt = kwargs["prompt"]
+                return {"response": "根据 transcript.md，答案需要复核。"}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            (run_dir / "operation_manual.md").write_text("主步骤", encoding="utf-8")
+            client = FakeClient()
+
+            answer = ask_video_docs(run_dir, "怎么操作？", client, "model")
+
+            self.assertIn("需要复核", answer)
+            self.assertIn("怎么操作？", client.prompt)
+
+    def test_start_example_runs_followup_steps(self):
+        text = Path("start_example.sh").read_text(encoding="utf-8")
+
+        self.assertIn("tools/run_multidoc_analysis.sh \"$RUN_DIR\" --profile \"$PROFILE\"", text)
+        self.assertIn("tools/generate_30s_agx_tts.sh \"$RUN_DIR\" --profile \"$PROFILE\"", text)
+        self.assertIn("[done] run_dir: ", text)
+        self.assertNotIn("Could not infer Bilibili BV id", text)
+        self.assertNotIn("VIDEO_ID=", text)
+
+    def test_start_example_parses_run_dir_marker_from_url_runner_output(self):
+        log_text = "\n".join(
+            [
+                "[download] ready",
+                "[done] manual: /tmp/video/operation_manual.md",
+                "[done] run_dir: /tmp/video/operation-manual",
+            ]
+        )
+
+        run_dir = next(
+            line.split(": ", 1)[1].strip()
+            for line in reversed(log_text.splitlines())
+            if line.startswith("[done] run_dir: ")
+        )
+
+        self.assertEqual(run_dir, "/tmp/video/operation-manual")
 
     def test_multidoc_analysis_runs_four_rounds_with_mock_llm(self):
         class FakeClient:
