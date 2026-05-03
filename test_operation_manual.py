@@ -38,6 +38,12 @@ run_operation_manual_from_url = importlib.util.module_from_spec(RUNNER_SPEC)
 assert RUNNER_SPEC and RUNNER_SPEC.loader
 RUNNER_SPEC.loader.exec_module(run_operation_manual_from_url)
 
+MULTIDOC_PATH = Path(__file__).resolve().parent / "tools" / "run_multidoc_analysis.py"
+MULTIDOC_SPEC = importlib.util.spec_from_file_location("run_multidoc_analysis", MULTIDOC_PATH)
+run_multidoc_analysis = importlib.util.module_from_spec(MULTIDOC_SPEC)
+assert MULTIDOC_SPEC and MULTIDOC_SPEC.loader
+MULTIDOC_SPEC.loader.exec_module(run_multidoc_analysis)
+
 try:
     import cv2
     import numpy as np
@@ -238,6 +244,87 @@ class OperationManualTests(unittest.TestCase):
         text = run_operation_manual_from_url.clean_json3_subtitles(json.dumps(payload, ensure_ascii=False))
 
         self.assertIn("[00:00:01 - 00:00:03] 点击安装按钮", text)
+
+    def test_multidoc_analysis_requires_existing_analysis_and_orin(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaises(FileNotFoundError):
+                run_multidoc_analysis.run_multidoc_analysis(Path(temp_dir))
+
+            run_dir = Path(temp_dir)
+            (run_dir / "analysis.json").write_text("{}", encoding="utf-8")
+            with self.assertRaises(FileNotFoundError):
+                run_multidoc_analysis.run_multidoc_analysis(run_dir)
+
+    def test_multidoc_analysis_runs_four_rounds_with_mock_llm(self):
+        class FakeClient:
+            def __init__(self):
+                self.prompts = []
+
+            def generate(self, **kwargs):
+                self.prompts.append(kwargs["prompt"])
+                return {"response": f"# response {len(self.prompts)}"}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            orin = run_dir / "orin"
+            orin.mkdir()
+            (run_dir / "operation_manual.md").write_text("original manual", encoding="utf-8")
+            (run_dir / "manual_evidence.md").write_text("manual evidence", encoding="utf-8")
+            (orin / "page_context.md").write_text(
+                "- 00:00:00 - 00:01:00: 第一章\n评论只能补充",
+                encoding="utf-8",
+            )
+            (orin / "transcript.md").write_text("- [00:00:00 - 00:00:05] 开场", encoding="utf-8")
+            (orin / "transcript.json").write_text(
+                json.dumps({"text": "开场", "segments": [{"start_time": 0, "end_time": 5, "text": "开场"}]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            (orin / "ocr_events.json").write_text(json.dumps([{"text": "按钮"}], ensure_ascii=False), encoding="utf-8")
+            (orin / "frame_analyses.json").write_text(
+                json.dumps([{"response": "shows button"}], ensure_ascii=False),
+                encoding="utf-8",
+            )
+            (run_dir / "analysis.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": {"text_model": "text-model", "audio_language": "zh"},
+                        "transcript": {"text": "开场", "segments": [{"start_time": 0, "end_time": 5, "text": "开场"}]},
+                        "ocr_events": [{"text": "按钮"}],
+                        "frame_analyses": [{"response": "shows button"}],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            client = FakeClient()
+
+            summary = run_multidoc_analysis.run_multidoc_analysis(run_dir, client=client)
+
+            output_dir = run_dir / "docs_analysis"
+            self.assertEqual(len(client.prompts), 6)
+            self.assertTrue((output_dir / "knowledge_notes.md").exists())
+            self.assertTrue((output_dir / "deep_report.md").exists())
+            self.assertTrue((output_dir / "operation_manual_review.md").exists())
+            self.assertTrue((output_dir / "analysis.json").exists())
+            self.assertTrue((output_dir / "orin" / "round_01_evidence_map.md").exists())
+            self.assertTrue((output_dir / "orin" / "round_02_chapter_analysis.md").exists())
+            self.assertTrue((output_dir / "orin" / "round_03_knowledge_notes_draft.md").exists())
+            self.assertTrue((output_dir / "orin" / "round_04_review.md").exists())
+            self.assertEqual((run_dir / "operation_manual.md").read_text(encoding="utf-8"), "original manual")
+            self.assertIn("docs_analysis/orin", summary["orin_dir"])
+
+    def test_multidoc_prompt_keeps_comments_low_trust(self):
+        evidence = {
+            "page_context": "context",
+            "transcript_md": "transcript",
+            "ocr_events": [],
+            "frame_analyses": [],
+        }
+
+        prompt = run_multidoc_analysis.build_evidence_map_prompt(evidence, "zh-CN")
+
+        self.assertIn("评论只能作为社区补充", prompt)
+        self.assertIn("OCR/VL", prompt)
 
     def test_url_runner_defaults_to_edge_vibevoice_and_spark_ocr(self):
         args = argparse.Namespace(
