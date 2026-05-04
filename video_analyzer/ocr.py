@@ -14,9 +14,7 @@ from .frame import Frame
 logger = logging.getLogger(__name__)
 
 DOTS_MOCR_ENDPOINTS = [
-    "http://192.168.100.169:8000/v1",
-    "http://192.168.100.131:8000/v1",
-    "http://127.0.0.1:8000/v1",
+    "http://spark-31d6.taild500c8.ts.net:8000/v1",
 ]
 
 PROMPTS = {

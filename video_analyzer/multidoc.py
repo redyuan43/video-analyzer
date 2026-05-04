@@ -14,7 +14,7 @@ from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient
 from video_analyzer.config import Config
 
 
-DEFAULT_LLM_BASE_URL = "http://127.0.0.1:1234/v1"
+DEFAULT_LLM_BASE_URL = "http://spark-31d6.taild500c8.ts.net:1234/v1"
 DEFAULT_TEXT_MODEL = "redhatai_qwen3.6-35b-a3b-nvfp4"
 DEFAULT_DOC_TYPES = ["knowledge_notes", "deep_report", "operation_manual_review"]
 DOC_FILENAMES = {

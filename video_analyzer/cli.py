@@ -211,6 +211,13 @@ def main():
                         providers_run=[] if provider == "none" else [provider],
                     )
                 if transcript is None:
+                    require_transcript = bool(asr_config.get("require_transcript", task == "operation_manual"))
+                    if require_transcript and provider != "none":
+                        failures = "; ".join(asr_result.failures or asr_result.merge_notes) if asr_result else ""
+                        raise RuntimeError(
+                            "Required ASR transcript was not produced. Check the configured Spark ASR/VibeVoice "
+                            f"endpoint health instead of falling back to another device. {failures}".strip()
+                        )
                     logger.warning("Could not generate reliable transcript. Proceeding with video analysis only.")
                 else:
                     transcript_markdown_path = write_transcript_markdown(transcript, output_dir / "transcript.md")

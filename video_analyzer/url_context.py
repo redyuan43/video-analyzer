@@ -3,9 +3,9 @@
 
 The default runtime policy matches the current tested setup:
 - video download through yt-dlp
-- VibeVoice ASR on edge, single remote worker
+- VibeVoice ASR on spark, single remote worker
 - DotsMOCR OCR on spark
-- LM Studio local VL/text models
+- LM Studio VL/text models on spark
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ from video_analyzer.config import Config
 FALLBACK_OUTPUT_ROOT = "downloads/url-videos"
 FALLBACK_RUN_NAME = "operation-manual"
 FALLBACK_SUBTITLE_LANGS = "zh-CN,zh-Hans,zh,en"
-FALLBACK_LLM_BASE_URL = "http://127.0.0.1:1234/v1"
-FALLBACK_VISION_MODEL = "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive@?"
+FALLBACK_LLM_BASE_URL = "http://spark-31d6.taild500c8.ts.net:1234/v1"
+FALLBACK_VISION_MODEL = "qwen/qwen3-vl-30b"
 FALLBACK_TEXT_MODEL = "redhatai_qwen3.6-35b-a3b-nvfp4"
 
 

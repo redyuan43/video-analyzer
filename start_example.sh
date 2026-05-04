@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROFILE="${PROFILE:-local_lan}"
+PROFILE="${PROFILE:-spark}"
 URL="${1:-https://www.bilibili.com/video/BV1prXyYMEjL/?spm_id_from=333.788.recommend_more_video.1&trackid=web_related_0.router-related-2479604-ptszh.1777734943162.1017&vd_source=70e95bad7ca28ab5623ab4b95161d8c2}"
 LOG_FILE="$(mktemp)"
 trap 'rm -f "$LOG_FILE"' EXIT

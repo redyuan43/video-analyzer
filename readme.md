@@ -198,7 +198,7 @@ Local video workflow:
     --output output/manual-run \
     --asr-provider vibevoice \
     --ocr-provider auto \
-    --llm-base-url http://127.0.0.1:1234/v1 \
+    --llm-base-url http://spark-31d6.taild500c8.ts.net:1234/v1 \
     --manual-language zh-CN \
     --keep-frames
 ```

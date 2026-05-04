@@ -19,16 +19,12 @@ from .audio_processor import AudioProcessor, AudioTranscript
 
 logger = logging.getLogger(__name__)
 
-CAPSWRITER_URL = "http://127.0.0.1:8001/api/asr/transcribe"
+CAPSWRITER_URL = "http://spark-31d6.taild500c8.ts.net:8001/api/asr/transcribe"
 REMOTE_VIBEVOICE_URLS = [
-    "http://192.168.100.169:8002/api/asr/transcribe",
-    "http://192.168.100.236:8003/api/asr/transcribe",
+    "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
 ]
 REMOTE_ASR_URLS = [
-    "http://192.168.100.117:8001/api/asr/transcribe",
-    "http://127.0.0.1:8001/api/asr/transcribe",
-    "http://192.168.100.169:8001/api/asr/transcribe",
-    "http://192.168.100.131:8001/api/asr/transcribe",
+    "http://spark-31d6.taild500c8.ts.net:8001/api/asr/transcribe",
 ]
 
 DEEP_ASR_MIN_SECONDS = 180.0
@@ -321,12 +317,6 @@ def transcribe_with_strategy(
             "vibevoice",
             lambda: transcribe_with_vibevoice(audio_path, vibevoice_config),
         )
-        if not _has_transcript_text(result.fast_transcript) and not _has_transcript_text(result.deep_transcript):
-            result.fast_transcript = _timed_transcribe(
-                result,
-                "faster_whisper",
-                lambda: AudioProcessor(language=language, model_size_or_path=whisper_model, device=device).transcribe(audio_path),
-            )
     elif normalized == "balanced":
         result.fast_transcript = _timed_transcribe(
             result,
@@ -342,25 +332,8 @@ def transcribe_with_strategy(
             )
         else:
             result.merge_notes.append("balanced skipped VibeVoice: fast transcript was sufficient for this audio length")
-        needs_fallback = not _has_transcript_text(result.deep_transcript) and (
-            not _has_transcript_text(result.fast_transcript) or fast_is_weak
-        )
-        if needs_fallback:
-            result.fast_transcript = _timed_transcribe(
-                result,
-                "capswriter_http",
-                lambda: transcribe_with_capswriter(audio_path),
-            )
-            fast_is_weak = _is_weak_fast_transcript(result.fast_transcript, _wav_duration(audio_path))
-        needs_fallback = not _has_transcript_text(result.deep_transcript) and (
-            not _has_transcript_text(result.fast_transcript) or fast_is_weak
-        )
-        if needs_fallback:
-            result.fast_transcript = _timed_transcribe(
-                result,
-                "faster_whisper",
-                lambda: AudioProcessor(language=language, model_size_or_path=whisper_model, device=device).transcribe(audio_path),
-            )
+        if not _has_transcript_text(result.deep_transcript) and fast_is_weak:
+            result.merge_notes.append("balanced did not fallback outside Spark ASR; investigate configured Spark endpoints")
     else:
         raise ValueError(f"Unknown ASR strategy: {strategy}")
 

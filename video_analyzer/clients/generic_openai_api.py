@@ -136,7 +136,7 @@ class GenericOpenAIAPIClient(LLMClient):
             address = ipaddress.ip_address(host)
             return address.is_private or address.is_loopback
         except ValueError:
-            return host.endswith(".local") or host.endswith(".lan")
+            return host.endswith(".local") or host.endswith(".lan") or host.endswith(".taild500c8.ts.net")
 
     @staticmethod
     def _clean_reasoning_content(text: str) -> str:

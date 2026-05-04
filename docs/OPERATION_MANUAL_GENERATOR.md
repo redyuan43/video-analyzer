@@ -38,7 +38,7 @@ tools/run_operation_manual_from_url.sh "https://www.bilibili.com/video/BVxxxx"
 The one-command runner downloads the video, saves the page metadata and
 description to `description.md`, collects subtitles/comments when available,
 builds `page_context.md`, then runs the full operation-manual pipeline.
-Defaults come from the `local_lan` runtime profile in
+Defaults come from the `spark` runtime profile in
 `video_analyzer/config/default_config.json`. Put local overrides in
 `config/config.json` rather than editing scripts.
 
@@ -66,14 +66,14 @@ To switch or customize endpoints/models, use a runtime profile:
 
 ```json
 {
-  "active_runtime_profile": "local_lan",
+  "active_runtime_profile": "spark",
   "runtime_profiles": {
-    "local_lan": {
-      "llm_base_url": "http://127.0.0.1:1234/v1",
-      "vision_model": "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive@?",
+    "spark": {
+      "llm_base_url": "http://spark-31d6.taild500c8.ts.net:1234/v1",
+      "vision_model": "qwen/qwen3-vl-30b",
       "text_model": "redhatai_qwen3.6-35b-a3b-nvfp4",
-      "vibevoice_url": "http://192.168.100.236:8003/api/asr/transcribe",
-      "ocr_base_url": "http://192.168.100.169:8000/v1",
+      "vibevoice_url": "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
+      "ocr_base_url": "http://spark-31d6.taild500c8.ts.net:8000/v1",
       "max_comments": 30,
       "subtitle_langs": "zh-CN,zh-Hans,zh,en"
     }
@@ -81,7 +81,7 @@ To switch or customize endpoints/models, use a runtime profile:
 }
 ```
 
-Both URL and multi-document runners accept `--profile local_lan`. Command-line
+Both URL and multi-document runners accept `--profile spark`. Command-line
 arguments still override the profile for one-off runs.
 
 For an existing local video:
@@ -102,14 +102,17 @@ Recommended current local model setup:
 
 - Vision / VL model, text model, LLM endpoint, VibeVoice URL, OCR URL, subtitle
   languages, and comment budget are managed by the active runtime profile.
+- Spark LM Studio should host the configured models on the Spark device itself.
+  If LM Link resolves `qwen/qwen3-vl-30b` or `redhatai_qwen3.6-35b-a3b-nvfp4`
+  to another machine, treat that as an environment issue before running the
+  pipeline.
 - ASR strategy: `balanced` by default for operation manuals. The default path
-  is remote GPU VibeVoice only; fast remote HTTP ASR endpoints are used only
-  when explicitly configured with `--remote-asr-url`.
-- VibeVoice endpoints: spark `http://192.168.100.169:8002/api/asr/transcribe`
-  and edge `http://192.168.100.236:8003/api/asr/transcribe`; do not use
-  Tailscale addresses for normal LAN runs.
-- OCR order: spark DotsMOCR vLLM over LAN first, then other shared endpoints,
-  then local LM Studio vision OCR fallback.
+  stays on Spark services; if Spark ASR/VibeVoice is unavailable, fix that
+  service instead of silently falling back to AGX or the caller machine.
+- VibeVoice endpoint: spark
+  `http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe`.
+- OCR order: spark DotsMOCR vLLM first, then Spark LM Studio vision OCR
+  fallback with `qwen/qwen3-vl-30b`.
 
 Current OCR deployment:
 
@@ -120,7 +123,7 @@ Current OCR deployment:
 | Container | `dots-mocr-vllm` |
 | Image | `vllm/vllm-openai:v0.17.1-cu130` |
 | Model path | `/workspace/dots.mocr/weights/DotsMOCR` |
-| API base URL | `http://192.168.100.169:8000/v1` or `http://192.168.100.131:8000/v1` |
+| API base URL | `http://spark-31d6.taild500c8.ts.net:8000/v1` |
 | Served model name | `model` |
 | max_model_len | `16384` |
 
@@ -211,7 +214,7 @@ for every frame, total runtime is slower than VL-only.
 Recommended policy:
 
 - Use spark DotsMOCR when available. It is preferred for exact screen text.
-- Use LM Studio vision OCR fallback only when shared OCR endpoints are down.
+- Use Spark LM Studio vision OCR fallback only when DotsMOCR is down.
 - Keep OCR for operation manuals because exact text is high-value evidence.
 - Reduce total cost by using density-based frame selection instead of uniformly
   increasing `--max-frames`.
@@ -263,8 +266,7 @@ Example remote VibeVoice override:
 
 ```bash
 --asr-strategy deep \
---vibevoice-url http://192.168.100.169:8002/api/asr/transcribe \
---vibevoice-url http://192.168.100.236:8003/api/asr/transcribe
+--vibevoice-url http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe
 ```
 
 Add `--remote-asr-url ...` only when you intentionally want a fast timestamp

@@ -126,8 +126,10 @@ class Config:
         if self.config.get("task") == "operation_manual" and not args.client:
             manual_config = self.config.setdefault("operation_manual", {})
             profile = self.get_runtime_profile(getattr(args, "profile", None))
-            llm_base_url = manual_config.get("llm_base_url") or profile.get("llm_base_url", "http://127.0.0.1:1234/v1")
-            vision_model = manual_config.get("vision_model") or profile.get("vision_model", "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive@?")
+            llm_base_url = manual_config.get("llm_base_url") or profile.get(
+                "llm_base_url", "http://spark-31d6.taild500c8.ts.net:1234/v1"
+            )
+            vision_model = manual_config.get("vision_model") or profile.get("vision_model", "qwen/qwen3-vl-30b")
             self.config["clients"]["default"] = "openai_api"
             self.config["clients"]["openai_api"]["api_url"] = llm_base_url
             self.config["clients"]["openai_api"]["api_key"] = self.config["clients"]["openai_api"].get("api_key") or "0"
@@ -160,7 +162,7 @@ def deep_merge(base: Any, override: Any) -> Any:
 
 def get_runtime_profile(config: dict[str, Any], profile_name: str | None = None) -> dict[str, Any]:
     profiles = config.get("runtime_profiles") or {}
-    name = profile_name or config.get("active_runtime_profile") or "local_lan"
+    name = profile_name or config.get("active_runtime_profile") or "spark"
     profile = profiles.get(name)
     if profile is None:
         available = ", ".join(sorted(profiles)) or "(none)"

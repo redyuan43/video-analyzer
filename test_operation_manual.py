@@ -56,7 +56,7 @@ except ModuleNotFoundError:
 
 
 class OperationManualTests(unittest.TestCase):
-    def test_operation_manual_config_uses_lmstudio_defaults(self):
+    def test_operation_manual_config_uses_spark_defaults(self):
         args = argparse.Namespace(
             video_path="video.mp4",
             config="config",
@@ -94,19 +94,25 @@ class OperationManualTests(unittest.TestCase):
 
         self.assertEqual(config.get("clients")["default"], "openai_api")
         self.assertEqual(config.get("clients")["openai_api"]["api_key"], "0")
-        self.assertEqual(config.get("clients")["openai_api"]["api_url"], "http://127.0.0.1:1234/v1")
+        self.assertEqual(
+            config.get("clients")["openai_api"]["api_url"],
+            "http://spark-31d6.taild500c8.ts.net:1234/v1",
+        )
         self.assertEqual(
             config.get("clients")["openai_api"]["model"],
-            "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive@?",
+            "qwen/qwen3-vl-30b",
         )
         self.assertEqual(config.get("asr")["provider"], "auto")
         self.assertEqual(config.get("asr")["strategy"], "balanced")
         self.assertEqual(config.get("asr")["vibevoice"]["remote_urls"], [])
-        self.assertEqual(config.get("asr")["vibevoice"]["deep_remote_urls"][1], "http://192.168.100.236:8003/api/asr/transcribe")
+        self.assertEqual(
+            config.get("asr")["vibevoice"]["deep_remote_urls"],
+            ["http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe"],
+        )
         self.assertTrue(config.get("asr")["vibevoice"]["use_native_chunking"])
         self.assertEqual(
             config.get("ocr")["fallback_model"],
-            "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive@?",
+            "qwen/qwen3-vl-30b",
         )
 
     def test_runtime_profile_merges_user_config_and_allows_cli_defaults(self):
@@ -137,6 +143,7 @@ class OperationManualTests(unittest.TestCase):
             self.assertEqual(profile["text_model"], "lab-text")
             self.assertEqual(profile["vibevoice_url"], "http://lab.local/asr")
             self.assertEqual(profile["ocr_base_url"], "http://lab.local/ocr")
+            self.assertIn("spark", config.get("runtime_profiles"))
             self.assertIn("local_lan", config.get("runtime_profiles"))
 
             args = argparse.Namespace(
@@ -465,13 +472,13 @@ class OperationManualTests(unittest.TestCase):
         self.assertIn("评论只能作为社区补充", prompt)
         self.assertIn("OCR/VL", prompt)
 
-    def test_url_runner_defaults_to_edge_vibevoice_and_spark_ocr(self):
+    def test_url_runner_defaults_to_spark_services(self):
         args = argparse.Namespace(
             python=".venv/bin/python",
-            vibevoice_url="http://192.168.100.236:8003/api/asr/transcribe",
-            ocr_base_url="http://192.168.100.169:8000/v1",
-            llm_base_url="http://127.0.0.1:1234/v1",
-            vision_model="sayanything-hauhaucs-aggressive@?",
+            vibevoice_url="http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
+            ocr_base_url="http://spark-31d6.taild500c8.ts.net:8000/v1",
+            llm_base_url="http://spark-31d6.taild500c8.ts.net:1234/v1",
+            vision_model="qwen/qwen3-vl-30b",
             text_model="redhatai_qwen3.6-35b-a3b-nvfp4",
             manual_language="zh-CN",
             max_frames=24,
@@ -489,8 +496,8 @@ class OperationManualTests(unittest.TestCase):
 
         self.assertIn("--asr-provider", command)
         self.assertIn("vibevoice", command)
-        self.assertIn("http://192.168.100.236:8003/api/asr/transcribe", command)
-        self.assertIn("http://192.168.100.169:8000/v1", command)
+        self.assertIn("http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe", command)
+        self.assertIn("http://spark-31d6.taild500c8.ts.net:8000/v1", command)
 
     def test_url_runner_rejects_unsafe_run_name_before_delete(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -524,11 +531,11 @@ class OperationManualTests(unittest.TestCase):
   "task": "describe",
   "clients": {
     "default": "openai_api",
-    "openai_api": {"api_key": "0", "api_url": "http://127.0.0.1:1234/v1", "model": "model"},
+    "openai_api": {"api_key": "0", "api_url": "http://spark-31d6.taild500c8.ts.net:1234/v1", "model": "model"},
     "ollama": {"url": "http://localhost:11434", "model": "model"},
     "temperature": 0.0
   },
-  "operation_manual": {"llm_base_url": "http://127.0.0.1:1234/v1", "vision_model": "vision", "text_model": "text"},
+  "operation_manual": {"llm_base_url": "http://spark-31d6.taild500c8.ts.net:1234/v1", "vision_model": "vision", "text_model": "text"},
   "ocr": {"provider": "none"},
   "asr": {"provider": "vibevoice", "strategy": "balanced", "vibevoice": {}},
   "audio": {"language": "zh", "whisper_model": "medium", "device": "cpu"},
@@ -618,7 +625,7 @@ class OperationManualTests(unittest.TestCase):
         self.assertEqual(vibevoice["deep_remote_urls"], ["http://spark/vibevoice"])
 
     def test_openai_client_uses_reasoning_content_when_content_is_empty(self):
-        client = GenericOpenAIAPIClient("0", "http://127.0.0.1:1234/v1", max_retries=1)
+        client = GenericOpenAIAPIClient("0", "http://spark-31d6.taild500c8.ts.net:1234/v1", max_retries=1)
         response = Mock()
         response.status_code = 200
         response.json.return_value = {
@@ -665,15 +672,13 @@ class OperationManualTests(unittest.TestCase):
 
         self.assertIn("reasoning_content fallback is only allowed", str(raised.exception))
 
-    def test_dots_mocr_default_endpoints_prefer_lan_before_localhost(self):
-        self.assertEqual(DOTS_MOCR_ENDPOINTS[0], "http://192.168.100.169:8000/v1")
-        self.assertEqual(DOTS_MOCR_ENDPOINTS[1], "http://192.168.100.131:8000/v1")
+    def test_dots_mocr_default_endpoint_uses_spark_tailscale(self):
+        self.assertEqual(DOTS_MOCR_ENDPOINTS, ["http://spark-31d6.taild500c8.ts.net:8000/v1"])
 
-    def test_asr_default_endpoints_use_lan_not_tailscale(self):
-        self.assertEqual(REMOTE_ASR_URLS[0], "http://192.168.100.117:8001/api/asr/transcribe")
-        self.assertEqual(REMOTE_VIBEVOICE_URLS[0], "http://192.168.100.169:8002/api/asr/transcribe")
-        self.assertEqual(REMOTE_VIBEVOICE_URLS[1], "http://192.168.100.236:8003/api/asr/transcribe")
-        self.assertFalse(any("taild500c8" in url for url in [*REMOTE_ASR_URLS, *REMOTE_VIBEVOICE_URLS]))
+    def test_asr_default_endpoints_use_spark_tailscale_only(self):
+        self.assertEqual(REMOTE_ASR_URLS, ["http://spark-31d6.taild500c8.ts.net:8001/api/asr/transcribe"])
+        self.assertEqual(REMOTE_VIBEVOICE_URLS, ["http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe"])
+        self.assertTrue(all("spark-31d6.taild500c8.ts.net" in url for url in [*REMOTE_ASR_URLS, *REMOTE_VIBEVOICE_URLS]))
 
     def test_ocr_provider_parses_dots_mocr_json(self):
         if cv2 is None:
@@ -774,7 +779,7 @@ class OperationManualTests(unittest.TestCase):
                 "http://ocr.test/v1",
                 "model",
                 "prompt_scene_spotting",
-                fallback_base_url="http://127.0.0.1:1234/v1",
+                fallback_base_url="http://spark-31d6.taild500c8.ts.net:1234/v1",
                 fallback_model="qwen/qwen3-vl-30b",
                 warmup_timeout_seconds=0,
             )
@@ -1270,7 +1275,7 @@ class OperationManualTests(unittest.TestCase):
         self.assertEqual(merged.segments[0]["start"], 1.0)
         self.assertEqual(merged.segments[0]["text"], "mystyle 风格。")
 
-    def test_balanced_empty_fast_transcript_falls_back_after_vibevoice_failure(self):
+    def test_balanced_empty_fast_transcript_does_not_fallback_outside_spark(self):
         audio_path = Path(tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name)
         with wave.open(str(audio_path), "wb") as wav_file:
             wav_file.setnchannels(1)
@@ -1278,21 +1283,23 @@ class OperationManualTests(unittest.TestCase):
             wav_file.setframerate(16000)
             wav_file.writeframes(b"\x00\x00" * 16000)
         empty_fast = AudioTranscript(text="", segments=[], language="unknown")
-        caps = AudioTranscript(text="caps text", segments=[{"start": 0.0, "end": 1.0, "text": "caps text"}], language="zh")
 
         with patch("video_analyzer.asr_providers.transcribe_with_remote_http", return_value=empty_fast), patch(
             "video_analyzer.asr_providers.transcribe_with_vibevoice", return_value=None
-        ), patch("video_analyzer.asr_providers.transcribe_with_capswriter", return_value=caps), patch(
+        ), patch("video_analyzer.asr_providers.transcribe_with_capswriter") as capswriter, patch(
             "video_analyzer.asr_providers.AudioProcessor"
         ) as processor:
             result = transcribe_with_strategy("balanced", audio_path, "", "medium", "cpu", {})
 
-        self.assertEqual(result.transcript.text, "caps text")
-        self.assertEqual(result.providers_run, ["remote_http", "vibevoice", "capswriter_http"])
+        self.assertIsNone(result.transcript)
+        self.assertEqual(result.providers_run, ["remote_http", "vibevoice"])
+        self.assertIn("remote_http produced no transcript", result.failures)
+        self.assertIn("vibevoice produced no transcript", result.failures)
+        capswriter.assert_not_called()
         processor.assert_not_called()
         audio_path.unlink()
 
-    def test_balanced_weak_fast_transcript_falls_back_when_vibevoice_fails(self):
+    def test_balanced_weak_fast_transcript_does_not_fallback_outside_spark(self):
         audio_path = Path(tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name)
         with wave.open(str(audio_path), "wb") as wav_file:
             wav_file.setnchannels(1)
@@ -1300,15 +1307,16 @@ class OperationManualTests(unittest.TestCase):
             wav_file.setframerate(16000)
             wav_file.writeframes(b"\x00\x00" * 16000)
         weak = AudioTranscript(text="嗯嗯", segments=[{"start": 0.0, "end": 1.0, "text": "嗯嗯"}], language="zh")
-        caps = AudioTranscript(text="caps repaired text", segments=[{"start": 0.0, "end": 1.0, "text": "caps repaired text"}], language="zh")
 
         with patch("video_analyzer.asr_providers.transcribe_with_remote_http", return_value=weak), patch(
             "video_analyzer.asr_providers.transcribe_with_vibevoice", return_value=None
-        ), patch("video_analyzer.asr_providers.transcribe_with_capswriter", return_value=caps):
+        ), patch("video_analyzer.asr_providers.transcribe_with_capswriter") as capswriter:
             result = transcribe_with_strategy("balanced", audio_path, "", "medium", "cpu", {})
 
-        self.assertEqual(result.transcript.text, "caps repaired text")
-        self.assertEqual(result.providers_run, ["remote_http", "vibevoice", "capswriter_http"])
+        self.assertEqual(result.transcript.text, "嗯嗯")
+        self.assertEqual(result.providers_run, ["remote_http", "vibevoice"])
+        self.assertTrue(any("balanced did not fallback outside Spark ASR" in note for note in result.merge_notes))
+        capswriter.assert_not_called()
         audio_path.unlink()
 
     def test_balanced_long_audio_runs_vibevoice(self):

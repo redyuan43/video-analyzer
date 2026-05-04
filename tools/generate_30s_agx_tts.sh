@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_DIR=""
-PROFILE="${PROFILE:-local_lan}"
+PROFILE="${PROFILE:-spark}"
 AGX_HOST="${AGX_HOST:-agx}"
 SPEAKER="${SPEAKER:-vivian}"
 TARGET_DURATION="${TARGET_DURATION:-30}"

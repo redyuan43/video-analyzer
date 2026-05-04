@@ -16,18 +16,39 @@
         }
     },
     "operation_manual": {
-        "llm_base_url": "http://127.0.0.1:1234/v1",
-        "vision_model": "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive@?",
+        "llm_base_url": "http://spark-31d6.taild500c8.ts.net:1234/v1",
+        "vision_model": "qwen/qwen3-vl-30b",
         "text_model": "redhatai_qwen3.6-35b-a3b-nvfp4"
     },
-    "active_runtime_profile": "local_lan",
+    "active_runtime_profile": "spark",
     "runtime_profiles": {
-        "local_lan": {
-            "llm_base_url": "http://127.0.0.1:1234/v1",
-            "vision_model": "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive@?",
+        "spark": {
+            "llm_base_url": "http://spark-31d6.taild500c8.ts.net:1234/v1",
+            "vision_model": "qwen/qwen3-vl-30b",
             "text_model": "redhatai_qwen3.6-35b-a3b-nvfp4",
-            "vibevoice_url": "http://192.168.100.236:8003/api/asr/transcribe",
-            "ocr_base_url": "http://192.168.100.169:8000/v1",
+            "vibevoice_url": "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
+            "ocr_base_url": "http://spark-31d6.taild500c8.ts.net:8000/v1",
+            "output_root": "downloads/url-videos",
+            "run_name": "operation-manual",
+            "max_frames": 24,
+            "manual_language": "zh-CN",
+            "subtitle_langs": "zh-CN,zh-Hans,zh,en",
+            "include_subtitles": true,
+            "include_comments": true,
+            "max_comments": 30,
+            "multidoc_doc_types": [
+                "knowledge_notes",
+                "deep_report",
+                "operation_manual_review"
+            ],
+            "multidoc_output_name": "docs_analysis"
+        },
+        "local_lan": {
+            "llm_base_url": "http://spark-31d6.taild500c8.ts.net:1234/v1",
+            "vision_model": "qwen/qwen3-vl-30b",
+            "text_model": "redhatai_qwen3.6-35b-a3b-nvfp4",
+            "vibevoice_url": "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
+            "ocr_base_url": "http://spark-31d6.taild500c8.ts.net:8000/v1",
             "output_root": "downloads/url-videos",
             "run_name": "operation-manual",
             "max_frames": 24,
@@ -52,8 +73,8 @@
         "probe_timeout_seconds": 5,
         "warmup_timeout_seconds": 180,
         "warmup_retry_interval_seconds": 5,
-        "fallback_base_url": "http://127.0.0.1:1234/v1",
-        "fallback_model": "qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive@?",
+        "fallback_base_url": "http://spark-31d6.taild500c8.ts.net:1234/v1",
+        "fallback_model": "qwen/qwen3-vl-30b",
         "fallback_api_key": "0"
     },
     "prompt_dir": "prompts",
@@ -94,10 +115,10 @@
     "asr": {
         "provider": "faster_whisper",
         "strategy": "balanced",
+        "require_transcript": true,
         "vibevoice": {
             "deep_remote_urls": [
-                "http://192.168.100.169:8002/api/asr/transcribe",
-                "http://192.168.100.236:8003/api/asr/transcribe"
+                "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe"
             ],
             "use_native_chunking": true,
             "distributed_min_seconds": 420,
