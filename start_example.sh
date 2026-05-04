@@ -2,18 +2,41 @@
 set -euo pipefail
 
 PROFILE="${PROFILE:-spark}"
-URL="${1:-https://www.bilibili.com/video/BV1prXyYMEjL/?spm_id_from=333.788.recommend_more_video.1&trackid=web_related_0.router-related-2479604-ptszh.1777734943162.1017&vd_source=70e95bad7ca28ab5623ab4b95161d8c2}"
+RAW_URL="${1:-https://www.bilibili.com/video/BV1prXyYMEjL/}"
 LOG_FILE="$(mktemp)"
 trap 'rm -f "$LOG_FILE"' EXIT
 
-# Full local-lan operation-manual pipeline: download, page context, ASR, OCR, VL, manual.
+URL="$(
+  python3 - "$RAW_URL" <<'PY'
+import re
+import sys
+from urllib.parse import urlsplit
+
+raw_url = sys.argv[1].strip()
+parsed = urlsplit(raw_url)
+host = parsed.netloc.lower()
+match = re.search(r"/video/(BV[0-9A-Za-z]+)", parsed.path)
+if host.endswith("bilibili.com") and match:
+    print(f"{parsed.scheme or 'https'}://{parsed.netloc}/video/{match.group(1)}/")
+else:
+    print(raw_url)
+PY
+)"
+
+if [[ "$URL" != "$RAW_URL" ]]; then
+  echo "Using canonical Bilibili URL: $URL" >&2
+  echo "Tip: quote full share URLs that contain &: ./start_example.sh 'https://...?a=1&b=2'" >&2
+fi
+
+# Full Spark operation-manual pipeline: download, page context, ASR, OCR, VL, manual.
 tools/run_operation_manual_from_url.sh \
   "$URL" \
   --profile "$PROFILE" \
   --cookies-from-browser chrome | tee "$LOG_FILE"
 
 RUN_DIR="$(
-  python3 - "$LOG_FILE" <<'PY'
+  {
+    python3 - "$LOG_FILE" <<'PY'
 import sys
 from pathlib import Path
 
@@ -25,7 +48,7 @@ for line in reversed(log_path.read_text(encoding="utf-8", errors="replace").spli
 else:
     raise SystemExit(1)
 PY
-  || true
+  } || true
 )"
 
 if [[ -z "$RUN_DIR" ]]; then

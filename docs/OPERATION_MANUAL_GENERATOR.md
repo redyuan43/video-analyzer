@@ -35,6 +35,19 @@ repository root:
 tools/run_operation_manual_from_url.sh "https://www.bilibili.com/video/BVxxxx"
 ```
 
+For Bilibili, prefer the canonical video URL without share parameters:
+
+```bash
+./start_example.sh https://www.bilibili.com/video/BVxxxx/
+```
+
+If you paste a full browser/share URL containing `&`, quote it. Otherwise bash
+treats `&` as "run in background" before the script can see the full URL:
+
+```bash
+./start_example.sh 'https://www.bilibili.com/video/BVxxxx/?share_source=copy_web&vd_source=...'
+```
+
 The one-command runner downloads the video, saves the page metadata and
 description to `description.md`, collects subtitles/comments when available,
 builds `page_context.md`, then runs the full operation-manual pipeline.

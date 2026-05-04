@@ -190,6 +190,14 @@ One-command URL workflow:
 tools/run_operation_manual_from_url.sh "https://www.bilibili.com/video/BVxxxx"
 ```
 
+For Bilibili share URLs, either use the canonical URL without query parameters
+or quote the full URL so shell `&` characters do not background the command:
+
+```bash
+./start_example.sh https://www.bilibili.com/video/BVxxxx/
+./start_example.sh 'https://www.bilibili.com/video/BVxxxx/?share_source=copy_web&vd_source=...'
+```
+
 Local video workflow:
 
 ```bash

@@ -381,8 +381,11 @@ class OperationManualTests(unittest.TestCase):
         self.assertIn("tools/run_multidoc_analysis.sh \"$RUN_DIR\" --profile \"$PROFILE\"", text)
         self.assertIn("tools/generate_30s_agx_tts.sh \"$RUN_DIR\" --profile \"$PROFILE\"", text)
         self.assertIn("[done] run_dir: ", text)
+        self.assertIn("Using canonical Bilibili URL", text)
+        self.assertIn("quote full share URLs that contain &", text)
         self.assertNotIn("Could not infer Bilibili BV id", text)
         self.assertNotIn("VIDEO_ID=", text)
+        self.assertNotIn("vd_source=", text)
 
     def test_start_example_parses_run_dir_marker_from_url_runner_output(self):
         log_text = "\n".join(
