@@ -29,6 +29,9 @@ REMOTE_ASR_URLS = [
 
 DEEP_ASR_MIN_SECONDS = 180.0
 VIBEVOICE_DISTRIBUTED_MIN_SECONDS = 420.0
+HTTP_ASR_RETRY_STATUSES = {429, 502, 503, 504}
+HTTP_ASR_MAX_ATTEMPTS = 6
+HTTP_ASR_RETRY_DELAY_SECONDS = 10.0
 
 
 @dataclass
@@ -97,30 +100,61 @@ def transcribe_with_http_asr(
     hotword: str = "",
     extra_data: Optional[Dict[str, object]] = None,
 ) -> Optional[AudioTranscript]:
-    try:
-        form_data = {"hotword": hotword}
-        if extra_data:
-            form_data.update({key: str(value) for key, value in extra_data.items() if value is not None})
-        with audio_path.open("rb") as audio_file:
-            response = requests.post(
-                url,
-                files={"audio": (audio_path.name, audio_file, "audio/wav")},
-                data=form_data,
-                timeout=(30, 900),
+    form_data = {"hotword": hotword}
+    if extra_data:
+        form_data.update({key: str(value) for key, value in extra_data.items() if value is not None})
+    for attempt in range(1, HTTP_ASR_MAX_ATTEMPTS + 1):
+        try:
+            with audio_path.open("rb") as audio_file:
+                response = requests.post(
+                    url,
+                    files={"audio": (audio_path.name, audio_file, "audio/wav")},
+                    data=form_data,
+                    timeout=(30, 900),
+                )
+            response.raise_for_status()
+            payload = response.json()
+            if not payload.get("success"):
+                logger.warning("HTTP ASR failed from %s: %s", url, payload)
+                return None
+            return AudioTranscript(
+                text=payload.get("text", ""),
+                segments=payload.get("segments") or [],
+                language=payload.get("language") or "unknown",
             )
-        response.raise_for_status()
-        payload = response.json()
-        if not payload.get("success"):
-            logger.warning("HTTP ASR failed from %s: %s", url, payload)
+        except requests.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            if status_code in HTTP_ASR_RETRY_STATUSES and attempt < HTTP_ASR_MAX_ATTEMPTS:
+                logger.warning(
+                    "HTTP ASR unavailable from %s: %s; retrying in %.0fs (%d/%d)",
+                    url,
+                    exc,
+                    HTTP_ASR_RETRY_DELAY_SECONDS,
+                    attempt,
+                    HTTP_ASR_MAX_ATTEMPTS,
+                )
+                time.sleep(HTTP_ASR_RETRY_DELAY_SECONDS)
+                continue
+            logger.warning("HTTP ASR unavailable from %s: %s", url, exc)
             return None
-        return AudioTranscript(
-            text=payload.get("text", ""),
-            segments=payload.get("segments") or [],
-            language=payload.get("language") or "unknown",
-        )
-    except Exception as exc:
-        logger.warning("HTTP ASR unavailable from %s: %s", url, exc)
-        return None
+        except requests.RequestException as exc:
+            if attempt < HTTP_ASR_MAX_ATTEMPTS:
+                logger.warning(
+                    "HTTP ASR unavailable from %s: %s; retrying in %.0fs (%d/%d)",
+                    url,
+                    exc,
+                    HTTP_ASR_RETRY_DELAY_SECONDS,
+                    attempt,
+                    HTTP_ASR_MAX_ATTEMPTS,
+                )
+                time.sleep(HTTP_ASR_RETRY_DELAY_SECONDS)
+                continue
+            logger.warning("HTTP ASR unavailable from %s: %s", url, exc)
+            return None
+        except Exception as exc:
+            logger.warning("HTTP ASR unavailable from %s: %s", url, exc)
+            return None
+    return None
 
 
 def transcribe_with_capswriter(audio_path: Path, hotword: str = "") -> Optional[AudioTranscript]:
