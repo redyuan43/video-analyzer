@@ -97,6 +97,36 @@ To switch or customize endpoints/models, use a runtime profile:
 Both URL and multi-document runners accept `--profile spark`. Command-line
 arguments still override the profile for one-off runs.
 
+### Remote Runtime Installation Notes
+
+For URL runs, install both the Python package and URL downloader in the project
+virtual environment:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -U pip setuptools wheel
+.venv/bin/python -m pip install -e .
+.venv/bin/python -m pip install yt-dlp
+sudo apt-get update && sudo apt-get install -y ffmpeg
+```
+
+`tools/run_operation_manual_from_url.sh` adds `.venv/bin` to `PATH` before
+starting Python, so commands such as `yt-dlp` are found even when the shell has
+not manually activated the virtual environment.
+
+When the LLM endpoint is a shared remote LM Studio server with limited VRAM,
+only configure models that are already loaded on that server. Verify with the
+LM Studio model API before running:
+
+```bash
+curl http://HOST:1234/api/v0/models
+```
+
+Use a model whose `state` is `loaded` for both `vision_model` and `text_model`
+unless there is enough free VRAM for a deliberate model switch. Do not point a
+runtime profile at an unloaded large model during normal operation; that can
+force LM Studio to load it and exhaust the remote machine.
+
 For an existing local video:
 
 ```bash

@@ -82,12 +82,22 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 
 3. Install the package:
 ```bash
+python -m pip install -U pip setuptools wheel
 pip install .  # For regular installation
 # OR
 pip install -e .  # For development installation
 ```
 
-4. Install FFmpeg:
+4. Install URL workflow dependencies when using `tools/run_operation_manual_from_url.sh`:
+```bash
+pip install yt-dlp
+```
+
+The project wrapper automatically prepends `.venv/bin` to `PATH` when a local
+virtual environment exists, so `yt-dlp` installed inside `.venv` is available to
+the URL downloader without manually activating the environment.
+
+5. Install FFmpeg:
 - Ubuntu/Debian:
   ```bash
   sudo apt-get update && sudo apt-get install -y ffmpeg
