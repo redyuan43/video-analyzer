@@ -18,7 +18,8 @@
     "operation_manual": {
         "llm_base_url": "http://spark-31d6.taild500c8.ts.net:1234/v1",
         "vision_model": "qwen/qwen3-vl-30b",
-        "text_model": "redhatai_qwen3.6-35b-a3b-nvfp4"
+        "text_model": "redhatai_qwen3.6-35b-a3b-nvfp4",
+        "frame_no_think": false
     },
     "active_runtime_profile": "spark",
     "runtime_profiles": {
@@ -98,7 +99,7 @@
         "max_frames": 2147483647
     },
     "response_length": {
-        "frame": 300,
+        "frame": 1200,
         "reconstruction": 1000,
         "narrative": 500
     },

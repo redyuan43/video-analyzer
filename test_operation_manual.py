@@ -675,6 +675,31 @@ class OperationManualTests(unittest.TestCase):
 
         self.assertIn("reasoning_content fallback is only allowed", str(raised.exception))
 
+    def test_frame_analysis_can_force_no_think_and_larger_token_budget(self):
+        client = Mock()
+        client.generate.return_value = {"response": "frame ok"}
+        prompt_loader = Mock()
+        prompt_loader.get_by_index.side_effect = [
+            "Frame prompt. {PREVIOUS_FRAMES} {prompt}",
+            "Video prompt.",
+        ]
+        analyzer = VideoAnalyzer(
+            client=client,
+            model="vision",
+            prompt_loader=prompt_loader,
+            temperature=0.0,
+            frame_num_predict=1200,
+            frame_no_think=True,
+        )
+        frame = Mock(number=1, timestamp=2.5, path=Path("/tmp/frame.jpg"))
+
+        analyzer.analyze_frame(frame, ocr_text="Button: Start")
+
+        kwargs = client.generate.call_args.kwargs
+        self.assertTrue(kwargs["prompt"].startswith("/no_think\n"))
+        self.assertIn("OCR evidence", kwargs["prompt"])
+        self.assertEqual(kwargs["num_predict"], 1200)
+
     def test_dots_mocr_default_endpoint_uses_spark_tailscale(self):
         self.assertEqual(DOTS_MOCR_ENDPOINTS, ["http://spark-31d6.taild500c8.ts.net:8000/v1"])
 

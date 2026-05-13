@@ -12,7 +12,16 @@ MAX_PREVIOUS_ANALYSIS_CHARS = 700
 MAX_OCR_EVIDENCE_CHARS = 2000
 
 class VideoAnalyzer:
-    def __init__(self, client: LLMClient, model: str, prompt_loader: PromptLoader, temperature: float, user_prompt: str = ""):
+    def __init__(
+        self,
+        client: LLMClient,
+        model: str,
+        prompt_loader: PromptLoader,
+        temperature: float,
+        user_prompt: str = "",
+        frame_num_predict: int = 300,
+        frame_no_think: bool = False,
+    ):
         """Initialize the VideoAnalyzer.
         
         Args:
@@ -27,6 +36,8 @@ class VideoAnalyzer:
         self.prompt_loader = prompt_loader
         self.temperature = temperature
         self.user_prompt = user_prompt  # Store user's question about the video
+        self.frame_num_predict = frame_num_predict
+        self.frame_no_think = frame_no_think
         self._load_prompts()
         self.previous_analyses = []
         
@@ -67,6 +78,8 @@ class VideoAnalyzer:
         prompt = self.frame_prompt.replace("{PREVIOUS_FRAMES}", self._format_previous_analyses())
         prompt = prompt.replace("{prompt}", self._format_user_prompt())
         prompt = f"{prompt}\nThis is frame {frame.number} captured at {frame.timestamp:.2f} seconds."
+        if self.frame_no_think:
+            prompt = f"/no_think\n{prompt}"
         if ocr_text:
             if len(ocr_text) > MAX_OCR_EVIDENCE_CHARS:
                 ocr_text = ocr_text[:MAX_OCR_EVIDENCE_CHARS] + "\n[truncated]"
@@ -81,7 +94,7 @@ class VideoAnalyzer:
                 image_path=str(frame.path),
                 model=self.model,
                 temperature=self.temperature,
-                num_predict=300
+                num_predict=self.frame_num_predict
             )
             logger.debug(f"Successfully analyzed frame {frame.number}")
             

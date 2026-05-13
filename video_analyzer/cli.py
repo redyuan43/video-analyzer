@@ -275,7 +275,9 @@ def main():
                 model, 
                 prompt_loader,
                 config.get("clients", {}).get("temperature", 0.2),
-                config.get("prompt", "")
+                config.get("prompt", ""),
+                frame_num_predict=config.get("response_length", {}).get("frame", 300),
+                frame_no_think=bool(config.get("operation_manual", {}).get("frame_no_think", False)),
             )
             frame_analyses = []
             ocr_by_frame = {event.frame_number: event for event in ocr_events}
