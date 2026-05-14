@@ -21,6 +21,7 @@ from .frame_selection import (
     resolve_vl_context_gap_seconds,
     select_vl_frames,
 )
+from .frame_manifest import write_frame_manifest
 from .jetson_frames import extract_frames_with_jetson_workers, extract_local_screen_keyframes
 from .prompt import PromptLoader
 from .analyzer import VideoAnalyzer
@@ -276,9 +277,9 @@ def main():
     parser.add_argument("--min-vl-frames", type=parse_auto_int_arg, default=AUTO, help="auto or minimum frames sent to VL")
     parser.add_argument("--max-vl-frames", type=parse_auto_int_arg, default=AUTO, help="auto or maximum frames sent to VL")
     parser.add_argument("--vl-frame-policy", choices=["auto", "all", "none"], default="auto", help="VL frame execution policy")
-    parser.add_argument("--vl-concurrency", type=int, default=2, help="Concurrent VL frame analysis requests")
-    parser.add_argument("--vl-context-before", type=int, default=3, help="Previous candidate frames to include as VL image context")
-    parser.add_argument("--vl-context-after", type=int, default=2, help="Next candidate frames to include as VL image context")
+    parser.add_argument("--vl-concurrency", type=int, default=3, help="Concurrent VL frame analysis requests")
+    parser.add_argument("--vl-context-before", type=int, default=0, help="Previous candidate frames to include as VL image context")
+    parser.add_argument("--vl-context-after", type=int, default=0, help="Next candidate frames to include as VL image context")
     parser.add_argument("--vl-context-max-gap", type=parse_auto_float_arg, default=AUTO, help="auto or max adjacent seconds for VL context frames")
     args = parser.parse_args()
 
@@ -440,6 +441,12 @@ def main():
                     )
                     frames = extraction.frames
                     frame_extraction_metadata = extraction.metadata
+                frame_manifest_path = write_frame_manifest(
+                    frames,
+                    output_dir,
+                    source=str(frame_extraction_metadata.get("backend", "unknown")),
+                )
+                frame_extraction_metadata["frame_manifest"] = str(frame_manifest_path)
                 frame_selection_metadata = {
                     "pipeline_mode": args.pipeline_mode,
                     "video_duration_seconds": video_duration,
@@ -453,6 +460,8 @@ def main():
                     duration=config.get("duration"),
                     max_frames=args.max_frames
                 )
+                frame_manifest_path = write_frame_manifest(frames, output_dir, source="local_keyframes")
+                frame_extraction_metadata["frame_manifest"] = str(frame_manifest_path)
             timings["candidate_frame_extraction_seconds"] = round(time.perf_counter() - stage_started, 3)
 
             if task == "operation_manual":

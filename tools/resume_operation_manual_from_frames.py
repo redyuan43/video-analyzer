@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -27,6 +28,7 @@ from video_analyzer.cli import (
 )
 from video_analyzer.config import Config, get_model
 from video_analyzer.frame import Frame
+from video_analyzer.frame_manifest import MANIFEST_NAME, read_frame_manifest
 from video_analyzer.frame_selection import (
     AUTO,
     FrameSelectionOptions,
@@ -48,6 +50,12 @@ LOGGER = logging.getLogger(__name__)
 TIMESTAMP_RE = re.compile(
     r"^-\s+\[(?P<start>\d\d:\d\d:\d\d)\s+-\s+(?P<end>\d\d:\d\d:\d\d)\]\s+(?P<text>.*)$"
 )
+
+
+@dataclass(frozen=True)
+class FrameLoadResult:
+    frames: list[Frame]
+    metadata: dict
 
 
 def bypass_proxy_environment() -> None:
@@ -113,23 +121,144 @@ def probe_duration(video_path: Path) -> float:
     return max(float(result.stdout.strip()), 0.0)
 
 
-def load_frames(run_dir: Path, video_duration_seconds: float) -> list[Frame]:
+def load_frames(
+    run_dir: Path,
+    video_duration_seconds: float,
+    source_analysis: Path | None,
+    allow_estimated_timestamps: bool,
+) -> FrameLoadResult:
     frame_paths = sorted(
         (run_dir / "frames").glob("frame_*.jpg"),
         key=lambda path: int(path.stem.split("_", 1)[1]),
     )
     if not frame_paths:
         raise FileNotFoundError(f"No frames found under {run_dir / 'frames'}")
-    denominator = max(len(frame_paths) - 1, 1)
-    return [
-        Frame(
-            number=index,
-            path=path,
-            timestamp=(video_duration_seconds * index / denominator),
-            score=0.0,
+
+    frame_numbers = [int(path.stem.split("_", 1)[1]) for path in frame_paths]
+    timestamp_sources = []
+    if source_analysis:
+        timestamp_sources.append(("analysis", source_analysis))
+    timestamp_sources.extend(
+        [
+            ("manifest", run_dir / MANIFEST_NAME),
+            ("analysis", run_dir / "analysis.json"),
+        ]
+    )
+    timestamp_map = {}
+    score_map = {}
+    timestamp_metadata = {}
+    for source_kind, timestamp_source in timestamp_sources:
+        if source_kind == "manifest":
+            candidate_timestamps, candidate_scores, candidate_metadata = read_frame_manifest(timestamp_source)
+        else:
+            candidate_timestamps, candidate_scores, candidate_metadata = _load_frame_timestamp_map(timestamp_source, frame_numbers)
+        if set(frame_numbers).issubset(candidate_timestamps):
+            timestamp_map = {number: candidate_timestamps[number] for number in frame_numbers}
+            score_map = candidate_scores
+            timestamp_metadata = candidate_metadata
+            break
+    if timestamp_map:
+        return FrameLoadResult(
+            frames=[
+                Frame(
+                    number=number,
+                    path=path,
+                    timestamp=timestamp_map[number],
+                    score=score_map.get(number, 0.0),
+                )
+                for number, path in zip(frame_numbers, frame_paths)
+            ],
+            metadata={
+                "backend": "resumed_existing_frames",
+                "frame_count": len(frame_paths),
+                "timestamp_source": timestamp_metadata,
+                "estimated_timestamps": False,
+            },
         )
-        for index, path in enumerate(frame_paths)
+
+    if not allow_estimated_timestamps:
+        raise RuntimeError(
+            "Frame timestamps were not found. Pass --source-analysis pointing at the original "
+            "analysis.json, or pass --allow-estimated-frame-timestamps to use uniform estimates."
+        )
+
+    denominator = max(len(frame_paths) - 1, 1)
+    return FrameLoadResult(
+        frames=[
+            Frame(
+                number=number,
+                path=path,
+                timestamp=(video_duration_seconds * index / denominator),
+                score=0.0,
+            )
+            for index, (number, path) in enumerate(zip(frame_numbers, frame_paths))
+        ],
+        metadata={
+            "backend": "resumed_existing_frames",
+            "frame_count": len(frame_paths),
+            "timestamp_source": {
+                "source": "uniform_estimate",
+                "reason": "no frame timestamp metadata was available",
+                "video_duration_seconds": video_duration_seconds,
+            },
+            "estimated_timestamps": True,
+        },
+    )
+
+
+def _load_frame_timestamp_map(source_analysis: Path, required_frame_numbers: list[int]) -> tuple[dict[int, float], dict[int, float], dict]:
+    if not source_analysis or not source_analysis.exists():
+        return {}, {}, {"source": "missing", "path": str(source_analysis) if source_analysis else ""}
+
+    payload = json.loads(source_analysis.read_text(encoding="utf-8"))
+    candidates = [
+        ("ocr_events", payload.get("ocr_events")),
+        ("frame_selection.frames", (payload.get("metadata") or {}).get("frame_selection", {}).get("frames")),
+        ("visual_events", payload.get("visual_events")),
+        ("frame_analyses", payload.get("frame_analyses")),
     ]
+    required = set(required_frame_numbers)
+    for source_name, items in candidates:
+        timestamp_map, score_map = _extract_timestamp_map(items)
+        if required.issubset(timestamp_map):
+            return (
+                {number: timestamp_map[number] for number in required_frame_numbers},
+                score_map,
+                {
+                    "source": source_name,
+                    "path": str(source_analysis),
+                },
+            )
+    return (
+        {},
+        {},
+        {
+            "source": "not_found",
+            "path": str(source_analysis),
+            "required_frame_count": len(required_frame_numbers),
+        },
+    )
+
+
+def _extract_timestamp_map(items) -> tuple[dict[int, float], dict[int, float]]:
+    timestamp_map: dict[int, float] = {}
+    score_map: dict[int, float] = {}
+    if not isinstance(items, list):
+        return timestamp_map, score_map
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        frame_number = item.get("frame_number", item.get("number"))
+        timestamp = item.get("timestamp")
+        if frame_number is None or timestamp is None:
+            continue
+        number = int(frame_number)
+        timestamp_map[number] = float(timestamp)
+        if item.get("visual_change_score") is not None:
+            score_map[number] = float(item["visual_change_score"])
+        elif item.get("score") is not None:
+            score_map[number] = float(item["score"])
+    return timestamp_map, score_map
 
 
 def configure_runtime(args: argparse.Namespace) -> Config:
@@ -187,9 +316,15 @@ def main() -> int:
     parser.add_argument("--vision-model", default="minicpm-v-4.5-v100")
     parser.add_argument("--text-model", default="hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive")
     parser.add_argument("--manual-language", default="zh-CN")
-    parser.add_argument("--vl-concurrency", type=int, default=2)
-    parser.add_argument("--vl-context-before", type=int, default=3)
-    parser.add_argument("--vl-context-after", type=int, default=2)
+    parser.add_argument("--source-analysis", type=Path, help="Original analysis.json to recover exact frame timestamps")
+    parser.add_argument(
+        "--allow-estimated-frame-timestamps",
+        action="store_true",
+        help="Allow uniform timestamp estimates when exact frame timestamps are unavailable",
+    )
+    parser.add_argument("--vl-concurrency", type=int, default=3)
+    parser.add_argument("--vl-context-before", type=int, default=0)
+    parser.add_argument("--vl-context-after", type=int, default=0)
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
     args = parser.parse_args()
 
@@ -207,7 +342,13 @@ def main() -> int:
     page_context_metadata = read_page_context_metadata(str(args.context_file), page_context)
     transcript = read_transcript(args.run_dir / "transcript.md")
     video_duration = probe_duration(args.video)
-    frames = load_frames(args.run_dir, video_duration)
+    frame_load = load_frames(
+        args.run_dir,
+        video_duration,
+        source_analysis=args.source_analysis,
+        allow_estimated_timestamps=args.allow_estimated_frame_timestamps,
+    )
+    frames = frame_load.frames
 
     LOGGER.info("Resuming from %s frames and transcript.md; starting at OCR", len(frames))
     stage_started = time.perf_counter()
@@ -315,7 +456,7 @@ def main() -> int:
             "frames_processed": len(frame_analyses),
             "vl_frames_processed": len(selected_frame_numbers),
             "frame_selection": frame_selection_metadata,
-            "frame_extraction": {"backend": "resumed_existing_frames", "frame_count": len(frames)},
+            "frame_extraction": frame_load.metadata,
             "ocr": {
                 "requested_endpoints": args.ocr_base_url,
                 "effective_endpoints": ocr_endpoints,
