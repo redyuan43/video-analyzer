@@ -57,6 +57,9 @@ echo "[run] frame extractor: jetson nx2,nx3"
   --text-base-url "http://100.90.114.26:18081/v1" \
   --vision-model "minicpm-v-4.5-v100" \
   --text-model "hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive" \
+  --vl-concurrency 3 \
+  --vl-context-before 0 \
+  --vl-context-after 0 \
   --manual-language zh-CN \
   --keep-frames \
   --log-level INFO
