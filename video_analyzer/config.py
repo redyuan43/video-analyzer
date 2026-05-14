@@ -38,11 +38,12 @@ class Config:
             logger.debug(f"Loading default config from {self.default_config}")
             with open(self.default_config) as f:
                 default_config = json.load(f)
+            self.user_config_data = {}
             if self.loaded_user_config:
                 logger.debug(f"Loading user config from {self.user_config}")
                 with open(self.user_config) as f:
-                    user_config = json.load(f)
-                self.config = deep_merge(default_config, user_config)
+                    self.user_config_data = json.load(f)
+                self.config = deep_merge(default_config, self.user_config_data)
             else:
                 logger.debug("No user config found, using default config")
                 self.config = default_config
@@ -87,6 +88,14 @@ class Config:
                     self.config["clients"]["openai_api"]["api_key"] = self.config["clients"]["openai_api"].get("api_key") or "0"
                     if not args.client:
                         self.config["clients"]["default"] = "openai_api"
+                elif key == "vision_base_url":
+                    self.config.setdefault("operation_manual", {})["vision_base_url"] = value
+                    self.config["clients"]["openai_api"]["api_url"] = value
+                    self.config["clients"]["openai_api"]["api_key"] = self.config["clients"]["openai_api"].get("api_key") or "0"
+                    if not args.client:
+                        self.config["clients"]["default"] = "openai_api"
+                elif key == "text_base_url":
+                    self.config.setdefault("operation_manual", {})["text_base_url"] = value
                 elif key == "vision_model":
                     self.config.setdefault("operation_manual", {})["vision_model"] = value
                     self.config["clients"]["openai_api"]["model"] = value
@@ -96,7 +105,16 @@ class Config:
                 elif key == "ocr_provider":
                     self.config.setdefault("ocr", {})["provider"] = value
                 elif key == "ocr_base_url":
-                    self.config.setdefault("ocr", {})["base_url"] = value
+                    endpoints = normalize_string_list(value)
+                    if endpoints:
+                        self.config.setdefault("ocr", {})["base_url"] = endpoints[0]
+                        self.config.setdefault("ocr", {})["base_urls"] = endpoints
+                elif key == "ocr_concurrency":
+                    self.config.setdefault("ocr", {})["concurrency"] = value
+                elif key == "ocr_cache":
+                    self.config.setdefault("ocr", {})["cache"] = value
+                elif key == "ocr_cache_dir":
+                    self.config.setdefault("ocr", {})["cache_dir"] = value
                 elif key == "asr_provider":
                     self.config.setdefault("asr", {})["provider"] = value
                 elif key == "asr_strategy":
@@ -127,14 +145,24 @@ class Config:
             manual_config = self.config.setdefault("operation_manual", {})
             profile = self.get_runtime_profile(getattr(args, "profile", None))
             llm_base_url = manual_config.get("llm_base_url") or profile.get(
-                "llm_base_url", "http://spark-31d6.taild500c8.ts.net:1234/v1"
+                "llm_base_url", "http://100.90.114.26:18081/v1"
             )
-            vision_model = manual_config.get("vision_model") or profile.get("vision_model", "qwen/qwen3-vl-30b")
+            vision_base_url = manual_config.get("vision_base_url") or profile.get("vision_base_url") or llm_base_url
+            text_base_url = manual_config.get("text_base_url") or profile.get("text_base_url") or llm_base_url
+            vision_model = manual_config.get("vision_model") or profile.get(
+                "vision_model", "hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive"
+            )
+            text_model = manual_config.get("text_model") or profile.get("text_model") or vision_model
+            manual_config["llm_base_url"] = llm_base_url
+            manual_config["vision_base_url"] = vision_base_url
+            manual_config["text_base_url"] = text_base_url
+            manual_config["vision_model"] = vision_model
+            manual_config["text_model"] = text_model
             self.config["clients"]["default"] = "openai_api"
-            self.config["clients"]["openai_api"]["api_url"] = llm_base_url
+            self.config["clients"]["openai_api"]["api_url"] = vision_base_url
             self.config["clients"]["openai_api"]["api_key"] = self.config["clients"]["openai_api"].get("api_key") or "0"
             self.config["clients"]["openai_api"]["model"] = vision_model
-            user_config_asr_provider = self.loaded_user_config and "provider" in self.config.get("asr", {})
+            user_config_asr_provider = "provider" in (getattr(self, "user_config_data", {}).get("asr") or {})
             if not getattr(args, "asr_provider", None) and not user_config_asr_provider:
                 self.config.setdefault("asr", {})["provider"] = "auto"
 
@@ -158,6 +186,25 @@ def deep_merge(base: Any, override: Any) -> Any:
             merged[key] = deep_merge(merged.get(key), value)
         return merged
     return override
+
+
+def normalize_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_values = [value]
+    elif isinstance(value, list):
+        raw_values = value
+    else:
+        raw_values = [str(value)]
+
+    values: list[str] = []
+    for item in raw_values:
+        for part in str(item).split(","):
+            cleaned = part.strip()
+            if cleaned and cleaned not in values:
+                values.append(cleaned)
+    return values
 
 
 def get_runtime_profile(config: dict[str, Any], profile_name: str | None = None) -> dict[str, Any]:
@@ -187,7 +234,8 @@ def get_client(config: Config) -> dict:
             raise ValueError("API URL is required when using OpenAI API client")
         return {
             "api_key": api_key,
-            "api_url": api_url
+            "api_url": api_url,
+            "timeout_seconds": int(client_config.get("timeout_seconds", 600)),
         }
     else:
         raise ValueError(f"Unknown client type: {client_type}")

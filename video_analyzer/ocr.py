@@ -1,8 +1,10 @@
 import base64
+import hashlib
 import json
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -15,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 DOTS_MOCR_ENDPOINTS = [
     "http://spark-31d6.taild500c8.ts.net:8000/v1",
+    "http://edgexpert-4353.taild500c8.ts.net:8000/v1",
 ]
 
 PROMPTS = {
@@ -40,6 +43,7 @@ class OCREvent:
     text: str
     items: List[Dict[str, Any]]
     error: Optional[str] = None
+    cache_status: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -50,11 +54,87 @@ class OCREvent:
             "text": self.text,
             "items": self.items,
             "error": self.error,
+            "cache_status": self.cache_status,
         }
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "OCREvent":
+        return cls(
+            frame_number=int(payload.get("frame_number", 0)),
+            timestamp=float(payload.get("timestamp", 0.0)),
+            provider=str(payload.get("provider", "")),
+            status=str(payload.get("status", "")),
+            text=str(payload.get("text", "")),
+            items=list(payload.get("items") or []),
+            error=payload.get("error"),
+            cache_status=payload.get("cache_status"),
+        )
 
 
 def _encode_image(path: Path) -> str:
     return base64.b64encode(path.read_bytes()).decode("utf-8")
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _frame_image_path(frame: Frame) -> Optional[Path]:
+    path = getattr(frame, "path", None)
+    if isinstance(path, Path):
+        return path
+    if isinstance(path, str):
+        return Path(path)
+    return None
+
+
+def _ocr_cache_key(frame: Frame, provider: str, model: str, prompt_mode: str, endpoint_family: str) -> Optional[str]:
+    image_path = _frame_image_path(frame)
+    if not image_path or not image_path.exists():
+        return None
+    payload = {
+        "version": 1,
+        "image_sha256": _hash_file(image_path),
+        "provider": provider,
+        "model": model,
+        "prompt_mode": prompt_mode,
+        "endpoint_family": endpoint_family,
+    }
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _read_cached_event(cache_dir: Optional[Path], key: str, frame: Frame) -> Optional[OCREvent]:
+    if not cache_dir or not key:
+        return None
+    cache_path = cache_dir / f"{key}.json"
+    if not cache_path.exists():
+        return None
+    try:
+        event = OCREvent.from_dict(json.loads(cache_path.read_text(encoding="utf-8")))
+        event.frame_number = frame.number
+        event.timestamp = frame.timestamp
+        event.cache_status = "hit"
+        return event
+    except Exception as exc:
+        logger.warning("Ignoring unreadable OCR cache entry %s: %s", cache_path, exc)
+        return None
+
+
+def _write_cached_event(cache_dir: Optional[Path], key: str, event: OCREvent) -> None:
+    if not cache_dir or not key or event.status != "ok":
+        return
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / f"{key}.json"
+    cache_path.write_text(json.dumps(event.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _cache_mode_enabled(cache_mode: str) -> bool:
+    return cache_mode in {"on", "refresh"}
 
 
 def _extract_json_array(text: str) -> Optional[List[Dict[str, Any]]]:
@@ -306,23 +386,119 @@ def _unavailable_events(frames: List[Frame], error: str) -> List[OCREvent]:
     ]
 
 
+def _normalize_endpoint(endpoint: str) -> str:
+    return endpoint.strip().rstrip("/")
+
+
+def _resolve_dots_endpoints(base_url: str, base_urls: Optional[List[str]] = None) -> List[str]:
+    if base_urls:
+        endpoints = base_urls
+    elif base_url == "auto":
+        endpoints = DOTS_MOCR_ENDPOINTS
+    else:
+        endpoints = [item.strip() for item in base_url.split(",") if item.strip()]
+    normalized = []
+    for endpoint in endpoints:
+        value = _normalize_endpoint(endpoint)
+        if value and value not in normalized:
+            normalized.append(value)
+    return normalized
+
+
+def _resolve_ocr_concurrency(value: int | str) -> int:
+    if value == "auto":
+        return 1
+    return max(1, int(value))
+
+
+def _probe_dots_providers(
+    endpoints: List[str],
+    model: str,
+    prompt_mode: str,
+    probe_timeout_seconds: float,
+    warmup_timeout_seconds: float,
+    warmup_retry_interval_seconds: float,
+) -> List[DotsMOCRVLLMProvider]:
+    providers = [
+        DotsMOCRVLLMProvider(
+            base_url=endpoint,
+            model=model,
+            prompt_mode=prompt_mode,
+            probe_timeout_seconds=probe_timeout_seconds,
+            warmup_timeout_seconds=warmup_timeout_seconds,
+            warmup_retry_interval_seconds=warmup_retry_interval_seconds,
+        )
+        for endpoint in endpoints
+    ]
+    if not providers:
+        return []
+    healthy: List[DotsMOCRVLLMProvider] = []
+    with ThreadPoolExecutor(max_workers=len(providers)) as executor:
+        futures = {executor.submit(provider.probe): provider for provider in providers}
+        for future in as_completed(futures):
+            provider = futures[future]
+            try:
+                if future.result():
+                    healthy.append(provider)
+            except Exception as exc:
+                provider.diagnostics.append({"endpoint": provider.base_url, "attempt": "probe", "error": str(exc)})
+    healthy.sort(key=lambda provider: endpoints.index(provider.base_url))
+    return healthy
+
+
 def run_ocr(
     frames: List[Frame],
     provider: str,
     base_url: str,
     model: str,
     prompt_mode: str,
+    base_urls: Optional[List[str]] = None,
+    ocr_concurrency: int | str = "auto",
     fallback_base_url: Optional[str] = None,
     fallback_model: Optional[str] = None,
     fallback_api_key: str = "0",
     probe_timeout_seconds: float = 5,
     warmup_timeout_seconds: float = 180,
     warmup_retry_interval_seconds: float = 5,
+    cache_mode: str = "on",
+    cache_dir: Optional[str] = ".cache/video-analyzer/ocr",
 ) -> List[OCREvent]:
     if provider == "none":
         return []
     if provider not in {"auto", "dots_mocr_vllm", "openai_vision"}:
         raise ValueError(f"Unknown OCR provider: {provider}")
+    if cache_mode not in {"on", "off", "refresh"}:
+        raise ValueError(f"Unknown OCR cache mode: {cache_mode}")
+    cache_path = Path(cache_dir) if cache_dir and _cache_mode_enabled(cache_mode) else None
+
+    def cached_or_analyze(frame: Frame, provider_name: str, endpoint_family: str, analyze) -> OCREvent:
+        key = _ocr_cache_key(frame, provider_name, model, prompt_mode, endpoint_family)
+        if key is None:
+            event = analyze(frame)
+            event.cache_status = "disabled"
+            return event
+        if cache_mode == "on":
+            cached = _read_cached_event(cache_path, key, frame)
+            if cached:
+                return cached
+        event = analyze(frame)
+        event.cache_status = "refresh" if cache_mode == "refresh" else "miss" if cache_mode == "on" else "disabled"
+        _write_cached_event(cache_path, key, event)
+        return event
+
+    def read_all_cached(provider_name: str, endpoint_family: str) -> Optional[List[OCREvent]]:
+        if cache_mode != "on" or not frames:
+            return None
+        events = []
+        for frame in frames:
+            key = _ocr_cache_key(frame, provider_name, model, prompt_mode, endpoint_family)
+            if key is None:
+                return None
+            cached = _read_cached_event(cache_path, key, frame)
+            if cached is None:
+                return None
+            events.append(cached)
+        return events
 
     if provider == "openai_vision":
         if not fallback_base_url or not fallback_model:
@@ -332,20 +508,38 @@ def run_ocr(
             model=fallback_model,
             api_key=fallback_api_key,
         )
+        endpoint_family = f"{fallback.base_url}:{fallback.model}"
+        cached_events = read_all_cached("openai_vision", endpoint_family)
+        if cached_events is not None:
+            return cached_events
         if not fallback.probe():
             return _unavailable_events(frames, f"OpenAI-compatible OCR endpoint is not reachable: {fallback_base_url}")
-        return [fallback.analyze_frame(frame) for frame in frames]
+        return [
+            cached_or_analyze(
+                frame,
+                "openai_vision",
+                endpoint_family,
+                fallback.analyze_frame,
+            )
+            for frame in frames
+        ]
 
-    dots = DotsMOCRVLLMProvider(
-        base_url=base_url,
+    dots_endpoints = _resolve_dots_endpoints(base_url, base_urls)
+    dots_endpoint_family = ",".join(dots_endpoints) if dots_endpoints else base_url
+    cached_events = read_all_cached("dots_mocr_vllm", dots_endpoint_family)
+    if cached_events is not None:
+        return cached_events
+
+    dots_providers = _probe_dots_providers(
+        endpoints=dots_endpoints,
         model=model,
         prompt_mode=prompt_mode,
         probe_timeout_seconds=probe_timeout_seconds,
         warmup_timeout_seconds=warmup_timeout_seconds,
         warmup_retry_interval_seconds=warmup_retry_interval_seconds,
     )
-    if not dots.probe():
-        error = f"DotsMOCR vLLM endpoint was not ready after {warmup_timeout_seconds}s: {dots.diagnostics}"
+    if not dots_providers:
+        error = f"DotsMOCR vLLM endpoint was not ready after {warmup_timeout_seconds}s"
         if provider == "auto" and fallback_base_url and fallback_model:
             logger.warning("%s Falling back to OpenAI-compatible vision OCR.", error)
             fallback = OpenAICompatibleVisionOCRProvider(
@@ -354,10 +548,50 @@ def run_ocr(
                 api_key=fallback_api_key,
             )
             if fallback.probe():
-                events = [fallback.analyze_frame(frame) for frame in frames]
+                events = [
+                    cached_or_analyze(
+                        frame,
+                        "openai_vision",
+                        f"{fallback.base_url}:{fallback.model}",
+                        fallback.analyze_frame,
+                    )
+                    for frame in frames
+                ]
                 for event in events:
                     if event.error:
                         event.error = f"DotsMOCR unavailable first: {error}; fallback error: {event.error}"
                 return events
         return _unavailable_events(frames, error)
-    return [dots.analyze_frame(frame) for frame in frames]
+
+    cached_by_number: Dict[int, OCREvent] = {}
+    pending_frames: List[Frame] = []
+    if cache_mode == "on":
+        for frame in frames:
+            key = _ocr_cache_key(frame, "dots_mocr_vllm", model, prompt_mode, dots_endpoint_family)
+            cached = _read_cached_event(cache_path, key, frame) if key else None
+            if cached:
+                cached_by_number[frame.number] = cached
+            else:
+                pending_frames.append(frame)
+    else:
+        pending_frames = list(frames)
+
+    results: Dict[int, OCREvent] = dict(cached_by_number)
+    concurrency = _resolve_ocr_concurrency(ocr_concurrency)
+    max_workers = max(1, len(dots_providers) * concurrency)
+
+    def analyze_pending(index_frame: tuple[int, Frame]) -> OCREvent:
+        index, frame = index_frame
+        dots = dots_providers[index % len(dots_providers)]
+        return cached_or_analyze(frame, "dots_mocr_vllm", dots_endpoint_family, dots.analyze_frame)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(analyze_pending, item)
+            for item in enumerate(pending_frames)
+        ]
+        for future in as_completed(futures):
+            event = future.result()
+            results[event.frame_number] = event
+
+    return [results[frame.number] for frame in frames]

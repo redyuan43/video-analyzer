@@ -3,11 +3,25 @@ from pathlib import Path
 import json
 import logging
 import shutil
-import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .artifacts import write_json, write_orin_artifacts, write_transcript_markdown
 from .config import Config, get_client, get_model
 from .frame import VideoProcessor
+from .frame_selection import (
+    AUTO,
+    FrameDecision,
+    FrameSelectionOptions,
+    build_frame_context_window,
+    make_skipped_visual_event,
+    parse_auto_float,
+    parse_auto_int,
+    resolve_candidate_frame_budget,
+    resolve_vl_context_gap_seconds,
+    select_vl_frames,
+)
+from .jetson_frames import extract_frames_with_jetson_workers, extract_local_screen_keyframes
 from .prompt import PromptLoader
 from .analyzer import VideoAnalyzer
 from .audio_processor import AudioProcessor, AudioTranscript
@@ -53,6 +67,81 @@ def cleanup_files(output_dir: Path):
     except Exception as e:
         logger.error(f"Error during cleanup: {e}")
 
+
+def parse_auto_int_arg(value: str) -> int | str:
+    try:
+        parsed = parse_auto_int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    if parsed is None:
+        raise argparse.ArgumentTypeError("value must be auto or a non-negative integer")
+    return parsed
+
+
+def parse_auto_float_arg(value: str) -> float | str:
+    try:
+        parsed = parse_auto_float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    if parsed is None:
+        raise argparse.ArgumentTypeError("value must be auto or a non-negative number")
+    return parsed
+
+
+def analyze_frames_for_vl(
+    analyzer: VideoAnalyzer,
+    frames,
+    ocr_events,
+    selected_frame_numbers: set[int],
+    decisions: list[FrameDecision],
+    concurrency: int,
+    context_before: int,
+    context_after: int,
+    context_max_gap: float | str,
+):
+    ocr_by_frame = {event.frame_number: event for event in ocr_events}
+    context_ocr_texts = {event.frame_number: event.text for event in ocr_events if event.text}
+    decisions_by_frame = {decision.frame_number: decision for decision in decisions}
+    frame_analyses = [None] * len(frames)
+
+    def analyze_one(index_frame):
+        index, frame = index_frame
+        ocr_text = ocr_by_frame.get(frame.number).text if frame.number in ocr_by_frame else ""
+        context_window = build_frame_context_window(
+            frames=frames,
+            current_frame=frame,
+            before=context_before,
+            after=context_after,
+            max_gap_seconds=context_max_gap,
+        )
+        return index, analyzer.analyze_frame(
+            frame,
+            ocr_text=ocr_text,
+            context_window=context_window,
+            context_ocr_texts=context_ocr_texts,
+        )
+
+    selected = [(index, frame) for index, frame in enumerate(frames) if frame.number in selected_frame_numbers]
+    skipped = [(index, frame) for index, frame in enumerate(frames) if frame.number not in selected_frame_numbers]
+    for index, frame in skipped:
+        frame_analyses[index] = make_skipped_visual_event(frame, decisions_by_frame[frame.number])
+
+    if not selected:
+        return frame_analyses
+
+    if concurrency <= 1:
+        for index_frame in selected:
+            index, analysis = analyze_one(index_frame)
+            frame_analyses[index] = analysis
+        return frame_analyses
+
+    with ThreadPoolExecutor(max_workers=max(concurrency, 1)) as executor:
+        futures = [executor.submit(analyze_one, item) for item in selected]
+        for future in as_completed(futures):
+            index, analysis = future.result()
+            frame_analyses[index] = analysis
+    return frame_analyses
+
 def create_client(config: Config):
     """Create the appropriate client based on configuration."""
     client_type = config.get("clients", {}).get("default", "ollama")
@@ -61,9 +150,39 @@ def create_client(config: Config):
     if client_type == "ollama":
         return OllamaClient(client_config["url"])
     elif client_type == "openai_api":
-        return GenericOpenAIAPIClient(client_config["api_key"], client_config["api_url"])
+        return GenericOpenAIAPIClient(
+            client_config["api_key"],
+            client_config["api_url"],
+            timeout_seconds=int(client_config.get("timeout_seconds", 600)),
+        )
     else:
         raise ValueError(f"Unknown client type: {client_type}")
+
+
+def create_operation_manual_text_client(config: Config, fallback_client):
+    """Create the text-generation client for operation manuals.
+
+    Operation-manual runs can route visual frame analysis to one endpoint and
+    final Markdown generation to another. Non-OpenAI clients keep the legacy
+    single-client behavior.
+    """
+    if config.get("clients", {}).get("default") != "openai_api":
+        return fallback_client
+
+    manual_config = config.get("operation_manual", {})
+    openai_config = config.get("clients", {}).get("openai_api", {})
+    text_base_url = (
+        manual_config.get("text_base_url")
+        or manual_config.get("llm_base_url")
+        or openai_config.get("api_url")
+    )
+    if not text_base_url:
+        return fallback_client
+    return GenericOpenAIAPIClient(
+        openai_config.get("api_key") or "0",
+        text_base_url,
+        timeout_seconds=int(openai_config.get("timeout_seconds", 600)),
+    )
 
 
 def read_page_context_metadata(context_file: str, page_context: str) -> dict:
@@ -101,7 +220,7 @@ def main():
     parser.add_argument("--keep-frames", action="store_true", help="Keep extracted frames after analysis")
     parser.add_argument("--whisper-model", type=str, help="Whisper model size (tiny, base, small, medium, large), or path to local Whisper model snapshot")
     parser.add_argument("--start-stage", type=int, default=1, help="Stage to start processing from (1-3)")
-    parser.add_argument("--max-frames", type=int, default=sys.maxsize, help="Maximum number of frames to process")
+    parser.add_argument("--max-frames", type=int, help="Explicit upper limit for the operation-manual candidate frame pool")
     parser.add_argument("--log-level", type=str, default="INFO", 
                         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
                         help="Set the logging level (default: INFO)")
@@ -113,15 +232,34 @@ def main():
     parser.add_argument("--task", choices=["describe", "operation_manual"], help="Analysis task")
     parser.add_argument("--manual-language", type=str, help="Language for operation manual output")
     parser.add_argument("--llm-base-url", type=str, help="OpenAI-compatible base URL for local LLMs")
+    parser.add_argument("--vision-base-url", type=str, help="OpenAI-compatible base URL for frame vision analysis")
+    parser.add_argument("--text-base-url", type=str, help="OpenAI-compatible base URL for final manual generation")
     parser.add_argument("--vision-model", type=str, help="Vision model used for frame analysis")
     parser.add_argument("--text-model", type=str, help="Text model used for manual generation")
     parser.add_argument("--ocr-provider", choices=["auto", "dots_mocr_vllm", "openai_vision", "none"], help="OCR provider")
-    parser.add_argument("--ocr-base-url", type=str, help="OCR OpenAI-compatible base URL or auto")
+    parser.add_argument("--ocr-base-url", action="append", help="OCR OpenAI-compatible base URL; can be provided multiple times")
+    parser.add_argument("--ocr-concurrency", default=None, help="OCR concurrency per endpoint, or auto")
+    parser.add_argument("--ocr-cache", choices=["on", "off", "refresh"], default=None, help="OCR cache mode")
+    parser.add_argument("--ocr-cache-dir", default=None, help="OCR cache directory")
     parser.add_argument("--asr-provider", choices=["auto", "remote_http", "capswriter_http", "vibevoice", "faster_whisper", "none"], help="ASR provider")
     parser.add_argument("--asr-strategy", choices=["fast", "balanced", "deep"], help="Dual-ASR strategy for operation manuals")
     parser.add_argument("--remote-asr-url", action="append", help="Remote fast ASR endpoint; can be provided multiple times")
     parser.add_argument("--vibevoice-url", action="append", help="Remote GPU VibeVoice ASR endpoint; can be provided multiple times")
     parser.add_argument("--context-file", type=str, help="Extra page/video context file")
+    parser.add_argument("--pipeline-mode", choices=["fast", "balanced", "deep"], default="balanced", help="Operation manual pipeline depth")
+    parser.add_argument("--candidate-frames", type=parse_auto_int_arg, default=AUTO, help="auto or explicit candidate frame pool size")
+    parser.add_argument("--frame-extractor", choices=["local", "jetson", "auto"], default="local", help="Candidate frame extraction backend")
+    parser.add_argument("--jetson-frame-hosts", default="nx2,nx3", help="Comma-separated Jetson SSH hosts for frame extraction")
+    parser.add_argument("--jetson-frame-backend", choices=["auto", "ssh", "ray"], default="auto", help="Jetson frame worker transport")
+    parser.add_argument("--jetson-sample-fps", default="auto", help="auto or preview sample fps used by Jetson frame workers")
+    parser.add_argument("--jetson-chunk-overlap-seconds", type=float, default=2.0, help="Overlap seconds between Jetson frame chunks")
+    parser.add_argument("--min-vl-frames", type=parse_auto_int_arg, default=AUTO, help="auto or minimum frames sent to VL")
+    parser.add_argument("--max-vl-frames", type=parse_auto_int_arg, default=AUTO, help="auto or maximum frames sent to VL")
+    parser.add_argument("--vl-frame-policy", choices=["auto", "all", "none"], default="auto", help="VL frame execution policy")
+    parser.add_argument("--vl-concurrency", type=int, default=2, help="Concurrent VL frame analysis requests")
+    parser.add_argument("--vl-context-before", type=int, default=3, help="Previous candidate frames to include as VL image context")
+    parser.add_argument("--vl-context-after", type=int, default=2, help="Next candidate frames to include as VL image context")
+    parser.add_argument("--vl-context-max-gap", type=parse_auto_float_arg, default=AUTO, help="auto or max adjacent seconds for VL context frames")
     args = parser.parse_args()
 
     # Set up logging with specified level
@@ -158,10 +296,18 @@ def main():
         page_context = ""
         page_context_metadata = {"context_file": "", "text_length": 0}
         transcript_markdown_path = None
+        timings = {}
+        frame_selection_metadata = {}
+        frame_extraction_metadata = {}
+        ocr_metadata = {}
+        selected_frame_numbers = set()
+        frame_decisions = []
+        total_started = time.perf_counter()
         
         # Stage 1: Frame and Audio Processing
         if args.start_stage <= 1:
             logger.info("Extracting audio from video...")
+            stage_started = time.perf_counter()
             try:
                 audio_path = extract_audio_to_wav(video_path, output_dir)
             except Exception as e:
@@ -221,35 +367,87 @@ def main():
                     logger.warning("Could not generate reliable transcript. Proceeding with video analysis only.")
                 else:
                     transcript_markdown_path = write_transcript_markdown(transcript, output_dir / "transcript.md")
+            timings["asr_seconds"] = round(time.perf_counter() - stage_started, 3)
             
             logger.info(f"Extracting frames from video using model {model}...")
+            stage_started = time.perf_counter()
             processor = VideoProcessor(
                 video_path, 
                 output_dir / "frames", 
                 model
             )
             if task == "operation_manual":
-                frames = processor.extract_screen_keyframes(
-                    frames_per_minute=config.get("frames", {}).get("per_minute", 60),
-                    duration=config.get("duration"),
-                    max_frames=args.max_frames,
+                video_duration = processor._probe_duration(config.get("duration"))
+                candidate_budget = resolve_candidate_frame_budget(
+                    video_duration_seconds=video_duration,
+                    pipeline_mode=args.pipeline_mode,
+                    candidate_frames=args.candidate_frames,
+                    explicit_max_frames=args.max_frames,
                 )
+                if args.frame_extractor in {"jetson", "auto"}:
+                    hosts = [host.strip() for host in args.jetson_frame_hosts.split(",") if host.strip()]
+                    try:
+                        extraction = extract_frames_with_jetson_workers(
+                            video_path=video_path,
+                            output_dir=output_dir / "frames",
+                            hosts=hosts,
+                            video_duration_seconds=video_duration,
+                            pipeline_mode=args.pipeline_mode,
+                            candidate_budget=candidate_budget,
+                            sample_fps=args.jetson_sample_fps,
+                            backend=args.jetson_frame_backend,
+                            overlap_seconds=args.jetson_chunk_overlap_seconds,
+                            strict=args.frame_extractor == "jetson",
+                        )
+                    except Exception:
+                        if args.frame_extractor == "jetson":
+                            raise
+                        logger.exception("Jetson frame extraction failed; falling back to local extraction")
+                        extraction = extract_local_screen_keyframes(
+                            processor=processor,
+                            frames_per_minute=config.get("frames", {}).get("per_minute", 60),
+                            duration=config.get("duration"),
+                            max_frames=candidate_budget,
+                        )
+                    frames = extraction.frames
+                    frame_extraction_metadata = extraction.metadata
+                else:
+                    extraction = extract_local_screen_keyframes(
+                        processor=processor,
+                        frames_per_minute=config.get("frames", {}).get("per_minute", 60),
+                        duration=config.get("duration"),
+                        max_frames=candidate_budget,
+                    )
+                    frames = extraction.frames
+                    frame_extraction_metadata = extraction.metadata
+                frame_selection_metadata = {
+                    "pipeline_mode": args.pipeline_mode,
+                    "video_duration_seconds": video_duration,
+                    "candidate_frames": args.candidate_frames,
+                    "candidate_frame_budget": candidate_budget,
+                    "explicit_max_frames": args.max_frames,
+                }
             else:
                 frames = processor.extract_keyframes(
                     frames_per_minute=config.get("frames", {}).get("per_minute", 60),
                     duration=config.get("duration"),
                     max_frames=args.max_frames
                 )
+            timings["candidate_frame_extraction_seconds"] = round(time.perf_counter() - stage_started, 3)
 
             if task == "operation_manual":
                 logger.info("Running OCR on extracted frames...")
+                stage_started = time.perf_counter()
                 ocr_config = config.get("ocr", {})
+                ocr_base_urls = ocr_config.get("base_urls")
                 ocr_events = run_ocr(
                     frames=frames,
                     provider=ocr_config.get("provider", "auto"),
                     base_url=ocr_config.get("base_url", "auto"),
                     model=ocr_config.get("model", "model"),
                     prompt_mode=ocr_config.get("prompt_mode", "prompt_scene_spotting"),
+                    base_urls=ocr_base_urls,
+                    ocr_concurrency=ocr_config.get("concurrency", "auto"),
                     fallback_base_url=ocr_config.get(
                         "fallback_base_url",
                         config.get("operation_manual", {}).get("llm_base_url"),
@@ -265,11 +463,35 @@ def main():
                     probe_timeout_seconds=ocr_config.get("probe_timeout_seconds", 5),
                     warmup_timeout_seconds=ocr_config.get("warmup_timeout_seconds", 180),
                     warmup_retry_interval_seconds=ocr_config.get("warmup_retry_interval_seconds", 5),
+                    cache_mode=ocr_config.get("cache", "on"),
+                    cache_dir=ocr_config.get("cache_dir", ".cache/video-analyzer/ocr"),
                 )
+                ocr_requested_endpoints = ocr_base_urls or [ocr_config.get("base_url", "auto")]
+                ocr_provider_endpoints = sorted(
+                    {
+                        event.provider.split(":", 1)[1]
+                        for event in ocr_events
+                        if event.provider.startswith("dots_mocr_vllm:")
+                    }
+                )
+                ocr_metadata = {
+                    "requested_endpoints": ocr_requested_endpoints,
+                    "effective_endpoints": ocr_provider_endpoints,
+                    "effective_worker_count": len(ocr_provider_endpoints),
+                    "concurrency": ocr_config.get("concurrency", "auto"),
+                    "cache_mode": ocr_config.get("cache", "on"),
+                    "cache_dir": ocr_config.get("cache_dir", ".cache/video-analyzer/ocr"),
+                    "cache_hits": sum(1 for event in ocr_events if event.cache_status == "hit"),
+                    "cache_misses": sum(1 for event in ocr_events if event.cache_status == "miss"),
+                    "cache_refreshes": sum(1 for event in ocr_events if event.cache_status == "refresh"),
+                    "cache_disabled": sum(1 for event in ocr_events if event.cache_status == "disabled"),
+                }
+                timings["ocr_seconds"] = round(time.perf_counter() - stage_started, 3)
             
         # Stage 2: Frame Analysis
         if args.start_stage <= 2:
-            logger.info("Analyzing frames...")
+            logger.info("Selecting and analyzing VL frames...")
+            stage_started = time.perf_counter()
             analyzer = VideoAnalyzer(
                 client, 
                 model, 
@@ -279,24 +501,59 @@ def main():
                 frame_num_predict=config.get("response_length", {}).get("frame", 300),
                 frame_no_think=bool(config.get("operation_manual", {}).get("frame_no_think", False)),
             )
-            frame_analyses = []
-            ocr_by_frame = {event.frame_number: event for event in ocr_events}
-            for frame in frames:
-                ocr_text = ocr_by_frame.get(frame.number).text if frame.number in ocr_by_frame else ""
-                analysis = analyzer.analyze_frame(frame, ocr_text=ocr_text)
-                frame_analyses.append(analysis)
+            if task == "operation_manual":
+                options = FrameSelectionOptions(
+                    pipeline_mode=args.pipeline_mode,
+                    candidate_frames=args.candidate_frames,
+                    min_vl_frames=args.min_vl_frames,
+                    max_vl_frames=args.max_vl_frames,
+                    vl_frame_policy=args.vl_frame_policy,
+                    explicit_max_frames=args.max_frames,
+                )
+                selected_frame_numbers, frame_decisions, selection_metadata = select_vl_frames(
+                    frames=frames,
+                    ocr_events=ocr_events,
+                    transcript=transcript,
+                    video_duration_seconds=frame_selection_metadata.get("video_duration_seconds", config.get("duration") or 0.0),
+                    options=options,
+                )
+                frame_selection_metadata.update(selection_metadata)
+                timings["frame_selection_seconds"] = round(time.perf_counter() - stage_started, 3)
+                vl_started = time.perf_counter()
+                frame_analyses = analyze_frames_for_vl(
+                    analyzer=analyzer,
+                    frames=frames,
+                    ocr_events=ocr_events,
+                    selected_frame_numbers=selected_frame_numbers,
+                    decisions=frame_decisions,
+                    concurrency=max(args.vl_concurrency, 1),
+                    context_before=max(args.vl_context_before, 0),
+                    context_after=max(args.vl_context_after, 0),
+                    context_max_gap=args.vl_context_max_gap,
+                )
+                timings["vl_seconds"] = round(time.perf_counter() - vl_started, 3)
+            else:
+                frame_analyses = []
+                ocr_by_frame = {event.frame_number: event for event in ocr_events}
+                for frame in frames:
+                    ocr_text = ocr_by_frame.get(frame.number).text if frame.number in ocr_by_frame else ""
+                    analysis = analyzer.analyze_frame(frame, ocr_text=ocr_text)
+                    frame_analyses.append(analysis)
+                timings["vl_seconds"] = round(time.perf_counter() - stage_started, 3)
                 
         # Stage 3: Video Reconstruction
         if args.start_stage <= 3:
             if task == "operation_manual":
                 logger.info("Generating operation manual...")
+                stage_started = time.perf_counter()
                 manual_config = config.get("operation_manual", {})
+                text_client = create_operation_manual_text_client(config, client)
                 page_context = read_context_file(config.get("context_file", ""))
                 page_context_metadata = read_page_context_metadata(config.get("context_file", ""), page_context)
                 text_model = manual_config.get("text_model") or model
                 frame_assets = prepare_frame_assets(frames, output_dir)
                 operation_manual = generate_operation_manual(
-                    client=client,
+                    client=text_client,
                     text_model=text_model,
                     frame_analyses=frame_analyses,
                     frames=frames,
@@ -307,6 +564,7 @@ def main():
                     language=config.get("manual_language", "zh-CN"),
                     temperature=config.get("clients", {}).get("temperature", 0.2),
                     frame_assets=frame_assets,
+                    no_think=bool(manual_config.get("manual_no_think", manual_config.get("frame_no_think", False))),
                 )
                 operation_manual["response"] = embed_step_images(
                     operation_manual.get("response", ""),
@@ -332,6 +590,7 @@ def main():
                     frame_assets=frame_assets,
                 )
                 operation_manual["evidence_path"] = str(evidence_path)
+                timings["manual_generation_seconds"] = round(time.perf_counter() - stage_started, 3)
             else:
                 logger.info("Reconstructing video description...")
                 video_description = analyzer.reconstruct_video(
@@ -339,13 +598,19 @@ def main():
                 )
         
         output_dir.mkdir(parents=True, exist_ok=True)
+        timings["total_seconds"] = round(time.perf_counter() - total_started, 3)
         results = {
             "metadata": {
                 "task": task,
                 "client": config.get("clients", {}).get("default"),
                 "model": model,
+                "vision_base_url": config.get("operation_manual", {}).get("vision_base_url")
+                or config.get("operation_manual", {}).get("llm_base_url"),
                 "text_model": config.get("operation_manual", {}).get("text_model"),
+                "text_base_url": config.get("operation_manual", {}).get("text_base_url")
+                or config.get("operation_manual", {}).get("llm_base_url"),
                 "ocr_provider": config.get("ocr", {}).get("provider"),
+                "ocr": ocr_metadata,
                 "asr_provider": config.get("asr", {}).get("provider"),
                 "asr_strategy": config.get("asr", {}).get("strategy"),
                 "context_file": config.get("context_file"),
@@ -355,7 +620,17 @@ def main():
                 "frames_per_minute": config.get("frames", {}).get("per_minute"),
                 "duration_processed": config.get("duration"),
                 "frames_extracted": len(frames),
-                "frames_processed": min(len(frames), args.max_frames),
+                "frames_processed": len(frame_analyses),
+                "vl_frames_processed": len(selected_frame_numbers) if task == "operation_manual" else len(frame_analyses),
+                "frame_selection": frame_selection_metadata,
+                "frame_extraction": frame_extraction_metadata,
+                "vl_context": {
+                    "before": max(args.vl_context_before, 0),
+                    "after": max(args.vl_context_after, 0),
+                    "max_gap_seconds": args.vl_context_max_gap,
+                    "resolved_max_gap_seconds": resolve_vl_context_gap_seconds(frames, args.vl_context_max_gap) if frames else 0.0,
+                },
+                "timings": timings,
                 "start_stage": args.start_stage,
                 "audio_language": transcript.language if transcript else None,
                 "transcription_successful": transcript is not None,

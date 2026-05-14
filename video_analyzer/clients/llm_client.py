@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import base64
 
 class LLMClient(ABC):
@@ -14,5 +14,6 @@ class LLMClient(ABC):
         stream: bool = False,
         model: str = "llama3.2-vision",
         temperature: float = 0.2,
-        num_predict: int = 256) -> Dict[Any, Any]:
+        num_predict: int = 256,
+        image_paths: Optional[List[str]] = None) -> Dict[Any, Any]:
         pass

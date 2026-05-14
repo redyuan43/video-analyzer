@@ -217,6 +217,8 @@ Local video workflow:
     --asr-provider vibevoice \
     --ocr-provider auto \
     --llm-base-url http://spark-31d6.taild500c8.ts.net:1234/v1 \
+    --pipeline-mode balanced \
+    --candidate-frames auto \
     --manual-language zh-CN \
     --keep-frames
 ```

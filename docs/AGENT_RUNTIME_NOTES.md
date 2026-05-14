@@ -4,6 +4,22 @@ This document records operational knowledge for AI agents working on this
 repository. It is intentionally practical: prefer these checks over assumptions
 when debugging the operation-manual pipeline.
 
+## LLM and Vision Runtime
+
+The operation-manual pipeline should use Ivan MiniCPM-V-4.5 for visual frame
+analysis and AMD Fast for final text/manual generation:
+
+```text
+Vision base URL: http://100.96.79.21:18082/v1
+Vision model: minicpm-v-4.5-v100
+Text base URL: http://100.90.114.26:18081/v1
+Text model: hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive
+```
+
+Do not use the generic SayAnything Gateway as the default for this repository.
+For Tailscale/LAN endpoints, bypass local proxy environment variables; routing
+through `127.0.0.1:10808` can cause long generation requests to time out.
+
 ## VibeVoice Dual-Worker Deployment
 
 The Spark/Edge VibeVoice ASR deployment is persisted as a shared Ray pool:

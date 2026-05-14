@@ -138,6 +138,7 @@ def generate_operation_manual(
     language: str,
     temperature: float,
     frame_assets: Optional[Dict[int, str]] = None,
+    no_think: bool = False,
 ) -> Dict[str, Any]:
     prompt = build_operation_manual_prompt(
         frame_analyses=frame_analyses,
@@ -149,6 +150,8 @@ def generate_operation_manual(
         language=language,
         frame_assets=frame_assets,
     )
+    if no_think:
+        prompt = f"/no_think\n{prompt}"
     try:
         response = client.generate(
             prompt=prompt,
@@ -242,6 +245,15 @@ def embed_step_images(manual_text: str, frames: List[Frame], frame_assets: Dict[
 
 def review_operation_manual_markdown(manual_text: str) -> List[Dict[str, str]]:
     issues: List[Dict[str, str]] = []
+    if manual_text.strip().startswith("Error generating operation manual:"):
+        issues.append(
+            {
+                "severity": "error",
+                "code": "manual_generation_error",
+                "message": "Manual generation returned an error placeholder instead of a usable manual.",
+            }
+        )
+
     code_span_images = re.findall(r"`\s*!\[[^\]]*\]\(manual_assets/[^)]+\)\s*`", manual_text)
     if code_span_images:
         issues.append(

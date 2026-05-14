@@ -11,6 +11,10 @@
 ## Operation Manual Runtime
 
 - The default operation-manual ASR path should use remote VibeVoice on Spark/Edge services. Do not add local Whisper or CPU fallback just to hide remote service failures.
+- The project-wide LLM/VL endpoint is AMD Fast:
+  - Base URL: `http://100.90.114.26:18081/v1`
+  - Model: `hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive`
+  Use this same OpenAI-compatible model for frame vision analysis and final text/manual generation. Do not route this project through the generic SayAnything Gateway unless the user explicitly asks for a cross-service comparison.
 - For long or strict ASR runs, use the VibeVoice HTTP endpoint on either:
   - `http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe`
   - `http://edgexpert-4353.taild500c8.ts.net:8012/api/asr/transcribe`
@@ -81,3 +85,14 @@ A passing dual-worker response includes:
 - Keep only one long VibeVoice ASR job active at a time. A single dual-worker request consumes both GPUs.
 - After a smoke test, stop only `vibevoice-asr-backend.service` if you want to unload model actors. Keep Ray head/worker and lazy proxies active.
 - If `8012` health times out during a request, check GPU processes before declaring failure; model/actor initialization can occupy the backend until the request completes.
+
+## Jetson Frame Extraction
+
+- For long operation-manual videos, prefer Jetson candidate-frame extraction instead of local CPU/OpenCV scanning.
+- Use `--frame-extractor jetson --jetson-frame-hosts nx2,nx3` for strict dual-worker mode. The current validated transport is SSH concurrent workers; Ray is only a reserved backend name for this path.
+- The NX workers are on-demand, not daemons: the local pipeline pushes `worker.py`, syncs/caches the video, runs both chunks, pulls candidates back, and merges locally.
+- Human one-command path for the current long sample is:
+  `OCR_CACHE=refresh tools/run_s36ri23_fast_full.sh`
+- Check worker readiness with:
+  `tools/check_jetson_frame_workers.sh`
+- Detailed operations, public CLI/API flags, maintenance commands, and the measured baseline live in `docs/JETSON_FRAME_WORKERS.md` and `.codex/skills/jetson-frame-extraction/SKILL.md`.

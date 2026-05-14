@@ -61,8 +61,29 @@ Useful URL-runner variants:
 # Use browser cookies for Bilibili/YouTube login or age-gated content.
 tools/run_operation_manual_from_url.sh "URL" --cookies-from-browser chrome
 
-# Spend more VL/OCR budget on dense tutorials.
-tools/run_operation_manual_from_url.sh "URL" --max-frames 48
+# Choose pipeline depth. balanced is the default.
+tools/run_operation_manual_from_url.sh "URL" --pipeline-mode fast
+tools/run_operation_manual_from_url.sh "URL" --pipeline-mode balanced
+tools/run_operation_manual_from_url.sh "URL" --pipeline-mode deep
+
+# Override dynamic frame budgets only when you need a hard cap or fixed pool.
+tools/run_operation_manual_from_url.sh "URL" --candidate-frames auto --max-vl-frames 80
+
+# Use two DotsMOCR endpoints and keep OCR cache enabled.
+tools/run_operation_manual_from_url.sh "URL" \
+  --ocr-base-url http://spark-31d6.taild500c8.ts.net:8000/v1 \
+  --ocr-base-url http://edgexpert-4353.taild500c8.ts.net:8000/v1 \
+  --ocr-concurrency auto \
+  --ocr-cache on
+
+# Offload candidate frame extraction to Jetson NX workers.
+.venv/bin/python -m video_analyzer.cli VIDEO.mp4 \
+  --task operation_manual \
+  --pipeline-mode fast \
+  --frame-extractor jetson \
+  --jetson-frame-hosts nx2,nx3 \
+  --jetson-frame-backend auto \
+  --jetson-sample-fps auto
 
 # Only download video and page context.
 tools/run_operation_manual_from_url.sh "URL" --download-only
@@ -79,14 +100,22 @@ To switch or customize endpoints/models, use a runtime profile:
 
 ```json
 {
-  "active_runtime_profile": "spark",
+  "active_runtime_profile": "ivan_minicpm_v100",
   "runtime_profiles": {
-    "spark": {
-      "llm_base_url": "http://spark-31d6.taild500c8.ts.net:1234/v1",
-      "vision_model": "qwen/qwen3-vl-30b",
-      "text_model": "redhatai_qwen3.6-35b-a3b-nvfp4",
+    "ivan_minicpm_v100": {
+      "llm_base_url": "http://100.90.114.26:18081/v1",
+      "vision_base_url": "http://100.96.79.21:18082/v1",
+      "text_base_url": "http://100.90.114.26:18081/v1",
+      "vision_model": "minicpm-v-4.5-v100",
+      "text_model": "hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
       "vibevoice_url": "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
       "ocr_base_url": "http://spark-31d6.taild500c8.ts.net:8000/v1",
+      "ocr_base_urls": [
+        "http://spark-31d6.taild500c8.ts.net:8000/v1",
+        "http://edgexpert-4353.taild500c8.ts.net:8000/v1"
+      ],
+      "ocr_concurrency": "auto",
+      "ocr_cache": "on",
       "max_comments": 30,
       "subtitle_langs": "zh-CN,zh-Hans,zh,en"
     }
@@ -94,7 +123,7 @@ To switch or customize endpoints/models, use a runtime profile:
 }
 ```
 
-Both URL and multi-document runners accept `--profile spark`. Command-line
+Both URL and multi-document runners accept `--profile ivan_minicpm_v100`. Command-line
 arguments still override the profile for one-off runs.
 
 ### Remote Runtime Installation Notes
@@ -136,26 +165,35 @@ For an existing local video:
   --context-file optional-page-description.md \
   --asr-strategy balanced \
   --ocr-provider auto \
-  --max-frames 24 \
+  --pipeline-mode balanced \
+  --candidate-frames auto \
+  --min-vl-frames auto \
+  --max-vl-frames auto \
+  --vl-context-before 3 \
+  --vl-context-after 2 \
   --keep-frames \
   --log-level INFO
 ```
 
 Recommended current local model setup:
 
-- Vision / VL model, text model, LLM endpoint, VibeVoice URL, OCR URL, subtitle
+- Vision / VL model, text model, LLM endpoints, VibeVoice URL, OCR URL, subtitle
   languages, and comment budget are managed by the active runtime profile.
-- Spark LM Studio should host the configured models on the Spark device itself.
-  If LM Link resolves `qwen/qwen3-vl-30b` or `redhatai_qwen3.6-35b-a3b-nvfp4`
-  to another machine, treat that as an environment issue before running the
-  pipeline.
+- The default visual frame analysis path uses Ivan MiniCPM-V-4.5:
+  `http://100.96.79.21:18082/v1`, model `minicpm-v-4.5-v100`, with context
+  `40960`. The final manual text path continues to use AMD Fast:
+  `http://100.90.114.26:18081/v1`, model
+  `hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive`.
+- MiniCPM is used for visual understanding only. OCR remains the hard evidence
+  source for UI text, commands, filenames, labels, and parameters.
 - ASR strategy: `balanced` by default for operation manuals. The default path
   stays on Spark services; if Spark ASR/VibeVoice is unavailable, fix that
   service instead of silently falling back to AGX or the caller machine.
 - VibeVoice endpoint: spark
   `http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe`.
-- OCR order: spark DotsMOCR vLLM first, then Spark LM Studio vision OCR
-  fallback with `qwen/qwen3-vl-30b`.
+- OCR order: spark/Edge DotsMOCR vLLM first, then AMD Fast OpenAI-compatible
+  vision OCR fallback with
+  `hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive`.
 
 Current OCR deployment:
 
@@ -211,33 +249,65 @@ steps -> checks/caveats" document. Full screenshot dumps belong in
 The tool does not analyze every source frame. A 30 fps, 165 second video has
 roughly 4,956 frames, which is too expensive to send to a vision model.
 
-Instead, `operation_manual` uses screen-recording keyframe extraction:
+Instead, `operation_manual` uses screen-recording keyframe extraction followed
+by a dynamic VL-selection pass:
 
 1. **Decode and sample**
    - OpenCV is tried first.
    - If OpenCV cannot open or decode useful frames, ffmpeg extracts preview
      frames. This handles AV1 and other codecs that OpenCV may not support.
 
-2. **Keep coverage**
+2. **Size the candidate frame pool**
+   - `--candidate-frames auto` scales with video duration and pipeline mode.
+   - Short videos keep a smaller candidate pool to avoid over-analysis.
+   - Long videos naturally expand to hundreds of candidate frames when needed;
+     a 1-hour balanced run is not constrained to 12 or 24 frames.
+   - `--max-frames` remains as a legacy explicit cap for the candidate pool.
+
+3. **Keep coverage**
    - The extractor preserves broad timeline coverage so long videos do not lose
      entire sections.
    - The density-budget selector keeps at least representative frames across
      coarse time buckets.
 
-3. **Spend remaining budget on information density**
+4. **Spend remaining budget on information density**
    - Candidate frames are scored by visual change.
-   - After coverage frames are reserved, the remaining `--max-frames` budget is
+   - After coverage frames are reserved, the remaining candidate budget is
      assigned to high-change frames.
    - This means dense sections, such as UI transitions, code blocks, tables, or
      slide changes, get more screenshots than static sections.
 
-4. **Remove near duplicates**
+5. **Remove near duplicates**
    - Very similar neighboring frames are skipped.
    - This avoids wasting model calls on unchanged screens.
 
-`--max-frames` is a budget, not the number of original video frames. For a short
-operation video, use 24-40. For long or dense tutorials, use 60-120 if latency
-and model cost are acceptable.
+6. **Select VL frames**
+   - `--pipeline-mode fast` skips VL but still keeps dynamic candidate frames
+     and OCR evidence.
+   - `--pipeline-mode balanced` sends a dynamic subset to VL, based on OCR text
+     density, ASR chapter density, visual change, and time coverage.
+   - `--pipeline-mode deep` sends the whole dynamic candidate pool to VL.
+   - `--vl-frame-policy all|none` can force the VL pass on or off.
+   - `--vl-concurrency N` controls how many selected VL frame requests may run
+     at the same time.
+   - `--vl-context-before 3 --vl-context-after 2` sends nearby candidate frames
+     as multi-image context for each selected VL frame.
+   - `--vl-context-max-gap auto` uses the median candidate-frame interval times
+     3, clamped to 8-45 seconds, so context does not cross obvious time breaks.
+
+`analysis.json` records `metadata.frame_selection` with candidate/VL counts and
+per-frame selection reasons. Skipped VL frames are still present in
+`visual_events` with `status: "skipped"`, an OCR summary, and the selection
+score. Runtime breakdowns are written to `metadata.timings`; `metadata.vl_context`
+records the before/after window and resolved time-gap threshold. OCR endpoint
+selection, cache mode, cache hit counts, and effective worker count are written
+to `metadata.ocr`.
+
+Candidate frame extraction can run locally or on Jetson workers. With
+`--frame-extractor jetson`, the video is cached on each listed Jetson host,
+split into overlapping chunks, processed in parallel, then merged locally with
+the same global density/coverage budget. Worker health, per-host timings,
+sample FPS, and transport are written to `metadata.frame_extraction`.
 
 ## OCR vs Vision Model Efficiency
 
@@ -257,10 +327,16 @@ for every frame, total runtime is slower than VL-only.
 Recommended policy:
 
 - Use spark DotsMOCR when available. It is preferred for exact screen text.
-- Use Spark LM Studio vision OCR fallback only when DotsMOCR is down.
+- Pass `--ocr-base-url` more than once, or set `ocr_base_urls`, to distribute
+  DotsMOCR frames across multiple healthy endpoints. `--ocr-concurrency auto`
+  means one in-flight OCR request per endpoint.
+- OCR cache is enabled by default. Use `--ocr-cache refresh` to recompute and
+  rewrite cached entries, or `--ocr-cache off` for a cold measurement.
+- Use the AMD Fast OpenAI-compatible vision OCR fallback only when DotsMOCR is
+  down.
 - Keep OCR for operation manuals because exact text is high-value evidence.
-- Reduce total cost by using density-based frame selection instead of uniformly
-  increasing `--max-frames`.
+- Reduce total cost by using the balanced dynamic VL selector instead of
+  uniformly increasing the candidate-frame cap.
 
 ## ASR Policy
 
@@ -350,7 +426,8 @@ The Bilibili sample used during validation:
   --context-file downloads/test-videos/BV12moMBrELB/description.md \
   --asr-strategy deep \
   --ocr-provider auto \
-  --max-frames 24 \
+  --pipeline-mode deep \
+  --candidate-frames auto \
   --keep-frames \
   --log-level INFO
 ```

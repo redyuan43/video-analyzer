@@ -37,12 +37,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile", help="Runtime profile from config/default_config.json or config.json")
     parser.add_argument("--output-root", help="Directory for downloaded videos and runs")
     parser.add_argument("--run-name", help="Output run directory name under the video folder")
-    parser.add_argument("--max-frames", type=int, help="Keyframe budget for operation_manual")
+    parser.add_argument("--max-frames", type=int, help="Explicit upper limit for the operation-manual candidate frame pool")
+    parser.add_argument("--pipeline-mode", choices=["fast", "balanced", "deep"])
+    parser.add_argument("--candidate-frames", help="auto or explicit candidate frame pool size")
+    parser.add_argument("--min-vl-frames", help="auto or minimum frames sent to VL")
+    parser.add_argument("--max-vl-frames", help="auto or maximum frames sent to VL")
+    parser.add_argument("--vl-frame-policy", choices=["auto", "all", "none"])
+    parser.add_argument("--vl-concurrency", type=int)
+    parser.add_argument("--vl-context-before", type=int)
+    parser.add_argument("--vl-context-after", type=int)
+    parser.add_argument("--vl-context-max-gap")
     parser.add_argument("--duration", type=float, help="Optional duration in seconds to process")
     parser.add_argument("--manual-language")
     parser.add_argument("--vibevoice-url", help="Remote GPU VibeVoice ASR endpoint")
-    parser.add_argument("--ocr-base-url", help="DotsMOCR OpenAI-compatible base URL")
+    parser.add_argument("--ocr-base-url", action="append", help="DotsMOCR OpenAI-compatible base URL; can be provided multiple times")
+    parser.add_argument("--ocr-concurrency", help="OCR concurrency per endpoint, or auto")
+    parser.add_argument("--ocr-cache", choices=["on", "off", "refresh"], help="OCR cache mode")
+    parser.add_argument("--ocr-cache-dir", help="OCR cache directory")
     parser.add_argument("--llm-base-url")
+    parser.add_argument("--vision-base-url")
+    parser.add_argument("--text-base-url")
     parser.add_argument("--vision-model")
     parser.add_argument("--text-model")
     parser.add_argument("--cookies-from-browser", help="Forward to yt-dlp, e.g. chrome, chromium, firefox, brave")
@@ -76,11 +90,24 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
     defaults = {
         "output_root": profile.get("output_root", FALLBACK_OUTPUT_ROOT),
         "run_name": profile.get("run_name", FALLBACK_RUN_NAME),
-        "max_frames": profile.get("max_frames", 24),
+        "pipeline_mode": profile.get("pipeline_mode", "balanced"),
+        "candidate_frames": profile.get("candidate_frames", "auto"),
+        "min_vl_frames": profile.get("min_vl_frames", "auto"),
+        "max_vl_frames": profile.get("max_vl_frames", "auto"),
+        "vl_frame_policy": profile.get("vl_frame_policy", "auto"),
+        "vl_concurrency": profile.get("vl_concurrency", 2),
+        "vl_context_before": profile.get("vl_context_before", 3),
+        "vl_context_after": profile.get("vl_context_after", 2),
+        "vl_context_max_gap": profile.get("vl_context_max_gap", "auto"),
         "manual_language": profile.get("manual_language", "zh-CN"),
         "vibevoice_url": profile.get("vibevoice_url"),
-        "ocr_base_url": profile.get("ocr_base_url"),
+        "ocr_base_url": profile.get("ocr_base_urls") or profile.get("ocr_base_url"),
+        "ocr_concurrency": profile.get("ocr_concurrency", "auto"),
+        "ocr_cache": profile.get("ocr_cache", "on"),
+        "ocr_cache_dir": profile.get("ocr_cache_dir", ".cache/video-analyzer/ocr"),
         "llm_base_url": profile.get("llm_base_url", FALLBACK_LLM_BASE_URL),
+        "vision_base_url": profile.get("vision_base_url"),
+        "text_base_url": profile.get("text_base_url"),
         "vision_model": profile.get("vision_model", FALLBACK_VISION_MODEL),
         "text_model": profile.get("text_model", FALLBACK_TEXT_MODEL),
         "include_subtitles": profile.get("include_subtitles", True),
@@ -534,6 +561,23 @@ def parse_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def normalize_cli_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, list):
+        values = value
+    else:
+        values = [str(value)]
+    normalized = []
+    for item in values:
+        cleaned = str(item).strip()
+        if cleaned and cleaned not in normalized:
+            normalized.append(cleaned)
+    return normalized
+
+
 def subtitle_langs_for_ytdlp(value: str) -> str:
     langs = parse_csv(value)
     return ",".join(langs) if langs else FALLBACK_SUBTITLE_LANGS
@@ -564,21 +608,53 @@ def build_analyzer_command(args: argparse.Namespace, video_path: Path, context_p
         args.vibevoice_url,
         "--ocr-provider",
         "auto",
-        "--ocr-base-url",
-        args.ocr_base_url,
         "--llm-base-url",
         args.llm_base_url,
+        "--vision-base-url",
+        getattr(args, "vision_base_url", None) or args.llm_base_url,
+        "--text-base-url",
+        getattr(args, "text_base_url", None) or args.llm_base_url,
         "--vision-model",
         args.vision_model,
         "--text-model",
         args.text_model,
         "--manual-language",
         args.manual_language,
-        "--max-frames",
-        str(args.max_frames),
         "--log-level",
         args.log_level,
+        "--pipeline-mode",
+        args.pipeline_mode,
+        "--candidate-frames",
+        str(args.candidate_frames),
+        "--min-vl-frames",
+        str(args.min_vl_frames),
+        "--max-vl-frames",
+        str(args.max_vl_frames),
+        "--vl-frame-policy",
+        args.vl_frame_policy,
+        "--vl-concurrency",
+        str(args.vl_concurrency),
+        "--vl-context-before",
+        str(args.vl_context_before),
+        "--vl-context-after",
+        str(args.vl_context_after),
+        "--vl-context-max-gap",
+        str(args.vl_context_max_gap),
     ]
+    for endpoint in normalize_cli_list(args.ocr_base_url):
+        command.extend(["--ocr-base-url", endpoint])
+    command.extend(
+        [
+            "--ocr-concurrency",
+            str(getattr(args, "ocr_concurrency", "auto")),
+            "--ocr-cache",
+            getattr(args, "ocr_cache", "on"),
+            "--ocr-cache-dir",
+            getattr(args, "ocr_cache_dir", ".cache/video-analyzer/ocr"),
+        ]
+    )
+    if args.max_frames is not None:
+        command.extend(["--max-frames", str(args.max_frames)])
     if args.duration is not None:
         command.extend(["--duration", str(args.duration)])
     if not args.no_keep_frames:

@@ -1,6 +1,6 @@
 import requests
 import json
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from .llm_client import LLMClient
 
 class OllamaClient(LLMClient):
@@ -14,7 +14,8 @@ class OllamaClient(LLMClient):
         stream: bool = False,
         model: str = "llama3.2-vision",
         temperature: float = 0.2,
-        num_predict: int = 256) -> Dict[Any, Any]:
+        num_predict: int = 256,
+        image_paths: Optional[List[str]] = None) -> Dict[Any, Any]:
         try:
             # Build the request data
             data = {
@@ -27,9 +28,10 @@ class OllamaClient(LLMClient):
                 }
             }
             
-            if image_path:
+            paths = image_paths or ([image_path] if image_path else [])
+            if paths:
                 # Use encode_image from parent LLMClient class
-                data["images"] = [self.encode_image(image_path)]
+                data["images"] = [self.encode_image(path) for path in paths]
                     
             response = requests.post(self.generate_url, json=data)
             response.raise_for_status()

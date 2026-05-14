@@ -3,6 +3,7 @@ import logging
 from .clients.llm_client import LLMClient
 from .prompt import PromptLoader
 from .frame import Frame
+from .frame_selection import FrameContextItem
 from .audio_processor import AudioTranscript
 
 logger = logging.getLogger(__name__)
@@ -10,6 +11,7 @@ logger = logging.getLogger(__name__)
 MAX_PREVIOUS_FRAME_CONTEXT = 3
 MAX_PREVIOUS_ANALYSIS_CHARS = 700
 MAX_OCR_EVIDENCE_CHARS = 2000
+MAX_CONTEXT_OCR_CHARS = 500
 
 class VideoAnalyzer:
     def __init__(
@@ -71,13 +73,24 @@ class VideoAnalyzer:
             
         return "\n".join(formatted_analyses)
 
-    def analyze_frame(self, frame: Frame, ocr_text: str = "") -> Dict[str, Any]:
+    def analyze_frame(
+        self,
+        frame: Frame,
+        ocr_text: str = "",
+        context_window: Optional[List[FrameContextItem]] = None,
+        context_ocr_texts: Optional[Dict[int, str]] = None,
+    ) -> Dict[str, Any]:
         """Analyze a single frame using the LLM."""
         # Replace {PREVIOUS_FRAMES} token with formatted previous analyses
         # Replace tokens in the prompt template
-        prompt = self.frame_prompt.replace("{PREVIOUS_FRAMES}", self._format_previous_analyses())
+        previous_context = "" if context_window else self._format_previous_analyses()
+        prompt = self.frame_prompt.replace("{PREVIOUS_FRAMES}", previous_context)
         prompt = prompt.replace("{prompt}", self._format_user_prompt())
         prompt = f"{prompt}\nThis is frame {frame.number} captured at {frame.timestamp:.2f} seconds."
+        image_paths = None
+        if context_window:
+            prompt = f"{prompt}\n\n{self._format_frame_context_window(frame, context_window, context_ocr_texts or {})}"
+            image_paths = [str(item.frame.path) for item in context_window]
         if self.frame_no_think:
             prompt = f"/no_think\n{prompt}"
         if ocr_text:
@@ -92,6 +105,7 @@ class VideoAnalyzer:
             response = self.client.generate(
                 prompt=prompt,
                 image_path=str(frame.path),
+                image_paths=image_paths,
                 model=self.model,
                 temperature=self.temperature,
                 num_predict=self.frame_num_predict
@@ -100,14 +114,39 @@ class VideoAnalyzer:
             
             # Store the analysis for future frames
             analysis_result = {k: v for k, v in response.items() if k != "context"}
-            self.previous_analyses.append(analysis_result)
+            if not context_window:
+                self.previous_analyses.append(analysis_result)
             
             return analysis_result
         except Exception as e:
             logger.error(f"Error analyzing frame {frame.number}: {e}")
             error_result = {"response": f"Error analyzing frame {frame.number}: {str(e)}"}
-            self.previous_analyses.append(error_result)
+            if not context_window:
+                self.previous_analyses.append(error_result)
             return error_result
+
+    def _format_frame_context_window(
+        self,
+        current_frame: Frame,
+        context_window: List[FrameContextItem],
+        context_ocr_texts: Dict[int, str],
+    ) -> str:
+        lines = [
+            "Multi-image temporal context:",
+            "The attached images are ordered exactly as listed below. Analyze the CURRENT frame as the main target; use previous/next frames only to understand continuity and before/after effects.",
+        ]
+        for index, item in enumerate(context_window, start=1):
+            ocr_text = " ".join((context_ocr_texts.get(item.frame.number) or "").split())
+            if len(ocr_text) > MAX_CONTEXT_OCR_CHARS:
+                ocr_text = ocr_text[:MAX_CONTEXT_OCR_CHARS] + "..."
+            role = "CURRENT" if item.frame.number == current_frame.number else item.role.upper()
+            lines.append(
+                f"[Image {index}] {role} frame {item.frame.number} at {item.frame.timestamp:.2f}s "
+                f"(delta {item.gap_seconds:.2f}s)."
+            )
+            if ocr_text:
+                lines.append(f"OCR context for image {index}: {ocr_text}")
+        return "\n".join(lines)
 
     def reconstruct_video(self, frame_analyses: List[Dict[str, Any]], frames: List[Frame], 
                          transcript: Optional[AudioTranscript] = None) -> Dict[str, Any]:

@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from video_analyzer.config import Config
+from video_analyzer.cli import create_operation_manual_text_client
 from video_analyzer.analyzer import VideoAnalyzer
 from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient
 from video_analyzer.manual import (
@@ -32,6 +33,17 @@ from video_analyzer.asr_providers import (
 from video_analyzer.ocr import DOTS_MOCR_ENDPOINTS, DotsMOCRVLLMProvider, run_ocr
 from video_analyzer.audio_processor import AudioTranscript
 from video_analyzer.doc_chat import ask_video_docs, build_doc_chat_prompt, load_video_docs
+from video_analyzer.frame import Frame
+from video_analyzer.frame_selection import (
+    FrameSelectionOptions,
+    build_frame_context_window,
+    resolve_candidate_frame_budget,
+    resolve_vl_context_gap_seconds,
+    resolve_vl_frame_budget,
+    select_vl_frames,
+)
+from video_analyzer.jetson_frames import resolve_jetson_sample_fps, split_jetson_workers
+from video_analyzer.ocr import OCREvent
 
 RUNNER_PATH = Path(__file__).resolve().parent / "tools" / "run_operation_manual_from_url.py"
 RUNNER_SPEC = importlib.util.spec_from_file_location("run_operation_manual_from_url", RUNNER_PATH)
@@ -56,7 +68,93 @@ except ModuleNotFoundError:
 
 
 class OperationManualTests(unittest.TestCase):
-    def test_operation_manual_config_uses_spark_defaults(self):
+    def test_candidate_frames_auto_scales_with_duration(self):
+        short_budget = resolve_candidate_frame_budget(
+            video_duration_seconds=4 * 60,
+            pipeline_mode="balanced",
+            candidate_frames="auto",
+        )
+        long_budget = resolve_candidate_frame_budget(
+            video_duration_seconds=60 * 60,
+            pipeline_mode="balanced",
+            candidate_frames="auto",
+        )
+
+        self.assertGreater(long_budget, short_budget * 10)
+        self.assertGreaterEqual(long_budget, 300)
+
+    def test_balanced_vl_budget_scales_with_duration_and_density(self):
+        short_frames = [Frame(i, Path(f"frame_{i}.jpg"), i * 10.0, 5.0) for i in range(24)]
+        long_frames = [Frame(i, Path(f"frame_{i}.jpg"), i * 12.0, 5.0) for i in range(300)]
+        low_ocr = [
+            OCREvent(i, frame.timestamp, "test", "ok", "ok", [])
+            for i, frame in enumerate(short_frames)
+        ]
+        high_ocr = [
+            OCREvent(i, frame.timestamp, "test", "ok", "按钮 设置 命令 参数 文件名 " * 20, [])
+            for i, frame in enumerate(long_frames)
+        ]
+        transcript = AudioTranscript(
+            text="dense transcript",
+            segments=[{"start": i * 15, "end": i * 15 + 5, "text": "step"} for i in range(120)],
+            language="zh",
+        )
+        options = FrameSelectionOptions(pipeline_mode="balanced")
+
+        short_budget = resolve_vl_frame_budget(short_frames, low_ocr, None, 4 * 60, options)
+        long_budget = resolve_vl_frame_budget(long_frames, high_ocr, transcript, 60 * 60, options)
+
+        self.assertNotEqual(short_budget, 12)
+        self.assertGreater(long_budget, short_budget)
+        self.assertGreater(long_budget, 100)
+
+    def test_pipeline_modes_control_vl_selection(self):
+        frames = [Frame(i, Path(f"frame_{i}.jpg"), i * 10.0, 10.0) for i in range(20)]
+        ocr_events = [OCREvent(i, frame.timestamp, "test", "ok", "按钮 " * 30, []) for i, frame in enumerate(frames)]
+
+        fast_selected, fast_decisions, fast_meta = select_vl_frames(
+            frames,
+            ocr_events,
+            None,
+            4 * 60,
+            FrameSelectionOptions(pipeline_mode="fast"),
+        )
+        deep_selected, deep_decisions, deep_meta = select_vl_frames(
+            frames,
+            ocr_events,
+            None,
+            4 * 60,
+            FrameSelectionOptions(pipeline_mode="deep"),
+        )
+
+        self.assertEqual(fast_selected, set())
+        self.assertTrue(all(not decision.selected_for_vl for decision in fast_decisions))
+        self.assertEqual(fast_meta["vl_frames_count"], 0)
+        self.assertEqual(deep_selected, {frame.number for frame in frames})
+        self.assertTrue(all(decision.selected_for_vl for decision in deep_decisions))
+        self.assertEqual(deep_meta["vl_frames_count"], len(frames))
+
+    def test_jetson_frame_workers_split_with_overlap(self):
+        workers = split_jetson_workers(
+            hosts=["nx2", "nx3"],
+            video_duration_seconds=100.0,
+            output_dir=Path("/tmp/frames"),
+            overlap_seconds=2.0,
+        )
+
+        self.assertEqual([worker.host for worker in workers], ["nx2", "nx3"])
+        self.assertEqual(workers[0].start_seconds, 0.0)
+        self.assertAlmostEqual(workers[0].duration_seconds, 52.0)
+        self.assertAlmostEqual(workers[1].start_seconds, 48.0)
+        self.assertAlmostEqual(workers[1].duration_seconds, 52.0)
+
+    def test_jetson_sample_fps_defaults_by_pipeline_mode(self):
+        self.assertEqual(resolve_jetson_sample_fps("auto", "fast"), 1.0)
+        self.assertEqual(resolve_jetson_sample_fps("auto", "balanced"), 2.0)
+        self.assertEqual(resolve_jetson_sample_fps("auto", "deep"), 3.0)
+        self.assertEqual(resolve_jetson_sample_fps("0.5", "fast"), 0.5)
+
+    def test_operation_manual_config_uses_ivan_minicpm_vision_defaults(self):
         args = argparse.Namespace(
             video_path="video.mp4",
             config="config",
@@ -79,41 +177,64 @@ class OperationManualTests(unittest.TestCase):
             task="operation_manual",
             manual_language=None,
             llm_base_url=None,
+            vision_base_url=None,
+            text_base_url=None,
             vision_model=None,
             text_model=None,
             ocr_provider=None,
             ocr_base_url=None,
+            ocr_concurrency=None,
+            ocr_cache=None,
+            ocr_cache_dir=None,
             asr_provider=None,
             asr_strategy=None,
             remote_asr_url=None,
             vibevoice_url=None,
             context_file=None,
         )
-        config = Config("config")
-        config.update_from_args(args)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = Config(temp_dir)
+            config.update_from_args(args)
 
-        self.assertEqual(config.get("clients")["default"], "openai_api")
-        self.assertEqual(config.get("clients")["openai_api"]["api_key"], "0")
-        self.assertEqual(
-            config.get("clients")["openai_api"]["api_url"],
-            "http://spark-31d6.taild500c8.ts.net:1234/v1",
-        )
-        self.assertEqual(
-            config.get("clients")["openai_api"]["model"],
-            "qwen/qwen3-vl-30b",
-        )
-        self.assertEqual(config.get("asr")["provider"], "auto")
-        self.assertEqual(config.get("asr")["strategy"], "balanced")
-        self.assertEqual(config.get("asr")["vibevoice"]["remote_urls"], [])
-        self.assertEqual(
-            config.get("asr")["vibevoice"]["deep_remote_urls"],
-            ["http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe"],
-        )
-        self.assertTrue(config.get("asr")["vibevoice"]["use_native_chunking"])
-        self.assertEqual(
-            config.get("ocr")["fallback_model"],
-            "qwen/qwen3-vl-30b",
-        )
+            self.assertEqual(config.get("clients")["default"], "openai_api")
+            self.assertEqual(config.get("clients")["openai_api"]["api_key"], "0")
+            self.assertEqual(
+                config.get("clients")["openai_api"]["api_url"],
+                "http://100.96.79.21:18082/v1",
+            )
+            self.assertEqual(
+                config.get("clients")["openai_api"]["model"],
+                "minicpm-v-4.5-v100",
+            )
+            self.assertEqual(
+                config.get("operation_manual")["text_base_url"],
+                "http://100.90.114.26:18081/v1",
+            )
+            self.assertEqual(
+                config.get("operation_manual")["text_model"],
+                "hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
+            )
+            self.assertEqual(config.get("asr")["provider"], "auto")
+            self.assertEqual(config.get("asr")["strategy"], "balanced")
+            self.assertEqual(config.get("asr")["vibevoice"]["remote_urls"], [])
+            self.assertEqual(
+                config.get("asr")["vibevoice"]["deep_remote_urls"],
+                ["http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe"],
+            )
+            self.assertTrue(config.get("asr")["vibevoice"]["use_native_chunking"])
+            self.assertEqual(
+                config.get("ocr")["fallback_model"],
+                "hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
+            )
+            self.assertEqual(
+                config.get("ocr")["base_urls"],
+                [
+                    "http://spark-31d6.taild500c8.ts.net:8000/v1",
+                    "http://edgexpert-4353.taild500c8.ts.net:8000/v1",
+                ],
+            )
+            self.assertEqual(config.get("ocr")["concurrency"], "auto")
+            self.assertEqual(config.get("ocr")["cache"], "on")
 
     def test_runtime_profile_merges_user_config_and_allows_cli_defaults(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -152,10 +273,24 @@ class OperationManualTests(unittest.TestCase):
                 output_root=None,
                 run_name=None,
                 max_frames=None,
+                pipeline_mode=None,
+                candidate_frames=None,
+                min_vl_frames=None,
+                max_vl_frames=None,
+                vl_frame_policy=None,
+                vl_concurrency=None,
+                vl_context_before=None,
+                vl_context_after=None,
+                vl_context_max_gap=None,
                 manual_language=None,
                 vibevoice_url=None,
                 ocr_base_url=None,
+                ocr_concurrency=None,
+                ocr_cache=None,
+                ocr_cache_dir=None,
                 llm_base_url=None,
+                vision_base_url=None,
+                text_base_url=None,
                 vision_model=None,
                 text_model=None,
                 include_subtitles=None,
@@ -479,12 +614,29 @@ class OperationManualTests(unittest.TestCase):
         args = argparse.Namespace(
             python=".venv/bin/python",
             vibevoice_url="http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
-            ocr_base_url="http://spark-31d6.taild500c8.ts.net:8000/v1",
+            ocr_base_url=[
+                "http://spark-31d6.taild500c8.ts.net:8000/v1",
+                "http://edgexpert-4353.taild500c8.ts.net:8000/v1",
+            ],
+            ocr_concurrency="auto",
+            ocr_cache="on",
+            ocr_cache_dir=".cache/video-analyzer/ocr",
             llm_base_url="http://spark-31d6.taild500c8.ts.net:1234/v1",
+            vision_base_url="http://100.96.79.21:18082/v1",
+            text_base_url="http://100.90.114.26:18081/v1",
             vision_model="qwen/qwen3-vl-30b",
             text_model="redhatai_qwen3.6-35b-a3b-nvfp4",
             manual_language="zh-CN",
             max_frames=24,
+            pipeline_mode="balanced",
+            candidate_frames="auto",
+            min_vl_frames="auto",
+            max_vl_frames="auto",
+            vl_frame_policy="auto",
+            vl_concurrency=2,
+            vl_context_before=3,
+            vl_context_after=2,
+            vl_context_max_gap="auto",
             log_level="INFO",
             duration=None,
             no_keep_frames=False,
@@ -501,6 +653,13 @@ class OperationManualTests(unittest.TestCase):
         self.assertIn("vibevoice", command)
         self.assertIn("http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe", command)
         self.assertIn("http://spark-31d6.taild500c8.ts.net:8000/v1", command)
+        self.assertIn("http://edgexpert-4353.taild500c8.ts.net:8000/v1", command)
+        self.assertIn("--vision-base-url", command)
+        self.assertIn("http://100.96.79.21:18082/v1", command)
+        self.assertIn("--text-base-url", command)
+        self.assertIn("http://100.90.114.26:18081/v1", command)
+        self.assertEqual(command.count("--ocr-base-url"), 2)
+        self.assertIn("--ocr-cache", command)
 
     def test_url_runner_rejects_unsafe_run_name_before_delete(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -575,6 +734,9 @@ class OperationManualTests(unittest.TestCase):
                 text_model=None,
                 ocr_provider=None,
                 ocr_base_url=None,
+                ocr_concurrency=None,
+                ocr_cache=None,
+                ocr_cache_dir=None,
                 asr_provider=None,
                 asr_strategy=None,
                 remote_asr_url=None,
@@ -614,6 +776,9 @@ class OperationManualTests(unittest.TestCase):
             text_model=None,
             ocr_provider=None,
             ocr_base_url=None,
+            ocr_concurrency=None,
+            ocr_cache=None,
+            ocr_cache_dir=None,
             asr_provider=None,
             asr_strategy="deep",
             remote_asr_url=["http://agx/asr"],
@@ -642,7 +807,7 @@ class OperationManualTests(unittest.TestCase):
             ]
         }
 
-        with patch("video_analyzer.clients.generic_openai_api.requests.post", return_value=response):
+        with patch.object(client.session, "post", return_value=response):
             result = client.generate(
                 prompt="describe",
                 image_path=None,
@@ -669,11 +834,55 @@ class OperationManualTests(unittest.TestCase):
             ]
         }
 
-        with patch("video_analyzer.clients.generic_openai_api.requests.post", return_value=response):
+        with patch.object(client.session, "post", return_value=response):
             with self.assertRaises(Exception) as raised:
                 client.generate(prompt="describe", model="vision")
 
         self.assertIn("reasoning_content fallback is only allowed", str(raised.exception))
+
+    def test_openai_client_sends_multiple_images_in_order(self):
+        client = GenericOpenAIAPIClient("0", "http://spark-31d6.taild500c8.ts.net:1234/v1", max_retries=1)
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_a = Path(temp_dir) / "a.jpg"
+            image_b = Path(temp_dir) / "b.jpg"
+            image_a.write_bytes(b"a")
+            image_b.write_bytes(b"b")
+            with patch.object(client.session, "post", return_value=response) as post:
+                client.generate(prompt="describe", image_paths=[str(image_a), str(image_b)], model="vision")
+
+        content = post.call_args.kwargs["json"]["messages"][0]["content"]
+        self.assertEqual([item["type"] for item in content], ["text", "image_url", "image_url"])
+        self.assertIn("YQ==", content[1]["image_url"]["url"])
+        self.assertIn("Yg==", content[2]["image_url"]["url"])
+
+    def test_operation_manual_text_client_can_use_separate_base_url(self):
+        config = Mock()
+        config.get.side_effect = lambda key, default=None: {
+            "clients": {
+                "default": "openai_api",
+                "openai_api": {
+                    "api_key": "0",
+                    "api_url": "http://vision.test/v1",
+                    "timeout_seconds": 123,
+                },
+            },
+            "operation_manual": {
+                "llm_base_url": "http://legacy.test/v1",
+                "vision_base_url": "http://vision.test/v1",
+                "text_base_url": "http://text.test/v1",
+            },
+        }.get(key, default)
+        fallback_client = Mock()
+
+        text_client = create_operation_manual_text_client(config, fallback_client)
+
+        self.assertIsInstance(text_client, GenericOpenAIAPIClient)
+        self.assertEqual(text_client.base_url, "http://text.test/v1")
+        self.assertEqual(text_client.timeout_seconds, 123)
 
     def test_frame_analysis_can_force_no_think_and_larger_token_budget(self):
         client = Mock()
@@ -700,8 +909,14 @@ class OperationManualTests(unittest.TestCase):
         self.assertIn("OCR evidence", kwargs["prompt"])
         self.assertEqual(kwargs["num_predict"], 1200)
 
-    def test_dots_mocr_default_endpoint_uses_spark_tailscale(self):
-        self.assertEqual(DOTS_MOCR_ENDPOINTS, ["http://spark-31d6.taild500c8.ts.net:8000/v1"])
+    def test_dots_mocr_default_endpoints_use_spark_and_edge_tailscale(self):
+        self.assertEqual(
+            DOTS_MOCR_ENDPOINTS,
+            [
+                "http://spark-31d6.taild500c8.ts.net:8000/v1",
+                "http://edgexpert-4353.taild500c8.ts.net:8000/v1",
+            ],
+        )
 
     def test_asr_default_endpoints_use_spark_tailscale_only(self):
         self.assertEqual(REMOTE_ASR_URLS, ["http://spark-31d6.taild500c8.ts.net:8001/api/asr/transcribe"])
@@ -755,6 +970,171 @@ class OperationManualTests(unittest.TestCase):
         self.assertEqual(len(events), 2)
         self.assertEqual(events[0].status, "unavailable")
         self.assertEqual(get.call_count, 1)
+
+    def test_run_ocr_uses_cache_without_probe_when_all_frames_hit(self):
+        frame_path = Path(tempfile.NamedTemporaryFile(suffix=".jpg", delete=False).name)
+        frame_path.write_bytes(b"cached-image")
+        frames = [Mock(number=0, timestamp=0.0, path=frame_path)]
+        ready = Mock()
+        ready.raise_for_status.return_value = None
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"choices": [{"message": {"content": '[{"text":"cached text"}]'}}]}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("video_analyzer.ocr.requests.get", return_value=ready), patch(
+                "video_analyzer.ocr.requests.post", return_value=response
+            ) as post:
+                first = run_ocr(
+                    frames,
+                    "auto",
+                    "http://ocr.test/v1",
+                    "model",
+                    "prompt_scene_spotting",
+                    cache_dir=temp_dir,
+                )
+            with patch("video_analyzer.ocr.requests.get", side_effect=RuntimeError("offline")) as get, patch(
+                "video_analyzer.ocr.requests.post"
+            ) as post_again:
+                second = run_ocr(
+                    frames,
+                    "auto",
+                    "http://ocr.test/v1",
+                    "model",
+                    "prompt_scene_spotting",
+                    cache_dir=temp_dir,
+                )
+
+        self.assertEqual(first[0].cache_status, "miss")
+        self.assertEqual(second[0].cache_status, "hit")
+        self.assertEqual(second[0].text, "cached text")
+        self.assertEqual(post.call_count, 1)
+        get.assert_not_called()
+        post_again.assert_not_called()
+        frame_path.unlink()
+
+    def test_run_ocr_refresh_ignores_cache_and_rewrites(self):
+        frame_path = Path(tempfile.NamedTemporaryFile(suffix=".jpg", delete=False).name)
+        frame_path.write_bytes(b"refresh-image")
+        frames = [Mock(number=0, timestamp=0.0, path=frame_path)]
+        ready = Mock()
+        ready.raise_for_status.return_value = None
+        first_response = Mock()
+        first_response.raise_for_status.return_value = None
+        first_response.json.return_value = {"choices": [{"message": {"content": '[{"text":"old"}]'}}]}
+        second_response = Mock()
+        second_response.raise_for_status.return_value = None
+        second_response.json.return_value = {"choices": [{"message": {"content": '[{"text":"new"}]'}}]}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("video_analyzer.ocr.requests.get", return_value=ready), patch(
+                "video_analyzer.ocr.requests.post", side_effect=[first_response, second_response]
+            ) as post:
+                run_ocr(
+                    frames,
+                    "auto",
+                    "http://ocr.test/v1",
+                    "model",
+                    "prompt_scene_spotting",
+                    cache_dir=temp_dir,
+                )
+                refreshed = run_ocr(
+                    frames,
+                    "auto",
+                    "http://ocr.test/v1",
+                    "model",
+                    "prompt_scene_spotting",
+                    cache_mode="refresh",
+                    cache_dir=temp_dir,
+                )
+
+        self.assertEqual(refreshed[0].cache_status, "refresh")
+        self.assertEqual(refreshed[0].text, "new")
+        self.assertEqual(post.call_count, 2)
+        frame_path.unlink()
+
+    def test_run_ocr_distributes_frames_across_multiple_dots_endpoints(self):
+        frame_paths = []
+        frames = []
+        for index in range(4):
+            frame_path = Path(tempfile.NamedTemporaryFile(suffix=".jpg", delete=False).name)
+            frame_path.write_bytes(f"image-{index}".encode())
+            frame_paths.append(frame_path)
+            frames.append(Mock(number=index, timestamp=float(index), path=frame_path))
+
+        ready = Mock()
+        ready.raise_for_status.return_value = None
+
+        def fake_post(url, **kwargs):
+            response = Mock()
+            response.raise_for_status.return_value = None
+            response.json.return_value = {
+                "choices": [{"message": {"content": f'[{{"text":"{url}"}}]'}}]
+            }
+            return response
+
+        with patch("video_analyzer.ocr.requests.get", return_value=ready), patch(
+            "video_analyzer.ocr.requests.post", side_effect=fake_post
+        ) as post:
+            events = run_ocr(
+                frames,
+                "auto",
+                "auto",
+                "model",
+                "prompt_scene_spotting",
+                base_urls=["http://spark-ocr/v1", "http://edge-ocr/v1"],
+                cache_mode="off",
+            )
+
+        providers = [event.provider for event in events]
+        self.assertEqual([event.frame_number for event in events], [0, 1, 2, 3])
+        self.assertEqual(sum("spark-ocr" in provider for provider in providers), 2)
+        self.assertEqual(sum("edge-ocr" in provider for provider in providers), 2)
+        self.assertEqual(post.call_count, 4)
+        for frame_path in frame_paths:
+            frame_path.unlink()
+
+    def test_run_ocr_uses_only_healthy_dots_endpoint(self):
+        frame_paths = []
+        frames = []
+        for index in range(2):
+            frame_path = Path(tempfile.NamedTemporaryFile(suffix=".jpg", delete=False).name)
+            frame_path.write_bytes(f"image-{index}".encode())
+            frame_paths.append(frame_path)
+            frames.append(Mock(number=index, timestamp=float(index), path=frame_path))
+
+        ready = Mock()
+        ready.raise_for_status.return_value = None
+
+        def fake_get(url, **kwargs):
+            if "edge-ocr" in url:
+                raise RuntimeError("offline")
+            return ready
+
+        def fake_post(url, **kwargs):
+            response = Mock()
+            response.raise_for_status.return_value = None
+            response.json.return_value = {"choices": [{"message": {"content": '[{"text":"ok"}]'}}]}
+            return response
+
+        with patch("video_analyzer.ocr.requests.get", side_effect=fake_get), patch(
+            "video_analyzer.ocr.requests.post", side_effect=fake_post
+        ):
+            events = run_ocr(
+                frames,
+                "auto",
+                "auto",
+                "model",
+                "prompt_scene_spotting",
+                base_urls=["http://spark-ocr/v1", "http://edge-ocr/v1"],
+                warmup_timeout_seconds=0,
+                cache_mode="off",
+            )
+
+        self.assertTrue(all("spark-ocr" in event.provider for event in events))
+        self.assertTrue(all(event.status == "ok" for event in events))
+        for frame_path in frame_paths:
+            frame_path.unlink()
 
     def test_dots_mocr_probe_waits_for_cold_start(self):
         first = RuntimeError("cold start")
@@ -1065,6 +1445,64 @@ class OperationManualTests(unittest.TestCase):
         self.assertIn("Frame 7", formatted)
         self.assertNotIn("Frame 4", formatted)
         self.assertLess(len(formatted), 2600)
+
+    def test_vl_context_window_uses_before_current_after(self):
+        frames = [Frame(i, Path(f"frame_{i}.jpg"), i * 5.0, 0.0) for i in range(8)]
+
+        context = build_frame_context_window(
+            frames=frames,
+            current_frame=frames[4],
+            before=3,
+            after=2,
+            max_gap_seconds="auto",
+        )
+
+        self.assertEqual([item.frame.number for item in context], [1, 2, 3, 4, 5, 6])
+        self.assertEqual([item.role for item in context], ["previous", "previous", "previous", "current", "next", "next"])
+
+    def test_vl_context_window_does_not_cross_time_breaks(self):
+        frames = [
+            Frame(0, Path("frame_0.jpg"), 0.0, 0.0),
+            Frame(1, Path("frame_1.jpg"), 5.0, 0.0),
+            Frame(2, Path("frame_2.jpg"), 10.0, 0.0),
+            Frame(3, Path("frame_3.jpg"), 80.0, 0.0),
+            Frame(4, Path("frame_4.jpg"), 85.0, 0.0),
+        ]
+
+        context = build_frame_context_window(
+            frames=frames,
+            current_frame=frames[3],
+            before=3,
+            after=2,
+            max_gap_seconds="auto",
+        )
+
+        self.assertEqual([item.frame.number for item in context], [3, 4])
+        self.assertEqual(resolve_vl_context_gap_seconds(frames, "auto"), 15.0)
+
+    def test_frame_analysis_uses_multiframe_context_images(self):
+        client = Mock()
+        client.generate.return_value = {"response": "frame ok"}
+        prompt_loader = Mock()
+        prompt_loader.get_by_index.side_effect = [
+            "Frame prompt. {PREVIOUS_FRAMES} {prompt}",
+            "Video prompt.",
+        ]
+        analyzer = VideoAnalyzer(
+            client=client,
+            model="vision",
+            prompt_loader=prompt_loader,
+            temperature=0.0,
+        )
+        frames = [Frame(i, Path(f"/tmp/frame_{i}.jpg"), i * 5.0, 0.0) for i in range(3)]
+        context = build_frame_context_window(frames, frames[1], before=1, after=1, max_gap_seconds=10)
+
+        analyzer.analyze_frame(frames[1], ocr_text="Current OCR", context_window=context, context_ocr_texts={0: "before", 2: "after"})
+
+        kwargs = client.generate.call_args.kwargs
+        self.assertEqual(kwargs["image_paths"], ["/tmp/frame_0.jpg", "/tmp/frame_1.jpg", "/tmp/frame_2.jpg"])
+        self.assertIn("CURRENT frame 1", kwargs["prompt"])
+        self.assertIn("OCR context", kwargs["prompt"])
 
     def test_vibevoice_defaults_to_remote_only(self):
         audio_path = Path(tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name)

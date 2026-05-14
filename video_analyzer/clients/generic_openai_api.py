@@ -4,7 +4,7 @@ import time
 import re
 import ipaddress
 from urllib.parse import urlparse
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, List
 from .llm_client import LLMClient
 import logging
 
@@ -14,13 +14,24 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_RETRIES = 3
 RATE_LIMIT_WAIT_TIME = 25  # seconds
 DEFAULT_WAIT_TIME = 25  # seconds
+DEFAULT_TIMEOUT_SECONDS = 600
 
 class GenericOpenAIAPIClient(LLMClient):
-    def __init__(self, api_key: str, api_url: str, max_retries: int = DEFAULT_MAX_RETRIES):
+    def __init__(
+        self,
+        api_key: str,
+        api_url: str,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    ):
         self.api_key = api_key
         self.base_url = api_url.rstrip('/')  # Remove trailing slash if present
         self.generate_url = f"{self.base_url}/chat/completions"
         self.max_retries = max_retries
+        self.timeout_seconds = timeout_seconds
+        self.session = requests.Session()
+        if self._should_bypass_env_proxy():
+            self.session.trust_env = False
 
     def generate(self,
         prompt: str,
@@ -28,18 +39,21 @@ class GenericOpenAIAPIClient(LLMClient):
         stream: bool = False,
         model: str = "llama3.2-vision",
         temperature: float = 0.2,
-        num_predict: int = 256) -> Dict[Any, Any]:
+        num_predict: int = 256,
+        image_paths: Optional[List[str]] = None) -> Dict[Any, Any]:
         """Generate response from OpenAI-compatible API."""
         # Prepare request content
-        if image_path:
-            base64_image = self.encode_image(image_path)
-            content = [
-                {"type": "text", "text": prompt},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
-                }
-            ]
+        paths = image_paths or ([image_path] if image_path else [])
+        if paths:
+            content = [{"type": "text", "text": prompt}]
+            for path in paths:
+                base64_image = self.encode_image(path)
+                content.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
+                    }
+                )
         else:
             content = prompt
 
@@ -63,7 +77,12 @@ class GenericOpenAIAPIClient(LLMClient):
         # Try request with retries
         for attempt in range(self.max_retries):
             try:
-                response = requests.post(self.generate_url, headers=headers, json=data, timeout=180)
+                response = self.session.post(
+                    self.generate_url,
+                    headers=headers,
+                    json=data,
+                    timeout=self.timeout_seconds,
+                )
                 if response.status_code >= 400:
                     detail = response.text[:1000]
                     raise requests.exceptions.HTTPError(
@@ -134,7 +153,18 @@ class GenericOpenAIAPIClient(LLMClient):
             return True
         try:
             address = ipaddress.ip_address(host)
-            return address.is_private or address.is_loopback
+            return address.is_private or address.is_loopback or address in ipaddress.ip_network("100.64.0.0/10")
+        except ValueError:
+            return host.endswith(".local") or host.endswith(".lan") or host.endswith(".taild500c8.ts.net")
+
+    def _should_bypass_env_proxy(self) -> bool:
+        parsed = urlparse(self.base_url)
+        host = parsed.hostname or ""
+        if host in {"localhost", "127.0.0.1", "::1"}:
+            return True
+        try:
+            address = ipaddress.ip_address(host)
+            return address.is_private or address.is_loopback or address in ipaddress.ip_network("100.64.0.0/10")
         except ValueError:
             return host.endswith(".local") or host.endswith(".lan") or host.endswith(".taild500c8.ts.net")
 
