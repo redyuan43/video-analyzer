@@ -12,6 +12,18 @@ from .ocr import OCREvent
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_MAX_FRAME_EVIDENCE_CHARS = 70_000
+
+
+def _truncate_evidence_text(value: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    value = value.strip()
+    if len(value) <= max_chars:
+        return value
+    marker = f"\n[已截断，原始长度 {len(value)} 字符；完整证据见 manual_evidence.md / analysis.json]"
+    return value[: max(0, max_chars - len(marker))].rstrip() + marker
+
 
 def read_context_file(path: Optional[str]) -> str:
     if not path:
@@ -31,10 +43,14 @@ def build_operation_manual_prompt(
     page_context: str,
     language: str,
     frame_assets: Optional[Dict[int, str]] = None,
+    max_frame_evidence_chars: int = DEFAULT_MAX_FRAME_EVIDENCE_CHARS,
 ) -> str:
     frame_notes = []
     frame_assets = frame_assets or {}
     ocr_by_frame = {event.frame_number: event for event in ocr_events}
+    per_frame_budget = max(max_frame_evidence_chars // max(len(frames), 1), 180)
+    visual_budget = max(int(per_frame_budget * 0.62), 100)
+    ocr_budget = max(int(per_frame_budget * 0.30), 60)
     for frame, analysis in zip(frames, frame_analyses):
         ocr = ocr_by_frame.get(frame.number)
         ocr_text = ocr.text if ocr and ocr.text else ""
@@ -45,12 +61,13 @@ def build_operation_manual_prompt(
                 [
                     f"Frame {frame.number} at {frame.timestamp:.2f}s",
                     f"Markdown image path: {image_path}",
-                    f"Visual analysis: {analysis.get('response', '')}",
+                    f"Visual analysis: {_truncate_evidence_text(analysis.get('response', ''), visual_budget)}",
                     f"OCR status: {ocr_status}",
-                    f"OCR text: {ocr_text}",
+                    f"OCR text: {_truncate_evidence_text(ocr_text, ocr_budget)}",
                 ]
             )
         )
+    frame_evidence = _truncate_evidence_text("\n\n".join(frame_notes), max_frame_evidence_chars)
 
     transcript_text = transcript.text if transcript else ""
     transcript_segments = json.dumps(transcript.segments, ensure_ascii=False, indent=2) if transcript else "[]"
@@ -92,7 +109,7 @@ ASR strategy evidence:
 {asr_metadata_text}
 
 Frame evidence:
-{chr(10).join(frame_notes)}
+{frame_evidence}
 
 Return Markdown with these sections:
 1. 概览
@@ -139,6 +156,7 @@ def generate_operation_manual(
     temperature: float,
     frame_assets: Optional[Dict[int, str]] = None,
     no_think: bool = False,
+    max_frame_evidence_chars: int = DEFAULT_MAX_FRAME_EVIDENCE_CHARS,
 ) -> Dict[str, Any]:
     prompt = build_operation_manual_prompt(
         frame_analyses=frame_analyses,
@@ -149,6 +167,7 @@ def generate_operation_manual(
         page_context=page_context,
         language=language,
         frame_assets=frame_assets,
+        max_frame_evidence_chars=max_frame_evidence_chars,
     )
     if no_think:
         prompt = f"/no_think\n{prompt}"
