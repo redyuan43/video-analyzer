@@ -9,6 +9,7 @@
 - Prefer `rg` for code and documentation search.
 - Operation-manual run scripts must bypass local proxy variables for LAN/Tailscale endpoints. Source `tools/operation_manual_no_proxy_env.sh` instead of letting `HTTP_PROXY`/`ALL_PROXY` route Spark, Edge, AMD Fast, or Jetson traffic through local proxies such as `127.0.0.1:10808`.
 - Keep DotsMOCR OCR endpoint configuration on stable MagicDNS names. The OCR client has a runtime fallback that uses `tailscale status --json` to resolve the current Tailscale IP if MagicDNS lookup fails.
+- If the user's request is clearly part of an ongoing implementation or says to continue, keep executing the next required step instead of stopping at a status update. Report concise progress, then continue until the task is genuinely blocked or complete.
 
 ## Operation Manual Runtime
 
@@ -91,10 +92,50 @@ A passing dual-worker response includes:
 ## Jetson Frame Extraction
 
 - For long operation-manual videos, prefer Jetson candidate-frame extraction instead of local CPU/OpenCV scanning.
-- Use `--frame-extractor jetson --jetson-frame-hosts nx2,nx3` for strict dual-worker mode. The current validated transport is SSH concurrent workers; Ray is only a reserved backend name for this path.
-- The NX workers are on-demand, not daemons: the local pipeline pushes `worker.py`, syncs/caches the video, runs both chunks, pulls candidates back, and merges locally.
+- For long podcast/talk videos, do not scan at `1fps` by default. Use the scripted fast path with subtitles and a sparse visual scan:
+  `tools/run_long_talk_fast_from_url.sh URL --keep-existing`
+  This path should use subtitles as transcript when available, skip audio ASR with `--asr-provider none`, disable VL with `--vl-frame-policy none`, use Jetson workers, require hardware decode, and sample at `--jetson-sample-fps 0.5` (one preview frame every 2 seconds).
+- The current validated long-talk worker set is:
+  `--jetson-frame-hosts nx1,nx2,nx3,nx4,agx`
+  Use equal-weight splitting across the five devices. Do not give AGX double segment weight by default; the measured 3.8-hour sample showed AGX became the tail when assigned two slices.
+- Hardware decode is mandatory for long-video Jetson extraction. Before claiming a worker is healthy, verify the worker `health` result reports `decode_backend` containing `nvdec`. The current expected backend is `ffmpeg-nvdec` on `nx1`, `nx2`, `nx3`, `nx4`, and `agx`. Do not silently fall back to software `ffmpeg` for long videos.
+- The current validated long-talk transport is Ray. Use `tools/start_jetson_frame_ray.sh` before long-video runs; it verifies the AGX Ray head and all five host resources, and restarts the cluster only when the resource set is incomplete.
+- Ray worker subprocesses must not inherit an empty `CUDA_VISIBLE_DEVICES`. On AGX, `ffmpeg -c:v h264_nvv4l2dec` can SIGSEGV under Ray when `CUDA_VISIBLE_DEVICES=""`; remove that variable before launching the frame worker subprocess.
+- The SSH workers are on-demand, not daemons: the local pipeline pushes `worker.py`, syncs/caches the video, runs chunks, pulls candidates back, and merges locally.
+- For Ray conversion, do not rely on the local `.venv` as the driver because it uses Python 3.14 and Ray wheels may be unavailable. The Jetson devices use Python 3.10, so run the Ray head/driver on a device, preferably AGX when available, and have NX devices join as Ray workers. If the Ray head disappears during a job, expect the job to fail; scripts may choose a new head before a run, but Ray will not automatically keep the current job alive by electing a replacement head.
 - Human one-command path for the current long sample is:
   `OCR_CACHE=refresh tools/run_s36ri23_fast_full.sh`
 - Check worker readiness with:
   `tools/check_jetson_frame_workers.sh`
 - Detailed operations, public CLI/API flags, maintenance commands, and the measured baseline live in `docs/JETSON_FRAME_WORKERS.md` and `.codex/skills/jetson-frame-extraction/SKILL.md`.
+
+## Jetson LAN Sync
+
+- Use Tailscale/MagicDNS as the control plane to reach devices and repair SSH state, but use `192.168.31.x` LAN addresses as the data plane for large video transfers between Jetson workers.
+- Current LAN identities:
+  - `nx1`: `nx@192.168.31.40`, Tailscale `100.119.5.57`
+  - `nx2`: `nx@192.168.31.68`, Tailscale `100.123.222.45`
+  - `nx3`: `nx@192.168.31.35`, Tailscale `100.127.71.86`
+  - `nx4`: `nx@192.168.31.10`, Tailscale `100.82.227.71`
+  - `agx`: `agx@192.168.31.201`, Tailscale `100.103.199.121`
+- All `nx*` device passwords are `nx`; AGX password is `agx`. Prefer using those only to bootstrap public-key auth, then keep automated runs passwordless.
+- Before large syncs, validate LAN mesh with direct device-to-device SSH, for example:
+  `ssh nx1 "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new nx@192.168.31.10 hostname"`
+  Every source device should be able to SSH to every peer LAN IP with `BatchMode=yes`.
+- If LAN SSH fails, fix the root cause instead of falling back to local retransmission:
+  - stale host key: run `ssh-keygen -f ~/.ssh/known_hosts -R <LAN_IP>` on the source device, then reconnect with `StrictHostKeyChecking=accept-new`;
+  - missing auth: collect the source device public key through the working Tailscale alias and append it to the target user's `~/.ssh/authorized_keys`;
+  - wrong user: use `nx@...` for NX devices and `agx@...` for AGX.
+- The video cache sync should be seed-to-peer over LAN. Do not repeatedly upload the same multi-GB video from the local machine to every worker. For multiple missing peers, sync in parallel from the seed where possible.
+- A full cached video should appear under:
+  `~/.cache/video-analyzer/frame-worker/videos/video-<size>-<mtime>.mp4`
+  Partial rsync files such as `.video-*.mp4.*` mean the cache is not ready yet.
+
+## Network And Proxy Notes
+
+- Keep proxy behavior split by domain:
+  - YouTube/yt-dlp metadata and subtitle/comment download may use the local proxy if direct access fails.
+  - LAN/Tailscale model endpoints, Jetson workers, Ray nodes, and rsync must bypass proxy variables.
+- When installing or starting distributed runtime components on Jetson devices, clear proxy variables unless intentionally needed:
+  `env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy ...`
+- If `pip` or another installer hangs on a Jetson device, check for inherited proxy settings and stuck `python3 -m pip` processes before waiting indefinitely.

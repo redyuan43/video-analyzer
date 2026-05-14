@@ -49,6 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vl-context-max-gap")
     parser.add_argument("--duration", type=float, help="Optional duration in seconds to process")
     parser.add_argument("--manual-language")
+    parser.add_argument("--asr-provider", choices=["none", "vibevoice"], help="Analyzer ASR provider when no subtitle transcript is used")
     parser.add_argument("--vibevoice-url", help="Remote GPU VibeVoice ASR endpoint")
     parser.add_argument("--ocr-base-url", action="append", help="DotsMOCR OpenAI-compatible base URL; can be provided multiple times")
     parser.add_argument("--ocr-concurrency", help="OCR concurrency per endpoint, or auto")
@@ -61,6 +62,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text-model")
     parser.add_argument("--cookies-from-browser", help="Forward to yt-dlp, e.g. chrome, chromium, firefox, brave")
     parser.add_argument("--cookies", help="Forward cookies.txt to yt-dlp")
+    parser.add_argument("--ytdlp-proxy", help="Proxy URL used only by yt-dlp download/metadata requests")
+    parser.add_argument("--refresh-context", action="store_true", help="Refresh page context, subtitles, and comments without redownloading an existing video")
+    parser.add_argument(
+        "--prefer-subtitle-transcript",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use downloaded author/automatic subtitles as transcript and skip audio ASR when available",
+    )
+    parser.add_argument("--transcript-file", help="Existing transcript markdown file passed through to the analyzer")
+    parser.add_argument("--frame-extractor", choices=["local", "jetson", "auto"])
+    parser.add_argument("--jetson-frame-hosts")
+    parser.add_argument("--jetson-frame-backend", choices=["auto", "ssh", "ray"])
+    parser.add_argument("--jetson-sample-fps")
+    parser.add_argument("--jetson-chunk-overlap-seconds", type=float)
+    parser.add_argument("--jetson-frame-weights")
+    parser.add_argument("--jetson-require-hwdec", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--download-only", action="store_true", help="Only download video and page context")
     parser.add_argument("--keep-existing", action="store_true", help="Reuse existing video/context if present")
     parser.add_argument("--no-keep-frames", action="store_true", help="Do not keep extracted frames after analysis")
@@ -100,6 +117,7 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
         "vl_context_after": profile.get("vl_context_after", 0),
         "vl_context_max_gap": profile.get("vl_context_max_gap", "auto"),
         "manual_language": profile.get("manual_language", "zh-CN"),
+        "asr_provider": profile.get("asr_provider", "vibevoice"),
         "vibevoice_url": profile.get("vibevoice_url"),
         "ocr_base_url": profile.get("ocr_base_urls") or profile.get("ocr_base_url"),
         "ocr_concurrency": profile.get("ocr_concurrency", "auto"),
@@ -114,6 +132,14 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
         "include_comments": profile.get("include_comments", True),
         "max_comments": profile.get("max_comments", 30),
         "subtitle_langs": profile.get("subtitle_langs", FALLBACK_SUBTITLE_LANGS),
+        "prefer_subtitle_transcript": profile.get("prefer_subtitle_transcript", False),
+        "frame_extractor": profile.get("frame_extractor", "local"),
+        "jetson_frame_hosts": profile.get("jetson_frame_hosts", "nx2,nx3"),
+        "jetson_frame_backend": profile.get("jetson_frame_backend", "auto"),
+        "jetson_sample_fps": profile.get("jetson_sample_fps", "auto"),
+        "jetson_chunk_overlap_seconds": profile.get("jetson_chunk_overlap_seconds", 2.0),
+        "jetson_frame_weights": profile.get("jetson_frame_weights", ""),
+        "jetson_require_hwdec": bool(profile.get("jetson_require_hwdec", False)),
     }
     for key, value in defaults.items():
         if getattr(args, key, None) is None and value is not None:
@@ -140,11 +166,15 @@ def main() -> int:
     info_path = video_dir / "info.json"
     description_path = video_dir / "description.md"
     page_context_path = video_dir / "page_context.md"
-    if args.keep_existing and video_path.exists() and page_context_path.exists():
+    if args.keep_existing and video_path.exists() and page_context_path.exists() and not args.refresh_context:
         print(f"[download] reusing {video_path}")
+        info = load_downloaded_info(video_dir) or info
     else:
-        download_video(args.url, video_dir, args)
-        materialize_download(video_dir, video_path)
+        if args.keep_existing and video_path.exists():
+            download_context_assets(args.url, video_dir, args)
+        else:
+            download_video(args.url, video_dir, args)
+            materialize_download(video_dir, video_path)
         info = load_downloaded_info(video_dir) or info
         info_path.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
         description_text = build_context_markdown(info, args.url)
@@ -158,6 +188,15 @@ def main() -> int:
         print(f"[download] video: {video_path}")
         print(f"[download] description: {description_path}")
         print(f"[download] context: {page_context_path}")
+
+    if args.prefer_subtitle_transcript and not args.transcript_file:
+        transcript_path = materialize_subtitle_transcript(video_dir, info)
+        if transcript_path:
+            args.transcript_file = str(transcript_path)
+            args.asr_provider = "none"
+            print(f"[download] subtitle transcript: {transcript_path}")
+        else:
+            print("[download] subtitle transcript: not available; analyzer will use configured ASR")
 
     if args.download_only:
         return 0
@@ -187,6 +226,7 @@ def ensure_tool(name: str) -> None:
 
 def fetch_metadata(url: str, args: argparse.Namespace) -> dict[str, Any]:
     command = ["yt-dlp", "--dump-single-json", "--no-warnings", "--skip-download", url]
+    add_ytdlp_network_args(command, args)
     add_cookie_args(command, args)
     raw = subprocess.check_output(command, text=True)
     return json.loads(raw)
@@ -210,6 +250,27 @@ def download_video(url: str, video_dir: Path, args: argparse.Namespace) -> None:
         command.extend(["--write-subs", "--write-auto-subs", "--sub-langs", subtitle_langs_for_ytdlp(args.subtitle_langs)])
     if args.include_comments:
         command.append("--write-comments")
+    add_ytdlp_network_args(command, args)
+    add_cookie_args(command, args)
+    subprocess.run(command, check=True)
+
+
+def download_context_assets(url: str, video_dir: Path, args: argparse.Namespace) -> None:
+    command = [
+        "yt-dlp",
+        "--no-playlist",
+        "--skip-download",
+        "--write-info-json",
+        "--write-description",
+        "-o",
+        str(video_dir / "download.%(ext)s"),
+        url,
+    ]
+    if args.include_subtitles:
+        command.extend(["--write-subs", "--write-auto-subs", "--sub-langs", subtitle_langs_for_ytdlp(args.subtitle_langs)])
+    if args.include_comments:
+        command.append("--write-comments")
+    add_ytdlp_network_args(command, args)
     add_cookie_args(command, args)
     subprocess.run(command, check=True)
 
@@ -228,6 +289,11 @@ def add_cookie_args(command: list[str], args: argparse.Namespace) -> None:
         command.extend(["--cookies-from-browser", args.cookies_from_browser])
     if args.cookies:
         command.extend(["--cookies", args.cookies])
+
+
+def add_ytdlp_network_args(command: list[str], args: argparse.Namespace) -> None:
+    if getattr(args, "ytdlp_proxy", None):
+        command.extend(["--proxy", args.ytdlp_proxy])
 
 
 def materialize_download(video_dir: Path, video_path: Path) -> None:
@@ -342,6 +408,58 @@ def collect_subtitles(video_dir: Path, info: dict[str, Any], args: argparse.Name
         ]
     )
     return {"markdown": markdown, "metadata": metadata}
+
+
+def materialize_subtitle_transcript(video_dir: Path, info: dict[str, Any]) -> Path | None:
+    files = [path for path in video_dir.glob("download.*") if path.suffix.lower() in {".vtt", ".srt", ".json3"}]
+    if not files:
+        return None
+    context_metadata_path = video_dir / "page_context.json"
+    preferred: list[str] = []
+    if context_metadata_path.exists():
+        try:
+            metadata = json.loads(context_metadata_path.read_text(encoding="utf-8"))
+            language = (((metadata.get("subtitles") or {}).get("language")) or "").strip()
+            if language:
+                preferred.append(language)
+        except Exception:
+            preferred = []
+    chosen = choose_subtitle_file(files, preferred, info)
+    cleaned = clean_subtitle_file(chosen)
+    segments = parse_cleaned_subtitle_segments(cleaned)
+    if not segments:
+        return None
+
+    transcript_path = video_dir / "subtitle_transcript.md"
+    language = infer_subtitle_lang(chosen)
+    lines = [
+        "# Transcript",
+        "",
+        f"- Language: {language}",
+        f"- Segments: {len(segments)}",
+        "",
+        "- Source: subtitle via yt-dlp",
+        f"- Raw file: {chosen}",
+        "",
+    ]
+    lines.extend(f"- [{start} - {end}] {text}" for start, end, text in segments)
+    transcript_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return transcript_path
+
+
+def parse_cleaned_subtitle_segments(text: str) -> list[tuple[str, str, str]]:
+    segments = []
+    pattern = re.compile(
+        r"^\[(?P<start>\d\d:\d\d:\d\d)(?:\.\d+)?\s+(?:-->|-)\s+(?P<end>\d\d:\d\d:\d\d)(?:\.\d+)?\]\s+(?P<text>.*)$"
+    )
+    for line in text.splitlines():
+        match = pattern.match(line.strip())
+        if not match:
+            continue
+        body = match.group("text").strip()
+        if body:
+            segments.append((match.group("start"), match.group("end"), body))
+    return segments
 
 
 def collect_comments(video_dir: Path, info: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
@@ -602,10 +720,6 @@ def build_analyzer_command(args: argparse.Namespace, video_path: Path, context_p
         str(run_dir),
         "--context-file",
         str(context_path),
-        "--asr-provider",
-        "vibevoice",
-        "--vibevoice-url",
-        args.vibevoice_url,
         "--ocr-provider",
         "auto",
         "--llm-base-url",
@@ -641,6 +755,30 @@ def build_analyzer_command(args: argparse.Namespace, video_path: Path, context_p
         "--vl-context-max-gap",
         str(args.vl_context_max_gap),
     ]
+    if getattr(args, "transcript_file", None):
+        command.extend(["--transcript-file", args.transcript_file, "--asr-provider", "none"])
+    else:
+        command.extend(["--asr-provider", args.asr_provider or "vibevoice"])
+        if (args.asr_provider or "vibevoice") == "vibevoice":
+            command.extend(["--vibevoice-url", args.vibevoice_url])
+    command.extend(
+        [
+            "--frame-extractor",
+            args.frame_extractor,
+            "--jetson-frame-hosts",
+            args.jetson_frame_hosts,
+            "--jetson-frame-backend",
+            args.jetson_frame_backend,
+            "--jetson-sample-fps",
+            str(args.jetson_sample_fps),
+            "--jetson-chunk-overlap-seconds",
+            str(args.jetson_chunk_overlap_seconds),
+        ]
+    )
+    if args.jetson_frame_weights:
+        command.extend(["--jetson-frame-weights", args.jetson_frame_weights])
+    if args.jetson_require_hwdec:
+        command.append("--jetson-require-hwdec")
     for endpoint in normalize_cli_list(args.ocr_base_url):
         command.extend(["--ocr-base-url", endpoint])
     command.extend(

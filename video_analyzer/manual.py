@@ -13,6 +13,9 @@ from .ocr import OCREvent
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_FRAME_EVIDENCE_CHARS = 70_000
+DEFAULT_MAX_TRANSCRIPT_TEXT_CHARS = 90_000
+DEFAULT_MAX_TRANSCRIPT_SEGMENTS_CHARS = 50_000
+DEFAULT_MAX_PAGE_CONTEXT_CHARS = 30_000
 
 
 def _truncate_evidence_text(value: str, max_chars: int) -> str:
@@ -23,6 +26,67 @@ def _truncate_evidence_text(value: str, max_chars: int) -> str:
         return value
     marker = f"\n[已截断，原始长度 {len(value)} 字符；完整证据见 manual_evidence.md / analysis.json]"
     return value[: max(0, max_chars - len(marker))].rstrip() + marker
+
+
+def _truncate_balanced_text(value: str, max_chars: int, label: str) -> str:
+    if max_chars <= 0:
+        return ""
+    value = value.strip()
+    if len(value) <= max_chars:
+        return value
+    marker = f"\n[{label}已压缩，原始长度 {len(value)} 字符；保留开头、中段、结尾，完整内容见 transcript.md / analysis.json]\n"
+    remaining = max_chars - len(marker)
+    if remaining <= 0:
+        return marker.strip()
+    head = remaining // 3
+    middle = remaining // 3
+    tail = remaining - head - middle
+    mid_start = max((len(value) // 2) - (middle // 2), head)
+    return (
+        value[:head].rstrip()
+        + marker
+        + value[mid_start : mid_start + middle].strip()
+        + marker
+        + value[-tail:].lstrip()
+    )
+
+
+def _format_transcript_segments(segments: List[Dict[str, Any]], max_chars: int) -> str:
+    if not segments or max_chars <= 0:
+        return "[]"
+
+    def line_for(segment: Dict[str, Any]) -> str:
+        start = segment.get("start", "")
+        end = segment.get("end", "")
+        text = str(segment.get("text") or "").replace("\n", " ").strip()
+        return f"[{start}-{end}] {text}"
+
+    lines = [line_for(segment) for segment in segments]
+    full_text = "\n".join(lines)
+    if len(full_text) <= max_chars:
+        return full_text
+
+    marker = (
+        f"[Transcript segments sampled: {len(segments)} segments, "
+        f"original {len(full_text)} chars; full data in transcript.md / analysis.json]"
+    )
+    budget = max(max_chars - len(marker) - 2, 0)
+    if budget <= 0:
+        return marker
+
+    selected: List[str] = []
+    used_indices = set()
+    step = max(len(lines) // 240, 1)
+    for index in list(range(0, len(lines), step)) + [len(lines) - 1]:
+        if index in used_indices:
+            continue
+        candidate = lines[index]
+        projected = len("\n".join(selected + [candidate]))
+        if projected > budget:
+            break
+        selected.append(candidate)
+        used_indices.add(index)
+    return marker + "\n" + "\n".join(selected)
 
 
 def read_context_file(path: Optional[str]) -> str:
@@ -69,10 +133,19 @@ def build_operation_manual_prompt(
         )
     frame_evidence = _truncate_evidence_text("\n\n".join(frame_notes), max_frame_evidence_chars)
 
-    transcript_text = transcript.text if transcript else ""
-    transcript_segments = json.dumps(transcript.segments, ensure_ascii=False, indent=2) if transcript else "[]"
+    transcript_text = _truncate_balanced_text(
+        transcript.text if transcript else "",
+        DEFAULT_MAX_TRANSCRIPT_TEXT_CHARS,
+        "Transcript",
+    )
+    transcript_segments = (
+        _format_transcript_segments(transcript.segments or [], DEFAULT_MAX_TRANSCRIPT_SEGMENTS_CHARS)
+        if transcript
+        else "[]"
+    )
     asr_metadata_text = json.dumps(asr_metadata or {}, ensure_ascii=False, indent=2)
     asr_rules = _build_asr_rules(asr_metadata or {})
+    page_context = _truncate_balanced_text(page_context, DEFAULT_MAX_PAGE_CONTEXT_CHARS, "Page context")
 
     return f"""
 You are converting an installation or operation video into a precise operating manual.

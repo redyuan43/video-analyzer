@@ -2,6 +2,7 @@ import argparse
 from pathlib import Path
 import json
 import logging
+import re
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -41,6 +42,9 @@ from .ocr import run_ocr
 
 # Initialize logger at module level
 logger = logging.getLogger(__name__)
+TRANSCRIPT_LINE_RE = re.compile(
+    r"^-\s+\[(?P<start>\d\d:\d\d:\d\d)\s+-\s+(?P<end>\d\d:\d\d:\d\d)\]\s+(?P<text>.*)$"
+)
 
 def get_log_level(level_str: str) -> int:
     """Convert string log level to logging constant."""
@@ -52,6 +56,61 @@ def get_log_level(level_str: str) -> int:
         'CRITICAL': logging.CRITICAL
     }
     return levels.get(level_str.upper(), logging.INFO)
+
+
+def seconds_from_timestamp(value: str) -> float:
+    hours, minutes, seconds = [int(part) for part in value.split(":")]
+    return float(hours * 3600 + minutes * 60 + seconds)
+
+
+def read_transcript_markdown(path: Path) -> AudioTranscript:
+    text = path.read_text(encoding="utf-8")
+    language = ""
+    segments = []
+    full_text = []
+    for line in text.splitlines():
+        if line.startswith("- Language:"):
+            language = line.split(":", 1)[1].strip()
+            continue
+        match = TRANSCRIPT_LINE_RE.match(line)
+        if not match:
+            continue
+        segment_text = match.group("text").strip()
+        if not segment_text:
+            continue
+        segments.append(
+            {
+                "start": seconds_from_timestamp(match.group("start")),
+                "end": seconds_from_timestamp(match.group("end")),
+                "text": segment_text,
+            }
+        )
+        full_text.append(segment_text)
+    if not segments:
+        full_text = [
+            line.strip()
+            for line in text.splitlines()
+            if line.strip()
+            and not line.startswith("#")
+            and not line.startswith("- Language:")
+            and not line.startswith("- Segments:")
+        ]
+    return AudioTranscript(text="\n".join(full_text).strip(), segments=segments, language=language)
+
+
+def parse_jetson_frame_weights(value: str | None) -> dict[str, float]:
+    if not value:
+        return {}
+    weights: dict[str, float] = {}
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise argparse.ArgumentTypeError(f"Invalid Jetson frame weight entry: {item}")
+        host, weight = item.split("=", 1)
+        weights[host.strip()] = max(float(weight), 0.1)
+    return weights
 
 def cleanup_files(output_dir: Path):
     """Clean up temporary files and directories."""
@@ -266,6 +325,7 @@ def main():
     parser.add_argument("--asr-strategy", choices=["fast", "balanced", "deep"], help="Dual-ASR strategy for operation manuals")
     parser.add_argument("--remote-asr-url", action="append", help="Remote fast ASR endpoint; can be provided multiple times")
     parser.add_argument("--vibevoice-url", action="append", help="Remote GPU VibeVoice ASR endpoint; can be provided multiple times")
+    parser.add_argument("--transcript-file", type=str, help="Use an existing transcript markdown file and skip audio ASR")
     parser.add_argument("--context-file", type=str, help="Extra page/video context file")
     parser.add_argument("--pipeline-mode", choices=["fast", "balanced", "deep"], default="balanced", help="Operation manual pipeline depth")
     parser.add_argument("--candidate-frames", type=parse_auto_int_arg, default=AUTO, help="auto or explicit candidate frame pool size")
@@ -274,6 +334,13 @@ def main():
     parser.add_argument("--jetson-frame-backend", choices=["auto", "ssh", "ray"], default="auto", help="Jetson frame worker transport")
     parser.add_argument("--jetson-sample-fps", default="auto", help="auto or preview sample fps used by Jetson frame workers")
     parser.add_argument("--jetson-chunk-overlap-seconds", type=float, default=2.0, help="Overlap seconds between Jetson frame chunks")
+    parser.add_argument("--jetson-frame-weights", help="Comma-separated Jetson frame worker weights, e.g. nx1=1,nx2=1,agx=2")
+    parser.add_argument(
+        "--jetson-require-hwdec",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Require Jetson workers to use hardware video decode instead of software ffmpeg",
+    )
     parser.add_argument("--min-vl-frames", type=parse_auto_int_arg, default=AUTO, help="auto or minimum frames sent to VL")
     parser.add_argument("--max-vl-frames", type=parse_auto_int_arg, default=AUTO, help="auto or maximum frames sent to VL")
     parser.add_argument("--vl-frame-policy", choices=["auto", "all", "none"], default="auto", help="VL frame execution policy")
@@ -327,67 +394,79 @@ def main():
         
         # Stage 1: Frame and Audio Processing
         if args.start_stage <= 1:
-            logger.info("Extracting audio from video...")
             stage_started = time.perf_counter()
-            try:
-                audio_path = extract_audio_to_wav(video_path, output_dir)
-            except Exception as e:
-                logger.error(f"Error extracting audio: {e}")
-                audio_path = None
-            
-            if audio_path is None:
-                logger.debug("No audio found in video - skipping transcription")
-                transcript = None
+            if args.transcript_file:
+                transcript_path = Path(args.transcript_file)
+                logger.info("Using existing transcript file: %s", transcript_path)
+                transcript = read_transcript_markdown(transcript_path)
+                asr_result = ASRStrategyResult(
+                    strategy="external_transcript_file",
+                    transcript=transcript,
+                    fast_transcript=transcript,
+                    providers_run=["external_transcript_file"],
+                )
+                transcript_markdown_path = write_transcript_markdown(transcript, output_dir / "transcript.md")
             else:
-                logger.info("Transcribing audio...")
-                asr_config = config.get("asr", {})
-                provider = asr_config.get("provider", "faster_whisper")
-                use_asr_strategy = task == "operation_manual" and args.asr_provider is None and provider == "auto"
-                if use_asr_strategy:
-                    asr_result = transcribe_with_strategy(
-                        strategy=asr_config.get("strategy", "balanced"),
-                        audio_path=audio_path,
-                        language=config.get("audio", {}).get("language", ""),
-                        whisper_model=config.get("audio", {}).get("whisper_model", "medium"),
-                        device=config.get("audio", {}).get("device", "cpu"),
-                        vibevoice_config=asr_config.get("vibevoice", {}),
-                    )
-                    transcript = asr_result.transcript
-                elif provider == "faster_whisper":
-                    audio_processor = AudioProcessor(
-                        language=config.get("audio", {}).get("language", ""),
-                        model_size_or_path=config.get("audio", {}).get("whisper_model", "medium"),
-                        device=config.get("audio", {}).get("device", "cpu"),
-                    )
-                    transcript = audio_processor.transcribe(audio_path)
+                logger.info("Extracting audio from video...")
+                try:
+                    audio_path = extract_audio_to_wav(video_path, output_dir)
+                except Exception as e:
+                    logger.error(f"Error extracting audio: {e}")
+                    audio_path = None
+
+                if audio_path is None:
+                    logger.debug("No audio found in video - skipping transcription")
+                    transcript = None
                 else:
-                    asr_result = transcribe_with_provider_result(
-                        provider=provider,
-                        audio_path=audio_path,
-                        language=config.get("audio", {}).get("language", ""),
-                        whisper_model=config.get("audio", {}).get("whisper_model", "medium"),
-                        device=config.get("audio", {}).get("device", "cpu"),
-                        vibevoice_config=asr_config.get("vibevoice", {}),
-                    )
-                    transcript = asr_result.transcript
-                if asr_result is None:
-                    asr_result = ASRStrategyResult(
-                        strategy=f"provider:{provider}",
-                        transcript=transcript,
-                        fast_transcript=transcript,
-                        providers_run=[] if provider == "none" else [provider],
-                    )
-                if transcript is None:
-                    require_transcript = bool(asr_config.get("require_transcript", task == "operation_manual"))
-                    if require_transcript and provider != "none":
-                        failures = "; ".join(asr_result.failures or asr_result.merge_notes) if asr_result else ""
-                        raise RuntimeError(
-                            "Required ASR transcript was not produced. Check the configured Spark ASR/VibeVoice "
-                            f"endpoint health instead of falling back to another device. {failures}".strip()
+                    logger.info("Transcribing audio...")
+                    asr_config = config.get("asr", {})
+                    provider = asr_config.get("provider", "faster_whisper")
+                    use_asr_strategy = task == "operation_manual" and args.asr_provider is None and provider == "auto"
+                    if use_asr_strategy:
+                        asr_result = transcribe_with_strategy(
+                            strategy=asr_config.get("strategy", "balanced"),
+                            audio_path=audio_path,
+                            language=config.get("audio", {}).get("language", ""),
+                            whisper_model=config.get("audio", {}).get("whisper_model", "medium"),
+                            device=config.get("audio", {}).get("device", "cpu"),
+                            vibevoice_config=asr_config.get("vibevoice", {}),
                         )
-                    logger.warning("Could not generate reliable transcript. Proceeding with video analysis only.")
-                else:
-                    transcript_markdown_path = write_transcript_markdown(transcript, output_dir / "transcript.md")
+                        transcript = asr_result.transcript
+                    elif provider == "faster_whisper":
+                        audio_processor = AudioProcessor(
+                            language=config.get("audio", {}).get("language", ""),
+                            model_size_or_path=config.get("audio", {}).get("whisper_model", "medium"),
+                            device=config.get("audio", {}).get("device", "cpu"),
+                        )
+                        transcript = audio_processor.transcribe(audio_path)
+                    else:
+                        asr_result = transcribe_with_provider_result(
+                            provider=provider,
+                            audio_path=audio_path,
+                            language=config.get("audio", {}).get("language", ""),
+                            whisper_model=config.get("audio", {}).get("whisper_model", "medium"),
+                            device=config.get("audio", {}).get("device", "cpu"),
+                            vibevoice_config=asr_config.get("vibevoice", {}),
+                        )
+                        transcript = asr_result.transcript
+                    if asr_result is None:
+                        asr_result = ASRStrategyResult(
+                            strategy=f"provider:{provider}",
+                            transcript=transcript,
+                            fast_transcript=transcript,
+                            providers_run=[] if provider == "none" else [provider],
+                        )
+                    if transcript is None:
+                        require_transcript = bool(asr_config.get("require_transcript", task == "operation_manual"))
+                        if require_transcript and provider != "none":
+                            failures = "; ".join(asr_result.failures or asr_result.merge_notes) if asr_result else ""
+                            raise RuntimeError(
+                                "Required ASR transcript was not produced. Check the configured Spark ASR/VibeVoice "
+                                f"endpoint health instead of falling back to another device. {failures}".strip()
+                            )
+                        logger.warning("Could not generate reliable transcript. Proceeding with video analysis only.")
+                    else:
+                        transcript_markdown_path = write_transcript_markdown(transcript, output_dir / "transcript.md")
             timings["asr_seconds"] = round(time.perf_counter() - stage_started, 3)
             
             logger.info(f"Extracting frames from video using model {model}...")
@@ -418,6 +497,8 @@ def main():
                             sample_fps=args.jetson_sample_fps,
                             backend=args.jetson_frame_backend,
                             overlap_seconds=args.jetson_chunk_overlap_seconds,
+                            host_weights=parse_jetson_frame_weights(args.jetson_frame_weights),
+                            require_hardware_decode=args.jetson_require_hwdec,
                             strict=args.frame_extractor == "jetson",
                         )
                     except Exception:
