@@ -7,6 +7,8 @@
 - Do not commit or push unless the user explicitly asks for it.
 - Keep local runtime overrides in `config/config.json`; do not commit machine-specific endpoint or model configuration.
 - Prefer `rg` for code and documentation search.
+- Operation-manual run scripts must bypass local proxy variables for LAN/Tailscale endpoints. Source `tools/operation_manual_no_proxy_env.sh` instead of letting `HTTP_PROXY`/`ALL_PROXY` route Spark, Edge, AMD Fast, or Jetson traffic through local proxies such as `127.0.0.1:10808`.
+- Keep DotsMOCR OCR endpoint configuration on stable MagicDNS names. The OCR client has a runtime fallback that uses `tailscale status --json` to resolve the current Tailscale IP if MagicDNS lookup fails.
 
 ## Operation Manual Runtime
 

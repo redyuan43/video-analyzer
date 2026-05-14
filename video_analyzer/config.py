@@ -115,6 +115,16 @@ class Config:
                     self.config.setdefault("ocr", {})["cache"] = value
                 elif key == "ocr_cache_dir":
                     self.config.setdefault("ocr", {})["cache_dir"] = value
+                elif key == "ocr_timeout_seconds":
+                    self.config.setdefault("ocr", {})["timeout_seconds"] = value
+                elif key == "ocr_prompt_mode":
+                    self.config.setdefault("ocr", {})["prompt_mode"] = value
+                elif key == "ocr_max_tokens":
+                    self.config.setdefault("ocr", {})["max_tokens"] = value
+                elif key == "ocr_max_image_long_side":
+                    self.config.setdefault("ocr", {})["max_image_long_side"] = value
+                elif key == "ocr_retry_endpoints":
+                    self.config.setdefault("ocr", {})["retry_endpoints"] = value
                 elif key == "asr_provider":
                     self.config.setdefault("asr", {})["provider"] = value
                 elif key == "asr_strategy":

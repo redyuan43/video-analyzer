@@ -241,6 +241,26 @@ def main():
     parser.add_argument("--ocr-concurrency", default=None, help="OCR concurrency per endpoint, or auto")
     parser.add_argument("--ocr-cache", choices=["on", "off", "refresh"], default=None, help="OCR cache mode")
     parser.add_argument("--ocr-cache-dir", default=None, help="OCR cache directory")
+    parser.add_argument("--ocr-timeout-seconds", type=float, default=None, help="Per-frame OCR request timeout")
+    parser.add_argument(
+        "--ocr-prompt-mode",
+        choices=["prompt_scene_spotting", "prompt_layout_json", "prompt_ocr"],
+        default=None,
+        help="DotsMOCR prompt preset",
+    )
+    parser.add_argument("--ocr-max-tokens", type=int, default=None, help="DotsMOCR max output tokens per frame")
+    parser.add_argument(
+        "--ocr-max-image-long-side",
+        type=int,
+        default=None,
+        help="Resize OCR images to this longest side before upload; <=0 disables resizing",
+    )
+    parser.add_argument(
+        "--ocr-retry-endpoints",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Retry the same OCR frame on another healthy endpoint after failure",
+    )
     parser.add_argument("--asr-provider", choices=["auto", "remote_http", "capswriter_http", "vibevoice", "faster_whisper", "none"], help="ASR provider")
     parser.add_argument("--asr-strategy", choices=["fast", "balanced", "deep"], help="Dual-ASR strategy for operation manuals")
     parser.add_argument("--remote-asr-url", action="append", help="Remote fast ASR endpoint; can be provided multiple times")
@@ -460,6 +480,10 @@ def main():
                         "fallback_api_key",
                         config.get("clients", {}).get("openai_api", {}).get("api_key", "0"),
                     ),
+                    request_timeout_seconds=ocr_config.get("timeout_seconds", 120),
+                    max_tokens=ocr_config.get("max_tokens", 1024),
+                    max_image_long_side=ocr_config.get("max_image_long_side", 1280),
+                    retry_endpoints=bool(ocr_config.get("retry_endpoints", True)),
                     probe_timeout_seconds=ocr_config.get("probe_timeout_seconds", 5),
                     warmup_timeout_seconds=ocr_config.get("warmup_timeout_seconds", 180),
                     warmup_retry_interval_seconds=ocr_config.get("warmup_retry_interval_seconds", 5),
@@ -479,6 +503,10 @@ def main():
                     "effective_endpoints": ocr_provider_endpoints,
                     "effective_worker_count": len(ocr_provider_endpoints),
                     "concurrency": ocr_config.get("concurrency", "auto"),
+                    "prompt_mode": ocr_config.get("prompt_mode", "prompt_scene_spotting"),
+                    "max_tokens": ocr_config.get("max_tokens", 1024),
+                    "max_image_long_side": ocr_config.get("max_image_long_side", 1280),
+                    "retry_endpoints": bool(ocr_config.get("retry_endpoints", True)),
                     "cache_mode": ocr_config.get("cache", "on"),
                     "cache_dir": ocr_config.get("cache_dir", ".cache/video-analyzer/ocr"),
                     "cache_hits": sum(1 for event in ocr_events if event.cache_status == "hit"),

@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+source "$ROOT_DIR/tools/operation_manual_no_proxy_env.sh"
+
 VIDEO_PATH="${VIDEO_PATH:-downloads/url-videos/S36ri23-l60/video.mp4}"
 CONTEXT_FILE="${CONTEXT_FILE:-downloads/url-videos/S36ri23-l60/page_context.md}"
 RUN_NAME="${RUN_NAME:-operation-manual-fast-full-$(date +%Y%m%d-%H%M%S)}"

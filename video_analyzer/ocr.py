@@ -1,15 +1,21 @@
 import base64
 import hashlib
+import ipaddress
+import io
 import json
 import logging
 import re
+import socket
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
+from PIL import Image
 
 from .frame import Frame
 
@@ -22,6 +28,9 @@ DOTS_MOCR_ENDPOINTS = [
 
 PROMPTS = {
     "prompt_scene_spotting": (
+        "Detect and recognize the text in the image."
+    ),
+    "prompt_layout_json": (
         "Please detect and recognize all meaningful visible text in this UI or scene image. "
         "Return JSON only as an array of objects. Each object must include bbox "
         "[x1,y1,x2,y2], category, and text. Prefer exact UI labels, command text, "
@@ -71,8 +80,21 @@ class OCREvent:
         )
 
 
-def _encode_image(path: Path) -> str:
-    return base64.b64encode(path.read_bytes()).decode("utf-8")
+def _encode_image(path: Path, max_long_side: int = 1280) -> str:
+    if max_long_side <= 0:
+        return base64.b64encode(path.read_bytes()).decode("utf-8")
+
+    with Image.open(path) as image:
+        image = image.convert("RGB")
+        width, height = image.size
+        longest = max(width, height)
+        if longest > max_long_side:
+            scale = max_long_side / longest
+            resized = (max(1, int(width * scale)), max(1, int(height * scale)))
+            image = image.resize(resized, Image.Resampling.LANCZOS)
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=90, optimize=True)
+        return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
 def _hash_file(path: Path) -> str:
@@ -92,17 +114,28 @@ def _frame_image_path(frame: Frame) -> Optional[Path]:
     return None
 
 
-def _ocr_cache_key(frame: Frame, provider: str, model: str, prompt_mode: str, endpoint_family: str) -> Optional[str]:
+def _ocr_cache_key(
+    frame: Frame,
+    provider: str,
+    model: str,
+    prompt_mode: str,
+    endpoint_family: str,
+    max_tokens: int,
+    max_image_long_side: int,
+) -> Optional[str]:
     image_path = _frame_image_path(frame)
     if not image_path or not image_path.exists():
         return None
     payload = {
-        "version": 1,
+        "version": 2,
         "image_sha256": _hash_file(image_path),
         "provider": provider,
         "model": model,
         "prompt_mode": prompt_mode,
+        "prompt": PROMPTS.get(prompt_mode, PROMPTS["prompt_scene_spotting"]),
         "endpoint_family": endpoint_family,
+        "max_tokens": int(max_tokens),
+        "max_image_long_side": int(max_image_long_side),
     }
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -166,6 +199,8 @@ class DotsMOCRVLLMProvider:
         model: str = "model",
         prompt_mode: str = "prompt_scene_spotting",
         timeout: int = 120,
+        max_tokens: int = 1024,
+        max_image_long_side: int = 1280,
         probe_timeout_seconds: float = 5,
         warmup_timeout_seconds: float = 180,
         warmup_retry_interval_seconds: float = 5,
@@ -174,11 +209,14 @@ class DotsMOCRVLLMProvider:
         self.model = model
         self.prompt_mode = prompt_mode
         self.timeout = timeout
+        self.max_tokens = max_tokens
+        self.max_image_long_side = max_image_long_side
         self.probe_timeout_seconds = probe_timeout_seconds
         self.warmup_timeout_seconds = warmup_timeout_seconds
         self.warmup_retry_interval_seconds = warmup_retry_interval_seconds
         self.selected_base_url: Optional[str] = None
         self.diagnostics: List[Dict[str, str]] = []
+        self.session = _make_session(self.base_url)
 
     def probe(self) -> Optional[str]:
         endpoints = DOTS_MOCR_ENDPOINTS if self.base_url == "auto" else [self.base_url]
@@ -191,7 +229,7 @@ class DotsMOCRVLLMProvider:
             for endpoint in endpoints:
                 normalized = endpoint.rstrip("/")
                 try:
-                    response = requests.get(f"{normalized}/models", timeout=self.probe_timeout_seconds)
+                    response = self.session.get(f"{normalized}/models", timeout=self.probe_timeout_seconds)
                     response.raise_for_status()
                     elapsed = time.monotonic() - started
                     self.selected_base_url = normalized
@@ -237,7 +275,7 @@ class DotsMOCRVLLMProvider:
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": f"data:image/jpeg;base64,{_encode_image(frame.path)}"
+                                "url": f"data:image/jpeg;base64,{_encode_image(frame.path, self.max_image_long_side)}"
                             },
                         },
                         {"type": "text", "text": f"<|img|><|imgpad|><|endofimg|>{prompt}"},
@@ -246,11 +284,11 @@ class DotsMOCRVLLMProvider:
             ],
             "temperature": 0.1,
             "top_p": 0.9,
-            "max_tokens": 10000,
+            "max_tokens": self.max_tokens,
         }
 
         try:
-            response = requests.post(
+            response = self.session.post(
                 f"{base_url}/chat/completions",
                 headers={"Authorization": "Bearer 0", "Content-Type": "application/json"},
                 json=payload,
@@ -291,15 +329,18 @@ class OpenAICompatibleVisionOCRProvider:
         model: str,
         api_key: str = "0",
         timeout: int = 180,
+        max_image_long_side: int = 1280,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key or "0"
         self.timeout = timeout
+        self.max_image_long_side = max_image_long_side
+        self.session = _make_session(self.base_url)
 
     def probe(self) -> bool:
         try:
-            response = requests.get(
+            response = self.session.get(
                 f"{self.base_url}/models",
                 headers={"Authorization": f"Bearer {self.api_key}"},
                 timeout=5,
@@ -327,7 +368,7 @@ class OpenAICompatibleVisionOCRProvider:
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": f"data:image/jpeg;base64,{_encode_image(frame.path)}"
+                                "url": f"data:image/jpeg;base64,{_encode_image(frame.path, self.max_image_long_side)}"
                             },
                         },
                     ],
@@ -337,7 +378,7 @@ class OpenAICompatibleVisionOCRProvider:
             "max_tokens": 4000,
         }
         try:
-            response = requests.post(
+            response = self.session.post(
                 f"{self.base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
                 json=payload,
@@ -387,7 +428,79 @@ def _unavailable_events(frames: List[Frame], error: str) -> List[OCREvent]:
 
 
 def _normalize_endpoint(endpoint: str) -> str:
-    return endpoint.strip().rstrip("/")
+    return _resolve_tailscale_endpoint(endpoint.strip().rstrip("/"))
+
+
+def _hostname_resolves(hostname: str) -> bool:
+    try:
+        socket.getaddrinfo(hostname, None)
+        return True
+    except OSError:
+        return False
+
+
+def _resolve_tailscale_endpoint(endpoint: str) -> str:
+    parsed = urlsplit(endpoint)
+    hostname = parsed.hostname
+    if not hostname or _hostname_resolves(hostname):
+        return endpoint
+
+    fallback_ip = _tailscale_ip_for_hostname(hostname)
+    if not fallback_ip:
+        return endpoint
+
+    netloc = fallback_ip
+    if parsed.port:
+        netloc = f"{fallback_ip}:{parsed.port}"
+    logger.warning("MagicDNS failed for %s; using Tailscale IP fallback %s", hostname, fallback_ip)
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+
+def _tailscale_ip_for_hostname(hostname: str) -> Optional[str]:
+    short_name = hostname.split(".", 1)[0]
+    try:
+        completed = subprocess.run(
+            ["tailscale", "status", "--json"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        status = json.loads(completed.stdout)
+    except Exception as exc:
+        logger.debug("Unable to read tailscale status for MagicDNS fallback: %s", exc)
+        return None
+
+    peers = status.get("Peer") or {}
+    for peer in peers.values():
+        peer_names = {
+            str(peer.get("HostName") or ""),
+            str(peer.get("DNSName") or "").rstrip("."),
+        }
+        if hostname not in peer_names and short_name not in peer_names:
+            continue
+        ips = peer.get("TailscaleIPs") or []
+        return str(ips[0]) if ips else None
+    return None
+
+
+def _should_bypass_env_proxy(endpoint: str) -> bool:
+    parsed = urlsplit(endpoint)
+    host = parsed.hostname or ""
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+        return address.is_private or address.is_loopback or address in ipaddress.ip_network("100.64.0.0/10")
+    except ValueError:
+        return host.endswith(".local") or host.endswith(".lan") or host.endswith(".taild500c8.ts.net")
+
+
+def _make_session(endpoint: str) -> requests.Session:
+    session = requests.Session()
+    if _should_bypass_env_proxy(endpoint):
+        session.trust_env = False
+    return session
 
 
 def _resolve_dots_endpoints(base_url: str, base_urls: Optional[List[str]] = None) -> List[str]:
@@ -415,6 +528,9 @@ def _probe_dots_providers(
     endpoints: List[str],
     model: str,
     prompt_mode: str,
+    request_timeout_seconds: float,
+    max_tokens: int,
+    max_image_long_side: int,
     probe_timeout_seconds: float,
     warmup_timeout_seconds: float,
     warmup_retry_interval_seconds: float,
@@ -424,6 +540,9 @@ def _probe_dots_providers(
             base_url=endpoint,
             model=model,
             prompt_mode=prompt_mode,
+            timeout=int(request_timeout_seconds),
+            max_tokens=max_tokens,
+            max_image_long_side=max_image_long_side,
             probe_timeout_seconds=probe_timeout_seconds,
             warmup_timeout_seconds=warmup_timeout_seconds,
             warmup_retry_interval_seconds=warmup_retry_interval_seconds,
@@ -457,6 +576,10 @@ def run_ocr(
     fallback_base_url: Optional[str] = None,
     fallback_model: Optional[str] = None,
     fallback_api_key: str = "0",
+    request_timeout_seconds: float = 120,
+    max_tokens: int = 1024,
+    max_image_long_side: int = 1280,
+    retry_endpoints: bool = True,
     probe_timeout_seconds: float = 5,
     warmup_timeout_seconds: float = 180,
     warmup_retry_interval_seconds: float = 5,
@@ -472,7 +595,15 @@ def run_ocr(
     cache_path = Path(cache_dir) if cache_dir and _cache_mode_enabled(cache_mode) else None
 
     def cached_or_analyze(frame: Frame, provider_name: str, endpoint_family: str, analyze) -> OCREvent:
-        key = _ocr_cache_key(frame, provider_name, model, prompt_mode, endpoint_family)
+        key = _ocr_cache_key(
+            frame,
+            provider_name,
+            model,
+            prompt_mode,
+            endpoint_family,
+            max_tokens,
+            max_image_long_side,
+        )
         if key is None:
             event = analyze(frame)
             event.cache_status = "disabled"
@@ -491,7 +622,15 @@ def run_ocr(
             return None
         events = []
         for frame in frames:
-            key = _ocr_cache_key(frame, provider_name, model, prompt_mode, endpoint_family)
+            key = _ocr_cache_key(
+                frame,
+                provider_name,
+                model,
+                prompt_mode,
+                endpoint_family,
+                max_tokens,
+                max_image_long_side,
+            )
             if key is None:
                 return None
             cached = _read_cached_event(cache_path, key, frame)
@@ -507,6 +646,8 @@ def run_ocr(
             base_url=fallback_base_url,
             model=fallback_model,
             api_key=fallback_api_key,
+            timeout=int(request_timeout_seconds),
+            max_image_long_side=max_image_long_side,
         )
         endpoint_family = f"{fallback.base_url}:{fallback.model}"
         cached_events = read_all_cached("openai_vision", endpoint_family)
@@ -534,6 +675,9 @@ def run_ocr(
         endpoints=dots_endpoints,
         model=model,
         prompt_mode=prompt_mode,
+        request_timeout_seconds=request_timeout_seconds,
+        max_tokens=max_tokens,
+        max_image_long_side=max_image_long_side,
         probe_timeout_seconds=probe_timeout_seconds,
         warmup_timeout_seconds=warmup_timeout_seconds,
         warmup_retry_interval_seconds=warmup_retry_interval_seconds,
@@ -546,6 +690,8 @@ def run_ocr(
                 base_url=fallback_base_url,
                 model=fallback_model,
                 api_key=fallback_api_key,
+                timeout=int(request_timeout_seconds),
+                max_image_long_side=max_image_long_side,
             )
             if fallback.probe():
                 events = [
@@ -567,7 +713,15 @@ def run_ocr(
     pending_frames: List[Frame] = []
     if cache_mode == "on":
         for frame in frames:
-            key = _ocr_cache_key(frame, "dots_mocr_vllm", model, prompt_mode, dots_endpoint_family)
+            key = _ocr_cache_key(
+                frame,
+                "dots_mocr_vllm",
+                model,
+                prompt_mode,
+                dots_endpoint_family,
+                max_tokens,
+                max_image_long_side,
+            )
             cached = _read_cached_event(cache_path, key, frame) if key else None
             if cached:
                 cached_by_number[frame.number] = cached
@@ -580,10 +734,40 @@ def run_ocr(
     concurrency = _resolve_ocr_concurrency(ocr_concurrency)
     max_workers = max(1, len(dots_providers) * concurrency)
 
+    def analyze_with_endpoint_retry(index: int, frame: Frame) -> OCREvent:
+        attempts = len(dots_providers) if retry_endpoints else 1
+        errors = []
+        for offset in range(attempts):
+            dots = dots_providers[(index + offset) % len(dots_providers)]
+            event = dots.analyze_frame(frame)
+            if event.status == "ok":
+                if offset:
+                    logger.info(
+                        "OCR frame %s succeeded via retry endpoint %s after %s failed attempt(s)",
+                        frame.number,
+                        event.provider,
+                        offset,
+                    )
+                return event
+            errors.append(f"{event.provider}: {event.error or event.status}")
+            if offset + 1 < attempts:
+                logger.warning(
+                    "OCR frame %s failed on %s; retrying next endpoint",
+                    frame.number,
+                    event.provider,
+                )
+        last = event
+        last.error = "; ".join(errors)
+        return last
+
     def analyze_pending(index_frame: tuple[int, Frame]) -> OCREvent:
         index, frame = index_frame
-        dots = dots_providers[index % len(dots_providers)]
-        return cached_or_analyze(frame, "dots_mocr_vllm", dots_endpoint_family, dots.analyze_frame)
+        return cached_or_analyze(
+            frame,
+            "dots_mocr_vllm",
+            dots_endpoint_family,
+            lambda item: analyze_with_endpoint_retry(index, item),
+        )
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [

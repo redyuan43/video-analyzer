@@ -10,5 +10,7 @@ if [[ -d "$ROOT_DIR/.venv/bin" ]]; then
   export PATH="$ROOT_DIR/.venv/bin:$PATH"
 fi
 
+source "$ROOT_DIR/tools/operation_manual_no_proxy_env.sh"
+
 cd "$ROOT_DIR"
 exec "$PYTHON_BIN" tools/run_operation_manual_from_url.py --python "$PYTHON_BIN" "$@"
