@@ -35,6 +35,7 @@ class JetsonFrameExtractionResult:
 
 REMOTE_WORKER_SCRIPT = r"""
 import argparse
+from fractions import Fraction
 import json
 import shutil
 import subprocess
@@ -127,10 +128,20 @@ def health():
 
 
 def diff_score(path, previous):
-    current = np.asarray(Image.open(path).convert("L").resize((320, 180)), dtype=np.float32)
+    with Image.open(path) as image:
+        if image.mode != "L":
+            image = image.convert("L")
+        if image.size != (320, 180):
+            image = image.resize((320, 180))
+        current = np.asarray(image, dtype=np.float32)
     if previous is None:
         return 255.0, current
     return float(np.mean(np.abs(current - previous))), current
+
+
+def gst_framerate(value):
+    fraction = Fraction(float(value)).limit_denominator(1000)
+    return f"{fraction.numerator}/{fraction.denominator}"
 
 
 def extract_with_ffmpeg(video, output_dir, start, duration, sample_fps):
@@ -241,12 +252,121 @@ def extract_with_gstreamer(video, output_dir, start, duration, sample_fps):
     return "gstreamer-nvdec" if decoder == "nvv4l2decoder" else "gstreamer"
 
 
+def extract_gray_preview_with_gstreamer(video, output_dir, start, duration, sample_fps):
+    segment = copy_h264_segment(video, output_dir, start, duration)
+    try:
+        pipeline = [
+            "gst-launch-1.0",
+            "-q",
+            "filesrc",
+            f"location={segment}",
+            "!",
+            "h264parse",
+            "!",
+            "nvv4l2decoder",
+            "!",
+            "nvvidconv",
+            "!",
+            "video/x-raw,format=GRAY8,width=320,height=180",
+            "!",
+            "videorate",
+            "!",
+            f"video/x-raw,format=GRAY8,width=320,height=180,framerate={gst_framerate(sample_fps)}",
+            "!",
+            "jpegenc",
+            "!",
+            "multifilesink",
+            f"location={output_dir / 'preview_%06d.jpg'}",
+        ]
+        subprocess.run(pipeline, check=True, capture_output=True)
+    finally:
+        segment.unlink(missing_ok=True)
+    return "gstreamer-nvdec-vic-gray"
+
+
 def extract_frames(video, output_dir, start, duration, sample_fps, backend):
     if backend == "ffmpeg-nvdec":
         return extract_with_ffmpeg_nvdec(video, output_dir, start, duration, sample_fps)
     if backend in {"gstreamer-nvdec", "gstreamer"}:
         return extract_with_gstreamer(video, output_dir, start, duration, sample_fps)
     return extract_with_ffmpeg(video, output_dir, start, duration, sample_fps)
+
+
+def extract_preview_frames(video, output_dir, start, duration, sample_fps, status):
+    tools = status.get("tools", {})
+    if (
+        tools.get("gst-launch-1.0")
+        and tools.get("h264parse")
+        and tools.get("nvv4l2decoder")
+        and tools.get("nvvidconv")
+        and tools.get("jpegenc")
+        and tools.get("multifilesink")
+    ):
+        try:
+            return extract_gray_preview_with_gstreamer(video, output_dir, start, duration, sample_fps), None
+        except Exception as exc:
+            return extract_frames(video, output_dir, start, duration, sample_fps, status["decode_backend"]), str(exc)
+    return extract_frames(video, output_dir, start, duration, sample_fps, status["decode_backend"]), None
+
+
+def extract_highres_candidate(video, timestamp, output_path):
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-c:v",
+        "h264_nvv4l2dec",
+        "-ss",
+        f"{timestamp:.3f}",
+        "-i",
+        str(video),
+        "-frames:v",
+        "1",
+        "-q:v",
+        "3",
+        str(output_path),
+    ]
+    try:
+        subprocess.run(command, check=True, capture_output=True)
+        return "ffmpeg-nvdec"
+    except Exception:
+        fallback = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            f"{timestamp:.3f}",
+            "-i",
+            str(video),
+            "-frames:v",
+            "1",
+            "-q:v",
+            "3",
+            str(output_path),
+        ]
+        subprocess.run(fallback, check=True, capture_output=True)
+        return "ffmpeg"
+
+
+def materialize_highres_candidates(video, output_dir, candidates):
+    highres_dir = output_dir / "candidates"
+    highres_dir.mkdir(parents=True, exist_ok=True)
+    materialized = []
+    still_backends = set()
+    for index, item in enumerate(candidates):
+        timestamp = float(item["timestamp"])
+        highres_path = highres_dir / f"candidate_{index:06d}.jpg"
+        still_backends.add(extract_highres_candidate(video, timestamp, highres_path))
+        materialized.append(
+            {
+                **item,
+                "preview_path": item.get("path", ""),
+                "path": str(highres_path),
+            }
+        )
+    return materialized, sorted(still_backends)
 
 
 def shlex_quote(value):
@@ -313,16 +433,20 @@ def main():
 
     preview_dir = output_dir / "preview"
     preview_dir.mkdir(parents=True, exist_ok=True)
-    backend = extract_frames(
-        Path(args.video),
+    video = Path(args.video)
+    preview_started = time.perf_counter()
+    backend, preview_fallback = extract_preview_frames(
+        video,
         preview_dir,
         args.start,
         args.duration,
         args.sample_fps,
-        status["decode_backend"],
+        status,
     )
+    preview_seconds = round(time.perf_counter() - preview_started, 3)
 
     image_paths = sorted(preview_dir.glob("preview_*.jpg"))
+    selection_started = time.perf_counter()
     candidates = select_candidates(
         image_paths,
         args.start,
@@ -332,16 +456,27 @@ def main():
         args.change_threshold,
         args.min_gap_seconds,
     )
+    selection_seconds = round(time.perf_counter() - selection_started, 3)
+    materialize_started = time.perf_counter()
+    candidates, still_backends = materialize_highres_candidates(video, output_dir, candidates)
+    materialize_seconds = round(time.perf_counter() - materialize_started, 3)
     manifest = {
         "success": True,
         "decode_backend": backend,
+        "preview_fallback": preview_fallback,
+        "candidate_still_backends": still_backends,
         "segment_start": args.start,
         "segment_duration": args.duration,
         "sample_fps": args.sample_fps,
         "preview_frames": len(image_paths),
         "candidate_frames": len(candidates),
         "candidates": candidates,
-        "timings": {"total_seconds": round(time.perf_counter() - started, 3)},
+        "timings": {
+            "preview_seconds": preview_seconds,
+            "selection_seconds": selection_seconds,
+            "materialize_seconds": materialize_seconds,
+            "total_seconds": round(time.perf_counter() - started, 3),
+        },
     }
     (output_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(manifest, ensure_ascii=False))
@@ -507,6 +642,8 @@ def extract_frames_with_jetson_workers(
                 "segment_start": worker.start_seconds,
                 "segment_duration": worker.duration_seconds,
                 "decode_backend": manifest.get("decode_backend"),
+                "preview_fallback": manifest.get("preview_fallback"),
+                "candidate_still_backends": manifest.get("candidate_still_backends", []),
                 "preview_frames": manifest.get("preview_frames"),
                 "candidate_frames": manifest.get("candidate_frames"),
                 "timings": manifest.get("timings", {}),

@@ -7,7 +7,7 @@ cd "$ROOT_DIR"
 if [[ "$#" -gt 0 ]]; then
   HOSTS=("$@")
 else
-  HOSTS=(nx2 nx3)
+  HOSTS=(nx1 nx2 nx3 nx4 agx)
 fi
 
 check_host() {
@@ -29,7 +29,7 @@ for name in ["cv2", "numpy", "PIL", "ray"]:
     print(f"{name}={bool(importlib.util.find_spec(name))}")
 PY
     if command -v gst-inspect-1.0 >/dev/null 2>&1; then
-      for plugin in nvv4l2decoder nvjpegenc h264parse avdec_h264 jpegenc multifilesink; do
+      for plugin in nvv4l2decoder nvvidconv nvjpegenc h264parse avdec_h264 jpegenc multifilesink; do
         gst-inspect-1.0 "$plugin" >/dev/null 2>&1 && echo "$plugin=true" || echo "$plugin=false"
       done
     else

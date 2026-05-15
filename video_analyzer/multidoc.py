@@ -171,6 +171,7 @@ def load_evidence(run_dir: Path, analysis: dict[str, Any]) -> dict[str, Any]:
     frame_analyses = read_json_if_exists(orin_dir / "frame_analyses.json") or analysis.get("frame_analyses") or []
     transcript = read_json_if_exists(orin_dir / "transcript.json") or analysis.get("transcript") or {}
     chapters = parse_chapters(page_context, transcript)
+    chapter_transcript = build_chapter_transcript_digest(chapters, transcript)
     return {
         "page_context": page_context,
         "transcript_md": transcript_md,
@@ -181,6 +182,7 @@ def load_evidence(run_dir: Path, analysis: dict[str, Any]) -> dict[str, Any]:
         "ocr_events": ocr_events,
         "frame_analyses": frame_analyses,
         "chapters": chapters,
+        "chapter_transcript": chapter_transcript,
         "metadata": analysis.get("metadata") or {},
     }
 
@@ -209,7 +211,7 @@ def build_evidence_map_prompt(evidence: dict[str, Any], language: str) -> str:
 {trim(evidence['page_context'], 5000)}
 
 带时间戳转写：
-{trim(evidence['transcript_md'], 9000)}
+{trim(evidence['chapter_transcript'], 30000)}
 
 OCR/视觉证据摘要：
 {trim(summarize_frame_evidence(evidence), 7000)}
@@ -232,14 +234,14 @@ def build_chapter_analysis_prompt(evidence: dict[str, Any], round1: str, languag
 {trim(round1, 9000)}
 
 转写摘要：
-{trim(evidence['transcript_md'], 9000)}
+{trim(evidence['chapter_transcript'], 35000)}
 """.strip()
 
 
 def build_document_prompt(doc_type: str, evidence: dict[str, Any], round1: str, round2: str, language: str) -> str:
     instructions = {
-        "knowledge_notes": "生成知识笔记：逐章总结、概念解释、关键观点、例子、可复用方法、时间戳引用。",
-        "deep_report": "生成深度报告：主论点、证据链、方法评价、风险限制、适用场景、延伸问题。",
+        "knowledge_notes": "生成知识笔记：必须覆盖全部章节；每章包含核心观点、概念解释、重要例子、可复用方法、时间戳引用。",
+        "deep_report": "生成深度报告：必须覆盖全部章节，不得压缩成少数大章；包含主论点、证据链、方法评价、风险限制、适用场景、延伸问题。",
         "operation_manual_review": "生成操作手册复核稿：基于现有手册与原始证据补充遗漏、标出需复核项，不覆盖原手册。",
     }
     return f"""
@@ -247,6 +249,7 @@ def build_document_prompt(doc_type: str, evidence: dict[str, Any], round1: str, 
 
 硬性规则：
 - 保留证据来源意识和时间戳。
+- 对长视频不得只给概览；需要按原始章节逐段展开，解释每段为什么重要。
 - 与视频证据冲突或证据不足的内容写入“需复核”。
 - 评论只进入社区补充、FAQ、风险提示。
 - 不要声称看到了没有证据支持的操作、命令或结论。
@@ -256,6 +259,9 @@ def build_document_prompt(doc_type: str, evidence: dict[str, Any], round1: str, 
 
 第二轮逐章分析：
 {trim(round2, 9000)}
+
+按章节转写摘录：
+{trim(evidence['chapter_transcript'], 30000)}
 
 现有手册：
 {trim(evidence['manual'], 7000)}
@@ -287,6 +293,8 @@ def build_review_prompt(evidence: dict[str, Any], drafts: dict[str, str], langua
 
 
 def generate_round(client: Any, model: str, temperature: float, prompt: str, path: Path) -> str:
+    if not prompt.lstrip().startswith("/no_think"):
+        prompt = f"/no_think\n{prompt}"
     response = client.generate(prompt=prompt, model=model, temperature=temperature, num_predict=8000)
     text = (response.get("response") or "").strip()
     path.write_text(text + "\n", encoding="utf-8")
@@ -311,6 +319,69 @@ def parse_chapters(page_context: str, transcript: dict[str, Any]) -> list[dict[s
     first = segments[0].get("start_time", segments[0].get("start", 0))
     last = segments[-1].get("end_time", segments[-1].get("end", first))
     return [{"start": format_timestamp(first), "end": format_timestamp(last), "title": "全片"}]
+
+
+def build_chapter_transcript_digest(
+    chapters: list[dict[str, Any]],
+    transcript: dict[str, Any],
+    max_chars_per_chapter: int = 1800,
+) -> str:
+    segments = (transcript or {}).get("segments") or []
+    if not segments:
+        return ""
+    blocks = []
+    for chapter in chapters:
+        start = timestamp_to_seconds(chapter.get("start"))
+        end = timestamp_to_seconds(chapter.get("end"))
+        if end <= start:
+            end = float("inf")
+        chapter_segments = [
+            segment
+            for segment in segments
+            if start <= segment_seconds(segment, "start") < end
+        ]
+        lines = [
+            f"## {chapter.get('start', '')} - {chapter.get('end', '')} {chapter.get('title', '')}",
+            f"- Segments: {len(chapter_segments)}",
+        ]
+        text_lines = [format_segment_line(segment) for segment in chapter_segments]
+        lines.append(trim_preserving_ends("\n".join(text_lines), max_chars_per_chapter))
+        blocks.append("\n".join(line for line in lines if line))
+    return "\n\n".join(blocks)
+
+
+def format_segment_line(segment: dict[str, Any]) -> str:
+    start = format_timestamp(segment_seconds(segment, "start"))
+    end = format_timestamp(segment_seconds(segment, "end"))
+    text = str(segment.get("text") or "").replace("\n", " ").strip()
+    return f"[{start}-{end}] {text}"
+
+
+def segment_seconds(segment: dict[str, Any], key: str) -> float:
+    value = segment.get(key)
+    if value is None:
+        value = segment.get(f"{key}_time")
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def timestamp_to_seconds(value: Any) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    parts = text.split(":")
+    try:
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + float(parts[1])
+        return float(text)
+    except ValueError:
+        return 0.0
 
 
 def summarize_frame_evidence(evidence: dict[str, Any]) -> str:
@@ -343,6 +414,14 @@ def trim(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars].rstrip() + "\n\n[truncated]"
+
+
+def trim_preserving_ends(text: str, max_chars: int) -> str:
+    text = text or ""
+    if len(text) <= max_chars:
+        return text
+    half = max_chars // 2
+    return text[:half].rstrip() + "\n\n[chapter middle truncated]\n\n" + text[-half:].lstrip()
 
 
 def read_json(path: Path) -> Any:

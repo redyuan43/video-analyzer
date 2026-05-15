@@ -98,7 +98,9 @@ A passing dual-worker response includes:
 - The current validated long-talk worker set is:
   `--jetson-frame-hosts nx1,nx2,nx3,nx4,agx`
   Use equal-weight splitting across the five devices. Do not give AGX double segment weight by default; the measured 3.8-hour sample showed AGX became the tail when assigned two slices.
+- AGX can run multiple NVDEC sessions concurrently; a two-way `h264_nvv4l2dec` smoke improved two 300s segments from about 138s sequential to about 48s parallel. The best AGX internal subworker count is not fixed yet, so do not enable a default without a dedicated benchmark.
 - Hardware decode is mandatory for long-video Jetson extraction. Before claiming a worker is healthy, verify the worker `health` result reports `decode_backend` containing `nvdec`. The current expected backend is `ffmpeg-nvdec` on `nx1`, `nx2`, `nx3`, `nx4`, and `agx`. Do not silently fall back to software `ffmpeg` for long videos.
+- Jetson workers should use hardware low-res previews for frame-difference scoring when available: `nvv4l2decoder ! nvvidconv ! video/x-raw,format=GRAY8,width=320,height=180`. The selected candidate timestamps are then materialized as high-resolution JPEG stills for OCR/VL. This keeps OCR quality while moving grayscale/resize work to VIC.
 - The current validated long-talk transport is Ray. Use `tools/start_jetson_frame_ray.sh` before long-video runs; it verifies the AGX Ray head and all five host resources, and restarts the cluster only when the resource set is incomplete.
 - Ray worker subprocesses must not inherit an empty `CUDA_VISIBLE_DEVICES`. On AGX, `ffmpeg -c:v h264_nvv4l2dec` can SIGSEGV under Ray when `CUDA_VISIBLE_DEVICES=""`; remove that variable before launching the frame worker subprocess.
 - The SSH workers are on-demand, not daemons: the local pipeline pushes `worker.py`, syncs/caches the video, runs chunks, pulls candidates back, and merges locally.
