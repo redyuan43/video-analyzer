@@ -26,7 +26,7 @@ from video_analyzer.cli import (
     create_operation_manual_text_client,
     read_page_context_metadata,
 )
-from video_analyzer.config import Config, get_model
+from video_analyzer.config import Config, get_model, resolve_temperature
 from video_analyzer.frame import Frame
 from video_analyzer.frame_manifest import MANIFEST_NAME, read_frame_manifest
 from video_analyzer.frame_selection import (
@@ -279,6 +279,10 @@ def configure_runtime(args: argparse.Namespace) -> Config:
             "text_base_url": args.text_base_url,
             "vision_model": args.vision_model,
             "text_model": args.text_model,
+            "text_temperature": args.text_temperature
+            if args.text_temperature is not None
+            else (1.0 if "deepseek.com" in args.text_base_url else 0.2),
+            "deepseek_thinking": args.deepseek_thinking,
             "frame_no_think": True,
             "manual_no_think": True,
         }
@@ -315,6 +319,8 @@ def main() -> int:
     parser.add_argument("--text-base-url", default="http://100.90.114.26:18081/v1")
     parser.add_argument("--vision-model", default="minicpm-v-4.5-v100")
     parser.add_argument("--text-model", default="hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive")
+    parser.add_argument("--text-temperature", type=float)
+    parser.add_argument("--deepseek-thinking", choices=["enabled", "disabled"], default="disabled")
     parser.add_argument("--manual-language", default="zh-CN")
     parser.add_argument("--source-analysis", type=Path, help="Original analysis.json to recover exact frame timestamps")
     parser.add_argument(
@@ -417,7 +423,7 @@ def main() -> int:
         ocr_events=ocr_events,
         page_context=page_context,
         language=args.manual_language,
-        temperature=config.get("clients", {}).get("temperature", 0.2),
+        temperature=resolve_temperature(config.get("operation_manual", {}), config.get("clients", {}).get("temperature", 0.2)),
         frame_assets=frame_assets,
         no_think=True,
     )
@@ -450,6 +456,10 @@ def main() -> int:
             "vision_base_url": config.get("operation_manual", {}).get("vision_base_url"),
             "text_model": config.get("operation_manual", {}).get("text_model"),
             "text_base_url": config.get("operation_manual", {}).get("text_base_url"),
+            "text_temperature": resolve_temperature(
+                config.get("operation_manual", {}),
+                config.get("clients", {}).get("temperature", 0.2),
+            ),
             "context_file": str(args.context_file),
             "page_context": page_context_metadata,
             "frames_extracted": len(frames),

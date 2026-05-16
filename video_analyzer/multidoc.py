@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient
-from video_analyzer.config import Config
+from video_analyzer.config import Config, build_openai_extra_body, resolve_api_key, resolve_temperature
 
 
 DEFAULT_LLM_BASE_URL = "http://spark-31d6.taild500c8.ts.net:1234/v1"
@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--language", default="zh-CN")
     parser.add_argument("--llm-base-url", default=None)
     parser.add_argument("--text-model", default=None)
-    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--temperature", type=float)
     parser.add_argument("--output", help="Output directory; default RUN_DIR/docs_analysis")
     return parser.parse_args()
 
@@ -48,7 +48,9 @@ def main() -> int:
         language=args.language,
         llm_base_url=args.llm_base_url or profile.get("llm_base_url"),
         text_model=args.text_model or profile.get("text_model"),
-        temperature=args.temperature,
+        temperature=args.temperature if args.temperature is not None else resolve_temperature(profile, 0.2),
+        api_key_env=profile.get("text_api_key_env") or profile.get("api_key_env"),
+        extra_body=build_openai_extra_body(profile, args.llm_base_url or profile.get("llm_base_url")),
     )
     return 0
 
@@ -61,6 +63,8 @@ def run_multidoc_analysis(
     llm_base_url: str | None = None,
     text_model: str | None = None,
     temperature: float = 0.2,
+    api_key_env: str | None = None,
+    extra_body: dict[str, Any] | None = None,
     client: Any | None = None,
 ) -> dict[str, Any]:
     run_dir = run_dir.expanduser().resolve()
@@ -75,7 +79,11 @@ def run_multidoc_analysis(
     metadata = analysis.get("metadata") or {}
     model = text_model or metadata.get("text_model") or DEFAULT_TEXT_MODEL
     base_url = llm_base_url or metadata.get("llm_base_url") or DEFAULT_LLM_BASE_URL
-    client = client or GenericOpenAIAPIClient("0", base_url)
+    client = client or GenericOpenAIAPIClient(
+        resolve_api_key(api_key_env=api_key_env, api_url=base_url),
+        base_url,
+        extra_body=extra_body,
+    )
 
     evidence = load_evidence(run_dir, analysis)
     round1 = generate_round(

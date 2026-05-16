@@ -17,6 +17,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from video_analyzer.audio_processor import AudioTranscript
 from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient
+from video_analyzer.config import build_openai_extra_body, resolve_api_key
 from video_analyzer.frame import Frame
 from video_analyzer.manual import (
     DEFAULT_MAX_FRAME_EVIDENCE_CHARS,
@@ -63,6 +64,7 @@ def main() -> int:
     parser.add_argument("--text-base-url", default="http://100.90.114.26:18081/v1")
     parser.add_argument("--text-model", default="hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive")
     parser.add_argument("--manual-language", default="zh-CN")
+    parser.add_argument("--temperature", type=float)
     parser.add_argument("--max-frame-evidence-chars", type=int, default=DEFAULT_MAX_FRAME_EVIDENCE_CHARS)
     parser.add_argument("--timeout-seconds", type=int, default=600)
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
@@ -89,7 +91,13 @@ def main() -> int:
     page_context = read_context_file(str(context_file)) if str(context_file) else ""
 
     LOGGER.info("Regenerating manual from %s visual events and %s OCR events", len(frame_analyses), len(ocr_events))
-    client = GenericOpenAIAPIClient("0", args.text_base_url, timeout_seconds=args.timeout_seconds)
+    temperature = args.temperature if args.temperature is not None else (1.0 if "deepseek.com" in args.text_base_url else 0.2)
+    client = GenericOpenAIAPIClient(
+        resolve_api_key(api_url=args.text_base_url),
+        args.text_base_url,
+        timeout_seconds=args.timeout_seconds,
+        extra_body=build_openai_extra_body({"deepseek_thinking": "disabled"}, args.text_base_url),
+    )
     frame_assets = prepare_frame_assets(frames, run_dir)
     operation_manual = generate_operation_manual(
         client=client,
@@ -101,7 +109,7 @@ def main() -> int:
         ocr_events=ocr_events,
         page_context=page_context,
         language=args.manual_language,
-        temperature=0.2,
+        temperature=temperature,
         frame_assets=frame_assets,
         no_think=True,
         max_frame_evidence_chars=args.max_frame_evidence_chars,

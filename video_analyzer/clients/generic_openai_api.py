@@ -23,12 +23,14 @@ class GenericOpenAIAPIClient(LLMClient):
         api_url: str,
         max_retries: int = DEFAULT_MAX_RETRIES,
         timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+        extra_body: Optional[Dict[str, Any]] = None,
     ):
         self.api_key = api_key
         self.base_url = api_url.rstrip('/')  # Remove trailing slash if present
         self.generate_url = f"{self.base_url}/chat/completions"
         self.max_retries = max_retries
         self.timeout_seconds = timeout_seconds
+        self.extra_body = dict(extra_body or {})
         self.session = requests.Session()
         if self._should_bypass_env_proxy():
             self.session.trust_env = False
@@ -40,7 +42,8 @@ class GenericOpenAIAPIClient(LLMClient):
         model: str = "llama3.2-vision",
         temperature: float = 0.2,
         num_predict: int = 256,
-        image_paths: Optional[List[str]] = None) -> Dict[Any, Any]:
+        image_paths: Optional[List[str]] = None,
+        extra_body: Optional[Dict[str, Any]] = None) -> Dict[Any, Any]:
         """Generate response from OpenAI-compatible API."""
         # Prepare request content
         paths = image_paths or ([image_path] if image_path else [])
@@ -65,6 +68,10 @@ class GenericOpenAIAPIClient(LLMClient):
             "temperature": temperature,
             "max_tokens": num_predict
         }
+        if self.extra_body:
+            data.update(self.extra_body)
+        if extra_body:
+            data.update(extra_body)
 
         # Prepare headers
         headers = {

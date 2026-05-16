@@ -1,9 +1,12 @@
 import argparse
 from pathlib import Path
 import json
+import os
 from typing import Any
 import logging
 from importlib import resources
+import ipaddress
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -163,11 +166,21 @@ class Config:
                 "vision_model", "hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive"
             )
             text_model = manual_config.get("text_model") or profile.get("text_model") or vision_model
+            text_temperature = manual_config.get("text_temperature", profile.get("text_temperature"))
             manual_config["llm_base_url"] = llm_base_url
             manual_config["vision_base_url"] = vision_base_url
             manual_config["text_base_url"] = text_base_url
             manual_config["vision_model"] = vision_model
             manual_config["text_model"] = text_model
+            if text_temperature is not None:
+                manual_config["text_temperature"] = text_temperature
+            if profile.get("text_api_key_env"):
+                manual_config["text_api_key_env"] = profile["text_api_key_env"]
+            for extra_key in ("deepseek_thinking", "reasoning_effort"):
+                if profile.get(extra_key):
+                    manual_config[extra_key] = profile[extra_key]
+            if profile.get("api_key_env"):
+                self.config["clients"]["openai_api"]["api_key_env"] = profile["api_key_env"]
             self.config["clients"]["default"] = "openai_api"
             self.config["clients"]["openai_api"]["api_url"] = vision_base_url
             self.config["clients"]["openai_api"]["api_key"] = self.config["clients"]["openai_api"].get("api_key") or "0"
@@ -226,6 +239,79 @@ def get_runtime_profile(config: dict[str, Any], profile_name: str | None = None)
         raise ValueError(f"Unknown runtime profile '{name}'. Available profiles: {available}")
     return dict(profile)
 
+
+def build_openai_extra_body(settings: dict[str, Any], api_url: str | None = None, prefix: str = "") -> dict[str, Any]:
+    """Build provider-specific OpenAI-compatible request body extensions."""
+    extra_body = dict(settings.get(f"{prefix}extra_body") or {})
+    thinking = settings.get(f"{prefix}deepseek_thinking")
+    reasoning_effort = settings.get(f"{prefix}reasoning_effort")
+    if _is_deepseek_api(api_url) and thinking:
+        extra_body["thinking"] = {"type": str(thinking)}
+        if reasoning_effort:
+            extra_body["reasoning_effort"] = str(reasoning_effort)
+    return extra_body
+
+
+def resolve_temperature(settings: dict[str, Any], fallback: float = 0.2, key: str = "text_temperature") -> float:
+    value = settings.get(key)
+    if value is None:
+        return fallback
+    return float(value)
+
+
+def _is_deepseek_api(api_url: str | None) -> bool:
+    parsed = urlparse(api_url or "")
+    host = parsed.hostname or ""
+    return host == "api.deepseek.com" or host.endswith(".api.deepseek.com")
+
+
+def resolve_api_key(
+    api_key: str | None = None,
+    api_key_env: str | None = None,
+    api_url: str | None = None,
+) -> str:
+    """Resolve an API key from explicit config, an env var, or local placeholders."""
+    env_name = (api_key_env or "").strip()
+    parsed = urlparse(api_url or "")
+    host = parsed.hostname or ""
+    if not env_name and host.endswith("deepseek.com"):
+        env_name = "DEEPSEEK_API_KEY"
+    if env_name:
+        value = os.environ.get(env_name)
+        if value:
+            return value
+        raise ValueError(f"API key environment variable {env_name} is required")
+
+    key = (api_key or "").strip()
+    if key.startswith("${") and key.endswith("}"):
+        value = os.environ.get(key[2:-1])
+        if value:
+            return value
+        raise ValueError(f"API key environment variable {key[2:-1]} is required")
+    if key.startswith("$") and len(key) > 1:
+        value = os.environ.get(key[1:])
+        if value:
+            return value
+        raise ValueError(f"API key environment variable {key[1:]} is required")
+    if key:
+        return key
+    if _allows_placeholder_api_key(api_url):
+        return "0"
+    raise ValueError("API key is required when using OpenAI API client")
+
+
+def _allows_placeholder_api_key(api_url: str | None) -> bool:
+    parsed = urlparse(api_url or "")
+    host = parsed.hostname or ""
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+        return address.is_private or address.is_loopback or address in ipaddress.ip_network("100.64.0.0/10")
+    except ValueError:
+        return host.endswith(".local") or host.endswith(".lan") or host.endswith(".taild500c8.ts.net")
+
+
 def get_client(config: Config) -> dict:
     """Get the appropriate client configuration based on configuration."""
     client_type = config.get("clients", {}).get("default", "ollama")
@@ -234,14 +320,14 @@ def get_client(config: Config) -> dict:
     if client_type == "ollama":
         return {"url": client_config.get("url", "http://localhost:11434")}
     elif client_type == "openai_api":
-        api_key = client_config.get("api_key")
         api_url = client_config.get("api_url")
-        if not api_key and api_url and "127.0.0.1" in api_url:
-            api_key = "0"
-        if not api_key:
-            raise ValueError("API key is required when using OpenAI API client")
         if not api_url:
             raise ValueError("API URL is required when using OpenAI API client")
+        api_key = resolve_api_key(
+            client_config.get("api_key"),
+            client_config.get("api_key_env"),
+            api_url,
+        )
         return {
             "api_key": api_key,
             "api_url": api_url,

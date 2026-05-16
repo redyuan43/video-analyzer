@@ -14,7 +14,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from video_analyzer.audio_processor import AudioTranscript
 from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient
-from video_analyzer.config import Config
+from video_analyzer.config import Config, build_openai_extra_body, resolve_api_key, resolve_temperature
 from video_analyzer.frame import Frame
 from video_analyzer.manual import (
     embed_step_images,
@@ -80,7 +80,15 @@ def main() -> int:
     frames = build_frames(run_dir, ocr_events, visual_events)
     frame_assets = prepare_frame_assets(frames, run_dir)
 
-    client = GenericOpenAIAPIClient("0", base_url, timeout_seconds=args.timeout_seconds)
+    client = GenericOpenAIAPIClient(
+        resolve_api_key(
+            api_key_env=profile.get("text_api_key_env") or profile.get("api_key_env"),
+            api_url=base_url,
+        ),
+        base_url,
+        timeout_seconds=args.timeout_seconds,
+        extra_body=build_openai_extra_body(profile, base_url),
+    )
     operation_manual = generate_operation_manual(
         client=client,
         text_model=text_model,
@@ -91,7 +99,7 @@ def main() -> int:
         ocr_events=ocr_events,
         page_context=(analysis.get("metadata") or {}).get("page_description") or "",
         language=args.manual_language,
-        temperature=0.0,
+        temperature=resolve_temperature(profile, 0.0),
         frame_assets=frame_assets,
         no_think=True,
     )
@@ -123,6 +131,7 @@ def main() -> int:
     metadata = analysis.setdefault("metadata", {})
     metadata["text_model"] = text_model
     metadata["llm_base_url"] = base_url
+    metadata["text_temperature"] = resolve_temperature(profile, 0.0)
     analysis_path.write_text(json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(f"manual: {manual_path}")

@@ -8,7 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .artifacts import write_json, write_orin_artifacts, write_transcript_markdown
-from .config import Config, get_client, get_model
+from .config import Config, build_openai_extra_body, get_client, get_model, resolve_api_key, resolve_temperature
 from .frame import VideoProcessor
 from .frame_selection import (
     AUTO,
@@ -214,6 +214,7 @@ def create_client(config: Config):
             client_config["api_key"],
             client_config["api_url"],
             timeout_seconds=int(client_config.get("timeout_seconds", 600)),
+            extra_body=build_openai_extra_body(config.get("clients", {}).get("openai_api", {}), client_config["api_url"]),
         )
     else:
         raise ValueError(f"Unknown client type: {client_type}")
@@ -239,9 +240,14 @@ def create_operation_manual_text_client(config: Config, fallback_client):
     if not text_base_url:
         return fallback_client
     return GenericOpenAIAPIClient(
-        openai_config.get("api_key") or "0",
+        resolve_api_key(
+            openai_config.get("api_key"),
+            manual_config.get("text_api_key_env") or openai_config.get("api_key_env"),
+            text_base_url,
+        ),
         text_base_url,
         timeout_seconds=int(openai_config.get("timeout_seconds", 600)),
+        extra_body=build_openai_extra_body(manual_config, text_base_url),
     )
 
 
@@ -680,7 +686,7 @@ def main():
                     ocr_events=ocr_events,
                     page_context=page_context,
                     language=config.get("manual_language", "zh-CN"),
-                    temperature=config.get("clients", {}).get("temperature", 0.2),
+                    temperature=resolve_temperature(manual_config, config.get("clients", {}).get("temperature", 0.2)),
                     frame_assets=frame_assets,
                     no_think=bool(manual_config.get("manual_no_think", manual_config.get("frame_no_think", False))),
                 )
@@ -727,6 +733,10 @@ def main():
                 "text_model": config.get("operation_manual", {}).get("text_model"),
                 "text_base_url": config.get("operation_manual", {}).get("text_base_url")
                 or config.get("operation_manual", {}).get("llm_base_url"),
+                "text_temperature": resolve_temperature(
+                    config.get("operation_manual", {}),
+                    config.get("clients", {}).get("temperature", 0.2),
+                ),
                 "ocr_provider": config.get("ocr", {}).get("provider"),
                 "ocr": ocr_metadata,
                 "asr_provider": config.get("asr", {}).get("provider"),

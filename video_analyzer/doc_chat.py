@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient
-from video_analyzer.config import Config
+from video_analyzer.config import Config, build_openai_extra_body, resolve_api_key, resolve_temperature
 
 DEFAULT_MAX_CONTEXT_CHARS = 60000
 DEFAULT_TEMPERATURE = 0.2
@@ -38,7 +38,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--profile", help="Runtime profile from config/default_config.json or config.json")
     parser.add_argument("--llm-base-url")
     parser.add_argument("--text-model")
-    parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
+    parser.add_argument("--temperature", type=float)
     parser.add_argument("--max-context-chars", type=int, default=DEFAULT_MAX_CONTEXT_CHARS)
     return parser.parse_args(argv)
 
@@ -50,14 +50,22 @@ def main(argv: list[str] | None = None) -> int:
     model = args.text_model or profile.get("text_model")
     if not model:
         raise ValueError("Runtime profile must provide text_model, or pass --text-model")
-    client = GenericOpenAIAPIClient("0", base_url)
+    client = GenericOpenAIAPIClient(
+        resolve_api_key(
+            api_key_env=profile.get("text_api_key_env") or profile.get("api_key_env"),
+            api_url=base_url,
+        ),
+        base_url,
+        extra_body=build_openai_extra_body(profile, base_url),
+    )
     run_dir = Path(args.run_dir).expanduser().resolve()
+    temperature = args.temperature if args.temperature is not None else resolve_temperature(profile, DEFAULT_TEMPERATURE)
 
     if args.question:
-        print(ask_video_docs(run_dir, args.question, client, model, args.temperature, args.max_context_chars))
+        print(ask_video_docs(run_dir, args.question, client, model, temperature, args.max_context_chars))
         return 0
 
-    chat_loop(run_dir, client, model, args.temperature, args.max_context_chars)
+    chat_loop(run_dir, client, model, temperature, args.max_context_chars)
     return 0
 
 
