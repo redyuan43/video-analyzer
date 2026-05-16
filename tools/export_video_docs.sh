@@ -32,6 +32,9 @@ docs=(
   "operation_manual.md"
   "docs_analysis/knowledge_notes.md"
   "docs_analysis/deep_report.md"
+  "docs_analysis_chapters/knowledge_notes_v2.md"
+  "docs_analysis_chapters/deep_report_v2.md"
+  "docs_analysis_chapters/deep_report_v2.review.md"
   "manual_evidence.md"
 )
 
@@ -45,7 +48,10 @@ for rel in "${docs[@]}"; do
   echo "[pdf] $rel"
   "$PDF_SCRIPT" "$input" "$EXPORT_DIR/$name.pdf"
   echo "[longpng] $rel"
-  "$PNG_SCRIPT" "$input" "$EXPORT_DIR/$name.long.png"
+    LONGPNG_VIEWPORT_SIZE="${LONGPNG_VIEWPORT_SIZE:-1600,1000}" \
+    LONGPNG_NO_MARGIN="${LONGPNG_NO_MARGIN:-1}" \
+    LONGPNG_CONTENT_PADDING="${LONGPNG_CONTENT_PADDING:-5}" \
+    "$PNG_SCRIPT" "$input" "$EXPORT_DIR/$name.long.png"
 done
 
 find "$EXPORT_DIR" -maxdepth 1 -type f -printf '%s %p\n' | sort -n
