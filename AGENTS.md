@@ -89,6 +89,24 @@ A passing dual-worker response includes:
 - After a smoke test, stop only `vibevoice-asr-backend.service` if you want to unload model actors. Keep Ray head/worker and lazy proxies active.
 - If `8012` health times out during a request, check GPU processes before declaring failure; model/actor initialization can occupy the backend until the request completes.
 
+## Video Link Status Server
+
+- The local status server starts durable `video-link` background runs from `http://127.0.0.1:18120/video-link`, then shows progress for:
+  `探测时长 -> 下载/上下文 -> 核心分析 -> 校验产物 -> 多文档分析 -> 章节深度报告 -> 导出 PDF/长图 -> 生成配图提示词`.
+- The server is `tools/video_link_status_server.py`, managed by `tools/run_video_link_status_server.sh`. It exposes `POST /api/video-link/jobs`, `POST /api/video-link/jobs/<job_id>/run`, manual stage endpoints under `/stages/<stage>`, a dashboard at `/video-link/jobs/<job_id>`, and stores job state/logs under `tmp/video-link-status/jobs/`.
+- Keep runtime progress and service failures visible on the status page, including failed stage, error message, log path, current log tail, and artifact counts.
+- The background runner skips stages already marked `succeeded` or `skipped`, then resumes from the first incomplete stage.
+- The create page should expose only common and collection options: URL, analysis mode, profile, run name, browser cookie source, skip images, keep existing, subtitles, subtitle transcript preference, comments, max comments, subtitle languages, and refresh context.
+- Model endpoint/model overrides should stay in runtime profiles, not page fields. The default page profile should prefer `deepseek_v4_flash` when available.
+- Start or restart the server with:
+  `tools/run_video_link_status_server.sh restart`
+  The launcher defaults to this repo's `.venv/bin/python`; use `VIDEO_LINK_STATUS_PYTHON=...` only for an intentional override. It must use `setsid ... < /dev/null` so the server survives Codex command-session cleanup.
+- Server child commands must prepend `.venv/bin` to `PATH` and set `PYTHON=.venv/bin/python`, otherwise URL analysis can accidentally run with system Python instead of the prepared project environment.
+- YouTube URLs can fail instantly with `Requested format is not available` when yt-dlp cannot solve YouTube's JS challenge. Keep `yt-dlp[default]`/`yt-dlp-ejs` installed in `.venv`, keep local `node` available, and let the URL runner's default `--ytdlp-js-runtimes auto` pass `--js-runtimes node`.
+- After changing the status server, run:
+  `python3 -m py_compile tools/video_link_status_server.py tests/test_video_link_status_server.py`
+  and `python3 -m unittest tests.test_video_link_status_server`.
+
 ## Jetson Frame Extraction
 
 - For long operation-manual videos, prefer Jetson candidate-frame extraction instead of local CPU/OpenCV scanning.

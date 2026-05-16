@@ -1,0 +1,1298 @@
+#!/usr/bin/env python3
+"""Local status server for running the video-link workflow."""
+
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_JOBS_DIR = REPO_ROOT / "tmp" / "video-link-status" / "jobs"
+BAOYU_PROMPT_SCRIPT = Path.home() / ".codex" / "skills" / "video-link" / "scripts" / "prepare_baoyu_image_prompts.py"
+ALLOWED_ANALYSIS_MODES = ("auto", "fast", "balanced", "deep", "long-talk-fast")
+ALLOWED_COOKIE_BROWSERS = ("", "chrome", "none", "edge", "firefox", "chromium", "brave")
+DEFAULT_COOKIE_BROWSER = "chrome"
+DEFAULT_PROFILE = "deepseek_v4_flash"
+DEFAULT_RUN_NAME = "operation-manual"
+DEFAULT_SUBTITLE_LANGS = "zh-CN,zh-Hans,zh,en"
+MODULE_ORDER = [
+    "probe",
+    "prepare",
+    "analyze-core",
+    "verify-core",
+    "multidoc",
+    "deep-v2",
+    "export",
+    "image-prompts",
+]
+MODULE_LABELS = {
+    "probe": "探测时长",
+    "prepare": "下载/上下文",
+    "analyze-core": "核心分析",
+    "verify-core": "校验产物",
+    "multidoc": "多文档分析",
+    "deep-v2": "章节深度报告",
+    "export": "导出 PDF/长图",
+    "image-prompts": "生成配图提示词",
+}
+MODULE_SPECS = {
+    "probe": {"requires": [], "produces": ["duration", "resolved_mode"]},
+    "prepare": {"requires": ["resolved_mode"], "produces": ["video_path", "page_context"]},
+    "analyze-core": {
+        "requires": ["video_path", "page_context"],
+        "produces": ["run_dir", "analysis_json", "operation_manual", "transcript", "frames", "ocr_events", "frame_analyses"],
+    },
+    "verify-core": {"requires": ["run_dir"], "produces": ["verified_core"]},
+    "multidoc": {"requires": ["run_dir", "verified_core"], "produces": ["docs_analysis"]},
+    "deep-v2": {"requires": ["run_dir", "verified_core"], "produces": ["chapter_deep_report"]},
+    "export": {"requires": ["run_dir", "verified_core"], "produces": ["exports"]},
+    "image-prompts": {"requires": ["run_dir"], "produces": ["image_prompts"]},
+}
+STAGE_ORDER = MODULE_ORDER
+STAGE_LABELS = MODULE_LABELS
+STAGE_ALIASES = {
+    "operation": "analyze-core",
+    "verify_core": "verify-core",
+    "deep_v2": "deep-v2",
+    "export_docs": "export",
+    "image_prompts": "image-prompts",
+}
+
+
+class BridgeError(Exception):
+    def __init__(self, status: HTTPStatus, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+class VideoLinkStatusServer:
+    def __init__(self, jobs_dir: Path = DEFAULT_JOBS_DIR, repo_root: Path = REPO_ROOT):
+        self.jobs_dir = jobs_dir
+        self.repo_root = repo_root
+        self.stage_lock = threading.Lock()
+        self.runner_lock = threading.Lock()
+        self.active_runners: dict[str, threading.Thread] = {}
+        self.jobs_dir.mkdir(parents=True, exist_ok=True)
+
+    def options(self) -> dict[str, Any]:
+        profiles = runtime_profile_names()
+        default_profile = DEFAULT_PROFILE if DEFAULT_PROFILE in profiles else active_runtime_profile(profiles)
+        return {
+            "defaults": {
+                "analysis_mode": "auto",
+                "profile": default_profile,
+                "run_name": DEFAULT_RUN_NAME,
+                "cookies_from_browser": DEFAULT_COOKIE_BROWSER,
+                "skip_images": False,
+                "keep_existing": True,
+                "include_subtitles": True,
+                "prefer_subtitle_transcript": False,
+                "include_comments": True,
+                "max_comments": 30,
+                "subtitle_langs": DEFAULT_SUBTITLE_LANGS,
+                "refresh_context": False,
+            },
+            "choices": {
+                "analysis_modes": list(ALLOWED_ANALYSIS_MODES),
+                "profiles": profiles,
+                "cookie_browsers": [item for item in ALLOWED_COOKIE_BROWSERS if item],
+            },
+        }
+
+    def create_job(self, payload: dict[str, Any]) -> dict[str, Any]:
+        video_url = str(payload.get("video_url") or payload.get("videoUrl") or "").strip()
+        if not video_url.startswith(("http://", "https://")):
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "video_url must be an http(s) URL")
+
+        analysis_mode = str(payload.get("analysis_mode") or payload.get("analysisMode") or "auto").strip() or "auto"
+        if analysis_mode not in ALLOWED_ANALYSIS_MODES:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, f"analysis_mode must be one of {sorted(ALLOWED_ANALYSIS_MODES)}")
+
+        cookie_browser = normalize_cookie_browser(payload.get("cookies_from_browser") or payload.get("cookiesFromBrowser"))
+        if cookie_browser not in ALLOWED_COOKIE_BROWSERS:
+            raise BridgeError(
+                HTTPStatus.BAD_REQUEST,
+                f"cookies_from_browser must be one of {sorted(ALLOWED_COOKIE_BROWSERS)} or none",
+            )
+
+        defaults = self.options()["defaults"]
+        run_name = sanitize_run_name(str(payload.get("run_name") or payload.get("runName") or defaults["run_name"]))
+        profile = str(payload.get("profile") or defaults["profile"]).strip() or defaults["profile"]
+        profiles = runtime_profile_names()
+        if profiles and profile not in profiles:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, f"profile must be one of {profiles}")
+        skip_images = parse_bool(normalize_optional_template(payload.get("skip_images") if "skip_images" in payload else payload.get("skipImages", False)))
+        auto_start = parse_bool(normalize_optional_template(payload.get("auto_start") if "auto_start" in payload else payload.get("autoStart", False)))
+        keep_existing = parse_bool_option(payload, "keep_existing", "keepExisting", defaults["keep_existing"])
+        include_subtitles = parse_bool_option(payload, "include_subtitles", "includeSubtitles", defaults["include_subtitles"])
+        prefer_subtitle_transcript = parse_bool_option(
+            payload,
+            "prefer_subtitle_transcript",
+            "preferSubtitleTranscript",
+            defaults["prefer_subtitle_transcript"],
+        )
+        include_comments = parse_bool_option(payload, "include_comments", "includeComments", defaults["include_comments"])
+        refresh_context = parse_bool_option(payload, "refresh_context", "refreshContext", defaults["refresh_context"])
+        max_comments = parse_int_option(payload.get("max_comments") if "max_comments" in payload else payload.get("maxComments"), defaults["max_comments"])
+        subtitle_langs = str(payload.get("subtitle_langs") or payload.get("subtitleLangs") or defaults["subtitle_langs"]).strip()
+
+        job_id = uuid.uuid4().hex
+        job_dir = self.job_dir(job_id)
+        job_dir.mkdir(parents=True, exist_ok=False)
+        job = {
+            "job_id": job_id,
+            "status": "created",
+            "created_at": iso_now(),
+            "updated_at": iso_now(),
+            "video_url": video_url,
+            "options": {
+                "analysis_mode": analysis_mode,
+                "profile": profile,
+                "run_name": run_name,
+                "cookies_from_browser": cookie_browser,
+                "skip_images": skip_images,
+                "keep_existing": keep_existing,
+                "include_subtitles": include_subtitles,
+                "prefer_subtitle_transcript": prefer_subtitle_transcript,
+                "include_comments": include_comments,
+                "max_comments": max_comments,
+                "subtitle_langs": subtitle_langs,
+                "refresh_context": refresh_context,
+            },
+            "resolved_mode": None,
+            "run_dir": None,
+            "artifacts": {},
+            "stages": {},
+            "modules": {},
+            "runner": {"status": "idle", "current_stage": None, "error": None},
+        }
+        self.save_job(job)
+        if auto_start:
+            return self.start_run(job_id)
+        return self.public_job(job)
+
+    def start_run(self, job_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        with self.runner_lock:
+            active = self.active_runners.get(job_id)
+            if active and active.is_alive():
+                return self.public_job(job)
+            self.active_runners.pop(job_id, None)
+
+            now = iso_now()
+            job["status"] = "running"
+            job["updated_at"] = now
+            job["runner"] = {
+                "status": "running",
+                "started_at": now,
+                "updated_at": now,
+                "finished_at": None,
+                "current_stage": self.next_stage(job),
+                "error": None,
+            }
+            self.save_job(job)
+            thread = threading.Thread(target=self._run_remaining_stages, args=(job_id,), daemon=True)
+            self.active_runners[job_id] = thread
+        thread.start()
+        return self.public_job(self.load_job(job_id))
+
+    def _run_remaining_stages(self, job_id: str) -> None:
+        try:
+            while True:
+                job = self.load_job(job_id)
+                stage = self.next_stage(job)
+                if not stage:
+                    job["status"] = "succeeded"
+                    self.update_runner(job, "succeeded", current_stage=None, finished=True)
+                    return
+                self.update_runner(job, "running", current_stage=stage)
+                self.run_stage(job_id, stage)
+        except BridgeError as exc:
+            job = self.load_job(job_id)
+            job["status"] = "failed"
+            self.update_runner(job, "failed", error=exc.message, finished=True)
+        except Exception as exc:
+            job = self.load_job(job_id)
+            job["status"] = "failed"
+            self.update_runner(job, "failed", error=str(exc), finished=True)
+        finally:
+            with self.runner_lock:
+                self.active_runners.pop(job_id, None)
+
+    def update_runner(
+        self,
+        job: dict[str, Any],
+        status: str,
+        current_stage: str | None = None,
+        error: str | None = None,
+        finished: bool = False,
+    ) -> None:
+        runner = dict(job.get("runner") or {})
+        runner["status"] = status
+        runner["updated_at"] = iso_now()
+        if "started_at" not in runner:
+            runner["started_at"] = runner["updated_at"]
+        runner["current_stage"] = current_stage
+        if error is not None:
+            runner["error"] = error
+        elif status != "failed":
+            runner["error"] = None
+        if finished:
+            runner["finished_at"] = runner["updated_at"]
+        job["runner"] = runner
+        job["updated_at"] = runner["updated_at"]
+        if status == "succeeded":
+            job["status"] = "succeeded"
+        elif status == "failed":
+            job["status"] = "failed"
+        self.save_job(job)
+
+    def run_stage(self, job_id: str, stage: str) -> dict[str, Any]:
+        stage = normalize_stage_name(stage)
+        if stage not in STAGE_ORDER:
+            raise BridgeError(HTTPStatus.NOT_FOUND, f"unknown stage: {stage}")
+        if not self.stage_lock.acquire(blocking=False):
+            raise BridgeError(HTTPStatus.CONFLICT, "another video-link stage is already running")
+        try:
+            return self._run_stage_locked(job_id, stage)
+        finally:
+            self.stage_lock.release()
+
+    def _run_stage_locked(self, job_id: str, stage: str) -> dict[str, Any]:
+        stage = normalize_stage_name(stage)
+        job = self.load_job(job_id)
+        self.ensure_dependencies(job, stage)
+        current_status = job.get("stages", {}).get(stage, {}).get("status")
+        if current_status in {"succeeded", "skipped"}:
+            return self.public_job(job)
+
+        if stage == "image-prompts" and job["options"].get("skip_images"):
+            return self.mark_stage_skipped(job, stage, "skip_images is true")
+
+        start = time.time()
+        stage_info = {
+            "status": "running",
+            "started_at": iso_now(),
+            "finished_at": None,
+            "exit_code": None,
+            "log_path": str(self.stage_log_path(job_id, stage)),
+            "artifacts": {},
+        }
+        job["status"] = "running"
+        job["updated_at"] = iso_now()
+        job["stages"][stage] = stage_info
+        self.save_job(job)
+
+        try:
+            if stage == "probe":
+                result = self.stage_probe(job)
+            elif stage == "prepare":
+                result = self.stage_prepare(job, stage_info["log_path"])
+            elif stage == "analyze-core":
+                result = self.stage_analyze_core(job, stage_info["log_path"])
+            elif stage == "verify-core":
+                result = self.stage_verify_core(job)
+            elif stage == "multidoc":
+                result = self.run_command_stage(job, stage, self.multidoc_command(job), stage_info["log_path"])
+            elif stage == "deep-v2":
+                result = self.run_command_stage(job, stage, self.deep_v2_command(job), stage_info["log_path"])
+            elif stage == "export":
+                result = self.run_command_stage(job, stage, self.export_command(job), stage_info["log_path"])
+            else:
+                result = self.run_command_stage(job, stage, self.image_prompts_command(job), stage_info["log_path"])
+            stage_info.update(result)
+            self.update_job_artifacts(job, stage, result.get("artifacts", {}))
+            stage_info["status"] = "succeeded"
+            stage_info["exit_code"] = 0
+            stage_info["duration_seconds"] = round(time.time() - start, 3)
+            stage_info["finished_at"] = iso_now()
+            job["status"] = "succeeded" if stage == STAGE_ORDER[-1] or (stage == "image-prompts") else "running"
+        except Exception as exc:
+            stage_info["status"] = "failed"
+            stage_info["exit_code"] = getattr(exc, "returncode", 1)
+            stage_info["duration_seconds"] = round(time.time() - start, 3)
+            stage_info["finished_at"] = iso_now()
+            stage_info["error"] = str(exc)
+            job["status"] = "failed"
+        job["updated_at"] = iso_now()
+        job["stages"][stage] = stage_info
+        job["summary"] = self.collect_summary(job)
+        self.save_job(job)
+        if stage_info["status"] == "failed":
+            raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, f"{stage} failed: {stage_info.get('error')}")
+        return self.public_job(job)
+
+    def stage_probe(self, job: dict[str, Any]) -> dict[str, Any]:
+        duration = probe_duration_seconds(job["video_url"])
+        requested_mode = job["options"]["analysis_mode"]
+        if requested_mode == "auto":
+            resolved_mode = "long-talk-fast" if duration is not None and duration >= 2700 else "balanced"
+        else:
+            resolved_mode = requested_mode
+        job["resolved_mode"] = resolved_mode
+        return {"artifacts": {"duration_seconds": duration, "resolved_mode": resolved_mode}}
+
+    def stage_operation(self, job: dict[str, Any], log_path: str) -> dict[str, Any]:
+        return self.stage_analyze_core(job, log_path)
+
+    def stage_prepare(self, job: dict[str, Any], log_path: str) -> dict[str, Any]:
+        if not job.get("resolved_mode"):
+            self.stage_probe(job)
+        command = self.prepare_command(job)
+        result = self.run_command(command, log_path)
+        text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+        video_path = parse_prefixed_path(text, "[download] video:")
+        page_context = parse_prefixed_path(text, "[download] context:")
+        if not video_path or not page_context:
+            raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, "prepare stage did not produce video/context paths")
+        job["video_path"] = str(self.resolve_output_path(video_path))
+        job["page_context_path"] = str(self.resolve_output_path(page_context))
+        job["video_dir"] = str(Path(job["video_path"]).parent)
+        artifacts = {
+            "video_path": job["video_path"],
+            "page_context": job["page_context_path"],
+            "video_dir": job["video_dir"],
+            "command": command,
+        }
+        return {"artifacts": artifacts, "stdout_tail": result["stdout_tail"]}
+
+    def stage_analyze_core(self, job: dict[str, Any], log_path: str) -> dict[str, Any]:
+        if not job.get("resolved_mode"):
+            self.stage_probe(job)
+        command = self.operation_command(job)
+        result = self.run_command(command, log_path)
+        run_dir = parse_run_dir(Path(log_path).read_text(encoding="utf-8", errors="replace"))
+        if not run_dir:
+            raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, "operation stage did not print a run directory")
+        job["run_dir"] = str(self.resolve_output_path(run_dir))
+        artifacts = {"run_dir": job["run_dir"], "command": command, **self.collect_core_artifacts(Path(job["run_dir"]))}
+        return {"artifacts": artifacts, "stdout_tail": result["stdout_tail"]}
+
+    def stage_verify_core(self, job: dict[str, Any]) -> dict[str, Any]:
+        run_dir = self.require_run_dir(job)
+        required = ["analysis.json", "operation_manual.md", "manual_evidence.md"]
+        missing = [name for name in required if not (run_dir / name).exists()]
+        if missing:
+            raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, f"missing core artifact(s): {', '.join(missing)}")
+        return {"artifacts": {"required": required, "missing": []}}
+
+    def run_command_stage(self, job: dict[str, Any], stage: str, command: list[str], log_path: str) -> dict[str, Any]:
+        result = self.run_command(command, log_path)
+        return {
+            "artifacts": {
+                "stage": stage,
+                "command": command,
+                **self.collect_summary(job),
+            },
+            "stdout_tail": result["stdout_tail"],
+        }
+
+    def run_command(self, command: list[str], log_path: str) -> dict[str, Any]:
+        env = operation_env()
+        Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+        with Path(log_path).open("w", encoding="utf-8") as log_file:
+            process = subprocess.Popen(
+                command,
+                cwd=str(self.repo_root),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
+            )
+            assert process.stdout is not None
+            for line in process.stdout:
+                log_file.write(line)
+                log_file.flush()
+            return_code = process.wait()
+        text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+        if return_code != 0:
+            error = subprocess.CalledProcessError(return_code, command)
+            error.output = text
+            raise error
+        return {"stdout_tail": tail_lines(text)}
+
+    def operation_command(self, job: dict[str, Any]) -> list[str]:
+        opts = job["options"]
+        resolved_mode = job.get("resolved_mode") or opts["analysis_mode"]
+        if resolved_mode == "long-talk-fast":
+            command = [
+                "tools/run_long_talk_fast_from_url.sh",
+                job["video_url"],
+                "--profile",
+                opts["profile"],
+                "--run-name",
+                opts["run_name"],
+            ]
+        else:
+            command = [
+                "tools/run_operation_manual_from_url.sh",
+                job["video_url"],
+                "--profile",
+                opts["profile"],
+                "--run-name",
+                opts["run_name"],
+                "--pipeline-mode",
+                pipeline_mode_for(resolved_mode),
+            ]
+        self.append_url_options(command, opts)
+        return command
+
+    def prepare_command(self, job: dict[str, Any]) -> list[str]:
+        opts = job["options"]
+        resolved_mode = job.get("resolved_mode") or opts["analysis_mode"]
+        command = [
+            "tools/run_operation_manual_from_url.sh",
+            job["video_url"],
+            "--profile",
+            opts["profile"],
+            "--run-name",
+            opts["run_name"],
+            "--pipeline-mode",
+            pipeline_mode_for(resolved_mode),
+            "--download-only",
+        ]
+        self.append_url_options(command, opts)
+        return command
+
+    def append_url_options(self, command: list[str], opts: dict[str, Any]) -> None:
+        if opts.get("keep_existing"):
+            command.append("--keep-existing")
+        if opts.get("cookies_from_browser"):
+            command.extend(["--cookies-from-browser", opts["cookies_from_browser"]])
+        command.append("--include-subtitles" if opts.get("include_subtitles") else "--no-include-subtitles")
+        command.append("--include-comments" if opts.get("include_comments") else "--no-include-comments")
+        if opts.get("prefer_subtitle_transcript"):
+            command.append("--prefer-subtitle-transcript")
+        if opts.get("refresh_context"):
+            command.append("--refresh-context")
+        if opts.get("max_comments") is not None:
+            command.extend(["--max-comments", str(opts["max_comments"])])
+        if opts.get("subtitle_langs"):
+            command.extend(["--subtitle-langs", opts["subtitle_langs"]])
+
+    def multidoc_command(self, job: dict[str, Any]) -> list[str]:
+        return ["tools/run_multidoc_analysis.sh", str(self.require_run_dir(job)), "--profile", job["options"]["profile"]]
+
+    def deep_v2_command(self, job: dict[str, Any]) -> list[str]:
+        return [
+            sys.executable,
+            "tools/generate_chapter_deep_report.py",
+            str(self.require_run_dir(job)),
+            "--profile",
+            job["options"]["profile"],
+            "--deep-v2",
+            "--no-final-synthesis",
+            "--no-format-markdown-final",
+        ]
+
+    def export_command(self, job: dict[str, Any]) -> list[str]:
+        return ["tools/export_video_docs.sh", str(self.require_run_dir(job))]
+
+    def image_prompts_command(self, job: dict[str, Any]) -> list[str]:
+        if not BAOYU_PROMPT_SCRIPT.exists():
+            raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, f"missing Baoyu prompt script: {BAOYU_PROMPT_SCRIPT}")
+        return [sys.executable, str(BAOYU_PROMPT_SCRIPT), str(self.require_run_dir(job))]
+
+    def mark_stage_skipped(self, job: dict[str, Any], stage: str, reason: str) -> dict[str, Any]:
+        stage = normalize_stage_name(stage)
+        job["stages"][stage] = {
+            "status": "skipped",
+            "reason": reason,
+            "started_at": iso_now(),
+            "finished_at": iso_now(),
+            "exit_code": 0,
+            "log_path": None,
+            "artifacts": self.collect_summary(job),
+        }
+        job["status"] = "succeeded"
+        job["updated_at"] = iso_now()
+        job["summary"] = self.collect_summary(job)
+        self.save_job(job)
+        return self.public_job(job)
+
+    def update_job_artifacts(self, job: dict[str, Any], stage: str, artifacts: dict[str, Any]) -> None:
+        artifact_store = dict(job.get("artifacts") or {})
+        produced = MODULE_SPECS.get(stage, {}).get("produces", [])
+        for name in produced:
+            if name in artifacts:
+                artifact_store[name] = {
+                    "value": artifacts[name],
+                    "module": stage,
+                    "updated_at": iso_now(),
+                }
+        if stage == "probe":
+            artifact_store["resolved_mode"] = {"value": job.get("resolved_mode"), "module": stage, "updated_at": iso_now()}
+        job["artifacts"] = artifact_store
+
+    def collect_core_artifacts(self, run_dir: Path) -> dict[str, Any]:
+        analysis_path = run_dir / "analysis.json"
+        manual_path = run_dir / "operation_manual.md"
+        quality_failed_path = run_dir / "operation_manual.quality_failed.md"
+        artifacts: dict[str, Any] = {
+            "analysis_json": str(analysis_path),
+            "operation_manual": str(manual_path if manual_path.exists() else quality_failed_path),
+        }
+        orin_dir = run_dir / "orin"
+        candidate_paths = {
+            "transcript": [run_dir / "transcript.md", orin_dir / "transcript.md"],
+            "ocr_events": [orin_dir / "ocr_events.json"],
+            "frame_analyses": [orin_dir / "frame_analyses.json"],
+            "frames": [run_dir / "frames"],
+        }
+        for name, paths in candidate_paths.items():
+            path = next((candidate for candidate in paths if candidate.exists()), None)
+            if path:
+                artifacts[name] = str(path)
+        if analysis_path.exists():
+            try:
+                payload = json.loads(analysis_path.read_text(encoding="utf-8"))
+                metadata = payload.get("metadata") or {}
+                artifacts["frames"] = artifacts.get("frames") or metadata.get("frame_extraction", {}).get("frame_manifest")
+                artifacts["transcript"] = artifacts.get("transcript") or metadata.get("transcript_markdown")
+                artifacts["core_counts"] = {
+                    "frames_extracted": metadata.get("frames_extracted"),
+                    "ocr_events": len(payload.get("ocr_events") or []),
+                    "frame_analyses": len(payload.get("frame_analyses") or []),
+                    "timings": metadata.get("timings") or {},
+                }
+            except Exception:
+                pass
+        return artifacts
+
+    def resolve_output_path(self, value: str) -> Path:
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = self.repo_root / path
+        return path.resolve()
+
+    def ensure_dependencies(self, job: dict[str, Any], stage: str) -> None:
+        stage = normalize_stage_name(stage)
+        if stage == "probe":
+            return
+        stage_index = STAGE_ORDER.index(stage)
+        for previous in STAGE_ORDER[:stage_index]:
+            if previous == "image-prompts":
+                continue
+            previous_status = job["stages"].get(previous, {}).get("status")
+            if previous_status not in {"succeeded", "skipped"}:
+                raise BridgeError(HTTPStatus.CONFLICT, f"stage {previous} must succeed before {stage}")
+
+    def require_run_dir(self, job: dict[str, Any]) -> Path:
+        run_dir = job.get("run_dir")
+        if not run_dir:
+            raise BridgeError(HTTPStatus.CONFLICT, "run_dir is not available yet")
+        path = Path(run_dir).expanduser().resolve()
+        if not path.is_dir():
+            raise BridgeError(HTTPStatus.CONFLICT, f"run_dir does not exist: {path}")
+        return path
+
+    def collect_summary(self, job: dict[str, Any]) -> dict[str, Any]:
+        run_dir_value = job.get("run_dir")
+        if not run_dir_value:
+            return {}
+        run_dir = Path(run_dir_value)
+        return {
+            "run_dir": str(run_dir),
+            "markdown_files": sorted(str(path.relative_to(run_dir)) for path in run_dir.glob("**/*.md") if path.is_file()),
+            "export_files": sorted(str(path.relative_to(run_dir)) for path in (run_dir / "exports").glob("*") if path.is_file())
+            if (run_dir / "exports").is_dir()
+            else [],
+            "prompt_files": sorted(str(path.relative_to(run_dir)) for path in (run_dir / "baoyu_images" / "prompts").glob("*") if path.is_file())
+            if (run_dir / "baoyu_images" / "prompts").is_dir()
+            else [],
+            "final_images": sorted(str(path.relative_to(run_dir)) for path in (run_dir / "baoyu_images" / "final").glob("*") if path.is_file())
+            if (run_dir / "baoyu_images" / "final").is_dir()
+            else [],
+        }
+
+    def public_job(self, job: dict[str, Any]) -> dict[str, Any]:
+        public = dict(job)
+        public["summary"] = self.collect_summary(job)
+        public["stage_order"] = STAGE_ORDER
+        public["progress"] = self.progress(job)
+        public["current_stage"] = self.current_stage(job)
+        public["next_stage"] = self.next_stage(job)
+        public["error_summary"] = self.error_summary(job)
+        public["dashboard_url"] = self.dashboard_url(job["job_id"])
+        return public
+
+    def error_summary(self, job: dict[str, Any]) -> dict[str, Any] | None:
+        runner = job.get("runner") or {}
+        failed_stage = None
+        failed_info: dict[str, Any] = {}
+        for stage in STAGE_ORDER:
+            info = job.get("stages", {}).get(stage, {})
+            if info.get("status") == "failed":
+                failed_stage = stage
+                failed_info = info
+                break
+        message = failed_info.get("error") or runner.get("error")
+        if not failed_stage and not message:
+            return None
+        return {
+            "stage": failed_stage,
+            "stage_label": STAGE_LABELS.get(failed_stage or "", failed_stage),
+            "message": message,
+            "log_path": failed_info.get("log_path"),
+        }
+
+    def progress(self, job: dict[str, Any]) -> dict[str, Any]:
+        statuses = [job.get("stages", {}).get(stage, {}).get("status") for stage in STAGE_ORDER]
+        completed = sum(1 for status in statuses if status in {"succeeded", "skipped"})
+        failed = sum(1 for status in statuses if status == "failed")
+        running = sum(1 for status in statuses if status == "running")
+        return {
+            "total": len(STAGE_ORDER),
+            "completed": completed,
+            "running": running,
+            "failed": failed,
+            "percent": int(round((completed / len(STAGE_ORDER)) * 100)),
+        }
+
+    def current_stage(self, job: dict[str, Any]) -> str | None:
+        runner = job.get("runner") or {}
+        if runner.get("status") == "running" and runner.get("current_stage"):
+            return runner["current_stage"]
+        for stage in STAGE_ORDER:
+            if job.get("stages", {}).get(stage, {}).get("status") == "running":
+                return stage
+        return None
+
+    def next_stage(self, job: dict[str, Any]) -> str | None:
+        for stage in STAGE_ORDER:
+            if job.get("stages", {}).get(stage, {}).get("status") not in {"succeeded", "skipped"}:
+                return stage
+        return None
+
+    def dashboard_url(self, job_id: str) -> str:
+        return f"http://127.0.0.1:18120/video-link/jobs/{job_id}"
+
+    def tail_stage_log(self, job_id: str, stage: str, limit: int = 80) -> dict[str, Any]:
+        stage = normalize_stage_name(stage)
+        if stage not in STAGE_ORDER:
+            raise BridgeError(HTTPStatus.NOT_FOUND, f"unknown stage: {stage}")
+        self.load_job(job_id)
+        limit = max(1, min(limit, 500))
+        log_path = self.stage_log_path(job_id, stage)
+        if not log_path.exists():
+            return {"job_id": job_id, "stage": stage, "log_path": str(log_path), "lines": []}
+        return {
+            "job_id": job_id,
+            "stage": stage,
+            "log_path": str(log_path),
+            "lines": tail_lines(log_path.read_text(encoding="utf-8", errors="replace"), limit),
+        }
+
+    def load_job(self, job_id: str) -> dict[str, Any]:
+        if not re.fullmatch(r"[a-f0-9]{32}", job_id):
+            raise BridgeError(HTTPStatus.NOT_FOUND, "job not found")
+        path = self.job_path(job_id)
+        if not path.exists():
+            raise BridgeError(HTTPStatus.NOT_FOUND, "job not found")
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def save_job(self, job: dict[str, Any]) -> None:
+        self.job_path(job["job_id"]).write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def job_dir(self, job_id: str) -> Path:
+        return self.jobs_dir / job_id
+
+    def job_path(self, job_id: str) -> Path:
+        return self.job_dir(job_id) / "job.json"
+
+    def stage_log_path(self, job_id: str, stage: str) -> Path:
+        return self.job_dir(job_id) / "logs" / f"{stage}.log"
+
+
+def sanitize_run_name(value: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip(".-")
+    return name or "operation-manual"
+
+
+def normalize_stage_name(stage: str) -> str:
+    value = str(stage or "").strip()
+    return STAGE_ALIASES.get(value, value)
+
+
+def pipeline_mode_for(analysis_mode: str) -> str:
+    return "fast" if analysis_mode == "long-talk-fast" else analysis_mode
+
+
+def operation_env() -> dict[str, str]:
+    env = os.environ.copy()
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        env.pop(key, None)
+    venv_bin = REPO_ROOT / ".venv" / "bin"
+    venv_python = venv_bin / "python"
+    if venv_bin.is_dir():
+        env["PATH"] = f"{venv_bin}:{env.get('PATH', '')}"
+    if venv_python.exists():
+        env["PYTHON"] = str(venv_python)
+    env["NO_PROXY"] = "*"
+    env["no_proxy"] = "*"
+    return env
+
+
+def parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def parse_bool_option(payload: dict[str, Any], snake_key: str, camel_key: str, default: bool) -> bool:
+    if snake_key in payload:
+        return parse_bool(normalize_optional_template(payload.get(snake_key)))
+    if camel_key in payload:
+        return parse_bool(normalize_optional_template(payload.get(camel_key)))
+    return default
+
+
+def parse_int_option(value: Any, default: int) -> int:
+    value = normalize_optional_template(value)
+    if value in {None, ""}:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise BridgeError(HTTPStatus.BAD_REQUEST, "max_comments must be an integer") from exc
+    return max(0, parsed)
+
+
+def normalize_optional_template(value: Any) -> Any:
+    if isinstance(value, str) and re.fullmatch(r"\s*\{\{\s*[^{}]+?\s*\}\}\s*", value):
+        return ""
+    return value
+
+
+def normalize_cookie_browser(value: Any) -> str:
+    browser = str(normalize_optional_template(value) or "").strip().lower()
+    if not browser or browser == "auto":
+        return DEFAULT_COOKIE_BROWSER
+    if browser in {"none", "no", "off", "false", "disabled"}:
+        return ""
+    return browser
+
+
+def runtime_config() -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for path in (REPO_ROOT / "video_analyzer" / "config" / "default_config.json", REPO_ROOT / "config" / "config.json"):
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if "active_runtime_profile" in data:
+            merged["active_runtime_profile"] = data["active_runtime_profile"]
+        profiles = data.get("runtime_profiles")
+        if isinstance(profiles, dict):
+            merged.setdefault("runtime_profiles", {}).update(profiles)
+    return merged
+
+
+def runtime_profile_names() -> list[str]:
+    profiles = runtime_config().get("runtime_profiles") or {}
+    return sorted(profiles)
+
+
+def active_runtime_profile(profiles: list[str]) -> str:
+    active = str(runtime_config().get("active_runtime_profile") or "").strip()
+    if active and active in profiles:
+        return active
+    return profiles[0] if profiles else DEFAULT_PROFILE
+
+
+def probe_duration_seconds(video_url: str) -> int | None:
+    command = ["yt-dlp", "--dump-single-json", "--skip-download", "--no-playlist", video_url]
+    if shutil.which("node"):
+        command[1:1] = ["--js-runtimes", "node"]
+    if can_connect_local_proxy():
+        command[1:1] = ["--proxy", "http://127.0.0.1:10808"]
+    try:
+        completed = subprocess.run(command, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=operation_env())
+        data = json.loads(completed.stdout)
+        duration = data.get("duration") or 0
+        return int(float(duration)) if duration else None
+    except Exception:
+        return None
+
+
+def can_connect_local_proxy() -> bool:
+    import socket
+
+    try:
+        with socket.create_connection(("127.0.0.1", 10808), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def parse_run_dir(text: str) -> str | None:
+    patterns = [
+        re.compile(r"^\[done\] RUN_DIR=(?P<path>.+)$"),
+        re.compile(r"^RUN_DIR=(?P<path>.+)$"),
+        re.compile(r"^\[done\] run_dir: (?P<path>.+)$"),
+    ]
+    for line in reversed(text.splitlines()):
+        for pattern in patterns:
+            match = pattern.match(line.strip())
+            if match:
+                return match.group("path").strip()
+    return None
+
+
+def parse_prefixed_path(text: str, prefix: str) -> str | None:
+    for line in reversed(text.splitlines()):
+        stripped = line.strip()
+        if stripped.startswith(prefix):
+            return stripped[len(prefix) :].strip()
+    return None
+
+
+def tail_lines(text: str, limit: int = 40) -> list[str]:
+    return text.splitlines()[-limit:]
+
+
+def iso_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def render_create_page(options: dict[str, Any]) -> str:
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>video-link 新建任务</title>
+  <style>
+    :root {{ color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    body {{ margin: 0; background: #f7f8fa; color: #202124; }}
+    main {{ max-width: 960px; margin: 0 auto; padding: 28px 20px 40px; }}
+    h1 {{ margin: 0 0 8px; font-size: 24px; }}
+    .meta {{ color: #5f6368; font-size: 13px; margin-bottom: 20px; }}
+    .panel {{ background: #fff; border: 1px solid #dadce0; border-radius: 8px; padding: 16px; margin: 14px 0; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; }}
+    label {{ display: block; color: #5f6368; font-size: 12px; margin-bottom: 6px; }}
+    input, select {{ box-sizing: border-box; width: 100%; border: 1px solid #c9d1d9; border-radius: 6px; padding: 9px 10px; font-size: 14px; background: #fff; }}
+    input[type="checkbox"] {{ width: auto; margin-right: 8px; }}
+    .wide {{ grid-column: 1 / -1; }}
+    .check {{ display: flex; align-items: center; min-height: 38px; color: #202124; font-size: 14px; }}
+    details summary {{ cursor: pointer; color: #174ea6; font-weight: 600; }}
+    button {{ border: 0; border-radius: 6px; background: #1a73e8; color: #fff; padding: 10px 16px; font-size: 14px; cursor: pointer; }}
+    button:disabled {{ background: #9aa0a6; cursor: wait; }}
+    .error {{ display: none; margin-top: 12px; color: #a50e0e; background: #fce8e6; border: 1px solid #f5c2c7; border-radius: 6px; padding: 10px; }}
+    .hint {{ color: #5f6368; font-size: 13px; margin-top: 8px; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>video-link 新建任务</h1>
+    <div class="meta">提交后会启动后台流程，并自动跳转到状态页查看进度、日志和产物。</div>
+    <form class="panel" id="jobForm">
+      <div class="grid">
+        <div class="wide">
+          <label for="video_url">视频链接</label>
+          <input id="video_url" name="video_url" type="url" placeholder="https://..." required autofocus>
+        </div>
+        <div>
+          <label for="analysis_mode">分析模式</label>
+          <select id="analysis_mode" name="analysis_mode"></select>
+        </div>
+        <div>
+          <label for="profile">运行配置</label>
+          <select id="profile" name="profile"></select>
+        </div>
+        <div>
+          <label for="run_name">运行名称</label>
+          <input id="run_name" name="run_name">
+        </div>
+        <div>
+          <label for="cookies_from_browser">Cookie 来源</label>
+          <select id="cookies_from_browser" name="cookies_from_browser"></select>
+        </div>
+        <label class="check"><input id="skip_images" name="skip_images" type="checkbox">跳过配图提示词</label>
+      </div>
+      <details class="panel">
+        <summary>采集选项</summary>
+        <div class="grid" style="margin-top: 14px;">
+          <label class="check"><input id="keep_existing" name="keep_existing" type="checkbox">复用已有下载</label>
+          <label class="check"><input id="include_subtitles" name="include_subtitles" type="checkbox">下载并纳入字幕</label>
+          <label class="check"><input id="prefer_subtitle_transcript" name="prefer_subtitle_transcript" type="checkbox">优先用字幕作为 transcript</label>
+          <label class="check"><input id="include_comments" name="include_comments" type="checkbox">下载并纳入评论</label>
+          <label class="check"><input id="refresh_context" name="refresh_context" type="checkbox">刷新页面上下文</label>
+          <div>
+            <label for="max_comments">最多评论数</label>
+            <input id="max_comments" name="max_comments" type="number" min="0" step="1">
+          </div>
+          <div class="wide">
+            <label for="subtitle_langs">字幕语言优先级</label>
+            <input id="subtitle_langs" name="subtitle_langs">
+          </div>
+        </div>
+      </details>
+      <button id="submitBtn" type="submit">启动任务</button>
+      <div class="hint">模型和 endpoint 由 profile 控制，不在页面临时覆盖。</div>
+      <div class="error" id="errorBox"></div>
+    </form>
+  </main>
+  <script>
+    const options = {json.dumps(options, ensure_ascii=False)};
+    const defaults = options.defaults || {{}};
+    const choices = options.choices || {{}};
+    function fillSelect(id, values, selected) {{
+      const node = document.getElementById(id);
+      node.innerHTML = (values || []).map(value => `<option value="${{value}}">${{value}}</option>`).join("");
+      node.value = selected || "";
+    }}
+    function setChecked(id, value) {{ document.getElementById(id).checked = Boolean(value); }}
+    fillSelect("analysis_mode", choices.analysis_modes, defaults.analysis_mode);
+    fillSelect("profile", choices.profiles, defaults.profile);
+    fillSelect("cookies_from_browser", choices.cookie_browsers, defaults.cookies_from_browser);
+    document.getElementById("run_name").value = defaults.run_name || "operation-manual";
+    document.getElementById("max_comments").value = defaults.max_comments ?? 30;
+    document.getElementById("subtitle_langs").value = defaults.subtitle_langs || "";
+    setChecked("skip_images", defaults.skip_images);
+    setChecked("keep_existing", defaults.keep_existing);
+    setChecked("include_subtitles", defaults.include_subtitles);
+    setChecked("prefer_subtitle_transcript", defaults.prefer_subtitle_transcript);
+    setChecked("include_comments", defaults.include_comments);
+    setChecked("refresh_context", defaults.refresh_context);
+    document.getElementById("jobForm").addEventListener("submit", async event => {{
+      event.preventDefault();
+      const button = document.getElementById("submitBtn");
+      const errorBox = document.getElementById("errorBox");
+      button.disabled = true;
+      errorBox.style.display = "none";
+      const payload = {{
+        video_url: document.getElementById("video_url").value.trim(),
+        analysis_mode: document.getElementById("analysis_mode").value,
+        profile: document.getElementById("profile").value,
+        run_name: document.getElementById("run_name").value.trim(),
+        cookies_from_browser: document.getElementById("cookies_from_browser").value,
+        skip_images: document.getElementById("skip_images").checked,
+        keep_existing: document.getElementById("keep_existing").checked,
+        include_subtitles: document.getElementById("include_subtitles").checked,
+        prefer_subtitle_transcript: document.getElementById("prefer_subtitle_transcript").checked,
+        include_comments: document.getElementById("include_comments").checked,
+        max_comments: Number(document.getElementById("max_comments").value || 0),
+        subtitle_langs: document.getElementById("subtitle_langs").value.trim(),
+        refresh_context: document.getElementById("refresh_context").checked,
+        auto_start: true
+      }};
+      try {{
+        const response = await fetch("/api/video-link/jobs", {{
+          method: "POST",
+          headers: {{"Content-Type": "application/json"}},
+          body: JSON.stringify(payload)
+        }});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || `HTTP ${{response.status}}`);
+        window.location.href = data.dashboard_url || `/video-link/jobs/${{data.job_id}}`;
+      }} catch (error) {{
+        errorBox.textContent = error.message;
+        errorBox.style.display = "block";
+        button.disabled = false;
+      }}
+    }});
+  </script>
+</body>
+</html>"""
+
+
+def render_job_dashboard(job: dict[str, Any]) -> str:
+    job_id = escape_text(job["job_id"])
+    api_url = f"/api/video-link/jobs/{job_id}"
+    initial_stage = job.get("current_stage") or job.get("next_stage") or STAGE_ORDER[-1]
+    log_url = f"/api/video-link/jobs/{job_id}/logs/{initial_stage}?tail=80"
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>video-link 状态 {job_id}</title>
+  <style>
+    :root {{ color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    body {{ margin: 0; background: #f7f8fa; color: #202124; }}
+    main {{ max-width: 1120px; margin: 0 auto; padding: 28px 20px 40px; }}
+    h1 {{ margin: 0 0 8px; font-size: 24px; }}
+    .meta {{ color: #5f6368; font-size: 13px; margin-bottom: 20px; }}
+    .panel {{ background: #fff; border: 1px solid #dadce0; border-radius: 8px; padding: 16px; margin: 14px 0; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }}
+    .key {{ color: #5f6368; font-size: 12px; margin-bottom: 4px; }}
+    .value {{ font-size: 14px; overflow-wrap: anywhere; }}
+    .bar {{ height: 10px; background: #eceff3; border-radius: 999px; overflow: hidden; margin-top: 10px; }}
+    .bar > div {{ height: 100%; width: 0%; background: #1a73e8; transition: width .25s ease; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
+    th, td {{ border-bottom: 1px solid #edf0f2; text-align: left; padding: 10px 8px; vertical-align: top; }}
+    th {{ color: #5f6368; font-weight: 600; }}
+    .status {{ display: inline-block; min-width: 70px; padding: 3px 8px; border-radius: 999px; background: #edf0f2; font-size: 12px; text-align: center; }}
+    .succeeded, .skipped {{ background: #e6f4ea; color: #137333; }}
+    .running {{ background: #e8f0fe; color: #174ea6; }}
+    .failed {{ background: #fce8e6; color: #a50e0e; }}
+    .errorBox {{ display: none; border-color: #f5c2c7; background: #fff5f5; color: #842029; }}
+    .errorBox strong {{ display: block; margin-bottom: 8px; }}
+    .hint {{ margin-top: 8px; color: #5f6368; font-size: 13px; }}
+    .actions {{ margin-top: 14px; display: flex; gap: 10px; align-items: center; }}
+    button {{ border: 0; border-radius: 6px; padding: 9px 14px; background: #202124; color: #fff; font-size: 14px; cursor: pointer; }}
+    button:disabled {{ opacity: .55; cursor: default; }}
+    pre {{ margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.5; max-height: 420px; overflow: auto; }}
+    a {{ color: #0969da; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>video-link 后台流程状态</h1>
+    <div class="meta">任务 ID: <code>{job_id}</code> · 每 5 秒自动刷新</div>
+    <section class="panel">
+      <div class="grid">
+        <div><div class="key">总体状态</div><div class="value" id="status">-</div></div>
+        <div><div class="key">当前阶段</div><div class="value" id="current">-</div></div>
+        <div><div class="key">下一阶段</div><div class="value" id="next">-</div></div>
+        <div><div class="key">进度</div><div class="value" id="progressText">-</div></div>
+      </div>
+      <div class="bar"><div id="progressBar"></div></div>
+      <div class="actions">
+        <button id="runButton" type="button">继续运行</button>
+        <span class="hint" id="runMessage"></span>
+      </div>
+    </section>
+    <section class="panel errorBox" id="errorBox">
+      <strong id="errorTitle">流程失败</strong>
+      <div class="value" id="errorMessage">-</div>
+      <div class="hint" id="errorHint">请查看下方当前日志尾部定位原因。</div>
+    </section>
+    <section class="panel">
+      <div class="grid">
+        <div><div class="key">视频链接</div><div class="value" id="videoUrl">-</div></div>
+        <div><div class="key">运行目录</div><div class="value" id="runDir">-</div></div>
+        <div><div class="key">分析模式</div><div class="value" id="mode">-</div></div>
+        <div><div class="key">更新时间</div><div class="value" id="updatedAt">-</div></div>
+      </div>
+    </section>
+    <section class="panel">
+      <h2>阶段</h2>
+      <table>
+        <thead><tr><th>阶段</th><th>状态</th><th>耗时</th><th>日志</th></tr></thead>
+        <tbody id="stages"></tbody>
+      </table>
+    </section>
+    <section class="panel">
+      <h2>产物</h2>
+      <div id="artifacts" class="value">-</div>
+    </section>
+    <section class="panel">
+      <h2>当前日志</h2>
+      <div class="hint" id="logHint">显示当前阶段或失败阶段的日志尾部。</div>
+      <pre id="logs">-</pre>
+    </section>
+  </main>
+  <script>
+    const apiUrl = {json.dumps(api_url)};
+    let logUrl = {json.dumps(log_url)};
+    const stageNames = {json.dumps(STAGE_LABELS, ensure_ascii=False)};
+    function text(id, value) {{ document.getElementById(id).textContent = value || "-"; }}
+    function statusClass(status) {{ return "status " + (status || "pending"); }}
+    async function refresh() {{
+      const job = await fetch(apiUrl).then(r => r.json());
+      const progress = job.progress || {{}};
+      text("status", job.status);
+      const runButton = document.getElementById("runButton");
+      runButton.disabled = job.status === "running" || job.runner?.status === "running";
+      runButton.textContent = job.status === "failed" ? "重试失败阶段" : "继续运行";
+      text("current", stageNames[job.current_stage] || job.current_stage);
+      text("next", stageNames[job.next_stage] || job.next_stage);
+      text("progressText", `${{progress.completed || 0}}/${{progress.total || 0}} · ${{progress.percent || 0}}%`);
+      document.getElementById("progressBar").style.width = (progress.percent || 0) + "%";
+      text("videoUrl", job.video_url);
+      text("runDir", job.summary?.run_dir || job.run_dir);
+      text("mode", `${{job.options?.analysis_mode || "-"}} -> ${{job.resolved_mode || "-"}}`);
+      text("updatedAt", job.updated_at);
+      const error = job.error_summary;
+      const errorBox = document.getElementById("errorBox");
+      if (error) {{
+        errorBox.style.display = "block";
+        text("errorTitle", `流程失败：${{error.stage_label || error.stage || "未知阶段"}}`);
+        text("errorMessage", error.message || "未提供错误信息");
+      }} else {{
+        errorBox.style.display = "none";
+      }}
+      document.getElementById("stages").innerHTML = (job.stage_order || []).map(stage => {{
+        const info = job.stages?.[stage] || {{}};
+        const duration = info.duration_seconds == null ? "-" : `${{info.duration_seconds}}s`;
+        const errorText = info.error ? `<div class="hint">${{info.error}}</div>` : "";
+        return `<tr><td>${{stageNames[stage] || stage}}${{errorText}}</td><td><span class="${{statusClass(info.status)}}">${{info.status || "pending"}}</span></td><td>${{duration}}</td><td>${{info.log_path || "-"}}</td></tr>`;
+      }}).join("");
+      const summary = job.summary || {{}};
+      document.getElementById("artifacts").innerHTML = [
+        `Markdown: ${{(summary.markdown_files || []).length}}`,
+        `导出文件: ${{(summary.export_files || []).length}}`,
+        `配图提示词: ${{(summary.prompt_files || []).length}}`,
+        `最终图片: ${{(summary.final_images || []).length}}`
+      ].join("<br>");
+      const stageForLog = job.current_stage || job.error_summary?.stage || job.next_stage || [...(job.stage_order || [])].reverse().find(stage => job.stages?.[stage]?.log_path);
+      text("logHint", stageForLog ? `显示：${{stageNames[stageForLog] || stageForLog}} 的日志尾部` : "暂无日志");
+      if (stageForLog) logUrl = `/api/video-link/jobs/${{job.job_id}}/logs/${{stageForLog}}?tail=80`;
+      const log = await fetch(logUrl).then(r => r.json()).catch(() => ({{lines: []}}));
+      text("logs", (log.lines || []).join("\\n"));
+    }}
+    document.getElementById("runButton").addEventListener("click", async () => {{
+      const button = document.getElementById("runButton");
+      const message = document.getElementById("runMessage");
+      button.disabled = true;
+      message.textContent = "已发送";
+      try {{
+        await fetch(`${{apiUrl}}/run`, {{ method: "POST", headers: {{ "Content-Type": "application/json" }}, body: "{{}}" }}).then(async r => {{
+          if (!r.ok) throw new Error((await r.json()).error || `HTTP ${{r.status}}`);
+          return r.json();
+        }});
+        message.textContent = "运行中";
+        await refresh();
+      }} catch (error) {{
+        message.textContent = error.message;
+        button.disabled = false;
+      }}
+    }});
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>"""
+
+
+def escape_text(value: Any) -> str:
+    return html.escape(str(value), quote=True)
+
+
+class StatusRequestHandler(BaseHTTPRequestHandler):
+    server_app: VideoLinkStatusServer
+
+    def do_GET(self) -> None:
+        try:
+            parsed = urlparse(self.path)
+            path = parsed.path
+            if path == "/video-link":
+                self.write_html(render_create_page(self.server_app.options()))
+                return
+            if path == "/api/video-link/health":
+                self.write_json({"ok": True, "stages": STAGE_ORDER})
+                return
+            if path == "/api/video-link/options":
+                self.write_json(self.server_app.options())
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})", path)
+            if match:
+                self.write_json(self.server_app.public_job(self.server_app.load_job(match.group(1))))
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/logs/([a-z0-9-]+)", path)
+            if match:
+                query = parse_qs(parsed.query)
+                limit = int(query.get("tail", ["80"])[0])
+                self.write_json(self.server_app.tail_stage_log(match.group(1), match.group(2), limit))
+                return
+            match = re.fullmatch(r"/video-link/jobs/([a-f0-9]{32})", path)
+            if match:
+                self.write_html(render_job_dashboard(self.server_app.public_job(self.server_app.load_job(match.group(1)))))
+                return
+            raise BridgeError(HTTPStatus.NOT_FOUND, "not found")
+        except ValueError as exc:
+            self.write_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        except BridgeError as exc:
+            self.write_json({"error": exc.message}, exc.status)
+
+    def do_POST(self) -> None:
+        try:
+            path = urlparse(self.path).path
+            payload = self.read_json_body()
+            if path == "/api/video-link/jobs":
+                self.write_json(self.server_app.create_job(payload), HTTPStatus.CREATED)
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/run", path)
+            if match:
+                self.write_json(self.server_app.start_run(match.group(1)), HTTPStatus.ACCEPTED)
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/stages/([a-z0-9-]+)", path)
+            if match:
+                self.write_json(self.server_app.run_stage(match.group(1), match.group(2)))
+                return
+            raise BridgeError(HTTPStatus.NOT_FOUND, "not found")
+        except BridgeError as exc:
+            self.write_json({"error": exc.message}, exc.status)
+
+    def read_json_body(self) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length == 0:
+            return {}
+        raw = self.rfile.read(length).decode("utf-8")
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, f"invalid JSON: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "request body must be a JSON object")
+        return payload
+
+    def write_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
+        body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        self.send_response(int(status))
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def write_html(self, body_text: str, status: HTTPStatus = HTTPStatus.OK) -> None:
+        body = body_text.encode("utf-8")
+        self.send_response(int(status))
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        sys.stderr.write("%s - %s\n" % (self.log_date_time_string(), fmt % args))
+
+
+def run_server(args: argparse.Namespace) -> None:
+    StatusRequestHandler.server_app = VideoLinkStatusServer(Path(args.jobs_dir), REPO_ROOT)
+    server = ThreadingHTTPServer((args.host, args.port), StatusRequestHandler)
+    print(f"video-link status server listening on http://{args.host}:{args.port}", flush=True)
+    server.serve_forever()
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    serve = subparsers.add_parser("serve")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=18120)
+    serve.add_argument("--jobs-dir", default=str(DEFAULT_JOBS_DIR))
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    if args.command == "serve":
+        run_server(args)
+
+
+if __name__ == "__main__":
+    main()
