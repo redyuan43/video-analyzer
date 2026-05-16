@@ -107,6 +107,29 @@ A passing dual-worker response includes:
   `python3 -m py_compile tools/video_link_status_server.py tests/test_video_link_status_server.py`
   and `python3 -m unittest tests.test_video_link_status_server`.
 
+## Video Link Resume And Publishing Notes
+
+- `tools/run_operation_manual_from_url.py` deletes the target `run_dir` before launching analyzer work, even when `--keep-existing` reuses the downloaded video and page context. Do not resume by passing `--transcript-file` that points inside the same target `run_dir`; the wrapper can delete the transcript before the analyzer reads it.
+- If a URL run is interrupted after ASR succeeds, first check whether `transcript.md` survived. If it exists, resume with absolute paths and skip ASR:
+  `python -m video_analyzer.cli VIDEO.mp4 --output NEW_RUN_DIR --context-file PAGE_CONTEXT.md --asr-provider none --transcript-file /abs/path/transcript.md ...`
+  Prefer a new resume output directory when in doubt, so existing ASR/transcript artifacts are not destroyed.
+- If the requested text LLM changes while ASR is already running, let VibeVoice finish and write `transcript.md`, then stop before OCR/VL/manual generation and restart from that transcript with the new runtime profile/model. Do not rerun download or ASR just to change the final LLM.
+- When the user asks for DeepSeek V4 output, use the `deepseek_v4_flash` runtime profile for text/manual/multidoc stages. Treat DeepSeek V4 as a text/review path; keep visual frame analysis on the configured vision model such as MiniCPM unless the user explicitly asks to change the visual model.
+- For publisher resume after operation-manual artifacts already exist, use:
+  `~/.codex/skills/video-link/scripts/run_video_link_analysis_publisher.sh URL --profile deepseek_v4_flash --run-dir "$RUN_DIR" --skip-operation`
+- For Baoyu final-image delivery, prefer the Baoyu image-generation CLI only when its prerequisites are present, including a `baoyu-imagine` `EXTEND.md` and `bun` or `npx -y bun`. If those are missing, use built-in `image_gen` one prompt at a time.
+- Built-in `image_gen` saves under `$HOME/.codex/generated_images/...` by default. For project-bound video-link outputs, copy the selected generated PNGs into `$RUN_DIR/baoyu_images/final` and leave the originals in `.codex` untouched.
+- Keep stable final image names for the four default prompt outputs:
+  - `01-image-cards-operation-manual.png`
+  - `02-infographic-knowledge-notes.png`
+  - `03-infographic-deep-report.png`
+  - `04-infographic-manual-evidence.png`
+- Before reporting video-link completion, verify:
+  `find "$RUN_DIR/exports" -maxdepth 1 -type f | wc -l`,
+  `find "$RUN_DIR/baoyu_images/prompts" -maxdepth 1 -type f | wc -l`,
+  `find "$RUN_DIR/baoyu_images/final" -maxdepth 1 -type f -name '*.png' | wc -l`,
+  and `file "$RUN_DIR/baoyu_images/final"/*.png`.
+
 ## Jetson Frame Extraction
 
 - For long operation-manual videos, prefer Jetson candidate-frame extraction instead of local CPU/OpenCV scanning.
