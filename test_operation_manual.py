@@ -297,6 +297,7 @@ class OperationManualTests(unittest.TestCase):
                 include_comments=None,
                 max_comments=None,
                 subtitle_langs=None,
+                ytdlp_js_runtimes=None,
             )
 
             run_operation_manual_from_url.apply_runtime_profile(args)
@@ -306,6 +307,25 @@ class OperationManualTests(unittest.TestCase):
             self.assertEqual(args.vibevoice_url, "http://lab.local/asr")
             self.assertEqual(args.ocr_base_url, "http://lab.local/ocr")
             self.assertEqual(args.output_root, "downloads/url-videos")
+            self.assertEqual(args.ytdlp_js_runtimes, "auto")
+
+    def test_url_runner_adds_node_js_runtime_for_youtube_challenges(self):
+        args = argparse.Namespace(ytdlp_js_runtimes="auto")
+        command = ["yt-dlp", "--dump-single-json", "https://example.test/video"]
+
+        with patch.object(run_operation_manual_from_url.shutil, "which", return_value="/usr/bin/node"):
+            run_operation_manual_from_url.add_ytdlp_runtime_args(command, args)
+
+        self.assertIn("--js-runtimes", command)
+        self.assertIn("node", command)
+
+    def test_url_runner_can_disable_ytdlp_js_runtime(self):
+        args = argparse.Namespace(ytdlp_js_runtimes="none")
+        command = ["yt-dlp", "--dump-single-json", "https://example.test/video"]
+
+        run_operation_manual_from_url.add_ytdlp_runtime_args(command, args)
+
+        self.assertNotIn("--js-runtimes", command)
 
     def test_url_runner_builds_page_context_markdown(self):
         info = {

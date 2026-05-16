@@ -63,6 +63,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cookies-from-browser", help="Forward to yt-dlp, e.g. chrome, chromium, firefox, brave")
     parser.add_argument("--cookies", help="Forward cookies.txt to yt-dlp")
     parser.add_argument("--ytdlp-proxy", help="Proxy URL used only by yt-dlp download/metadata requests")
+    parser.add_argument(
+        "--ytdlp-js-runtimes",
+        help="Forward to yt-dlp --js-runtimes. Use auto/node for YouTube JS challenges, or none to disable.",
+    )
     parser.add_argument("--refresh-context", action="store_true", help="Refresh page context, subtitles, and comments without redownloading an existing video")
     parser.add_argument(
         "--prefer-subtitle-transcript",
@@ -132,6 +136,7 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
         "include_comments": profile.get("include_comments", True),
         "max_comments": profile.get("max_comments", 30),
         "subtitle_langs": profile.get("subtitle_langs", FALLBACK_SUBTITLE_LANGS),
+        "ytdlp_js_runtimes": profile.get("ytdlp_js_runtimes", "auto"),
         "prefer_subtitle_transcript": profile.get("prefer_subtitle_transcript", False),
         "frame_extractor": profile.get("frame_extractor", "local"),
         "jetson_frame_hosts": profile.get("jetson_frame_hosts", "nx2,nx3"),
@@ -226,6 +231,7 @@ def ensure_tool(name: str) -> None:
 
 def fetch_metadata(url: str, args: argparse.Namespace) -> dict[str, Any]:
     command = ["yt-dlp", "--dump-single-json", "--no-warnings", "--skip-download", url]
+    add_ytdlp_runtime_args(command, args)
     add_ytdlp_network_args(command, args)
     add_cookie_args(command, args)
     raw = subprocess.check_output(command, text=True)
@@ -250,6 +256,7 @@ def download_video(url: str, video_dir: Path, args: argparse.Namespace) -> None:
         command.extend(["--write-subs", "--write-auto-subs", "--sub-langs", subtitle_langs_for_ytdlp(args.subtitle_langs)])
     if args.include_comments:
         command.append("--write-comments")
+    add_ytdlp_runtime_args(command, args)
     add_ytdlp_network_args(command, args)
     add_cookie_args(command, args)
     subprocess.run(command, check=True)
@@ -270,6 +277,7 @@ def download_context_assets(url: str, video_dir: Path, args: argparse.Namespace)
         command.extend(["--write-subs", "--write-auto-subs", "--sub-langs", subtitle_langs_for_ytdlp(args.subtitle_langs)])
     if args.include_comments:
         command.append("--write-comments")
+    add_ytdlp_runtime_args(command, args)
     add_ytdlp_network_args(command, args)
     add_cookie_args(command, args)
     subprocess.run(command, check=True)
@@ -294,6 +302,18 @@ def add_cookie_args(command: list[str], args: argparse.Namespace) -> None:
 def add_ytdlp_network_args(command: list[str], args: argparse.Namespace) -> None:
     if getattr(args, "ytdlp_proxy", None):
         command.extend(["--proxy", args.ytdlp_proxy])
+
+
+def add_ytdlp_runtime_args(command: list[str], args: argparse.Namespace) -> None:
+    value = str(getattr(args, "ytdlp_js_runtimes", None) or "auto").strip()
+    if value.lower() == "auto":
+        if not shutil.which("node"):
+            return
+        value = "node"
+    if not value or value.lower() in {"none", "no", "off", "false", "disabled"}:
+        return
+    if "--js-runtimes" not in command:
+        command.extend(["--js-runtimes", value])
 
 
 def materialize_download(video_dir: Path, video_path: Path) -> None:
