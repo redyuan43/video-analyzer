@@ -2,9 +2,13 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from video_analyzer.multidoc import parse_chapters
 from tools.augment_video_docs_images import main as augment_main
+from tools.md_to_mobile_pdf import main as mobile_pdf_main
+from tools.md_to_mobile_pdf import render_mermaid_blocks
+from tools.pdf_to_long_png import main as long_png_main
 from tools.prepare_video_doc_export import rewrite_image_paths
 
 
@@ -76,6 +80,77 @@ class VideoDocImageTests(unittest.TestCase):
 
             self.assertIn("(baoyu_images/final/03-infographic-deep-report.png)", rewritten)
             self.assertNotIn("../baoyu_images", rewritten)
+
+    def test_mobile_pdf_export_writes_non_empty_pdf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            source = run_dir / "sample.md"
+            target = run_dir / "sample.pdf"
+            source.write_text("# 标题\n\n正文段落，适合手机阅读。\n\n| 项 | 值 |\n| --- | --- |\n| A | 很长的一段中文内容 |\n", encoding="utf-8")
+
+            import sys
+
+            old_argv = sys.argv
+            try:
+                sys.argv = ["md_to_mobile_pdf.py", str(source), str(target)]
+                mobile_pdf_main()
+            finally:
+                sys.argv = old_argv
+
+            self.assertGreater(target.stat().st_size, 1000)
+            self.assertEqual(target.read_bytes()[:4], b"%PDF")
+
+    def test_pdf_to_long_png_writes_non_empty_png(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            source = run_dir / "sample.md"
+            pdf = run_dir / "sample.pdf"
+            png = run_dir / "sample.long.png"
+            source.write_text("# 标题\n\n第一页。\n\n第二段内容。\n", encoding="utf-8")
+
+            import sys
+
+            old_argv = sys.argv
+            try:
+                sys.argv = ["md_to_mobile_pdf.py", str(source), str(pdf)]
+                mobile_pdf_main()
+                sys.argv = ["pdf_to_long_png.py", str(pdf), str(png), "--dpi", "96"]
+                long_png_main()
+            finally:
+                sys.argv = old_argv
+
+            self.assertGreater(png.stat().st_size, 1000)
+            self.assertEqual(png.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+
+    def test_mobile_pdf_export_rewrites_linear_flowchart_to_html(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work_dir = Path(tmp)
+
+            rendered = render_mermaid_blocks(
+                "```mermaid\nflowchart TD\nA[Start] --> B{Check}\nB --> C[End]\n```\n",
+                work_dir,
+            )
+
+            self.assertIn('class="mobile-flowchart"', rendered)
+            self.assertIn("Start", rendered)
+            self.assertIn("Check", rendered)
+            self.assertIn("End", rendered)
+            self.assertNotIn("```mermaid", rendered)
+            self.assertFalse((work_dir / "mermaid_001.png").exists())
+
+    def test_mobile_pdf_export_rewrites_non_linear_mermaid_to_png_images(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work_dir = Path(tmp)
+
+            def fake_run(command, check):
+                Path(command[command.index("-o") + 1]).write_bytes(b"png")
+
+            with patch("tools.md_to_mobile_pdf.subprocess.run", side_effect=fake_run):
+                rendered = render_mermaid_blocks("```mermaid\nsequenceDiagram\nA->>B: Hi\n```\n", work_dir)
+
+            self.assertIn("![Mermaid diagram 1](file://", rendered)
+            self.assertNotIn("```mermaid", rendered)
+            self.assertTrue((work_dir / "mermaid_001.png").exists())
 
 
 if __name__ == "__main__":

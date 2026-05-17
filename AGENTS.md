@@ -117,19 +117,13 @@ A passing dual-worker response includes:
 - When the user asks for DeepSeek V4 output, use the `deepseek_v4_flash` runtime profile for text/manual/multidoc stages. Treat DeepSeek V4 as a text/review path; keep visual frame analysis on the configured vision model such as MiniCPM unless the user explicitly asks to change the visual model.
 - For publisher resume after operation-manual artifacts already exist, use:
   `~/.codex/skills/video-link/scripts/run_video_link_analysis_publisher.sh URL --profile deepseek_v4_flash --run-dir "$RUN_DIR" --skip-operation`
-- For Baoyu final-image delivery, prefer the Baoyu image-generation CLI only when its prerequisites are present, including a `baoyu-imagine` `EXTEND.md` and `bun` or `npx -y bun`. If those are missing, use built-in `image_gen` one prompt at a time.
-- Built-in `image_gen` saves under `$HOME/.codex/generated_images/...` by default. For project-bound video-link outputs, copy the selected generated PNGs into `$RUN_DIR/baoyu_images/final` and leave the originals in `.codex` untouched.
-- Keep stable final image names for the four default prompt outputs:
-  - `01-image-cards-operation-manual.png`
-  - `02-infographic-knowledge-notes.png`
-  - `03-infographic-deep-report.png`
-  - `04-infographic-manual-evidence.png`
-- Before reporting video-link completion, verify:
-  `find "$RUN_DIR/exports" -maxdepth 1 -type f | wc -l` equals `8`,
-  `find "$RUN_DIR/baoyu_images/prompts" -maxdepth 1 -type f | wc -l`,
-  `find "$RUN_DIR/baoyu_images/final" -maxdepth 1 -type f -name '*.png' | wc -l`,
-  and `file "$RUN_DIR/baoyu_images/final"/*.png`.
-  The default final publish set is only four document stems: `operation_manual`, `knowledge_notes_v2`, `deep_report_v2`, and `manual_evidence`. Keep `knowledge_notes`, `deep_report`, and `deep_report_v2.review` as intermediate or QA artifacts unless the user explicitly asks for them.
+- Current final publish is mobile-first PDF-only by default. Do not require `.long.png` unless the user explicitly asks for long-image delivery.
+- The default PDF backend is `tools/md_to_mobile_pdf.py` through `tools/export_video_docs.sh`. It renders prepared Markdown to narrow mobile-readable PDF with WeasyPrint. Linear `flowchart TD` Mermaid blocks should render as native mobile HTML flowcharts; other Mermaid blocks may fall back to high-resolution PNG.
+- Optional long-image delivery uses `tools/export_video_docs.sh --long-png` or `tools/run_video_doc_final_publish.sh --long-png`. It converts each verified PDF page to PNG, trims page whitespace, and stitches pages into `<name>.long.png`.
+- Final publish should generate the four Baoyu final images when `skip_images` is false, run `tools/augment_video_docs_images.py`, then generate PDFs from the image-augmented Markdown.
+- Before reporting video-link completion, verify the four default PDF outputs exist and are non-empty, and verify four final image PNGs exist unless `skip_images` is true:
+  `operation_manual.pdf`, `knowledge_notes_v2.pdf`, `deep_report_v2.pdf`, and `manual_evidence.pdf`.
+  Keep `knowledge_notes`, `deep_report`, and `deep_report_v2.review` as intermediate or QA artifacts unless the user explicitly asks for them.
 
 ## Jetson Frame Extraction
 

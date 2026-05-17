@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [ "${1:-}" = "" ]; then
-  echo "Usage: tools/run_video_doc_final_publish.sh RUN_DIR [--profile PROFILE] [--jobs N] [--finalize-only] [--skip-images] [--skip-send] [--to WECHAT_ID]" >&2
+  echo "Usage: tools/run_video_doc_final_publish.sh RUN_DIR [--profile PROFILE] [--jobs N] [--finalize-only] [--skip-images] [--skip-send] [--to WECHAT_ID] [--long-png]" >&2
   exit 2
 fi
 
@@ -15,6 +15,7 @@ JOBS=3
 FINALIZE_ONLY=0
 SKIP_IMAGES=0
 SKIP_SEND=0
+LONG_PNG=0
 WECHAT_TO="${WECLAW_TO:-}"
 WECLAW_API_URL="${WECLAW_API_URL:-http://127.0.0.1:18011}"
 
@@ -38,6 +39,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --skip-send)
       SKIP_SEND=1
+      shift
+      ;;
+    --long-png)
+      LONG_PNG=1
       shift
       ;;
     --to)
@@ -92,12 +97,25 @@ generate_final_images() {
     echo "[images] prompt directory missing: $PROMPT_DIR" >&2
     return 1
   fi
+  local active=0
   for index in "${!PROMPTS[@]}"; do
+    generate_one_final_image "$index" &
+    active=$((active + 1))
+    if [ "$active" -ge "$JOBS" ]; then
+      wait -n
+      active=$((active - 1))
+    fi
+  done
+  wait
+}
+
+generate_one_final_image() {
+    local index="$1"
     local prompt_file="$PROMPT_DIR/${PROMPTS[$index]}"
     local target="$FINAL_DIR/${FINAL_IMAGES[$index]}"
     if [ -s "$target" ]; then
       echo "[images] exists: $target"
-      continue
+      return 0
     fi
     if [ ! -f "$prompt_file" ]; then
       echo "[images] missing prompt: $prompt_file" >&2
@@ -107,23 +125,33 @@ generate_final_images() {
     marker="$(mktemp)"
     touch "$marker"
     echo "[images] codex exec image_gen: $(basename "$prompt_file")"
-    codex exec --cd "$RUN_DIR" --skip-git-repo-check --sandbox read-only "$(cat <<EOF
+    local log_file
+    log_file="$(mktemp)"
+    if ! codex exec --cd "$RUN_DIR" --skip-git-repo-check --sandbox read-only "$(cat <<EOF
 Use the imagegen skill/image_gen tool to generate exactly one PNG image from this prompt file:
 $prompt_file
 
 Do not edit files. Do not create Markdown. Only generate the raster image.
 EOF
-)"
+)" 2>&1 | tee "$log_file"; then
+      rm -f "$marker" "$log_file"
+      return 1
+    fi
+    local session_id
+    session_id="$(awk '/session id:/ {print $3}' "$log_file" | tail -1)"
     local generated
-    generated="$(find "$HOME/.codex/generated_images" -type f -name '*.png' -newer "$marker" -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
-    rm -f "$marker"
+    if [ -n "$session_id" ] && [ -d "$HOME/.codex/generated_images/$session_id" ]; then
+      generated="$(find "$HOME/.codex/generated_images/$session_id" -type f -name '*.png' -newer "$marker" -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
+    else
+      generated=""
+    fi
+    rm -f "$marker" "$log_file"
     if [ -z "$generated" ] || [ ! -s "$generated" ]; then
       echo "[images] no generated PNG found for $prompt_file" >&2
       return 1
     fi
     cp "$generated" "$target"
     echo "[images] copied: $target"
-  done
 }
 
 regenerate_docs() {
@@ -140,19 +168,21 @@ regenerate_docs() {
 }
 
 verify_counts() {
-  local pdf_count png_count final_count
+  local pdf_count
   pdf_count="$(find "$EXPORT_DIR" -maxdepth 1 -type f -name '*.pdf' | wc -l)"
-  png_count="$(find "$EXPORT_DIR" -maxdepth 1 -type f -name '*.long.png' | wc -l)"
-  final_count="$(find "$FINAL_DIR" -maxdepth 1 -type f -name '*.png' | wc -l)"
-  echo "[verify] pdf=$pdf_count longpng=$png_count final_images=$final_count"
+  echo "[verify] pdf=$pdf_count"
   [ "$pdf_count" -eq 4 ]
-  [ "$png_count" -eq 4 ]
-  if [ "$SKIP_IMAGES" -eq 0 ]; then
-    [ "$final_count" -eq 4 ]
-  fi
-  test -s "$EXPORT_DIR/manual_evidence.long.png"
-  if compgen -G "$FINAL_DIR/*.png" >/dev/null; then
-    file "$FINAL_DIR"/*.png
+  for name in "${DOCS[@]}"; do
+    test -s "$EXPORT_DIR/$name.pdf"
+  done
+  if [ "$LONG_PNG" -eq 1 ]; then
+    local png_count
+    png_count="$(find "$EXPORT_DIR" -maxdepth 1 -type f -name '*.long.png' | wc -l)"
+    echo "[verify] long_png=$png_count"
+    [ "$png_count" -eq 4 ]
+    for name in "${DOCS[@]}"; do
+      test -s "$EXPORT_DIR/$name.long.png"
+    done
   fi
 }
 
@@ -223,12 +253,6 @@ send_outputs() {
   for name in "${DOCS[@]}"; do
     send_file "$EXPORT_DIR/$name.pdf"
   done
-  for name in "${DOCS[@]}"; do
-    send_file "$EXPORT_DIR/$name.long.png"
-  done
-  for image in "${FINAL_IMAGES[@]}"; do
-    send_file "$FINAL_DIR/$image"
-  done
 }
 
 cd "$ROOT_DIR"
@@ -249,7 +273,11 @@ if [ "$FINALIZE_ONLY" -eq 0 ]; then
 fi
 
 "$PYTHON_BIN" "$ROOT_DIR/tools/augment_video_docs_images.py" "$RUN_DIR"
-"$ROOT_DIR/tools/export_video_docs.sh" "$RUN_DIR" --final-only --jobs "$JOBS"
+export_args=(--final-only --jobs "$JOBS")
+if [ "$LONG_PNG" -eq 1 ]; then
+  export_args+=(--long-png)
+fi
+"$ROOT_DIR/tools/export_video_docs.sh" "$RUN_DIR" "${export_args[@]}"
 verify_counts
 write_summary
 

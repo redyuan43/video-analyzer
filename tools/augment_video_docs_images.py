@@ -11,10 +11,10 @@ from pathlib import Path
 
 
 DOCS = [
-    ("operation_manual.md", "01-image-cards-operation-manual.png", "操作手册视觉摘要"),
-    ("docs_analysis_chapters/knowledge_notes_v2.md", "02-infographic-knowledge-notes.png", "逐章知识笔记视觉摘要"),
-    ("docs_analysis_chapters/deep_report_v2.md", "03-infographic-deep-report.png", "逐章深度报告视觉摘要"),
-    ("manual_evidence.md", "04-infographic-manual-evidence.png", "证据索引视觉摘要"),
+    ("operation_manual.md", "01-image-cards-operation-manual.png", "操作手册视觉摘要", r"^## 4\. 图文操作步骤\s*$"),
+    ("docs_analysis_chapters/knowledge_notes_v2.md", "02-infographic-knowledge-notes.png", "逐章知识笔记视觉摘要", r"^## 01\. .+$"),
+    ("docs_analysis_chapters/deep_report_v2.md", "03-infographic-deep-report.png", "逐章深度报告视觉摘要", r"^## 逐章分析\s*$"),
+    ("manual_evidence.md", "04-infographic-manual-evidence.png", "证据索引视觉摘要", r"^## 0\.00s / Frame 0\s*$"),
 ]
 
 
@@ -35,14 +35,14 @@ def main() -> int:
     chapter_assets = load_chapter_assets(run_dir)
     frame_assets = load_frame_assets(run_dir, args.max_frame_images)
     changed = []
-    for rel, final_name, title in DOCS:
+    for rel, final_name, title, target_heading in DOCS:
         path = run_dir / rel
         if not path.exists():
             print(f"[skip missing] {rel}")
             continue
         final_image = final_dir / final_name
         text = path.read_text(encoding="utf-8")
-        text = ensure_final_image(text, path, final_image, title)
+        text = ensure_final_image(text, path, final_image, title, target_heading)
         text = ensure_representative_images(text, path, chapter_assets, frame_assets)
         path.write_text(normalize_spacing(text), encoding="utf-8")
         changed.append(rel)
@@ -78,15 +78,32 @@ def load_frame_assets(run_dir: Path, limit: int) -> list[Path]:
     return selected
 
 
-def ensure_final_image(text: str, md_path: Path, image_path: Path, title: str) -> str:
+def ensure_final_image(text: str, md_path: Path, image_path: Path, title: str, target_heading: str) -> str:
     if not image_path.exists():
         print(f"[warn] final image missing: {image_path}")
         return text
     rel = markdown_relpath(md_path, image_path)
+    text = remove_final_image_block(text, title)
     if rel in text:
         return text
-    block = f"## {title}\n\n![{title}]({rel})\n\n"
-    return insert_after_first_heading(text, block)
+    block = f"![{title}]({rel})\n\n"
+    return insert_after_heading(text, target_heading, block)
+
+
+def remove_final_image_block(text: str, title: str) -> str:
+    block_re = re.compile(
+        rf"(?:^|\n)## {re.escape(title)}\s*\n+\s*!\[{re.escape(title)}\]\([^)]+\)\s*\n+",
+        flags=re.MULTILINE,
+    )
+    return block_re.sub("\n", text)
+
+
+def insert_after_heading(text: str, heading_pattern: str, block: str) -> str:
+    match = re.search(heading_pattern, text, flags=re.MULTILINE)
+    if not match:
+        return insert_after_first_heading(text, block)
+    insert_at = match.end()
+    return text[:insert_at].rstrip() + "\n\n" + block + text[insert_at:].lstrip()
 
 
 def ensure_representative_images(

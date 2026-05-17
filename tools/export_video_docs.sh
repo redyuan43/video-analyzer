@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [ "${1:-}" = "" ]; then
-  echo "Usage: tools/export_video_docs.sh <operation-manual-run-dir> [export-dir] [--final-only] [--jobs N]" >&2
+  echo "Usage: tools/export_video_docs.sh <operation-manual-run-dir> [export-dir] [--final-only] [--jobs N] [--long-png]" >&2
   exit 2
 fi
 
@@ -17,6 +17,9 @@ shift
 EXPORT_DIR="$RUN_DIR/exports"
 FINAL_ONLY=0
 JOBS=1
+LONG_PNG=0
+PNG_DPI=180
+PNG_PADDING=24
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -40,6 +43,42 @@ while [ "$#" -gt 0 ]; do
       fi
       shift
       ;;
+    --long-png)
+      LONG_PNG=1
+      shift
+      ;;
+    --png-dpi)
+      PNG_DPI="${2:-}"
+      if ! [[ "$PNG_DPI" =~ ^[0-9]+$ ]] || [ "$PNG_DPI" -lt 72 ]; then
+        echo "--png-dpi requires an integer >= 72" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    --png-dpi=*)
+      PNG_DPI="${1#--png-dpi=}"
+      if ! [[ "$PNG_DPI" =~ ^[0-9]+$ ]] || [ "$PNG_DPI" -lt 72 ]; then
+        echo "--png-dpi requires an integer >= 72" >&2
+        exit 2
+      fi
+      shift
+      ;;
+    --png-padding)
+      PNG_PADDING="${2:-}"
+      if ! [[ "$PNG_PADDING" =~ ^[0-9]+$ ]]; then
+        echo "--png-padding requires a non-negative integer" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    --png-padding=*)
+      PNG_PADDING="${1#--png-padding=}"
+      if ! [[ "$PNG_PADDING" =~ ^[0-9]+$ ]]; then
+        echo "--png-padding requires a non-negative integer" >&2
+        exit 2
+      fi
+      shift
+      ;;
     -*)
       echo "Unknown option: $1" >&2
       exit 2
@@ -52,25 +91,27 @@ while [ "$#" -gt 0 ]; do
 done
 EXPORT_DIR="$(realpath -m "$EXPORT_DIR")"
 
-PDF_SCRIPT="${PDF_SCRIPT:-/home/ivan/github/my-skills-repo/markdown-to-pdf-cli/scripts/md_to_pdf.sh}"
-PNG_SCRIPT="${PNG_SCRIPT:-/home/ivan/github/my-skills-repo/markdown-to-longpng/scripts/md_to_longpng.sh}"
+PDF_SCRIPT="${PDF_SCRIPT:-$ROOT_DIR/tools/md_to_mobile_pdf.py}"
+LONG_PNG_SCRIPT="${LONG_PNG_SCRIPT:-$ROOT_DIR/tools/pdf_to_long_png.py}"
 PREPARE_SCRIPT="${PREPARE_SCRIPT:-$ROOT_DIR/tools/prepare_video_doc_export.py}"
 PREPARE_SCRIPT="$(realpath -m "$PREPARE_SCRIPT")"
+PDF_SCRIPT="$(realpath -m "$PDF_SCRIPT")"
+LONG_PNG_SCRIPT="$(realpath -m "$LONG_PNG_SCRIPT")"
 
 if [ ! -d "$RUN_DIR" ]; then
   echo "Run directory not found: $RUN_DIR" >&2
   exit 1
 fi
-if [ ! -x "$PDF_SCRIPT" ]; then
-  echo "PDF converter not executable: $PDF_SCRIPT" >&2
-  exit 1
-fi
-if [ ! -x "$PNG_SCRIPT" ]; then
-  echo "Long PNG converter not executable: $PNG_SCRIPT" >&2
+if [ ! -f "$PDF_SCRIPT" ]; then
+  echo "PDF converter not found: $PDF_SCRIPT" >&2
   exit 1
 fi
 if [ ! -f "$PREPARE_SCRIPT" ]; then
   echo "Export prepare script not found: $PREPARE_SCRIPT" >&2
+  exit 1
+fi
+if [ "$LONG_PNG" -eq 1 ] && [ ! -f "$LONG_PNG_SCRIPT" ]; then
+  echo "Long PNG converter not found: $LONG_PNG_SCRIPT" >&2
   exit 1
 fi
 
@@ -105,12 +146,13 @@ export_one() {
   "$PYTHON_BIN" "$PREPARE_SCRIPT" "$RUN_DIR" "$input" "$prepared" >/dev/null
   trap cleanup_prepared RETURN
   echo "[pdf] $rel"
-  "$PDF_SCRIPT" "$prepared" "$EXPORT_DIR/$name.pdf"
-  echo "[longpng] $rel"
-    LONGPNG_VIEWPORT_SIZE="${LONGPNG_VIEWPORT_SIZE:-1600,1000}" \
-    LONGPNG_NO_MARGIN="${LONGPNG_NO_MARGIN:-1}" \
-    LONGPNG_CONTENT_PADDING="${LONGPNG_CONTENT_PADDING:-5}" \
-    "$PNG_SCRIPT" "$prepared" "$EXPORT_DIR/$name.long.png"
+  "$PYTHON_BIN" "$PDF_SCRIPT" "$prepared" "$EXPORT_DIR/$name.pdf" --title "$name"
+  if [ "$LONG_PNG" -eq 1 ]; then
+    echo "[long-png] $rel"
+    "$PYTHON_BIN" "$LONG_PNG_SCRIPT" "$EXPORT_DIR/$name.pdf" "$EXPORT_DIR/$name.long.png" \
+      --dpi "$PNG_DPI" \
+      --padding "$PNG_PADDING"
+  fi
   cleanup_prepared
   trap - RETURN
 }
