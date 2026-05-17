@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import uuid
+from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -37,8 +38,8 @@ MODULE_ORDER = [
     "verify-core",
     "multidoc",
     "deep-v2",
-    "export",
     "image-prompts",
+    "final-publish",
 ]
 MODULE_LABELS = {
     "probe": "探测时长",
@@ -47,8 +48,8 @@ MODULE_LABELS = {
     "verify-core": "校验产物",
     "multidoc": "多文档分析",
     "deep-v2": "章节深度报告",
-    "export": "导出 PDF/长图",
     "image-prompts": "生成配图提示词",
+    "final-publish": "最终定稿/发布",
 }
 MODULE_SPECS = {
     "probe": {"requires": [], "produces": ["duration", "resolved_mode"]},
@@ -60,8 +61,8 @@ MODULE_SPECS = {
     "verify-core": {"requires": ["run_dir"], "produces": ["verified_core"]},
     "multidoc": {"requires": ["run_dir", "verified_core"], "produces": ["docs_analysis"]},
     "deep-v2": {"requires": ["run_dir", "verified_core"], "produces": ["chapter_deep_report"]},
-    "export": {"requires": ["run_dir", "verified_core"], "produces": ["exports"]},
     "image-prompts": {"requires": ["run_dir"], "produces": ["image_prompts"]},
+    "final-publish": {"requires": ["run_dir", "verified_core"], "produces": ["exports"]},
 }
 STAGE_ORDER = MODULE_ORDER
 STAGE_LABELS = MODULE_LABELS
@@ -69,9 +70,41 @@ STAGE_ALIASES = {
     "operation": "analyze-core",
     "verify_core": "verify-core",
     "deep_v2": "deep-v2",
-    "export_docs": "export",
+    "export": "final-publish",
+    "export_docs": "final-publish",
     "image_prompts": "image-prompts",
+    "final_publish": "final-publish",
 }
+STAGE_RESOURCES = {
+    "probe": "prepare",
+    "prepare": "prepare",
+    "analyze-core": "core",
+    "verify-core": "verify",
+    "multidoc": "multidoc",
+    "deep-v2": "deep-v2",
+    "image-prompts": "image-prompts",
+    "final-publish": "final-publish",
+}
+RESOURCE_LIMITS = {
+    "prepare": 2,
+    "core": 1,
+    "verify": 2,
+    "multidoc": 1,
+    "deep-v2": 1,
+    "image-prompts": 1,
+    "final-publish": 1,
+}
+CORE_PROGRESS_STEPS = [
+    ("ray", "Ray 集群准备", (r"\[jetson-ray\]", r"Ray runtime started")),
+    ("context", "页面/评论/素材准备", (r"Extracting cookies", r"\[youtube\]", r"Writing video metadata")),
+    ("audio", "音频提取", (r"Extracting audio from video",)),
+    ("asr", "ASR 转写", (r"Transcribing audio",)),
+    ("frames", "候选帧抽取", (r"Extracting frames from video", r"Jetson video cache", r"frame worker")),
+    ("ocr", "OCR", (r"Running OCR",)),
+    ("vl", "VL 帧选择/分析", (r"Selecting and analyzing VL frames",)),
+    ("manual", "操作手册生成", (r"Generating operation manual",)),
+    ("write", "结果写出", (r"Operation manual saved", r"Analysis complete", r"\[done\] run_dir:")),
+]
 
 
 class BridgeError(Exception):
@@ -82,13 +115,15 @@ class BridgeError(Exception):
 
 
 class VideoLinkStatusServer:
-    def __init__(self, jobs_dir: Path = DEFAULT_JOBS_DIR, repo_root: Path = REPO_ROOT):
+    def __init__(self, jobs_dir: Path = DEFAULT_JOBS_DIR, repo_root: Path = REPO_ROOT, auto_resume: bool = False):
         self.jobs_dir = jobs_dir
         self.repo_root = repo_root
-        self.stage_lock = threading.Lock()
         self.runner_lock = threading.Lock()
         self.active_runners: dict[str, threading.Thread] = {}
+        self.resource_locks = {name: threading.BoundedSemaphore(limit) for name, limit in RESOURCE_LIMITS.items()}
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
+        if auto_resume:
+            self.recover_interrupted_jobs(auto_start=True)
 
     def options(self) -> dict[str, Any]:
         profiles = runtime_profile_names()
@@ -187,6 +222,16 @@ class VideoLinkStatusServer:
             return self.start_run(job_id)
         return self.public_job(job)
 
+    def list_jobs(self, limit: int = 50) -> dict[str, Any]:
+        jobs = []
+        for path in self.jobs_dir.glob("*/job.json"):
+            try:
+                jobs.append(self.public_job(self.load_job(path.parent.name)))
+            except Exception:
+                continue
+        jobs.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+        return {"jobs": jobs[: max(1, min(limit, 200))], "total": len(jobs)}
+
     def start_run(self, job_id: str) -> dict[str, Any]:
         job = self.load_job(job_id)
         with self.runner_lock:
@@ -211,6 +256,42 @@ class VideoLinkStatusServer:
             self.active_runners[job_id] = thread
         thread.start()
         return self.public_job(self.load_job(job_id))
+
+    def recover_interrupted_jobs(self, auto_start: bool = False) -> None:
+        for path in sorted(self.jobs_dir.glob("*/job.json")):
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            runner = raw.get("runner") or {}
+            stages = raw.get("stages") or {}
+            stage = runner.get("current_stage") or self.current_stage(raw) or self.next_stage(raw)
+            interrupted = runner.get("status") in {"running", "queued"} or any(
+                info.get("status") in {"running", "queued"} for info in stages.values()
+            )
+            if not interrupted:
+                continue
+            now = iso_now()
+            raw["status"] = "queued"
+            raw["updated_at"] = now
+            raw["runner"] = {
+                **runner,
+                "status": "queued",
+                "current_stage": stage,
+                "updated_at": now,
+                "error": "server restarted while this stage was running; queued to continue",
+            }
+            if stage and stage in STAGE_ORDER:
+                stage_info = dict(stages.get(stage) or {})
+                stage_info["status"] = "queued"
+                stage_info["queued_at"] = now
+                stage_info["queued_for"] = stage_resource(stage)
+                stage_info["error"] = raw["runner"]["error"]
+                stage_info.setdefault("log_path", str(self.stage_log_path(raw["job_id"], stage)))
+                raw.setdefault("stages", {})[stage] = stage_info
+            self.save_job(raw)
+            if auto_start:
+                self.start_run(raw["job_id"])
 
     def _run_remaining_stages(self, job_id: str) -> None:
         try:
@@ -267,23 +348,29 @@ class VideoLinkStatusServer:
         stage = normalize_stage_name(stage)
         if stage not in STAGE_ORDER:
             raise BridgeError(HTTPStatus.NOT_FOUND, f"unknown stage: {stage}")
-        if not self.stage_lock.acquire(blocking=False):
-            raise BridgeError(HTTPStatus.CONFLICT, "another video-link stage is already running")
-        try:
-            return self._run_stage_locked(job_id, stage)
-        finally:
-            self.stage_lock.release()
-
-    def _run_stage_locked(self, job_id: str, stage: str) -> dict[str, Any]:
-        stage = normalize_stage_name(stage)
         job = self.load_job(job_id)
         self.ensure_dependencies(job, stage)
         current_status = job.get("stages", {}).get(stage, {}).get("status")
         if current_status in {"succeeded", "skipped"}:
             return self.public_job(job)
-
         if stage == "image-prompts" and job["options"].get("skip_images"):
             return self.mark_stage_skipped(job, stage, "skip_images is true")
+
+        resource = stage_resource(stage)
+        self.mark_stage_queued(job, stage, resource)
+        lock = self.resource_locks[resource]
+        lock.acquire()
+        try:
+            return self._run_stage_locked(job_id, stage)
+        finally:
+            lock.release()
+
+    def _run_stage_locked(self, job_id: str, stage: str) -> dict[str, Any]:
+        stage = normalize_stage_name(stage)
+        job = self.load_job(job_id)
+        current_status = job.get("stages", {}).get(stage, {}).get("status")
+        if current_status in {"succeeded", "skipped"}:
+            return self.public_job(job)
 
         start = time.time()
         stage_info = {
@@ -293,6 +380,7 @@ class VideoLinkStatusServer:
             "exit_code": None,
             "log_path": str(self.stage_log_path(job_id, stage)),
             "artifacts": {},
+            "queued_for": stage_resource(stage),
         }
         job["status"] = "running"
         job["updated_at"] = iso_now()
@@ -312,17 +400,17 @@ class VideoLinkStatusServer:
                 result = self.run_command_stage(job, stage, self.multidoc_command(job), stage_info["log_path"])
             elif stage == "deep-v2":
                 result = self.run_command_stage(job, stage, self.deep_v2_command(job), stage_info["log_path"])
-            elif stage == "export":
-                result = self.run_command_stage(job, stage, self.export_command(job), stage_info["log_path"])
-            else:
+            elif stage == "image-prompts":
                 result = self.run_command_stage(job, stage, self.image_prompts_command(job), stage_info["log_path"])
+            else:
+                result = self.run_command_stage(job, stage, self.final_publish_command(job), stage_info["log_path"])
             stage_info.update(result)
             self.update_job_artifacts(job, stage, result.get("artifacts", {}))
             stage_info["status"] = "succeeded"
             stage_info["exit_code"] = 0
             stage_info["duration_seconds"] = round(time.time() - start, 3)
             stage_info["finished_at"] = iso_now()
-            job["status"] = "succeeded" if stage == STAGE_ORDER[-1] or (stage == "image-prompts") else "running"
+            job["status"] = "succeeded" if stage == STAGE_ORDER[-1] else "running"
         except Exception as exc:
             stage_info["status"] = "failed"
             stage_info["exit_code"] = getattr(exc, "returncode", 1)
@@ -337,6 +425,33 @@ class VideoLinkStatusServer:
         if stage_info["status"] == "failed":
             raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, f"{stage} failed: {stage_info.get('error')}")
         return self.public_job(job)
+
+    def mark_stage_queued(self, job: dict[str, Any], stage: str, resource: str) -> None:
+        now = iso_now()
+        stage_info = dict((job.get("stages") or {}).get(stage) or {})
+        stage_info.update(
+            {
+                "status": "queued",
+                "queued_at": now,
+                "queued_for": resource,
+                "log_path": stage_info.get("log_path") or str(self.stage_log_path(job["job_id"], stage)),
+            }
+        )
+        stage_info.pop("finished_at", None)
+        stage_info.pop("exit_code", None)
+        job.setdefault("stages", {})[stage] = stage_info
+        job["status"] = "queued"
+        runner = dict(job.get("runner") or {})
+        runner["status"] = "queued"
+        runner["current_stage"] = stage
+        runner["queued_for"] = resource
+        runner["updated_at"] = now
+        runner["error"] = None
+        if "started_at" not in runner:
+            runner["started_at"] = now
+        job["runner"] = runner
+        job["updated_at"] = now
+        self.save_job(job)
 
     def stage_probe(self, job: dict[str, Any]) -> dict[str, Any]:
         duration = probe_duration_seconds(job["video_url"])
@@ -502,7 +617,22 @@ class VideoLinkStatusServer:
         ]
 
     def export_command(self, job: dict[str, Any]) -> list[str]:
-        return ["tools/export_video_docs.sh", str(self.require_run_dir(job))]
+        return ["tools/export_video_docs.sh", str(self.require_run_dir(job)), "--final-only", "--jobs", "3"]
+
+    def final_publish_command(self, job: dict[str, Any]) -> list[str]:
+        command = [
+            "tools/run_video_doc_final_publish.sh",
+            str(self.require_run_dir(job)),
+            "--profile",
+            job["options"].get("profile") or DEFAULT_PROFILE,
+            "--jobs",
+            "3",
+            "--finalize-only",
+            "--skip-send",
+        ]
+        if job["options"].get("skip_images"):
+            command.append("--skip-images")
+        return command
 
     def image_prompts_command(self, job: dict[str, Any]) -> list[str]:
         if not BAOYU_PROMPT_SCRIPT.exists():
@@ -520,7 +650,7 @@ class VideoLinkStatusServer:
             "log_path": None,
             "artifacts": self.collect_summary(job),
         }
-        job["status"] = "succeeded"
+        job["status"] = "succeeded" if stage == STAGE_ORDER[-1] else "running"
         job["updated_at"] = iso_now()
         job["summary"] = self.collect_summary(job)
         self.save_job(job)
@@ -587,8 +717,6 @@ class VideoLinkStatusServer:
             return
         stage_index = STAGE_ORDER.index(stage)
         for previous in STAGE_ORDER[:stage_index]:
-            if previous == "image-prompts":
-                continue
             previous_status = job["stages"].get(previous, {}).get("status")
             if previous_status not in {"succeeded", "skipped"}:
                 raise BridgeError(HTTPStatus.CONFLICT, f"stage {previous} must succeed before {stage}")
@@ -623,14 +751,48 @@ class VideoLinkStatusServer:
 
     def public_job(self, job: dict[str, Any]) -> dict[str, Any]:
         public = dict(job)
+        public["stages"] = dict(job.get("stages") or {})
         public["summary"] = self.collect_summary(job)
         public["stage_order"] = STAGE_ORDER
         public["progress"] = self.progress(job)
         public["current_stage"] = self.current_stage(job)
         public["next_stage"] = self.next_stage(job)
         public["error_summary"] = self.error_summary(job)
+        public["core_progress"] = self.core_progress(job)
         public["dashboard_url"] = self.dashboard_url(job["job_id"])
+        public["queue"] = self.queue_info(public)
+        queued_stage = public["queue"].get("stage")
+        if queued_stage and queued_stage in public["stages"]:
+            public["stages"][queued_stage] = dict(public["stages"][queued_stage])
+            public["stages"][queued_stage]["queue_position"] = public["queue"].get("position")
         return public
+
+    def queue_info(self, job: dict[str, Any]) -> dict[str, Any]:
+        runner = job.get("runner") or {}
+        stage = runner.get("current_stage") or self.current_stage(job)
+        if runner.get("status") != "queued" or not stage:
+            return {}
+        resource = runner.get("queued_for") or stage_resource(stage)
+        queued = []
+        for path in self.jobs_dir.glob("*/job.json"):
+            try:
+                candidate = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            candidate_runner = candidate.get("runner") or {}
+            if candidate_runner.get("status") == "queued" and (candidate_runner.get("queued_for") or stage_resource(candidate_runner.get("current_stage") or "")) == resource:
+                queued.append(candidate)
+        queued.sort(key=lambda item: item.get("updated_at") or item.get("created_at") or "")
+        position = next((index + 1 for index, item in enumerate(queued) if item.get("job_id") == job.get("job_id")), None)
+        return {"stage": stage, "resource": resource, "position": position, "size": len(queued)}
+
+    def core_progress(self, job: dict[str, Any]) -> dict[str, Any] | None:
+        stage_info = (job.get("stages") or {}).get("analyze-core") or {}
+        if not stage_info and not self.stage_log_path(job["job_id"], "analyze-core").exists():
+            return None
+        log_path = Path(stage_info.get("log_path") or self.stage_log_path(job["job_id"], "analyze-core"))
+        text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+        return parse_core_progress(text, stage_info.get("status") or "pending")
 
     def error_summary(self, job: dict[str, Any]) -> dict[str, Any] | None:
         runner = job.get("runner") or {}
@@ -657,20 +819,22 @@ class VideoLinkStatusServer:
         completed = sum(1 for status in statuses if status in {"succeeded", "skipped"})
         failed = sum(1 for status in statuses if status == "failed")
         running = sum(1 for status in statuses if status == "running")
+        queued = sum(1 for status in statuses if status == "queued")
         return {
             "total": len(STAGE_ORDER),
             "completed": completed,
             "running": running,
+            "queued": queued,
             "failed": failed,
             "percent": int(round((completed / len(STAGE_ORDER)) * 100)),
         }
 
     def current_stage(self, job: dict[str, Any]) -> str | None:
         runner = job.get("runner") or {}
-        if runner.get("status") == "running" and runner.get("current_stage"):
-            return runner["current_stage"]
+        if runner.get("status") in {"running", "queued"} and runner.get("current_stage"):
+            return normalize_stage_name(runner["current_stage"])
         for stage in STAGE_ORDER:
-            if job.get("stages", {}).get(stage, {}).get("status") == "running":
+            if job.get("stages", {}).get(stage, {}).get("status") in {"running", "queued"}:
                 return stage
         return None
 
@@ -681,9 +845,9 @@ class VideoLinkStatusServer:
         return None
 
     def dashboard_url(self, job_id: str) -> str:
-        return f"http://127.0.0.1:18120/video-link/jobs/{job_id}"
+        return f"/?job={job_id}"
 
-    def tail_stage_log(self, job_id: str, stage: str, limit: int = 80) -> dict[str, Any]:
+    def stage_log(self, job_id: str, stage: str, limit: int = 80, full: bool = False) -> dict[str, Any]:
         stage = normalize_stage_name(stage)
         if stage not in STAGE_ORDER:
             raise BridgeError(HTTPStatus.NOT_FOUND, f"unknown stage: {stage}")
@@ -691,13 +855,19 @@ class VideoLinkStatusServer:
         limit = max(1, min(limit, 500))
         log_path = self.stage_log_path(job_id, stage)
         if not log_path.exists():
-            return {"job_id": job_id, "stage": stage, "log_path": str(log_path), "lines": []}
+            return {"job_id": job_id, "stage": stage, "log_path": str(log_path), "lines": [], "text": ""}
+        text = log_path.read_text(encoding="utf-8", errors="replace")
         return {
             "job_id": job_id,
             "stage": stage,
             "log_path": str(log_path),
-            "lines": tail_lines(log_path.read_text(encoding="utf-8", errors="replace"), limit),
+            "lines": text.splitlines() if full else tail_lines(text, limit),
+            "text": text if full else "",
+            "full": full,
         }
+
+    def tail_stage_log(self, job_id: str, stage: str, limit: int = 80) -> dict[str, Any]:
+        return self.stage_log(job_id, stage, limit=limit, full=False)
 
     def load_job(self, job_id: str) -> dict[str, Any]:
         if not re.fullmatch(r"[a-f0-9]{32}", job_id):
@@ -705,7 +875,37 @@ class VideoLinkStatusServer:
         path = self.job_path(job_id)
         if not path.exists():
             raise BridgeError(HTTPStatus.NOT_FOUND, "job not found")
-        return json.loads(path.read_text(encoding="utf-8"))
+        job = json.loads(path.read_text(encoding="utf-8"))
+        return self.recover_orphaned_running_job(job)
+
+    def recover_orphaned_running_job(self, job: dict[str, Any]) -> dict[str, Any]:
+        runner = job.get("runner") or {}
+        if runner.get("status") not in {"running", "queued"}:
+            return job
+        active = self.active_runners.get(job["job_id"])
+        if active and active.is_alive():
+            return job
+
+        stage = runner.get("current_stage") or self.current_stage(job) or self.next_stage(job)
+        message = "server restarted while this stage was running; queued to continue"
+        runner["status"] = "queued"
+        runner["error"] = message
+        runner["updated_at"] = iso_now()
+        runner["current_stage"] = stage
+        runner["queued_for"] = stage_resource(stage or "")
+        job["runner"] = runner
+        job["status"] = "queued"
+        if stage and stage in STAGE_ORDER:
+            stage_info = dict((job.get("stages") or {}).get(stage) or {})
+            if stage_info.get("status") in {"running", "queued"}:
+                stage_info["status"] = "queued"
+                stage_info["error"] = message
+                stage_info["queued_at"] = runner["updated_at"]
+                stage_info["queued_for"] = runner["queued_for"]
+                job.setdefault("stages", {})[stage] = stage_info
+        job["updated_at"] = runner["updated_at"]
+        self.save_job(job)
+        return job
 
     def save_job(self, job: dict[str, Any]) -> None:
         self.job_path(job["job_id"]).write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -728,6 +928,96 @@ def sanitize_run_name(value: str) -> str:
 def normalize_stage_name(stage: str) -> str:
     value = str(stage or "").strip()
     return STAGE_ALIASES.get(value, value)
+
+
+def stage_resource(stage: str) -> str:
+    return STAGE_RESOURCES.get(normalize_stage_name(stage), "core")
+
+
+def parse_core_progress(text: str, stage_status: str) -> dict[str, Any]:
+    lines = text.splitlines()
+    matches: dict[str, dict[str, Any]] = {}
+    for line_number, line in enumerate(lines, start=1):
+        for index, (step_id, _label, patterns) in enumerate(CORE_PROGRESS_STEPS):
+            if step_id in matches:
+                continue
+            if any(re.search(pattern, line) for pattern in patterns):
+                matches[step_id] = {
+                    "index": index,
+                    "line": line_number,
+                    "message": line.strip(),
+                    "timestamp": parse_log_timestamp(line),
+                }
+                break
+
+    current_index = max((item["index"] for item in matches.values()), default=None)
+    current_step = None
+    steps = []
+    for index, (step_id, label, _patterns) in enumerate(CORE_PROGRESS_STEPS):
+        match = matches.get(step_id)
+        status = "pending"
+        if match:
+            if stage_status == "failed" and index == current_index:
+                status = "failed"
+            elif stage_status == "running" and index == current_index:
+                status = "running"
+                current_step = step_id
+            else:
+                status = "succeeded"
+        elif current_index is not None and index < current_index:
+            status = "succeeded"
+
+        started_at = match.get("timestamp") if match else None
+        finished_at = None
+        duration = None
+        if started_at:
+            next_ts = next(
+                (
+                    candidate.get("timestamp")
+                    for candidate in sorted(matches.values(), key=lambda item: item["index"])
+                    if candidate["index"] > index and candidate.get("timestamp")
+                ),
+                None,
+            )
+            if status == "running":
+                duration = max(0.0, time.time() - started_at)
+            elif next_ts:
+                finished_at = next_ts
+                duration = max(0.0, next_ts - started_at)
+        steps.append(
+            {
+                "id": step_id,
+                "label": label,
+                "status": status,
+                "line": match.get("line") if match else None,
+                "message": match.get("message") if match else None,
+                "started_at": format_epoch(started_at) if started_at else None,
+                "finished_at": format_epoch(finished_at) if finished_at else None,
+                "duration_seconds": round(duration, 3) if duration is not None else None,
+            }
+        )
+    if stage_status == "failed" and current_index is not None:
+        current_step = CORE_PROGRESS_STEPS[current_index][0]
+    return {
+        "status": stage_status,
+        "current_step": current_step,
+        "steps": steps,
+    }
+
+
+def parse_log_timestamp(line: str) -> float | None:
+    match = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),(\d{3})", line)
+    if not match:
+        return None
+    try:
+        parsed = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return time.mktime(parsed.timetuple()) + int(match.group(2)) / 1000
+
+
+def format_epoch(value: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(value))
 
 
 def pipeline_mode_for(analysis_mode: str) -> str:
@@ -1054,7 +1344,9 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
     .hint {{ margin-top: 8px; color: #5f6368; font-size: 13px; }}
     .actions {{ margin-top: 14px; display: flex; gap: 10px; align-items: center; }}
     button {{ border: 0; border-radius: 6px; padding: 9px 14px; background: #202124; color: #fff; font-size: 14px; cursor: pointer; }}
+    button.secondary {{ background: #eef2f7; color: #202124; }}
     button:disabled {{ opacity: .55; cursor: default; }}
+    .logLink {{ border: 0; background: transparent; color: #0969da; padding: 0; cursor: pointer; font: inherit; }}
     pre {{ margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.5; max-height: 420px; overflow: auto; }}
     a {{ color: #0969da; }}
   </style>
@@ -1096,6 +1388,13 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
         <tbody id="stages"></tbody>
       </table>
     </section>
+    <section class="panel" id="corePanel" style="display:none">
+      <h2>核心分析子项</h2>
+      <table>
+        <thead><tr><th>子项</th><th>状态</th><th>耗时</th><th>最近信号</th></tr></thead>
+        <tbody id="coreSteps"></tbody>
+      </table>
+    </section>
     <section class="panel">
       <h2>产物</h2>
       <div id="artifacts" class="value">-</div>
@@ -1103,17 +1402,38 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
     <section class="panel">
       <h2>当前日志</h2>
       <div class="hint" id="logHint">显示当前阶段或失败阶段的日志尾部。</div>
+      <div class="actions">
+        <button id="copyLogButton" class="secondary" type="button">复制完整日志</button>
+        <span class="hint" id="copyLogMessage"></span>
+      </div>
       <pre id="logs">-</pre>
     </section>
   </main>
   <script>
     const apiUrl = {json.dumps(api_url)};
     let logUrl = {json.dumps(log_url)};
+    let selectedLogStage = null;
+    let currentJobId = {json.dumps(job_id)};
     const stageNames = {json.dumps(STAGE_LABELS, ensure_ascii=False)};
     function text(id, value) {{ document.getElementById(id).textContent = value || "-"; }}
     function statusClass(status) {{ return "status " + (status || "pending"); }}
+    function duration(value) {{ return value == null ? "-" : `${{value}}s`; }}
+    function escapeHtml(value) {{
+      return String(value ?? "").replace(/[&<>"']/g, char => {{
+        if (char === "&") return "&amp;";
+        if (char === "<") return "&lt;";
+        if (char === ">") return "&gt;";
+        if (char === '"') return "&quot;";
+        return "&#39;";
+      }});
+    }}
+    function chooseLogStage(job) {{
+      if (selectedLogStage) return selectedLogStage;
+      return job.current_stage || job.error_summary?.stage || job.next_stage || [...(job.stage_order || [])].reverse().find(stage => job.stages?.[stage]?.log_path);
+    }}
     async function refresh() {{
       const job = await fetch(apiUrl).then(r => r.json());
+      currentJobId = job.job_id;
       const progress = job.progress || {{}};
       text("status", job.status);
       const runButton = document.getElementById("runButton");
@@ -1138,10 +1458,17 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
       }}
       document.getElementById("stages").innerHTML = (job.stage_order || []).map(stage => {{
         const info = job.stages?.[stage] || {{}};
-        const duration = info.duration_seconds == null ? "-" : `${{info.duration_seconds}}s`;
         const errorText = info.error ? `<div class="hint">${{info.error}}</div>` : "";
-        return `<tr><td>${{stageNames[stage] || stage}}${{errorText}}</td><td><span class="${{statusClass(info.status)}}">${{info.status || "pending"}}</span></td><td>${{duration}}</td><td>${{info.log_path || "-"}}</td></tr>`;
+        const logCell = info.log_path ? `<button class="logLink" type="button" data-stage="${{stage}}">查看日志</button>` : "-";
+        return `<tr><td>${{stageNames[stage] || stage}}${{errorText}}</td><td><span class="${{statusClass(info.status)}}">${{info.status || "pending"}}</span></td><td>${{duration(info.duration_seconds)}}</td><td>${{logCell}}</td></tr>`;
       }}).join("");
+      document.querySelectorAll(".logLink").forEach(button => {{
+        button.addEventListener("click", async () => {{
+          selectedLogStage = button.dataset.stage;
+          await loadLog(job, selectedLogStage);
+        }});
+      }});
+      renderCoreProgress(job.core_progress);
       const summary = job.summary || {{}};
       document.getElementById("artifacts").innerHTML = [
         `Markdown: ${{(summary.markdown_files || []).length}}`,
@@ -1149,12 +1476,42 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
         `配图提示词: ${{(summary.prompt_files || []).length}}`,
         `最终图片: ${{(summary.final_images || []).length}}`
       ].join("<br>");
-      const stageForLog = job.current_stage || job.error_summary?.stage || job.next_stage || [...(job.stage_order || [])].reverse().find(stage => job.stages?.[stage]?.log_path);
+      const stageForLog = chooseLogStage(job);
+      await loadLog(job, stageForLog);
+    }}
+    function renderCoreProgress(core) {{
+      const panel = document.getElementById("corePanel");
+      if (!core || !(core.steps || []).some(step => step.status !== "pending")) {{
+        panel.style.display = "none";
+        return;
+      }}
+      panel.style.display = "block";
+      document.getElementById("coreSteps").innerHTML = core.steps.map(step => {{
+        const message = step.message ? escapeHtml(step.message) : "-";
+        return `<tr><td>${{escapeHtml(step.label)}}</td><td><span class="${{statusClass(step.status)}}">${{step.status}}</span></td><td>${{duration(step.duration_seconds)}}</td><td>${{message}}</td></tr>`;
+      }}).join("");
+    }}
+    async function loadLog(job, stageForLog) {{
       text("logHint", stageForLog ? `显示：${{stageNames[stageForLog] || stageForLog}} 的日志尾部` : "暂无日志");
       if (stageForLog) logUrl = `/api/video-link/jobs/${{job.job_id}}/logs/${{stageForLog}}?tail=80`;
       const log = await fetch(logUrl).then(r => r.json()).catch(() => ({{lines: []}}));
       text("logs", (log.lines || []).join("\\n"));
     }}
+    document.getElementById("copyLogButton").addEventListener("click", async () => {{
+      const message = document.getElementById("copyLogMessage");
+      const stage = selectedLogStage || logUrl.match(/\\/logs\\/([a-z0-9-]+)/)?.[1];
+      if (!stage) {{
+        message.textContent = "暂无日志";
+        return;
+      }}
+      try {{
+        const log = await fetch(`/api/video-link/jobs/${{currentJobId}}/logs/${{stage}}?full=1`).then(r => r.json());
+        await navigator.clipboard.writeText(log.text || (log.lines || []).join("\\n"));
+        message.textContent = "已复制";
+      }} catch (error) {{
+        message.textContent = `复制失败：${{error.message}}`;
+      }}
+    }});
     document.getElementById("runButton").addEventListener("click", async () => {{
       const button = document.getElementById("runButton");
       const message = document.getElementById("runMessage");
@@ -1199,6 +1556,11 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/video-link/options":
                 self.write_json(self.server_app.options())
                 return
+            if path == "/api/video-link/jobs":
+                query = parse_qs(parsed.query)
+                limit = int(query.get("limit", ["50"])[0])
+                self.write_json(self.server_app.list_jobs(limit))
+                return
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})", path)
             if match:
                 self.write_json(self.server_app.public_job(self.server_app.load_job(match.group(1))))
@@ -1207,11 +1569,20 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             if match:
                 query = parse_qs(parsed.query)
                 limit = int(query.get("tail", ["80"])[0])
-                self.write_json(self.server_app.tail_stage_log(match.group(1), match.group(2), limit))
+                full = parse_bool(query.get("full", ["false"])[0])
+                self.write_json(self.server_app.stage_log(match.group(1), match.group(2), limit, full))
                 return
             match = re.fullmatch(r"/video-link/jobs/([a-f0-9]{32})", path)
             if match:
-                self.write_html(render_job_dashboard(self.server_app.public_job(self.server_app.load_job(match.group(1)))))
+                self.write_redirect(f"/?job={match.group(1)}")
+                return
+            if path == "/":
+                query = parse_qs(parsed.query)
+                job_id = (query.get("job") or [""])[0]
+                if re.fullmatch(r"[a-f0-9]{32}", job_id):
+                    self.write_html(render_job_dashboard(self.server_app.public_job(self.server_app.load_job(job_id))))
+                else:
+                    self.write_redirect("/video-link")
                 return
             raise BridgeError(HTTPStatus.NOT_FOUND, "not found")
         except ValueError as exc:
@@ -1267,12 +1638,18 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def write_redirect(self, location: str) -> None:
+        self.send_response(int(HTTPStatus.FOUND))
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("%s - %s\n" % (self.log_date_time_string(), fmt % args))
 
 
 def run_server(args: argparse.Namespace) -> None:
-    StatusRequestHandler.server_app = VideoLinkStatusServer(Path(args.jobs_dir), REPO_ROOT)
+    StatusRequestHandler.server_app = VideoLinkStatusServer(Path(args.jobs_dir), REPO_ROOT, auto_resume=True)
     server = ThreadingHTTPServer((args.host, args.port), StatusRequestHandler)
     print(f"video-link status server listening on http://{args.host}:{args.port}", flush=True)
     server.serve_forever()

@@ -6,7 +6,7 @@ RUNTIME_DIR="$ROOT_DIR/tmp/video-link-status"
 PID_FILE="$RUNTIME_DIR/server.pid"
 LOG_FILE="$RUNTIME_DIR/server.log"
 HOST="${VIDEO_LINK_STATUS_HOST:-127.0.0.1}"
-PORT="${VIDEO_LINK_STATUS_PORT:-18120}"
+PORT="${VIDEO_LINK_STATUS_PORT:-5000}"
 PYTHON_BIN="${VIDEO_LINK_STATUS_PYTHON:-$ROOT_DIR/.venv/bin/python}"
 if [[ ! -x "$PYTHON_BIN" ]]; then
   PYTHON_BIN="$(command -v python3)"
@@ -24,10 +24,11 @@ start_server() {
     return 0
   fi
   cd "$ROOT_DIR"
-  setsid "$PYTHON_BIN" tools/video_link_status_server.py serve --host "$HOST" --port "$PORT" \
+  PYTHONPATH="$ROOT_DIR/video-analyzer-ui:$ROOT_DIR:${PYTHONPATH:-}" \
+    setsid "$PYTHON_BIN" -m video_analyzer_ui.server --host "$HOST" --port "$PORT" --jobs-dir "$RUNTIME_DIR/jobs" \
     >"$LOG_FILE" 2>&1 < /dev/null &
   echo "$!" >"$PID_FILE"
-  echo "video-link status server started: http://$HOST:$PORT/video-link"
+  echo "video-link status server started: http://$HOST:$PORT/"
   echo "log: $LOG_FILE"
 }
 
@@ -55,7 +56,7 @@ case "${1:-status}" in
     ;;
   status)
     if is_running; then
-      echo "running: pid=$(cat "$PID_FILE") http://$HOST:$PORT"
+      echo "running: pid=$(cat "$PID_FILE") http://$HOST:$PORT/"
     else
       echo "not running"
       exit 1

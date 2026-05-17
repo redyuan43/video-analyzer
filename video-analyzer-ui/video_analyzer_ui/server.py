@@ -6,20 +6,39 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from http import HTTPStatus
 from pathlib import Path
-from flask import Flask, render_template, request, jsonify, send_file, Response
+from flask import Flask, render_template, request, jsonify, send_file, Response, redirect
 from werkzeug.utils import secure_filename
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tools.video_link_status_server import (  # noqa: E402
+    DEFAULT_JOBS_DIR,
+    REPO_ROOT as VIDEO_LINK_REPO_ROOT,
+    BridgeError,
+    STAGE_ORDER,
+    VideoLinkStatusServer,
+)
 
 # Initialize logger
 logger = logging.getLogger(__name__)
 
 class VideoAnalyzerUI:
-    def __init__(self, host='localhost', port=5000, dev_mode=False):
-        self.app = Flask(__name__)
+    def __init__(self, host='localhost', port=5000, dev_mode=False, jobs_dir=DEFAULT_JOBS_DIR, video_link_auto_resume=True):
+        package_dir = Path(__file__).resolve().parent
+        self.app = Flask(
+            __name__,
+            template_folder=str(package_dir / 'templates'),
+            static_folder=str(package_dir / 'static'),
+        )
         self.host = host
         self.port = port
         self.dev_mode = dev_mode
         self.sessions = {}
+        self.video_link = VideoLinkStatusServer(Path(jobs_dir), VIDEO_LINK_REPO_ROOT, auto_resume=video_link_auto_resume)
         
         # Ensure tmp directories exist
         self.tmp_root = Path(tempfile.gettempdir()) / 'video-analyzer-ui'
@@ -34,6 +53,64 @@ class VideoAnalyzerUI:
         @self.app.route('/')
         def index():
             return render_template('index.html')
+
+        @self.app.route('/video-link')
+        def video_link_home():
+            return redirect('/', code=int(HTTPStatus.FOUND))
+
+        @self.app.route('/video-link/jobs/<job_id>')
+        def video_link_job_redirect(job_id):
+            return redirect(f'/?job={job_id}', code=int(HTTPStatus.FOUND))
+
+        @self.app.route('/api/video-link/health')
+        def video_link_health():
+            return jsonify({'ok': True, 'stages': STAGE_ORDER})
+
+        @self.app.route('/api/video-link/options')
+        def video_link_options():
+            return jsonify(self.video_link.options())
+
+        @self.app.route('/api/video-link/jobs')
+        def video_link_jobs():
+            limit = request.args.get('limit', default=50, type=int)
+            return jsonify(self.video_link.list_jobs(limit))
+
+        @self.app.route('/api/video-link/jobs', methods=['POST'])
+        def video_link_create_job():
+            try:
+                return jsonify(self.video_link.create_job(request.get_json(silent=True) or {})), int(HTTPStatus.CREATED)
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>')
+        def video_link_get_job(job_id):
+            try:
+                return jsonify(self.video_link.public_job(self.video_link.load_job(job_id)))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>/run', methods=['POST'])
+        def video_link_run_job(job_id):
+            try:
+                return jsonify(self.video_link.start_run(job_id)), int(HTTPStatus.ACCEPTED)
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>/stages/<stage>', methods=['POST'])
+        def video_link_run_stage(job_id, stage):
+            try:
+                return jsonify(self.video_link.run_stage(job_id, stage))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>/logs/<stage>')
+        def video_link_stage_log(job_id, stage):
+            try:
+                limit = request.args.get('tail', default=80, type=int)
+                full = str(request.args.get('full', 'false')).lower() in {'1', 'true', 'yes', 'on'}
+                return jsonify(self.video_link.stage_log(job_id, stage, limit, full))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
             
         @self.app.route('/upload', methods=['POST'])
         def upload_file():
@@ -265,6 +342,7 @@ def main():
     parser.add_argument('--port', type=int, default=5000, help='Port to listen on')
     parser.add_argument('--dev', action='store_true', help='Enable development mode')
     parser.add_argument('--log-file', help='Log file path')
+    parser.add_argument('--jobs-dir', default=str(DEFAULT_JOBS_DIR), help='Durable video-link job directory')
     
     args = parser.parse_args()
     
@@ -277,21 +355,12 @@ def main():
         log_config['filename'] = args.log_file
     logging.basicConfig(**log_config)
     
-    try:
-        # Check if video-analyzer is installed
-        subprocess.run(['video-analyzer', '--help'], capture_output=True, check=True)
-    except subprocess.CalledProcessError:
-        logger.error("video-analyzer command not found. Please install video-analyzer package.")
-        sys.exit(1)
-    except FileNotFoundError:
-        logger.error("video-analyzer command not found. Please install video-analyzer package.")
-        sys.exit(1)
-    
     # Start server
     server = VideoAnalyzerUI(
         host=args.host,
         port=args.port,
-        dev_mode=args.dev
+        dev_mode=args.dev,
+        jobs_dir=args.jobs_dir,
     )
     server.run()
 
