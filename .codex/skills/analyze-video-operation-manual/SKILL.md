@@ -18,7 +18,8 @@ Run the `video-analyzer` operation-manual pipeline end to end from either an onl
 - Use the project VibeVoice HTTP endpoint for required ASR. Spark and Edge expose lazy `8012` services; a cold first request can take several minutes while the backend loads.
 - Use Spark/Edge DotsMOCR on `:8000/v1` for OCR. A short `/v1/models` timeout can be lazy cold start rather than OCR failure.
 - Use the project AMD Fast OpenAI-compatible endpoint for text and vision unless the user explicitly asks for a different backend.
-- Do not use AGX/Qwen3-ASR unless the user explicitly asks for a fast ASR endpoint.
+- Do not use AGX/Qwen3-ASR or local Whisper as a fallback just to hide VibeVoice failures unless the user explicitly asks for another ASR backend.
+- Clear local proxy variables for LAN/Tailscale ASR, OCR, VL, Jetson, Ray, and rsync calls.
 
 ## Workflow
 
@@ -27,6 +28,7 @@ Run the `video-analyzer` operation-manual pipeline end to end from either an onl
    - Otherwise treat it as a local video path.
 2. Ensure required local services are reachable when practical:
    - `curl http://spark-31d6.taild500c8.ts.net:8012/api/health`
+   - `curl http://edgexpert-4353.taild500c8.ts.net:8012/api/health`
    - `curl http://spark-31d6.taild500c8.ts.net:8000/v1/models`
    - `curl http://edgexpert-4353.taild500c8.ts.net:8000/v1/models`
    - AMD Fast at `http://100.90.114.26:18081/v1`
