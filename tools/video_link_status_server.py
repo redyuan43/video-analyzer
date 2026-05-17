@@ -908,7 +908,11 @@ class VideoLinkStatusServer:
         return job
 
     def save_job(self, job: dict[str, Any]) -> None:
-        self.job_path(job["job_id"]).write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+        path = self.job_path(job["job_id"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.replace(path)
 
     def job_dir(self, job_id: str) -> Path:
         return self.jobs_dir / job_id

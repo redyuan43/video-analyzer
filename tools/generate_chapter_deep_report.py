@@ -145,7 +145,7 @@ def main() -> int:
                 chapter_outputs.append(future.result())
         chapter_outputs.sort(key=lambda item: item[0])
 
-    knowledge_notes = render_knowledge_notes(chapter_outputs)
+    knowledge_notes = render_knowledge_notes(chapter_outputs, chapter_assets=chapter_assets)
     deep_report = render_deep_report(chapter_outputs, chapter_assets=chapter_assets, deep_v2=args.deep_v2)
     if final_synthesis:
         structured_deep_report = deep_report
@@ -337,7 +337,10 @@ def clean_report_output(text: str) -> str:
     return normalize_markdown_spacing(normalize_chapter_section_titles(text))
 
 
-def render_knowledge_notes(chapter_outputs: list[tuple[int, dict, str, bool]]) -> str:
+def render_knowledge_notes(
+    chapter_outputs: list[tuple[int, dict, str, bool]],
+    chapter_assets: list[dict] | None = None,
+) -> str:
     lines = [
         "# 逐章知识笔记",
         "",
@@ -350,14 +353,23 @@ def render_knowledge_notes(chapter_outputs: list[tuple[int, dict, str, bool]]) -
         lines.append(f"- {index:02d}. {chapter.get('start')} - {chapter.get('end')} {chapter.get('title')}")
     lines.append("")
     for index, chapter, text, _cached in chapter_outputs:
+        asset = chapter_assets[index - 1] if chapter_assets and index - 1 < len(chapter_assets) else None
         lines.extend(
             [
                 f"## {index:02d}. {chapter.get('start')} - {chapter.get('end')} {chapter.get('title')}",
                 "",
-                text.strip(),
-                "",
             ]
         )
+        if asset:
+            lines.extend(
+                [
+                    f"![第{index:02d}章插图：{chapter.get('title')}（{asset['timestamp_label']}）]({asset['markdown_path']})",
+                    "",
+                    f"*图：视频 {asset['timestamp_label']} 处的章节代表帧。*",
+                    "",
+                ]
+            )
+        lines.extend([text.strip(), ""])
     return "\n".join(lines).rstrip() + "\n"
 
 

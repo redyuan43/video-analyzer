@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "${1:-}" = "" ]; then
+  echo "Usage: tools/run_video_doc_final_publish.sh RUN_DIR [--profile PROFILE] [--jobs N] [--finalize-only] [--skip-images] [--skip-send] [--to WECHAT_ID]" >&2
+  exit 2
+fi
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RUN_DIR="$(realpath "$1")"
+shift
+
+PROFILE="deepseek_v4_flash"
+JOBS=3
+FINALIZE_ONLY=0
+SKIP_IMAGES=0
+SKIP_SEND=0
+WECHAT_TO="${WECLAW_TO:-}"
+WECLAW_API_URL="${WECLAW_API_URL:-http://127.0.0.1:18011}"
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --profile)
+      PROFILE="${2:-}"
+      shift 2
+      ;;
+    --jobs)
+      JOBS="${2:-}"
+      shift 2
+      ;;
+    --finalize-only)
+      FINALIZE_ONLY=1
+      shift
+      ;;
+    --skip-images)
+      SKIP_IMAGES=1
+      shift
+      ;;
+    --skip-send)
+      SKIP_SEND=1
+      shift
+      ;;
+    --to)
+      WECHAT_TO="${2:-}"
+      shift 2
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [ ! -d "$RUN_DIR" ]; then
+  echo "Run directory not found: $RUN_DIR" >&2
+  exit 1
+fi
+
+PYTHON_BIN="${PYTHON:-$ROOT_DIR/.venv/bin/python}"
+if [ ! -x "$PYTHON_BIN" ]; then
+  PYTHON_BIN="$(command -v python3)"
+fi
+
+FINAL_DIR="$RUN_DIR/baoyu_images/final"
+PROMPT_DIR="$RUN_DIR/baoyu_images/prompts"
+EXPORT_DIR="$RUN_DIR/exports"
+mkdir -p "$FINAL_DIR" "$EXPORT_DIR"
+
+declare -a FINAL_IMAGES=(
+  "01-image-cards-operation-manual.png"
+  "02-infographic-knowledge-notes.png"
+  "03-infographic-deep-report.png"
+  "04-infographic-manual-evidence.png"
+)
+
+declare -a PROMPTS=(
+  "01-image-cards-operation-manual.md"
+  "02-infographic-knowledge-notes.md"
+  "03-infographic-deep-report.md"
+  "04-infographic-manual-evidence.md"
+)
+
+declare -a DOCS=(
+  "operation_manual"
+  "knowledge_notes_v2"
+  "deep_report_v2"
+  "manual_evidence"
+)
+
+generate_final_images() {
+  if [ ! -d "$PROMPT_DIR" ]; then
+    echo "[images] prompt directory missing: $PROMPT_DIR" >&2
+    return 1
+  fi
+  for index in "${!PROMPTS[@]}"; do
+    local prompt_file="$PROMPT_DIR/${PROMPTS[$index]}"
+    local target="$FINAL_DIR/${FINAL_IMAGES[$index]}"
+    if [ -s "$target" ]; then
+      echo "[images] exists: $target"
+      continue
+    fi
+    if [ ! -f "$prompt_file" ]; then
+      echo "[images] missing prompt: $prompt_file" >&2
+      return 1
+    fi
+    local marker
+    marker="$(mktemp)"
+    touch "$marker"
+    echo "[images] codex exec image_gen: $(basename "$prompt_file")"
+    codex exec --cd "$RUN_DIR" --skip-git-repo-check --sandbox read-only "$(cat <<EOF
+Use the imagegen skill/image_gen tool to generate exactly one PNG image from this prompt file:
+$prompt_file
+
+Do not edit files. Do not create Markdown. Only generate the raster image.
+EOF
+)"
+    local generated
+    generated="$(find "$HOME/.codex/generated_images" -type f -name '*.png' -newer "$marker" -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
+    rm -f "$marker"
+    if [ -z "$generated" ] || [ ! -s "$generated" ]; then
+      echo "[images] no generated PNG found for $prompt_file" >&2
+      return 1
+    fi
+    cp "$generated" "$target"
+    echo "[images] copied: $target"
+  done
+}
+
+regenerate_docs() {
+  echo "[docs] multidoc"
+  "$ROOT_DIR/tools/run_multidoc_analysis.sh" "$RUN_DIR" --profile "$PROFILE"
+  echo "[docs] deep-v2"
+  "$PYTHON_BIN" "$ROOT_DIR/tools/generate_chapter_deep_report.py" "$RUN_DIR" \
+    --profile "$PROFILE" \
+    --deep-v2 \
+    --no-final-synthesis \
+    --no-format-markdown-final \
+    --refresh-chapters \
+    --chapter-concurrency "$JOBS"
+}
+
+verify_counts() {
+  local pdf_count png_count final_count
+  pdf_count="$(find "$EXPORT_DIR" -maxdepth 1 -type f -name '*.pdf' | wc -l)"
+  png_count="$(find "$EXPORT_DIR" -maxdepth 1 -type f -name '*.long.png' | wc -l)"
+  final_count="$(find "$FINAL_DIR" -maxdepth 1 -type f -name '*.png' | wc -l)"
+  echo "[verify] pdf=$pdf_count longpng=$png_count final_images=$final_count"
+  [ "$pdf_count" -eq 4 ]
+  [ "$png_count" -eq 4 ]
+  if [ "$SKIP_IMAGES" -eq 0 ]; then
+    [ "$final_count" -eq 4 ]
+  fi
+  test -s "$EXPORT_DIR/manual_evidence.long.png"
+  if compgen -G "$FINAL_DIR/*.png" >/dev/null; then
+    file "$FINAL_DIR"/*.png
+  fi
+}
+
+write_summary() {
+  "$PYTHON_BIN" - "$RUN_DIR" "$SKIP_SEND" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+run_dir = Path(sys.argv[1])
+skip_send = bool(int(sys.argv[2]))
+exports = sorted(path.relative_to(run_dir).as_posix() for path in (run_dir / "exports").glob("*") if path.is_file())
+final_images = sorted(path.relative_to(run_dir).as_posix() for path in (run_dir / "baoyu_images" / "final").glob("*.png"))
+summary = {
+    "final_documents": [
+        "operation_manual",
+        "knowledge_notes_v2",
+        "deep_report_v2",
+        "manual_evidence",
+    ],
+    "export_files": exports,
+    "final_images": final_images,
+    "send_skipped": skip_send,
+}
+(run_dir / "final_publish_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+print("[summary] " + str(run_dir / "final_publish_summary.json"))
+PY
+}
+
+resolve_wechat_to() {
+  if [ -n "$WECHAT_TO" ]; then
+    return 0
+  fi
+  if [ -f "$HOME/.weclaw/weclaw.log" ]; then
+    WECHAT_TO="$(tail -n 500 "$HOME/.weclaw/weclaw.log" | rg -o '[A-Za-z0-9._-]+@im\.wechat' | tail -1 || true)"
+  fi
+  if [ -z "$WECHAT_TO" ]; then
+    echo "No WECLAW_TO and no recent @im.wechat ID found" >&2
+    return 1
+  fi
+}
+
+send_file() {
+  local path="$1"
+  test -f "$path"
+  "$PYTHON_BIN" - "$WECLAW_API_URL" "$WECHAT_TO" "$path" <<'PY'
+import json
+import sys
+import urllib.request
+
+api, to, path = sys.argv[1], sys.argv[2], sys.argv[3]
+payload = json.dumps({"to": to, "media_path": path}).encode("utf-8")
+request = urllib.request.Request(
+    api.rstrip("/") + "/api/send",
+    data=payload,
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+with urllib.request.urlopen(request, timeout=180) as response:
+    print(path + "\t" + response.read().decode("utf-8", errors="replace"))
+PY
+}
+
+send_outputs() {
+  curl -fsS "$WECLAW_API_URL/health" >/dev/null
+  resolve_wechat_to
+  echo "[send] to=$WECHAT_TO"
+  for name in "${DOCS[@]}"; do
+    send_file "$EXPORT_DIR/$name.pdf"
+  done
+  for name in "${DOCS[@]}"; do
+    send_file "$EXPORT_DIR/$name.long.png"
+  done
+  for image in "${FINAL_IMAGES[@]}"; do
+    send_file "$FINAL_DIR/$image"
+  done
+}
+
+cd "$ROOT_DIR"
+
+if [ "$SKIP_IMAGES" -eq 0 ]; then
+  generate_final_images &
+  images_pid=$!
+fi
+if [ "$FINALIZE_ONLY" -eq 0 ]; then
+  regenerate_docs &
+  docs_pid=$!
+fi
+if [ "$SKIP_IMAGES" -eq 0 ]; then
+  wait "$images_pid"
+fi
+if [ "$FINALIZE_ONLY" -eq 0 ]; then
+  wait "$docs_pid"
+fi
+
+"$PYTHON_BIN" "$ROOT_DIR/tools/augment_video_docs_images.py" "$RUN_DIR"
+"$ROOT_DIR/tools/export_video_docs.sh" "$RUN_DIR" --final-only --jobs "$JOBS"
+verify_counts
+write_summary
+
+if [ "$SKIP_SEND" -eq 0 ]; then
+  send_outputs
+else
+  echo "[send] skipped"
+fi

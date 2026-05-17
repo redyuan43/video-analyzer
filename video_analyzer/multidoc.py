@@ -322,11 +322,35 @@ def parse_chapters(page_context: str, transcript: dict[str, Any]) -> list[dict[s
     if chapters:
         return chapters
     segments = (transcript or {}).get("segments") or []
-    if not segments:
+    timed_segments = [segment for segment in segments if segment_seconds(segment, "end") > segment_seconds(segment, "start")]
+    if not timed_segments:
         return [{"start": "00:00:00", "end": "", "title": "全片"}]
-    first = segments[0].get("start_time", segments[0].get("start", 0))
-    last = segments[-1].get("end_time", segments[-1].get("end", first))
-    return [{"start": format_timestamp(first), "end": format_timestamp(last), "title": "全片"}]
+    return build_fallback_chapters(timed_segments)
+
+
+def build_fallback_chapters(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    first = min(segment_seconds(segment, "start") for segment in segments)
+    last = max(segment_seconds(segment, "end") for segment in segments)
+    duration = max(last - first, 1.0)
+    chapter_count = max(1, min(10, round(duration / 240.0)))
+    if duration >= 900:
+        chapter_count = max(6, chapter_count)
+    if chapter_count == 1:
+        return [{"start": format_timestamp(first), "end": format_timestamp(last), "title": "全片"}]
+
+    boundaries = [first + (duration * index / chapter_count) for index in range(chapter_count + 1)]
+    chapters = []
+    for index in range(chapter_count):
+        start = boundaries[index]
+        end = boundaries[index + 1]
+        chapters.append(
+            {
+                "start": format_timestamp(start),
+                "end": format_timestamp(end),
+                "title": f"自动分段 {index + 1:02d}",
+            }
+        )
+    return chapters
 
 
 def build_chapter_transcript_digest(
