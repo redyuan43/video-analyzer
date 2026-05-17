@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -159,6 +160,20 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertIn("--skip-send", command)
         self.assertIn("--jobs", command)
         self.assertEqual(command[command.index("--jobs") + 1], "3")
+        self.assertNotIn("--skip-images", command)
+
+    def test_final_publish_stage_respects_skip_images_option(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "skip_images": True})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            loaded["run_dir"] = str(run_dir)
+
+            command = server.final_publish_command(loaded)
+
+        self.assertIn("--skip-images", command)
 
     def test_failed_stage_can_be_retried(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -170,7 +185,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             loaded["stages"]["prepare"] = {"status": "failed", "error": "old error"}
             server.save_job(loaded)
 
-            def fake_prepare(current_job, log_path):
+            def fake_prepare(current_job, log_path, stage_info=None):
                 return {"artifacts": {"video_path": "/tmp/video.mp4"}, "stdout_tail": ["ok"]}
 
             with patch.object(server, "stage_prepare", side_effect=fake_prepare):
@@ -231,7 +246,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(queued["stages"]["analyze-core"]["queue_position"], 1)
         self.assertFalse(thread.is_alive())
 
-    def test_load_job_marks_orphaned_running_stage_queued_to_continue(self):
+    def test_load_job_marks_orphaned_running_stage_failed_when_process_is_gone(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
             job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
@@ -243,10 +258,55 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
             recovered = server.load_job(job["job_id"])
 
-        self.assertEqual(recovered["status"], "queued")
-        self.assertEqual(recovered["runner"]["status"], "queued")
-        self.assertEqual(recovered["stages"]["final-publish"]["status"], "queued")
-        self.assertIn("queued", recovered["runner"]["error"])
+        self.assertEqual(recovered["status"], "failed")
+        self.assertEqual(recovered["runner"]["status"], "failed")
+        self.assertEqual(recovered["stages"]["final-publish"]["status"], "failed")
+        self.assertIn("process is gone", recovered["runner"]["error"])
+
+    def test_load_job_keeps_orphaned_stage_running_when_process_is_alive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
+            loaded = server.load_job(job["job_id"])
+            loaded["status"] = "running"
+            loaded["runner"] = {"status": "running", "current_stage": "final-publish"}
+            loaded["stages"]["final-publish"] = {
+                "status": "running",
+                "process": {"pid": os.getpid(), "command": ["sleep", "10"]},
+            }
+            server.save_job(loaded)
+
+            recovered = server.load_job(job["job_id"])
+
+        self.assertEqual(recovered["status"], "running")
+        self.assertEqual(recovered["runner"]["status"], "running")
+        self.assertTrue(recovered["stages"]["final-publish"]["process"]["alive"])
+        self.assertTrue(recovered["stages"]["final-publish"]["process"]["orphaned"])
+
+    def test_load_job_marks_final_publish_succeeded_when_exports_are_complete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            run_dir = Path(tmp) / "run"
+            export_dir = run_dir / "exports"
+            export_dir.mkdir(parents=True)
+            for name in server_mod.EXPECTED_FINAL_EXPORTS:
+                (export_dir / name).write_text("ok", encoding="utf-8")
+            job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
+            loaded = server.load_job(job["job_id"])
+            loaded["run_dir"] = str(run_dir)
+            loaded["status"] = "running"
+            loaded["runner"] = {"status": "running", "current_stage": "final-publish"}
+            for stage in server_mod.STAGE_ORDER:
+                if stage != "final-publish":
+                    loaded["stages"][stage] = {"status": "succeeded"}
+            loaded["stages"]["final-publish"] = {"status": "running", "process": {"pid": 99999999}}
+            server.save_job(loaded)
+
+            recovered = server.load_job(job["job_id"])
+
+        self.assertEqual(recovered["status"], "succeeded")
+        self.assertEqual(recovered["runner"]["status"], "succeeded")
+        self.assertEqual(recovered["stages"]["final-publish"]["status"], "succeeded")
 
     def test_probe_auto_routes_long_video_to_long_talk_fast(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -268,7 +328,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
             server.run_stage(job["job_id"], "probe")
 
-            def fake_run(command, log_path):
+            def fake_run(command, log_path, on_start=None):
                 Path(log_path).parent.mkdir(parents=True, exist_ok=True)
                 Path(log_path).write_text(f"[done] run_dir: {run_dir}\n", encoding="utf-8")
                 return {"stdout_tail": ["ok"]}

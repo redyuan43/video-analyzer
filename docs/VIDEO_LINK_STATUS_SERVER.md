@@ -29,7 +29,7 @@ tmp/video-link-status/
 - `profile`：从 `config/config.json` 和 `video_analyzer/config/default_config.json` 的 `runtime_profiles` 读取；默认优先 `deepseek_v4_flash`。
 - `run_name`：输出目录名，默认 `operation-manual`。
 - `cookies_from_browser`：`chrome` / `none` / `edge` / `firefox` / `chromium` / `brave`。
-- `skip_images`：跳过最后的配图提示词阶段。
+- `skip_images`：跳过配图提示词和最终图片生成。
 
 采集选项在折叠区：
 
@@ -49,7 +49,9 @@ tmp/video-link-status/
 - `analyze-core` 一次只跑 1 个，避免抢占 ASR、Ray、GPU、OCR/VL 资源。
 - `multidoc`、`deep-v2`、`image-prompts`、`final-publish` 各自一次只跑 1 个。
 - 资源忙时阶段会显示 `queued`，而不是返回锁冲突失败。
-- 服务重启后如果发现旧任务停在 `running`/`queued`，会把当前阶段放回队列并从第一个未完成阶段继续。
+- 服务重启后如果发现旧任务停在 `running`/`queued`，会检查记录的阶段进程：进程仍在则保持 `running`，进程已退出且产物不完整则标记 `failed`，最终 PDF 已完整则标记 `succeeded`。
+- 最终发布阶段默认生成 Baoyu 最终图片并插入 Markdown，然后生成手机优先 PDF；不再默认生成长图 PNG。PDF 由 `tools/md_to_mobile_pdf.py` 使用 WeasyPrint 渲染。线性 `flowchart TD` 会转成手机友好的原生 HTML 流程图，其他 Mermaid 图可降级为高分辨率 PNG。
+- 如需连续阅读长图，使用 `tools/run_video_doc_final_publish.sh RUN_DIR --finalize-only --long-png`，会额外生成 `<name>.long.png`，并裁掉 PDF 页间大块空白后纵向拼接。
 
 ## API
 

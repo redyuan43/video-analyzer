@@ -178,8 +178,7 @@ async function refreshSelectedJob() {
         renderJob(job);
         await refreshJobsNoSelect();
     } catch (error) {
-        nodes.selectedTitle.textContent = '任务不可用';
-        nodes.selectedSubtitle.textContent = error.message;
+        renderServiceOffline(error);
     }
 }
 
@@ -205,17 +204,45 @@ function renderEmpty() {
     nodes.selectedSubtitle.textContent = '创建或选择一个任务后查看进度。';
 }
 
+function renderServiceOffline(error) {
+    nodes.runButton.disabled = true;
+    nodes.selectedTitle.textContent = '服务未连接';
+    nodes.selectedSubtitle.textContent = error.message;
+    setText(nodes.statusValue, 'offline');
+    setText(nodes.currentStageValue, '-');
+    setText(nodes.nextStageValue, '-');
+    setText(nodes.queueValue, '-');
+    nodes.progressText.textContent = '0/0 · 0%';
+    nodes.progressBar.style.width = '0%';
+}
+
+function activeProcess(job) {
+    const stage = job.current_stage || job.next_stage;
+    return job.process || job.stages?.[stage]?.process || null;
+}
+
+function runDisabledReason(job) {
+    const process = activeProcess(job);
+    if (process?.alive) return `已有外部进程 PID ${process.pid} 仍在运行`;
+    if (job.runner?.status === 'running') return '阶段仍在运行，等待完成';
+    if (job.runner?.status === 'queued') return `等待资源: ${job.queue?.resource || job.runner?.queued_for || '-'}`;
+    return '';
+}
+
 function renderJob(job) {
     const progress = job.progress || {};
     const queue = job.queue || {};
+    const reason = runDisabledReason(job);
+    const process = activeProcess(job);
     nodes.selectedTitle.textContent = job.video_url || job.job_id;
-    nodes.selectedSubtitle.textContent = `任务 ID: ${job.job_id}`;
-    nodes.runButton.disabled = job.runner?.status === 'running' || job.runner?.status === 'queued';
+    nodes.selectedSubtitle.textContent = reason ? `任务 ID: ${job.job_id} · ${reason}` : `任务 ID: ${job.job_id}`;
+    nodes.runButton.disabled = Boolean(reason);
     nodes.runButton.textContent = job.status === 'failed' ? '重试失败阶段' : '继续运行';
     setText(nodes.statusValue, job.status);
     setText(nodes.currentStageValue, stageNames[job.current_stage] || job.current_stage);
     setText(nodes.nextStageValue, stageNames[job.next_stage] || job.next_stage);
-    setText(nodes.queueValue, queue.resource ? `${queue.resource} #${queue.position || '-'}/${queue.size || '-'}` : '-');
+    const queueText = queue.resource ? `${queue.resource} #${queue.position || '-'}/${queue.size || '-'}` : '-';
+    setText(nodes.queueValue, process?.alive ? `${queueText} · PID ${process.pid}` : queueText);
     nodes.progressText.textContent = `${progress.completed || 0}/${progress.total || 0} · ${progress.percent || 0}%`;
     nodes.progressBar.style.width = `${progress.percent || 0}%`;
     setText(nodes.detailUrl, job.video_url);

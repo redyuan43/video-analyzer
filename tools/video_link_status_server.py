@@ -94,6 +94,12 @@ RESOURCE_LIMITS = {
     "image-prompts": 1,
     "final-publish": 1,
 }
+EXPECTED_FINAL_EXPORTS = (
+    "operation_manual.pdf",
+    "knowledge_notes_v2.pdf",
+    "deep_report_v2.pdf",
+    "manual_evidence.pdf",
+)
 CORE_PROGRESS_STEPS = [
     ("ray", "Ray 集群准备", (r"\[jetson-ray\]", r"Ray runtime started")),
     ("context", "页面/评论/素材准备", (r"Extracting cookies", r"\[youtube\]", r"Writing video metadata")),
@@ -250,6 +256,7 @@ class VideoLinkStatusServer:
                 "finished_at": None,
                 "current_stage": self.next_stage(job),
                 "error": None,
+                "server_pid": os.getpid(),
             }
             self.save_job(job)
             thread = threading.Thread(target=self._run_remaining_stages, args=(job_id,), daemon=True)
@@ -265,32 +272,17 @@ class VideoLinkStatusServer:
                 continue
             runner = raw.get("runner") or {}
             stages = raw.get("stages") or {}
-            stage = runner.get("current_stage") or self.current_stage(raw) or self.next_stage(raw)
             interrupted = runner.get("status") in {"running", "queued"} or any(
                 info.get("status") in {"running", "queued"} for info in stages.values()
             )
             if not interrupted:
                 continue
-            now = iso_now()
-            raw["status"] = "queued"
-            raw["updated_at"] = now
-            raw["runner"] = {
-                **runner,
-                "status": "queued",
-                "current_stage": stage,
-                "updated_at": now,
-                "error": "server restarted while this stage was running; queued to continue",
-            }
-            if stage and stage in STAGE_ORDER:
-                stage_info = dict(stages.get(stage) or {})
-                stage_info["status"] = "queued"
-                stage_info["queued_at"] = now
-                stage_info["queued_for"] = stage_resource(stage)
-                stage_info["error"] = raw["runner"]["error"]
-                stage_info.setdefault("log_path", str(self.stage_log_path(raw["job_id"], stage)))
-                raw.setdefault("stages", {})[stage] = stage_info
-            self.save_job(raw)
-            if auto_start:
+            try:
+                recovered = self.load_job(raw["job_id"])
+            except BridgeError:
+                continue
+            recovered_runner = recovered.get("runner") or {}
+            if auto_start and recovered.get("status") == "queued" and recovered_runner.get("status") == "queued":
                 self.start_run(raw["job_id"])
 
     def _run_remaining_stages(self, job_id: str) -> None:
@@ -327,6 +319,7 @@ class VideoLinkStatusServer:
         runner = dict(job.get("runner") or {})
         runner["status"] = status
         runner["updated_at"] = iso_now()
+        runner["server_pid"] = os.getpid()
         if "started_at" not in runner:
             runner["started_at"] = runner["updated_at"]
         runner["current_stage"] = current_stage
@@ -391,20 +384,21 @@ class VideoLinkStatusServer:
             if stage == "probe":
                 result = self.stage_probe(job)
             elif stage == "prepare":
-                result = self.stage_prepare(job, stage_info["log_path"])
+                result = self.stage_prepare(job, stage_info["log_path"], stage_info)
             elif stage == "analyze-core":
-                result = self.stage_analyze_core(job, stage_info["log_path"])
+                result = self.stage_analyze_core(job, stage_info["log_path"], stage_info)
             elif stage == "verify-core":
                 result = self.stage_verify_core(job)
             elif stage == "multidoc":
-                result = self.run_command_stage(job, stage, self.multidoc_command(job), stage_info["log_path"])
+                result = self.run_command_stage(job, stage, self.multidoc_command(job), stage_info["log_path"], stage_info)
             elif stage == "deep-v2":
-                result = self.run_command_stage(job, stage, self.deep_v2_command(job), stage_info["log_path"])
+                result = self.run_command_stage(job, stage, self.deep_v2_command(job), stage_info["log_path"], stage_info)
             elif stage == "image-prompts":
-                result = self.run_command_stage(job, stage, self.image_prompts_command(job), stage_info["log_path"])
+                result = self.run_command_stage(job, stage, self.image_prompts_command(job), stage_info["log_path"], stage_info)
             else:
-                result = self.run_command_stage(job, stage, self.final_publish_command(job), stage_info["log_path"])
+                result = self.run_command_stage(job, stage, self.final_publish_command(job), stage_info["log_path"], stage_info)
             stage_info.update(result)
+            stage_info.pop("process", None)
             self.update_job_artifacts(job, stage, result.get("artifacts", {}))
             stage_info["status"] = "succeeded"
             stage_info["exit_code"] = 0
@@ -417,6 +411,7 @@ class VideoLinkStatusServer:
             stage_info["duration_seconds"] = round(time.time() - start, 3)
             stage_info["finished_at"] = iso_now()
             stage_info["error"] = str(exc)
+            stage_info.pop("process", None)
             job["status"] = "failed"
         job["updated_at"] = iso_now()
         job["stages"][stage] = stage_info
@@ -446,6 +441,7 @@ class VideoLinkStatusServer:
         runner["current_stage"] = stage
         runner["queued_for"] = resource
         runner["updated_at"] = now
+        runner["server_pid"] = os.getpid()
         runner["error"] = None
         if "started_at" not in runner:
             runner["started_at"] = now
@@ -466,11 +462,11 @@ class VideoLinkStatusServer:
     def stage_operation(self, job: dict[str, Any], log_path: str) -> dict[str, Any]:
         return self.stage_analyze_core(job, log_path)
 
-    def stage_prepare(self, job: dict[str, Any], log_path: str) -> dict[str, Any]:
+    def stage_prepare(self, job: dict[str, Any], log_path: str, stage_info: dict[str, Any] | None = None) -> dict[str, Any]:
         if not job.get("resolved_mode"):
             self.stage_probe(job)
         command = self.prepare_command(job)
-        result = self.run_command(command, log_path)
+        result = self.run_command(command, log_path, on_start=self.record_stage_process(job, "prepare", stage_info))
         text = Path(log_path).read_text(encoding="utf-8", errors="replace")
         video_path = parse_prefixed_path(text, "[download] video:")
         page_context = parse_prefixed_path(text, "[download] context:")
@@ -487,11 +483,11 @@ class VideoLinkStatusServer:
         }
         return {"artifacts": artifacts, "stdout_tail": result["stdout_tail"]}
 
-    def stage_analyze_core(self, job: dict[str, Any], log_path: str) -> dict[str, Any]:
+    def stage_analyze_core(self, job: dict[str, Any], log_path: str, stage_info: dict[str, Any] | None = None) -> dict[str, Any]:
         if not job.get("resolved_mode"):
             self.stage_probe(job)
         command = self.operation_command(job)
-        result = self.run_command(command, log_path)
+        result = self.run_command(command, log_path, on_start=self.record_stage_process(job, "analyze-core", stage_info))
         run_dir = parse_run_dir(Path(log_path).read_text(encoding="utf-8", errors="replace"))
         if not run_dir:
             raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, "operation stage did not print a run directory")
@@ -507,8 +503,15 @@ class VideoLinkStatusServer:
             raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, f"missing core artifact(s): {', '.join(missing)}")
         return {"artifacts": {"required": required, "missing": []}}
 
-    def run_command_stage(self, job: dict[str, Any], stage: str, command: list[str], log_path: str) -> dict[str, Any]:
-        result = self.run_command(command, log_path)
+    def run_command_stage(
+        self,
+        job: dict[str, Any],
+        stage: str,
+        command: list[str],
+        log_path: str,
+        stage_info: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        result = self.run_command(command, log_path, on_start=self.record_stage_process(job, stage, stage_info))
         return {
             "artifacts": {
                 "stage": stage,
@@ -518,7 +521,12 @@ class VideoLinkStatusServer:
             "stdout_tail": result["stdout_tail"],
         }
 
-    def run_command(self, command: list[str], log_path: str) -> dict[str, Any]:
+    def run_command(
+        self,
+        command: list[str],
+        log_path: str,
+        on_start: Any | None = None,
+    ) -> dict[str, Any]:
         env = operation_env()
         Path(log_path).parent.mkdir(parents=True, exist_ok=True)
         with Path(log_path).open("w", encoding="utf-8") as log_file:
@@ -530,6 +538,8 @@ class VideoLinkStatusServer:
                 text=True,
                 env=env,
             )
+            if on_start:
+                on_start(process)
             assert process.stdout is not None
             for line in process.stdout:
                 log_file.write(line)
@@ -541,6 +551,36 @@ class VideoLinkStatusServer:
             error.output = text
             raise error
         return {"stdout_tail": tail_lines(text)}
+
+    def record_stage_process(self, job: dict[str, Any], stage: str, stage_info: dict[str, Any] | None = None):
+        def _record(process: subprocess.Popen) -> None:
+            process_info = {
+                "pid": process.pid,
+                "command": list(process.args) if isinstance(process.args, (list, tuple)) else process.args,
+                "started_at": iso_now(),
+                "alive": True,
+            }
+            if stage_info is not None:
+                stage_info["process"] = process_info
+            try:
+                current = self.load_job(job["job_id"])
+            except BridgeError:
+                return
+            current_stage = dict((current.get("stages") or {}).get(stage) or {})
+            current_stage["process"] = process_info
+            current_stage["status"] = "running"
+            current.setdefault("stages", {})[stage] = current_stage
+            runner = dict(current.get("runner") or {})
+            runner["status"] = "running"
+            runner["current_stage"] = stage
+            runner["updated_at"] = process_info["started_at"]
+            runner["server_pid"] = os.getpid()
+            current["runner"] = runner
+            current["status"] = "running"
+            current["updated_at"] = process_info["started_at"]
+            self.save_job(current)
+
+        return _record
 
     def operation_command(self, job: dict[str, Any]) -> list[str]:
         opts = job["options"]
@@ -765,7 +805,25 @@ class VideoLinkStatusServer:
         if queued_stage and queued_stage in public["stages"]:
             public["stages"][queued_stage] = dict(public["stages"][queued_stage])
             public["stages"][queued_stage]["queue_position"] = public["queue"].get("position")
+        current_stage = public.get("current_stage")
+        current_info = public["stages"].get(current_stage or "", {})
+        public["process"] = self.public_process_info(current_info.get("process"))
         return public
+
+    def public_process_info(self, process_info: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not process_info:
+            return None
+        info = dict(process_info)
+        pid = info.get("pid")
+        info["alive"] = process_alive(pid) if pid else False
+        return info
+
+    def export_outputs_complete(self, job: dict[str, Any]) -> bool:
+        run_dir_value = job.get("run_dir")
+        if not run_dir_value:
+            return False
+        export_dir = Path(run_dir_value) / "exports"
+        return all((export_dir / name).is_file() and (export_dir / name).stat().st_size > 0 for name in EXPECTED_FINAL_EXPORTS)
 
     def queue_info(self, job: dict[str, Any]) -> dict[str, Any]:
         runner = job.get("runner") or {}
@@ -885,25 +943,77 @@ class VideoLinkStatusServer:
         active = self.active_runners.get(job["job_id"])
         if active and active.is_alive():
             return job
+        if runner.get("server_pid") == os.getpid():
+            return job
 
-        stage = runner.get("current_stage") or self.current_stage(job) or self.next_stage(job)
-        message = "server restarted while this stage was running; queued to continue"
-        runner["status"] = "queued"
-        runner["error"] = message
-        runner["updated_at"] = iso_now()
-        runner["current_stage"] = stage
-        runner["queued_for"] = stage_resource(stage or "")
-        job["runner"] = runner
-        job["status"] = "queued"
-        if stage and stage in STAGE_ORDER:
-            stage_info = dict((job.get("stages") or {}).get(stage) or {})
-            if stage_info.get("status") in {"running", "queued"}:
-                stage_info["status"] = "queued"
-                stage_info["error"] = message
-                stage_info["queued_at"] = runner["updated_at"]
-                stage_info["queued_for"] = runner["queued_for"]
+        raw_stage = runner.get("current_stage") or self.current_stage(job) or self.next_stage(job)
+        stage = normalize_stage_name(raw_stage or "") if raw_stage else None
+        stage_info = dict((job.get("stages") or {}).get(stage or "") or (job.get("stages") or {}).get(raw_stage or "") or {})
+        process_info = dict(stage_info.get("process") or {})
+        pid = process_info.get("pid")
+        now = iso_now()
+
+        if pid and process_alive(pid):
+            process_info["alive"] = True
+            process_info["orphaned"] = True
+            process_info["checked_at"] = now
+            stage_info["process"] = process_info
+            stage_info["status"] = "running"
+            stage_info["error"] = "server restarted; external process is still running"
+            runner["status"] = "running"
+            runner["error"] = stage_info["error"]
+            runner["updated_at"] = now
+            runner["current_stage"] = stage
+            runner.pop("queued_for", None)
+            job["runner"] = runner
+            job["status"] = "running"
+            if stage:
                 job.setdefault("stages", {})[stage] = stage_info
-        job["updated_at"] = runner["updated_at"]
+            job["updated_at"] = now
+            self.save_job(job)
+            return job
+
+        if stage == "final-publish" and self.export_outputs_complete(job):
+            stage_info["status"] = "succeeded"
+            stage_info["exit_code"] = 0
+            stage_info["finished_at"] = now
+            stage_info["error"] = None
+            stage_info.pop("process", None)
+            job.setdefault("stages", {})[stage] = stage_info
+            next_stage = self.next_stage(job)
+            runner["status"] = "queued" if next_stage else "succeeded"
+            runner["current_stage"] = next_stage
+            runner["updated_at"] = now
+            runner["error"] = None
+            if not next_stage:
+                runner["finished_at"] = now
+            job["runner"] = runner
+            job["status"] = "queued" if next_stage else "succeeded"
+            job["summary"] = self.collect_summary(job)
+            job["updated_at"] = now
+            self.save_job(job)
+            return job
+
+        message = (
+            "server stopped while this stage was running; process is gone and artifacts are incomplete; retry to continue"
+        )
+        runner["status"] = "failed"
+        runner["error"] = message
+        runner["updated_at"] = now
+        runner["finished_at"] = now
+        runner["current_stage"] = stage
+        runner.pop("queued_for", None)
+        job["runner"] = runner
+        job["status"] = "failed"
+        if stage and stage in STAGE_ORDER:
+            if stage_info.get("status") in {"running", "queued"}:
+                stage_info["status"] = "failed"
+                stage_info["error"] = message
+                stage_info["finished_at"] = now
+                stage_info["exit_code"] = 1
+                stage_info.pop("process", None)
+                job.setdefault("stages", {})[stage] = stage_info
+        job["updated_at"] = now
         self.save_job(job)
         return job
 
@@ -936,6 +1046,20 @@ def normalize_stage_name(stage: str) -> str:
 
 def stage_resource(stage: str) -> str:
     return STAGE_RESOURCES.get(normalize_stage_name(stage), "core")
+
+
+def process_alive(pid: Any) -> bool:
+    try:
+        value = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if value <= 0:
+        return False
+    try:
+        os.kill(value, 0)
+    except OSError:
+        return False
+    return True
 
 
 def parse_core_progress(text: str, stage_status: str) -> dict[str, Any]:
@@ -1224,7 +1348,7 @@ def render_create_page(options: dict[str, Any]) -> str:
           <label for="cookies_from_browser">Cookie 来源</label>
           <select id="cookies_from_browser" name="cookies_from_browser"></select>
         </div>
-        <label class="check"><input id="skip_images" name="skip_images" type="checkbox">跳过配图提示词</label>
+        <label class="check"><input id="skip_images" name="skip_images" type="checkbox">跳过配图/提示词</label>
       </div>
       <details class="panel">
         <summary>采集选项</summary>

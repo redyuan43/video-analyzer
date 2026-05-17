@@ -18,7 +18,14 @@ is_running() {
   [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
 }
 
+clear_stale_pid() {
+  if [[ -f "$PID_FILE" ]] && ! is_running; then
+    rm -f "$PID_FILE"
+  fi
+}
+
 start_server() {
+  clear_stale_pid
   if is_running; then
     echo "video-link status server already running: pid=$(cat "$PID_FILE")"
     return 0
@@ -55,6 +62,7 @@ case "${1:-status}" in
     start_server
     ;;
   status)
+    clear_stale_pid
     if is_running; then
       echo "running: pid=$(cat "$PID_FILE") http://$HOST:$PORT/"
     else
