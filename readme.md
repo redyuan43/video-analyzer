@@ -194,6 +194,13 @@ human-readable manual.
 
 ![Operation manual workflow](docs/operation-manual-workflow.png)
 
+The current publishing workflow also produces an evidence map and review
+dashboard. This dashboard explains how the final documents are backed by
+page context, subtitles/ASR, OCR, visual frame evidence, generated summary
+images, PDF/long-PNG exports, and WeChat delivery status.
+
+![Operation manual evidence dashboard](docs/operation-manual-evidence-dashboard.png)
+
 One-command URL workflow:
 
 ```bash
@@ -238,11 +245,25 @@ Typical outputs are written under the run directory:
 - `operation_manual.md` — illustrated manual for humans
 - `analysis.json` — structured evidence, transcript, OCR, visual events, and review metadata
 - `manual_assets/` and `frames/` — screenshots referenced by the manual
+- `docs_analysis/` and `docs_analysis_chapters/` — knowledge notes, deep reports, reviews, and chapter representative images
+- `baoyu_images/final/` — generated visual summaries inserted into the final Markdown documents
+- `exports/` — final PDFs and long PNGs generated after all Markdown images are inserted; the default publish set is `operation_manual`, `knowledge_notes_v2`, `deep_report_v2`, and `manual_evidence`
 
 For URL inputs, the download folder also keeps `description.md`, `page_context.md`,
 `subtitles/`, `comments.json`, and `comments.md`. Subtitles are treated as
 timeline/speech evidence; comments are low-confidence community supplements and
 should not become main operation steps unless confirmed by stronger evidence.
+
+For a completed publishing pass, use:
+
+```bash
+tools/run_video_doc_final_publish.sh output/manual-run --profile deepseek_v4_flash --jobs 3
+```
+
+This resumes from existing analysis artifacts, generates final visual summaries
+with `codex exec` + `image_gen`, inserts those images into the final Markdown
+files, exports only the four-document final Markdown set, and sends the resulting
+PDF/long-PNG files through the local WeClaw/WeChat queue.
 
 ## Output
 

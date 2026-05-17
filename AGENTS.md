@@ -91,12 +91,12 @@ A passing dual-worker response includes:
 
 ## Video Link Status Server
 
-- The local status server starts durable `video-link` background runs from `http://127.0.0.1:18120/video-link`, then shows progress for:
-  `探测时长 -> 下载/上下文 -> 核心分析 -> 校验产物 -> 多文档分析 -> 章节深度报告 -> 导出 PDF/长图 -> 生成配图提示词`.
-- The server is `tools/video_link_status_server.py`, managed by `tools/run_video_link_status_server.sh`. It exposes `POST /api/video-link/jobs`, `POST /api/video-link/jobs/<job_id>/run`, manual stage endpoints under `/stages/<stage>`, a dashboard at `/video-link/jobs/<job_id>`, and stores job state/logs under `tmp/video-link-status/jobs/`.
-- Keep runtime progress and service failures visible on the status page, including failed stage, error message, log path, current log tail, and artifact counts.
-- The background runner skips stages already marked `succeeded` or `skipped`, then resumes from the first incomplete stage.
-- The create page should expose only common and collection options: URL, analysis mode, profile, run name, browser cookie source, skip images, keep existing, subtitles, subtitle transcript preference, comments, max comments, subtitle languages, and refresh context.
+- The local status server starts durable `video-link` background runs from the unified UI at `http://127.0.0.1:5000/`, then shows progress for:
+  `探测时长 -> 下载/上下文 -> 核心分析 -> 校验产物 -> 多文档分析 -> 章节深度报告 -> 生成配图提示词 -> 最终定稿/发布`.
+- The reusable job engine is `tools/video_link_status_server.py`; the human entrypoint is the Flask UI under `video-analyzer-ui/video_analyzer_ui`, managed by `tools/run_video_link_status_server.sh`. It exposes `POST /api/video-link/jobs`, `GET /api/video-link/jobs`, `POST /api/video-link/jobs/<job_id>/run`, manual stage endpoints under `/stages/<stage>`, and stores job state/logs under `tmp/video-link-status/jobs/`.
+- Keep runtime progress and service failures visible on the home page, including failed stage, queue/resource state, error message, log path, selected log tail, full-log copy, core-analysis substeps, and artifact counts.
+- The background runner skips stages already marked `succeeded` or `skipped`, then resumes from the first incomplete stage. If a resource is busy, the stage should become `queued` instead of failing with a lock conflict.
+- The home page should expose only common and collection options: URL, analysis mode, profile, run name, browser cookie source, skip images, keep existing, subtitles, subtitle transcript preference, comments, max comments, subtitle languages, and refresh context.
 - Model endpoint/model overrides should stay in runtime profiles, not page fields. The default page profile should prefer `deepseek_v4_flash` when available.
 - Start or restart the server with:
   `tools/run_video_link_status_server.sh restart`
@@ -104,8 +104,8 @@ A passing dual-worker response includes:
 - Server child commands must prepend `.venv/bin` to `PATH` and set `PYTHON=.venv/bin/python`, otherwise URL analysis can accidentally run with system Python instead of the prepared project environment.
 - YouTube URLs can fail instantly with `Requested format is not available` when yt-dlp cannot solve YouTube's JS challenge. Keep `yt-dlp[default]`/`yt-dlp-ejs` installed in `.venv`, keep local `node` available, and let the URL runner's default `--ytdlp-js-runtimes auto` pass `--js-runtimes node`.
 - After changing the status server, run:
-  `python3 -m py_compile tools/video_link_status_server.py tests/test_video_link_status_server.py`
-  and `python3 -m unittest tests.test_video_link_status_server`.
+  `.venv/bin/python -m py_compile tools/video_link_status_server.py video-analyzer-ui/video_analyzer_ui/server.py tests/test_video_link_status_server.py tests/test_video_analyzer_ui.py`
+  and `.venv/bin/python -m unittest tests.test_video_link_status_server tests.test_video_analyzer_ui`.
 
 ## Video Link Resume And Publishing Notes
 
@@ -125,10 +125,11 @@ A passing dual-worker response includes:
   - `03-infographic-deep-report.png`
   - `04-infographic-manual-evidence.png`
 - Before reporting video-link completion, verify:
-  `find "$RUN_DIR/exports" -maxdepth 1 -type f | wc -l`,
+  `find "$RUN_DIR/exports" -maxdepth 1 -type f | wc -l` equals `8`,
   `find "$RUN_DIR/baoyu_images/prompts" -maxdepth 1 -type f | wc -l`,
   `find "$RUN_DIR/baoyu_images/final" -maxdepth 1 -type f -name '*.png' | wc -l`,
   and `file "$RUN_DIR/baoyu_images/final"/*.png`.
+  The default final publish set is only four document stems: `operation_manual`, `knowledge_notes_v2`, `deep_report_v2`, and `manual_evidence`. Keep `knowledge_notes`, `deep_report`, and `deep_report_v2.review` as intermediate or QA artifacts unless the user explicitly asks for them.
 
 ## Jetson Frame Extraction
 
