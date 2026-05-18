@@ -7,7 +7,9 @@ from unittest.mock import patch
 from video_analyzer.multidoc import parse_chapters
 from tools.augment_video_docs_images import main as augment_main
 from tools.md_to_mobile_pdf import main as mobile_pdf_main
+from tools.md_to_mobile_pdf import render_markdown
 from tools.md_to_mobile_pdf import render_mermaid_blocks
+from tools.md_to_mobile_pdf import wrap_final_images
 from tools.pdf_to_long_png import main as long_png_main
 from tools.prepare_video_doc_export import rewrite_image_paths
 
@@ -151,6 +153,19 @@ class VideoDocImageTests(unittest.TestCase):
             self.assertIn("![Mermaid diagram 1](file://", rendered)
             self.assertNotIn("```mermaid", rendered)
             self.assertTrue((work_dir / "mermaid_001.png").exists())
+
+    def test_mobile_pdf_wraps_final_images_as_full_pages(self):
+        body = render_markdown(
+            "![视觉摘要](baoyu_images/final/01-image-cards-operation-manual.png)\n\n"
+            "![普通帧](manual_assets/frame_000.jpg)\n"
+        )
+
+        wrapped = wrap_final_images(body)
+
+        self.assertIn('class="final-image-page"', wrapped)
+        self.assertIn("baoyu_images/final/01-image-cards-operation-manual.png", wrapped)
+        self.assertIn("<p><img alt=\"普通帧\" src=\"manual_assets/frame_000.jpg\"", wrapped)
+        self.assertEqual(wrapped.count('class="final-image-page"'), 1)
 
 
 if __name__ == "__main__":

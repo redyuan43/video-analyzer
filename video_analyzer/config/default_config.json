@@ -17,15 +17,16 @@
         }
     },
     "operation_manual": {
-        "llm_base_url": "http://100.90.114.26:18081/v1",
+        "llm_base_url": "https://api.deepseek.com",
         "vision_base_url": "http://100.96.79.21:18082/v1",
-        "text_base_url": "http://100.90.114.26:18081/v1",
+        "text_base_url": "https://api.deepseek.com",
+        "text_api_key_env": "DEEPSEEK_API_KEY",
         "vision_model": "minicpm-v-4.5-v100",
-        "text_model": "hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
+        "text_model": "deepseek-v4-pro",
         "frame_no_think": true,
         "manual_no_think": true
     },
-    "active_runtime_profile": "ivan_minicpm_v100",
+    "active_runtime_profile": "deepseek_v4_pro",
     "runtime_profiles": {
         "ivan_minicpm_v100": {
             "llm_base_url": "http://100.90.114.26:18081/v1",

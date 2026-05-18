@@ -29,10 +29,10 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             options = server.options()
 
         self.assertEqual(options["defaults"]["analysis_mode"], "auto")
-        self.assertEqual(options["defaults"]["profile"], "deepseek_v4_flash")
+        self.assertEqual(options["defaults"]["profile"], "deepseek_v4_pro")
         self.assertEqual(options["defaults"]["cookies_from_browser"], "chrome")
         self.assertIn("balanced", options["choices"]["analysis_modes"])
-        self.assertIn("deepseek_v4_flash", options["choices"]["profiles"])
+        self.assertIn("deepseek_v4_pro", options["choices"]["profiles"])
 
     def test_create_job_saves_common_and_collection_options(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -141,7 +141,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
         self.assertEqual(command[0], "tools/run_long_talk_fast_from_url.sh")
         self.assertIn("--profile", command)
-        self.assertEqual(command[command.index("--profile") + 1], "deepseek_v4_flash")
+        self.assertEqual(command[command.index("--profile") + 1], "deepseek_v4_pro")
         self.assertNotIn("--pipeline-mode", command)
 
     def test_final_publish_stage_uses_finalize_only_script(self):
@@ -160,6 +160,8 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertIn("--skip-send", command)
         self.assertIn("--jobs", command)
         self.assertEqual(command[command.index("--jobs") + 1], "3")
+        self.assertIn("--profile", command)
+        self.assertEqual(command[command.index("--profile") + 1], "deepseek_v4_pro")
         self.assertNotIn("--skip-images", command)
 
     def test_final_publish_stage_respects_skip_images_option(self):

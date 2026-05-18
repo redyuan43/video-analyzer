@@ -28,7 +28,7 @@ BAOYU_PROMPT_SCRIPT = Path.home() / ".codex" / "skills" / "video-link" / "script
 ALLOWED_ANALYSIS_MODES = ("auto", "fast", "balanced", "deep", "long-talk-fast")
 ALLOWED_COOKIE_BROWSERS = ("", "chrome", "none", "edge", "firefox", "chromium", "brave")
 DEFAULT_COOKIE_BROWSER = "chrome"
-DEFAULT_PROFILE = "deepseek_v4_flash"
+DEFAULT_PROFILE = "deepseek_v4_pro"
 DEFAULT_RUN_NAME = "operation-manual"
 DEFAULT_SUBTITLE_LANGS = "zh-CN,zh-Hans,zh,en"
 MODULE_ORDER = [
@@ -1162,6 +1162,21 @@ def operation_env() -> dict[str, str]:
         env["PATH"] = f"{venv_bin}:{env.get('PATH', '')}"
     if venv_python.exists():
         env["PYTHON"] = str(venv_python)
+    deepseek_env = Path(os.environ.get("VIDEO_ANALYZER_DEEPSEEK_ENV", Path.home() / ".config" / "video-analyzer" / "deepseek.env"))
+    if deepseek_env.is_file():
+        for line in deepseek_env.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.startswith("export "):
+                stripped = stripped[len("export ") :].strip()
+            if "=" not in stripped:
+                continue
+            key, value = stripped.split("=", 1)
+            key = key.strip()
+            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
+                continue
+            env[key] = value.strip().strip("\"'")
     env["NO_PROXY"] = "*"
     env["no_proxy"] = "*"
     return env

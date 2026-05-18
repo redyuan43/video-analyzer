@@ -10,7 +10,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_DIR="$(realpath "$1")"
 shift
 
-PROFILE="deepseek_v4_flash"
+PROFILE="deepseek_v4_pro"
 JOBS=3
 FINALIZE_ONLY=0
 SKIP_IMAGES=0
@@ -64,6 +64,14 @@ fi
 PYTHON_BIN="${PYTHON:-$ROOT_DIR/.venv/bin/python}"
 if [ ! -x "$PYTHON_BIN" ]; then
   PYTHON_BIN="$(command -v python3)"
+fi
+
+DEEPSEEK_ENV="${VIDEO_ANALYZER_DEEPSEEK_ENV:-$HOME/.config/video-analyzer/deepseek.env}"
+if [[ -f "$DEEPSEEK_ENV" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$DEEPSEEK_ENV"
+  set +a
 fi
 
 FINAL_DIR="$RUN_DIR/baoyu_images/final"

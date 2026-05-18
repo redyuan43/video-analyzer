@@ -121,6 +121,27 @@ img, svg {
   max-width: 100%;
 }
 
+.final-image-page {
+  align-items: center;
+  break-after: page;
+  break-before: page;
+  display: flex;
+  height: 158mm;
+  justify-content: center;
+  margin: 0;
+  page-break-after: always;
+  page-break-before: always;
+  page-break-inside: avoid;
+}
+
+.final-image-page img {
+  height: auto;
+  margin: 0 auto;
+  max-height: 154mm;
+  max-width: 100%;
+  object-fit: contain;
+}
+
 .mobile-flowchart {
   margin: 0.8em 0 1em;
 }
@@ -225,6 +246,14 @@ def render_markdown(text: str) -> str:
     )
 
 
+def wrap_final_images(body: str) -> str:
+    final_image_re = re.compile(
+        r"<p>\s*(<img\b(?=[^>]*\bsrc=\"[^\"]*baoyu_images/final/[^\"]+\.png\")[^>]*>)\s*</p>",
+        re.I,
+    )
+    return final_image_re.sub(r'<section class="final-image-page">\1</section>', body)
+
+
 def normalize_mermaid(diagram: str) -> str:
     return re.sub(
         r'(?<![\w])([A-Za-z][A-Za-z0-9_]*)\[([^"\]\n][^\]\n]*)\]',
@@ -254,14 +283,17 @@ def render_linear_mermaid_flowchart(diagram: str) -> str | None:
         for line in diagram.splitlines()
         if line.strip() and not line.strip().startswith("%%")
     ]
-    if not lines or not re.match(r"^flowchart\s+TD\b", lines[0], re.I):
+    if not lines:
+        return None
+    first_line = lines[0].strip()
+    if not re.match(r"^(flowchart\s+TD|graph\s+(LR|RL))\b", first_line, re.I):
         return None
 
     labels: dict[str, str] = {}
     shapes: dict[str, str] = {}
     edges: list[tuple[str, str]] = []
     for line in lines[1:]:
-        edge_match = re.match(r"^(.+?)\s*-->\s*(.+?)\s*;?$", line)
+        edge_match = re.match(r"^(.+?)\s*-->(?:\|.*?\|)?\s*(.+?)\s*;?$", line)
         if not edge_match:
             return None
         left_id, left_label, left_shape = parse_mermaid_node(edge_match.group(1))
@@ -339,25 +371,30 @@ def render_mermaid_blocks(text: str, work_dir: Path) -> str:
         mmd_path = work_dir / f"{stem}.mmd"
         image_path = work_dir / f"{stem}.png"
         mmd_path.write_text(normalize_mermaid(diagram) + "\n", encoding="utf-8")
-        subprocess.run(
-            [
-                "npx",
-                "--yes",
-                "@mermaid-js/mermaid-cli",
-                "-q",
-                "-i",
-                str(mmd_path),
-                "-o",
-                str(image_path),
-                "-b",
-                "white",
-                "-s",
-                "2",
-                "-p",
-                str(puppeteer_config),
-            ],
-            check=True,
-        )
+        try:
+            subprocess.run(
+                [
+                    "npx",
+                    "--yes",
+                    "@mermaid-js/mermaid-cli",
+                    "-q",
+                    "-i",
+                    str(mmd_path),
+                    "-o",
+                    str(image_path),
+                    "-b",
+                    "white",
+                    "-s",
+                    "2",
+                    "-p",
+                    str(puppeteer_config),
+                ],
+                check=True,
+            )
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            parts.append(f"\n\n```mermaid\n{diagram}\n```\n\n")
+            last = match.end()
+            continue
         parts.append(f"![Mermaid diagram {count}]({image_path.as_uri()})")
         last = match.end()
     parts.append(text[last:])
@@ -402,6 +439,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="video-doc-mermaid-") as mermaid_dir:
         text = render_mermaid_blocks(text, Path(mermaid_dir))
         body = render_markdown(text)
+        body = wrap_final_images(body)
         HTML(string=html_document(body, args.title), base_url=str(input_md.parent)).write_pdf(output_pdf)
     if not output_pdf.is_file() or output_pdf.stat().st_size == 0:
         raise SystemExit(f"PDF output not written: {output_pdf}")

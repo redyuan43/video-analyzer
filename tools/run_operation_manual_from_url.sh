@@ -12,6 +12,14 @@ fi
 
 source "$ROOT_DIR/tools/operation_manual_no_proxy_env.sh"
 
+DEEPSEEK_ENV="${VIDEO_ANALYZER_DEEPSEEK_ENV:-$HOME/.config/video-analyzer/deepseek.env}"
+if [[ -f "$DEEPSEEK_ENV" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$DEEPSEEK_ENV"
+  set +a
+fi
+
 ARGS=("$@")
 has_ytdlp_proxy=0
 for arg in "${ARGS[@]}"; do
