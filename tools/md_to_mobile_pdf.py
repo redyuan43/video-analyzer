@@ -186,6 +186,23 @@ img, svg {
   text-align: center;
 }
 
+.flow-row {
+  align-items: stretch;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45em;
+  justify-content: center;
+  page-break-inside: avoid;
+}
+
+.flow-row .flow-node {
+  display: block;
+  flex: 1 1 38%;
+  margin: 0;
+  max-width: 100%;
+  min-width: 8.5em;
+}
+
 table {
   border-collapse: collapse;
   display: table;
@@ -277,7 +294,12 @@ def parse_mermaid_node(node: str) -> tuple[str, str | None, str]:
     return node_id, label, shape
 
 
-def render_linear_mermaid_flowchart(diagram: str) -> str | None:
+def mermaid_label_to_html(label: str) -> str:
+    escaped = html.escape(label)
+    return re.sub(r"&lt;br\s*/?&gt;", "<br>", escaped, flags=re.I)
+
+
+def render_simple_mermaid_flowchart(diagram: str) -> str | None:
     lines = [
         line.strip()
         for line in diagram.splitlines()
@@ -286,12 +308,13 @@ def render_linear_mermaid_flowchart(diagram: str) -> str | None:
     if not lines:
         return None
     first_line = lines[0].strip()
-    if not re.match(r"^(flowchart\s+TD|graph\s+(LR|RL))\b", first_line, re.I):
+    if not re.match(r"^(flowchart\s+(TB|TD)|graph\s+(TB|TD|LR|RL))\b", first_line, re.I):
         return None
 
     labels: dict[str, str] = {}
     shapes: dict[str, str] = {}
     edges: list[tuple[str, str]] = []
+    node_order: list[str] = []
     for line in lines[1:]:
         edge_match = re.match(r"^(.+?)\s*-->(?:\|.*?\|)?\s*(.+?)\s*;?$", line)
         if not edge_match:
@@ -302,6 +325,8 @@ def render_linear_mermaid_flowchart(diagram: str) -> str | None:
             (left_id, left_label, left_shape),
             (right_id, right_label, right_shape),
         ):
+            if node_id not in node_order:
+                node_order.append(node_id)
             if label is not None:
                 labels[node_id] = label
             shapes.setdefault(node_id, shape)
@@ -315,28 +340,49 @@ def render_linear_mermaid_flowchart(diagram: str) -> str | None:
         incoming[right_id] = incoming.get(right_id, 0) + 1
         incoming.setdefault(left_id, incoming.get(left_id, 0))
     starts = [node_id for node_id in nodes if incoming.get(node_id, 0) == 0]
-    if len(starts) != 1 or any(len(next_nodes) > 1 for next_nodes in outgoing.values()):
+    if not starts:
         return None
 
-    ordered = [starts[0]]
-    seen = {starts[0]}
-    while ordered[-1] in outgoing:
-        next_nodes = outgoing[ordered[-1]]
-        if len(next_nodes) != 1 or next_nodes[0] in seen:
-            return None
-        ordered.append(next_nodes[0])
-        seen.add(next_nodes[0])
-    if len(ordered) != len(nodes):
+    order_index = {node_id: index for index, node_id in enumerate(node_order)}
+    queue = sorted(starts, key=lambda node_id: order_index.get(node_id, 10**9))
+    remaining_incoming = dict(incoming)
+    topological: list[str] = []
+    while queue:
+        node_id = queue.pop(0)
+        topological.append(node_id)
+        for next_id in outgoing.get(node_id, []):
+            remaining_incoming[next_id] -= 1
+            if remaining_incoming[next_id] == 0:
+                queue.append(next_id)
+                queue.sort(key=lambda item: order_index.get(item, 10**9))
+    if len(topological) != len(nodes):
         return None
+
+    levels: dict[str, int] = {node_id: 0 for node_id in starts}
+    for node_id in topological:
+        base_level = levels.get(node_id, 0)
+        for next_id in outgoing.get(node_id, []):
+            levels[next_id] = max(levels.get(next_id, 0), base_level + 1)
+    max_level = max(levels.values(), default=0)
+    grouped: list[list[str]] = [[] for _ in range(max_level + 1)]
+    for node_id in topological:
+        grouped[levels.get(node_id, 0)].append(node_id)
 
     flow_parts = ['<div class="mobile-flowchart" aria-label="流程图">']
-    for index, node_id in enumerate(ordered, start=1):
-        label = html.escape(labels.get(node_id, node_id))
-        shape = " decision" if shapes.get(node_id) == "decision" else ""
-        flow_parts.append(
-            f'<div class="flow-node{shape}"><span class="flow-index">{index}</span>{label}</div>'
-        )
-        if index < len(ordered):
+    rendered_index = 1
+    for level, row in enumerate(grouped):
+        if not row:
+            return None
+        flow_parts.append('<div class="flow-row">')
+        for node_id in row:
+            label = mermaid_label_to_html(labels.get(node_id, node_id))
+            shape = " decision" if shapes.get(node_id) == "decision" else ""
+            flow_parts.append(
+                f'<div class="flow-node{shape}"><span class="flow-index">{rendered_index}</span>{label}</div>'
+            )
+            rendered_index += 1
+        flow_parts.append("</div>")
+        if level < max_level:
             flow_parts.append('<div class="flow-arrow">↓</div>')
     flow_parts.append("</div>")
     return "\n".join(flow_parts)
@@ -351,7 +397,7 @@ def render_mermaid_blocks(text: str, work_dir: Path) -> str:
         count += 1
         parts.append(text[last : match.start()])
         diagram = match.group(2).strip()
-        flow_html = render_linear_mermaid_flowchart(diagram)
+        flow_html = render_simple_mermaid_flowchart(diagram)
         if flow_html is not None:
             parts.append(f"\n\n{flow_html}\n\n")
             last = match.end()
