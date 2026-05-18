@@ -1,6 +1,6 @@
 ---
 name: video-docs-chat
-description: Use when the user wants to ask questions or have a multi-turn conversation over generated video-analyzer documents from an operation-manual run directory. Supports single-question CLI use, interactive chat, evidence-grounded summaries, and 30-second spoken recap audio via AGX local TTS over operation_manual.md, transcript.md, manual_evidence.md, page_context, comments, and docs_analysis outputs.
+description: Use when the user wants to ask questions or have a multi-turn conversation over generated video-analyzer documents from an operation-manual run directory. Supports single-question CLI use, interactive chat, and evidence-grounded summaries over operation_manual.md, transcript.md, manual_evidence.md, page_context, comments, and docs_analysis outputs. For audio narration, use the full Markdown narration workflow backed by audio-narration-script/Ivan TTS instead of the old 30-second AGX recap path.
 ---
 
 # Video Docs Chat
@@ -49,74 +49,33 @@ tools/chat_with_video_docs.sh RUN_DIR --profile local_lan
 
 Then ask questions interactively. Use `/exit` to quit.
 
-## 30-second spoken recap with AGX TTS
+## Audio narration
 
-When the user asks for a `30秒口播`, `口播音频`, `TTS`, or asks for audio from the video docs, produce a concise Chinese spoken recap and synthesize it with the AGX local TTS service by default.
+When the user asks for `音频讲解`, `讲解稿`, `Markdown 转音频`, `生成 WAV`, `朗读音频`, or asks to turn one of the exported PDFs into audio, use the full narration workflow instead of the old short AGX recap path.
 
-Default assumptions:
+Run:
 
-- Target host: SSH alias `agx`.
-- TTS service: CapsWriter/Qwen3-TTS on AGX at `http://127.0.0.1:8002`.
-- Default speaker: `vivian` unless the user specifies another voice.
-- Output location: the provided `RUN_DIR`, with filenames ending in `_agx` to show provenance.
-- Do not use online TTS or local non-AGX fallback unless AGX is unreachable or unavailable; if falling back, say so explicitly.
+```bash
+tools/generate_audio_narration.sh RUN_DIR --profile local_lan
+```
 
-Workflow:
+The tool defaults to `--tts-concurrency 2` so the Ivan gateway can use both ready Qwen3-TTS workers. Lower it only when the user explicitly asks to keep TTS load minimal.
 
-1. Draft a natural spoken recap from the evidence files, not a written abstract. Keep it short enough for about 30 seconds in the AGX voice; if AGX output is long, shorten the script first.
-2. Check AGX reachability and health:
+If the user names an exported PDF, pass that file or basename with `--source`; the tool maps `*.pdf` to the matching Markdown file before writing narration:
 
-   ```bash
-   ssh -o BatchMode=yes -o ConnectTimeout=8 agx \
-     'hostname; uname -m; curl -s --max-time 10 http://127.0.0.1:8002/api/health'
-   ```
+```bash
+tools/generate_audio_narration.sh RUN_DIR --source knowledge_notes_v2.pdf --profile local_lan
+```
 
-3. If `tts_model_loaded` is not `true`, load and poll:
+Outputs are written under `RUN_DIR/audio_narration/`:
 
-   ```bash
-   ssh -o BatchMode=yes agx '
-     curl -s -X POST http://127.0.0.1:8002/api/tts/load
-     for i in $(seq 1 30); do
-       h=$(curl -s http://127.0.0.1:8002/api/health)
-       loaded=$(printf "%s" "$h" | grep -o "\"tts_model_loaded\":[^,}]*" | grep -o "true\|false")
-       workers=$(printf "%s" "$h" | grep -o "\"tts_parallel_workers_ready\":[0-9]*" | grep -o "[0-9]*$" || true)
-       [ "$loaded" = true ] && [ "${workers:-0}" -gt 0 ] && exit 0
-       sleep 3
-     done
-     exit 1
-   '
-   ```
+- `narration_outline.md`
+- `narration_script.md`
+- `narration_script.txt`
+- `audio_output/narration_full.wav`
+- `audio_output/manifest.json`
 
-4. Synthesize on AGX and copy the WAV back to `RUN_DIR`:
-
-   ```bash
-   RUN_DIR="downloads/url-videos/BVxxxx/operation-manual"
-   OUT_BASENAME="video_30s_summary_agx"
-   TEXT="这里填入约30秒中文口播稿"
-
-   printf '%s' "$TEXT" | ssh -o BatchMode=yes agx 'cat > /tmp/video_30s_summary_agx.txt'
-
-   ssh -o BatchMode=yes agx 'bash -s' <<'REMOTE'
-   set -euo pipefail
-   OUT=/tmp/video_30s_summary_agx.wav
-   PAYLOAD=$(python3 -c 'import json, pathlib; text = pathlib.Path("/tmp/video_30s_summary_agx.txt").read_text(encoding="utf-8"); print(json.dumps({"text": text, "speaker": "vivian", "speed": 1.0}, ensure_ascii=False))')
-   printf '%s' "$PAYLOAD" | curl -sS -X POST http://127.0.0.1:8002/api/tts/speak \
-     -H 'Content-Type: application/json' \
-     --data-binary @- \
-     -o "$OUT"
-   file "$OUT"
-   REMOTE
-
-   scp -q agx:/tmp/video_30s_summary_agx.wav "$RUN_DIR/$OUT_BASENAME.wav"
-   ```
-
-5. Verify duration locally:
-
-   ```bash
-   ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$RUN_DIR/$OUT_BASENAME.wav"
-   ```
-
-6. If the duration is outside roughly 27-33 seconds, shorten or expand the recap and regenerate. Use `ffmpeg atempo` only as a final polish when the wording is already correct and the user wants a strict duration.
+Do not call `tools/generate_30s_agx_tts.sh` for audio narration requests. That script is now only a deprecated compatibility wrapper and forwards to `tools/generate_audio_narration.sh`.
 
 ## Evidence policy
 

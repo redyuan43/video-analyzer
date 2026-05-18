@@ -59,5 +59,5 @@ fi
 # Follow-up multi-round document analysis from the generated operation-manual run.
 tools/run_multidoc_analysis.sh "$RUN_DIR" --profile "$PROFILE"
 
-# Final 30-second spoken recap synthesized by the AGX local TTS service.
-tools/generate_30s_agx_tts.sh "$RUN_DIR" --profile "$PROFILE"
+# Final full narration script and WAV synthesized by the Ivan Qwen3-TTS gateway.
+tools/generate_audio_narration.sh "$RUN_DIR" --profile "$PROFILE"

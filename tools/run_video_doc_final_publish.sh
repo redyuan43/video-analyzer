@@ -76,8 +76,9 @@ fi
 
 FINAL_DIR="$RUN_DIR/baoyu_images/final"
 PROMPT_DIR="$RUN_DIR/baoyu_images/prompts"
+IMAGE_LOG_DIR="$RUN_DIR/baoyu_images/logs"
 EXPORT_DIR="$RUN_DIR/exports"
-mkdir -p "$FINAL_DIR" "$EXPORT_DIR"
+mkdir -p "$FINAL_DIR" "$IMAGE_LOG_DIR" "$EXPORT_DIR"
 
 declare -a FINAL_IMAGES=(
   "01-image-cards-operation-manual.png"
@@ -105,22 +106,16 @@ generate_final_images() {
     echo "[images] prompt directory missing: $PROMPT_DIR" >&2
     return 1
   fi
-  local active=0
   for index in "${!PROMPTS[@]}"; do
-    generate_one_final_image "$index" &
-    active=$((active + 1))
-    if [ "$active" -ge "$JOBS" ]; then
-      wait -n
-      active=$((active - 1))
-    fi
+    generate_one_final_image "$index"
   done
-  wait
 }
 
 generate_one_final_image() {
     local index="$1"
     local prompt_file="$PROMPT_DIR/${PROMPTS[$index]}"
     local target="$FINAL_DIR/${FINAL_IMAGES[$index]}"
+    local prompt_base="${PROMPTS[$index]%.md}"
     if [ -s "$target" ]; then
       echo "[images] exists: $target"
       return 0
@@ -134,26 +129,30 @@ generate_one_final_image() {
     touch "$marker"
     echo "[images] codex exec image_gen: $(basename "$prompt_file")"
     local log_file
-    log_file="$(mktemp)"
+    log_file="$IMAGE_LOG_DIR/$prompt_base.codex.log"
+    : > "$log_file"
     if ! codex exec --cd "$RUN_DIR" --skip-git-repo-check --sandbox read-only "$(cat <<EOF
-Use the imagegen skill/image_gen tool to generate exactly one PNG image from this prompt file:
+Use the \$imagegen skill with the built-in image_gen tool to generate exactly one PNG image from this prompt file:
 $prompt_file
 
-Do not edit files. Do not create Markdown. Only generate the raster image.
+Read the prompt file and generate the raster PNG image. Do not create or edit Markdown. Do not modify repository files. The wrapper script will copy the generated PNG from the default generated_images location.
 EOF
 )" 2>&1 | tee "$log_file"; then
-      rm -f "$marker" "$log_file"
+      rm -f "$marker"
       return 1
     fi
     local session_id
-    session_id="$(awk '/session id:/ {print $3}' "$log_file" | tail -1)"
+    session_id="$(awk 'tolower($0) ~ /session id:/ {print $3}' "$log_file" | tail -1)"
     local generated
     if [ -n "$session_id" ] && [ -d "$HOME/.codex/generated_images/$session_id" ]; then
       generated="$(find "$HOME/.codex/generated_images/$session_id" -type f -name '*.png' -newer "$marker" -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
     else
       generated=""
     fi
-    rm -f "$marker" "$log_file"
+    if [ -z "$generated" ]; then
+      generated="$(find "$HOME/.codex/generated_images" -type f -name '*.png' -newer "$marker" -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
+    fi
+    rm -f "$marker"
     if [ -z "$generated" ] || [ ! -s "$generated" ]; then
       echo "[images] no generated PNG found for $prompt_file" >&2
       return 1

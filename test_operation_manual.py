@@ -57,6 +57,12 @@ run_multidoc_analysis = importlib.util.module_from_spec(MULTIDOC_SPEC)
 assert MULTIDOC_SPEC and MULTIDOC_SPEC.loader
 MULTIDOC_SPEC.loader.exec_module(run_multidoc_analysis)
 
+NARRATION_PATH = Path(__file__).resolve().parent / "tools" / "generate_audio_narration.py"
+NARRATION_SPEC = importlib.util.spec_from_file_location("generate_audio_narration", NARRATION_PATH)
+generate_audio_narration = importlib.util.module_from_spec(NARRATION_SPEC)
+assert NARRATION_SPEC and NARRATION_SPEC.loader
+NARRATION_SPEC.loader.exec_module(generate_audio_narration)
+
 try:
     import cv2
     import numpy as np
@@ -534,13 +540,25 @@ class OperationManualTests(unittest.TestCase):
         text = Path("start_example.sh").read_text(encoding="utf-8")
 
         self.assertIn("tools/run_multidoc_analysis.sh \"$RUN_DIR\" --profile \"$PROFILE\"", text)
-        self.assertIn("tools/generate_30s_agx_tts.sh \"$RUN_DIR\" --profile \"$PROFILE\"", text)
+        self.assertIn("tools/generate_audio_narration.sh \"$RUN_DIR\" --profile \"$PROFILE\"", text)
         self.assertIn("[done] run_dir: ", text)
         self.assertIn("Using canonical Bilibili URL", text)
         self.assertIn("quote full share URLs that contain &", text)
         self.assertNotIn("Could not infer Bilibili BV id", text)
         self.assertNotIn("VIDEO_ID=", text)
         self.assertNotIn("vd_source=", text)
+
+    def test_audio_narration_resolves_default_and_pdf_source(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir)
+            (run_dir / "operation_manual.md").write_text("默认手册", encoding="utf-8")
+            chapters = run_dir / "docs_analysis_chapters"
+            chapters.mkdir()
+            notes = chapters / "knowledge_notes_v2.md"
+            notes.write_text("知识笔记", encoding="utf-8")
+
+            self.assertEqual(generate_audio_narration.resolve_source(run_dir, None), run_dir / "operation_manual.md")
+            self.assertEqual(generate_audio_narration.resolve_source(run_dir, "knowledge_notes_v2.pdf"), notes)
 
     def test_start_example_parses_run_dir_marker_from_url_runner_output(self):
         log_text = "\n".join(
