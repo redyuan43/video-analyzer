@@ -309,6 +309,62 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(queued["stages"]["analyze-core"]["queue_position"], 1)
         self.assertFalse(thread.is_alive())
 
+    def test_stage_waits_for_live_persisted_resource_user_after_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            blocker = server.create_job({"video_url": "https://example.com/blocker", "analysis_mode": "fast"})
+            waiting = server.create_job({"video_url": "https://example.com/waiting", "analysis_mode": "fast"})
+            blocker_loaded = server.load_job(blocker["job_id"])
+            blocker_loaded["status"] = "running"
+            blocker_loaded["runner"] = {"status": "running", "current_stage": "analyze-core"}
+            blocker_loaded["stages"]["analyze-core"] = {
+                "status": "running",
+                "process": {"pid": os.getpid()},
+            }
+            server.save_job(blocker_loaded)
+            waiting_loaded = server.load_job(waiting["job_id"])
+            waiting_loaded["resolved_mode"] = "fast"
+            waiting_loaded["stages"]["probe"] = {"status": "succeeded"}
+            waiting_loaded["stages"]["prepare"] = {"status": "succeeded"}
+            server.save_job(waiting_loaded)
+            sleep_calls = []
+
+            def release_blocker(_seconds):
+                sleep_calls.append(_seconds)
+                released = server.load_job(blocker["job_id"])
+                released["status"] = "succeeded"
+                released["runner"] = {"status": "succeeded", "current_stage": None}
+                released["stages"]["analyze-core"] = {"status": "succeeded"}
+                server.save_job(released)
+
+            def fake_locked(job_id, stage):
+                current = server.load_job(job_id)
+                current["stages"][stage] = {"status": "succeeded"}
+                server.save_job(current)
+                return server.public_job(current)
+
+            with patch.object(server_mod.time, "sleep", side_effect=release_blocker), patch.object(
+                server, "_run_stage_locked", side_effect=fake_locked
+            ):
+                result = server.run_stage(waiting["job_id"], "analyze-core")
+
+        self.assertEqual(sleep_calls, [server_mod.RESOURCE_WAIT_SECONDS])
+        self.assertEqual(result["stages"]["analyze-core"]["status"], "succeeded")
+
+    def test_live_resource_users_counts_process_even_when_stage_status_is_stale(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
+            loaded = server.load_job(job["job_id"])
+            loaded["status"] = "running"
+            loaded["runner"] = {"status": "running", "current_stage": "analyze-core"}
+            loaded["stages"]["analyze-core"] = {"status": "queued", "process": {"pid": os.getpid()}}
+            server.save_job(loaded)
+
+            users = server.live_resource_users("core")
+
+        self.assertEqual([user["job_id"] for user in users], [job["job_id"]])
+
     def test_load_job_requeues_orphaned_running_stage_when_process_is_gone(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)

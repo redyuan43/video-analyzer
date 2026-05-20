@@ -106,6 +106,7 @@ ORPHANED_PROCESS_GONE_MESSAGE = (
 ORPHANED_PROCESS_REQUEUE_MESSAGE = (
     "server stopped while this stage was running; process is gone and artifacts are incomplete; queued for retry"
 )
+RESOURCE_WAIT_SECONDS = 5.0
 CORE_PROGRESS_STEPS = [
     ("ray", "Ray 集群准备", (r"\[jetson-ray\]", r"Ray runtime started")),
     ("context", "页面/评论/素材准备", (r"Extracting cookies", r"\[youtube\]", r"Writing video metadata")),
@@ -443,6 +444,7 @@ class VideoLinkStatusServer:
         return self.public_job(self.load_job(job_id))
 
     def recover_interrupted_jobs(self, auto_start: bool = False) -> None:
+        recovered_jobs: list[dict[str, Any]] = []
         for path in sorted(self.jobs_dir.glob("*/job.json")):
             try:
                 raw = json.loads(path.read_text(encoding="utf-8"))
@@ -459,9 +461,14 @@ class VideoLinkStatusServer:
                 recovered = self.load_job(raw["job_id"])
             except BridgeError:
                 continue
+            recovered_jobs.append(recovered)
+
+        if not auto_start:
+            return
+        for recovered in recovered_jobs:
             recovered_runner = recovered.get("runner") or {}
             if auto_start and recovered.get("status") == "queued" and recovered_runner.get("status") == "queued":
-                self.start_run(raw["job_id"])
+                self.start_run(recovered["job_id"])
 
     def _run_remaining_stages(self, job_id: str) -> None:
         try:
@@ -529,12 +536,43 @@ class VideoLinkStatusServer:
 
         resource = stage_resource(stage)
         self.mark_stage_queued(job, stage, resource)
+        self.wait_for_resource_slot(resource, job_id)
         lock = self.resource_locks[resource]
         lock.acquire()
         try:
             return self._run_stage_locked(job_id, stage)
         finally:
             lock.release()
+
+    def wait_for_resource_slot(self, resource: str, job_id: str) -> None:
+        limit = max(1, int(RESOURCE_LIMITS.get(resource, 1)))
+        while True:
+            blockers = self.live_resource_users(resource, exclude_job_id=job_id)
+            if len(blockers) < limit:
+                return
+            time.sleep(RESOURCE_WAIT_SECONDS)
+
+    def live_resource_users(self, resource: str, exclude_job_id: str | None = None) -> list[dict[str, Any]]:
+        users = []
+        for path in self.jobs_dir.glob("*/job.json"):
+            if exclude_job_id and path.parent.name == exclude_job_id:
+                continue
+            try:
+                job = self.load_job(path.parent.name)
+            except Exception:
+                continue
+            runner = job.get("runner") or {}
+            if runner.get("status") != "running":
+                continue
+            stage = normalize_stage_name(runner.get("current_stage") or self.current_stage(job) or "")
+            if not stage or stage_resource(stage) != resource:
+                continue
+            stage_info = (job.get("stages") or {}).get(stage) or {}
+            process_info = stage_info.get("process") or {}
+            pid = process_info.get("pid")
+            if self.stage_is_live(job, stage, stage_info) or (pid and process_alive(pid)):
+                users.append(job)
+        return users
 
     def _run_stage_locked(self, job_id: str, stage: str) -> dict[str, Any]:
         stage = normalize_stage_name(stage)
