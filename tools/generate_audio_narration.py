@@ -14,7 +14,7 @@ from typing import Any
 from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient
 from video_analyzer.config import Config, build_openai_extra_body, resolve_api_key, resolve_temperature
 
-DEFAULT_RENDERER = Path("/home/nx/github/my-skills-repo/audio-narration-script/scripts/render_with_ivan_tts.py")
+DEFAULT_RENDERER = Path.home() / "github/my-skills-repo/audio-narration-script/scripts/render_with_ivan_tts.py"
 DEFAULT_MAX_SOURCE_CHARS = 90000
 DEFAULT_TEMPERATURE = 0.2
 
