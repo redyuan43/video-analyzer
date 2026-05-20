@@ -131,17 +131,33 @@ generate_one_final_image() {
     local log_file
     log_file="$IMAGE_LOG_DIR/$prompt_base.codex.log"
     : > "$log_file"
-    if ! codex exec --cd "$RUN_DIR" --skip-git-repo-check --sandbox read-only "$(cat <<EOF
+    local session_id
+    local codex_env=()
+    if timeout 1 bash -c '</dev/tcp/127.0.0.1/10808' 2>/dev/null; then
+      codex_env=(
+        HTTP_PROXY="http://127.0.0.1:10808/"
+        HTTPS_PROXY="http://127.0.0.1:10808/"
+        ALL_PROXY="socks5://127.0.0.1:10808"
+        http_proxy="http://127.0.0.1:10808/"
+        https_proxy="http://127.0.0.1:10808/"
+        all_proxy="socks5://127.0.0.1:10808"
+        NO_PROXY="localhost,127.0.0.0/8,::1"
+        no_proxy="localhost,127.0.0.0/8,::1"
+      )
+    fi
+    local codex_cmd=(
+      codex exec --cd "$RUN_DIR" --skip-git-repo-check --sandbox read-only "$(cat <<EOF
 Use the \$imagegen skill with the built-in image_gen tool to generate exactly one PNG image from this prompt file:
 $prompt_file
 
 Read the prompt file and generate the raster PNG image. Do not create or edit Markdown. Do not modify repository files. The wrapper script will copy the generated PNG from the default generated_images location.
 EOF
-)" 2>&1 | tee "$log_file"; then
+)"
+    )
+    if ! env "${codex_env[@]}" "${codex_cmd[@]}" 2>&1 | tee "$log_file"; then
       rm -f "$marker"
       return 1
     fi
-    local session_id
     session_id="$(awk 'tolower($0) ~ /session id:/ {print $3}' "$log_file" | tail -1)"
     local generated
     if [ -n "$session_id" ] && [ -d "$HOME/.codex/generated_images/$session_id" ]; then
