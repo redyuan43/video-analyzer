@@ -374,6 +374,38 @@ def shlex_quote(value):
     return shlex.quote(value)
 
 
+def add_uniform_coverage_candidates(candidates, image_paths, segment_start, segment_duration, sample_fps, max_frames):
+    if not max_frames or not image_paths:
+        return candidates
+    target = min(max_frames, len(image_paths))
+    if len(candidates) >= target:
+        return candidates
+
+    by_path = {item["path"]: item for item in candidates}
+    needed = target - len(by_path)
+    if needed <= 0:
+        return candidates
+
+    denominator = max(target - 1, 1)
+    uniform_indexes = [round(index * (len(image_paths) - 1) / denominator) for index in range(target)]
+    for index in uniform_indexes:
+        if needed <= 0:
+            break
+        path = image_paths[index]
+        path_text = str(path)
+        if path_text in by_path:
+            continue
+        timestamp = segment_start + (index / sample_fps if sample_fps else 0.0)
+        by_path[path_text] = {
+            "path": path_text,
+            "timestamp": min(timestamp, segment_start + segment_duration),
+            "score": 0.0,
+        }
+        needed -= 1
+
+    return sorted(by_path.values(), key=lambda item: item["timestamp"])
+
+
 def select_candidates(image_paths, segment_start, segment_duration, sample_fps, max_frames, change_threshold, min_gap_seconds):
     candidates = []
     previous = None
@@ -388,6 +420,15 @@ def select_candidates(image_paths, segment_start, segment_duration, sample_fps, 
             candidates.append({"path": str(path), "timestamp": timestamp, "score": score})
             last_selected_ts = timestamp
         previous = current
+
+    candidates = add_uniform_coverage_candidates(
+        candidates,
+        image_paths,
+        segment_start,
+        segment_duration,
+        sample_fps,
+        max_frames,
+    )
 
     if max_frames and len(candidates) > max_frames:
         coverage = {}
