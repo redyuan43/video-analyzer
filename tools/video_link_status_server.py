@@ -228,6 +228,50 @@ class VideoLinkStatusServer:
             return self.start_run(job_id)
         return self.public_job(job)
 
+    def create_jobs(self, payload: dict[str, Any]) -> dict[str, Any]:
+        urls = extract_batch_urls(payload)
+        if not urls:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "video_urls must include at least one http(s) URL")
+
+        auto_start = parse_bool(normalize_optional_template(payload.get("auto_start") if "auto_start" in payload else payload.get("autoStart", True)))
+        base_run_name = sanitize_run_name(str(payload.get("run_name") or payload.get("runName") or self.options()["defaults"]["run_name"]))
+        created: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        seen: dict[str, int] = {}
+
+        for index, url in enumerate(urls, start=1):
+            if not url.startswith(("http://", "https://")):
+                errors.append({"index": index, "video_url": url, "error": "video_url must be an http(s) URL"})
+                continue
+            seen[url] = seen.get(url, 0) + 1
+            batch_payload = dict(payload)
+            batch_payload["video_url"] = url
+            batch_payload["run_name"] = f"{base_run_name}-{index:03d}"
+            batch_payload["auto_start"] = False
+            try:
+                job = self.create_job(batch_payload)
+                created.append(job)
+            except BridgeError as exc:
+                errors.append({"index": index, "video_url": url, "error": exc.message})
+
+        if auto_start:
+            started = []
+            for job in created:
+                try:
+                    started.append(self.start_run(job["job_id"]))
+                except BridgeError as exc:
+                    errors.append({"index": None, "video_url": job.get("video_url"), "job_id": job.get("job_id"), "error": exc.message})
+            created = started
+
+        return {
+            "jobs": created,
+            "errors": errors,
+            "created": len(created),
+            "failed": len(errors),
+            "total": len(urls),
+            "duplicates": {url: count for url, count in seen.items() if count > 1},
+        }
+
     def list_jobs(self, limit: int = 50) -> dict[str, Any]:
         jobs = []
         for path in self.jobs_dir.glob("*/job.json"):
@@ -236,7 +280,73 @@ class VideoLinkStatusServer:
             except Exception:
                 continue
         jobs.sort(key=lambda item: item.get("created_at") or "", reverse=True)
-        return {"jobs": jobs[: max(1, min(limit, 200))], "total": len(jobs)}
+        return {
+            "jobs": jobs[: max(1, min(limit, 200))],
+            "total": len(jobs),
+            "summary": self.jobs_summary(jobs),
+            "resources": self.resource_summary(jobs),
+        }
+
+    def jobs_summary(self, jobs: list[dict[str, Any]]) -> dict[str, Any]:
+        counts = {status: 0 for status in ("created", "running", "queued", "succeeded", "failed")}
+        progress_values = []
+        for job in jobs:
+            status = job.get("status") or "created"
+            counts[status] = counts.get(status, 0) + 1
+            progress = job.get("progress") or {}
+            if "percent" in progress:
+                progress_values.append(progress.get("percent") or 0)
+        return {
+            "total": len(jobs),
+            "counts": counts,
+            "average_progress": int(round(sum(progress_values) / len(progress_values))) if progress_values else 0,
+        }
+
+    def resource_summary(self, jobs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        if jobs is None:
+            jobs = []
+            for path in self.jobs_dir.glob("*/job.json"):
+                try:
+                    jobs.append(self.public_job(self.load_job(path.parent.name)))
+                except Exception:
+                    continue
+
+        resources = {
+            name: {"limit": limit, "running": [], "queued": []}
+            for name, limit in RESOURCE_LIMITS.items()
+        }
+        for job in jobs:
+            runner = job.get("runner") or {}
+            status = runner.get("status")
+            stage = runner.get("current_stage") or job.get("current_stage")
+            if status not in {"running", "queued"} or not stage:
+                continue
+            resource = runner.get("queued_for") or stage_resource(stage)
+            entry = {
+                "job_id": job.get("job_id"),
+                "video_url": job.get("video_url"),
+                "stage": normalize_stage_name(stage),
+                "stage_label": STAGE_LABELS.get(normalize_stage_name(stage), stage),
+                "updated_at": job.get("updated_at"),
+                "progress_percent": (job.get("progress") or {}).get("percent"),
+            }
+            resources.setdefault(resource, {"limit": RESOURCE_LIMITS.get(resource, 1), "running": [], "queued": []})
+            if status == "queued":
+                entry["position"] = (job.get("queue") or {}).get("position")
+                resources[resource]["queued"].append(entry)
+            else:
+                process = job.get("process")
+                if process:
+                    entry["pid"] = process.get("pid")
+                resources[resource]["running"].append(entry)
+
+        for info in resources.values():
+            info["running"].sort(key=lambda item: item.get("updated_at") or "")
+            info["queued"].sort(key=lambda item: (item.get("position") or 999999, item.get("updated_at") or ""))
+            info["running_count"] = len(info["running"])
+            info["queued_count"] = len(info["queued"])
+            info["available"] = max(0, int(info.get("limit") or 0) - len(info["running"]))
+        return resources
 
     def start_run(self, job_id: str) -> dict[str, Any]:
         job = self.load_job(job_id)
@@ -1037,6 +1147,23 @@ class VideoLinkStatusServer:
 def sanitize_run_name(value: str) -> str:
     name = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip(".-")
     return name or "operation-manual"
+
+
+def extract_batch_urls(payload: dict[str, Any]) -> list[str]:
+    raw = payload.get("video_urls")
+    if raw is None:
+        raw = payload.get("videoUrls")
+    if raw is None:
+        raw = payload.get("video_urls_text")
+    if raw is None:
+        raw = payload.get("videoUrlsText")
+    if isinstance(raw, str):
+        candidates = re.split(r"[\n\r\t ,]+", raw)
+    elif isinstance(raw, list):
+        candidates = [str(item or "") for item in raw]
+    else:
+        candidates = []
+    return [item.strip() for item in candidates if item and item.strip()]
 
 
 def normalize_stage_name(stage: str) -> str:

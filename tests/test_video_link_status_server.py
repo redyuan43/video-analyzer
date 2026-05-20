@@ -210,6 +210,67 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(result["total"], 2)
         self.assertEqual(result["jobs"][0]["job_id"], second["job_id"])
         self.assertEqual(result["jobs"][1]["job_id"], first["job_id"])
+        self.assertEqual(result["summary"]["total"], 2)
+        self.assertIn("core", result["resources"])
+
+    def test_create_jobs_batch_partially_accepts_valid_urls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            result = server.create_jobs(
+                {
+                    "video_urls_text": "https://example.com/one\nnot-a-url\nhttps://example.com/two",
+                    "run_name": "batch",
+                    "auto_start": False,
+                }
+            )
+
+        self.assertEqual(result["created"], 2)
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(result["jobs"][0]["options"]["run_name"], "batch-001")
+        self.assertEqual(result["jobs"][1]["options"]["run_name"], "batch-003")
+        self.assertEqual(result["errors"][0]["index"], 2)
+
+    def test_create_jobs_batch_suffixes_duplicate_urls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            result = server.create_jobs(
+                {
+                    "videoUrls": ["https://example.com/same", "https://example.com/same"],
+                    "runName": "same-run",
+                    "autoStart": False,
+                }
+            )
+
+        self.assertEqual(result["created"], 2)
+        self.assertEqual(result["duplicates"], {"https://example.com/same": 2})
+        self.assertEqual([job["options"]["run_name"] for job in result["jobs"]], ["same-run-001", "same-run-002"])
+
+    def test_resource_summary_reports_running_and_queued_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            running = server.create_job({"video_url": "https://example.com/running"})
+            queued = server.create_job({"video_url": "https://example.com/queued"})
+            loaded_running = server.load_job(running["job_id"])
+            loaded_running["status"] = "running"
+            loaded_running["runner"] = {"status": "running", "current_stage": "analyze-core", "server_pid": os.getpid()}
+            loaded_running["stages"]["analyze-core"] = {"status": "running"}
+            server.save_job(loaded_running)
+            loaded_queued = server.load_job(queued["job_id"])
+            loaded_queued["status"] = "queued"
+            loaded_queued["runner"] = {
+                "status": "queued",
+                "current_stage": "analyze-core",
+                "queued_for": "core",
+                "server_pid": os.getpid(),
+            }
+            loaded_queued["stages"]["analyze-core"] = {"status": "queued", "queued_for": "core"}
+            server.save_job(loaded_queued)
+
+            resources = server.list_jobs()["resources"]
+
+        self.assertEqual(resources["core"]["running_count"], 1)
+        self.assertEqual(resources["core"]["queued_count"], 1)
+        self.assertEqual(resources["core"]["queued"][0]["job_id"], queued["job_id"])
 
     def test_stage_waits_in_queue_when_resource_is_busy(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -96,7 +96,8 @@ label {
 }
 
 input,
-select {
+select,
+textarea {
     width: 100%;
     border: 1px solid #c9d3df;
     border-radius: 6px;
@@ -104,6 +105,12 @@ select {
     color: #1f2933;
     background: #fff;
     font-size: 14px;
+}
+
+textarea {
+    resize: vertical;
+    min-height: 116px;
+    line-height: 1.45;
 }
 
 .check {
@@ -170,6 +177,86 @@ button:disabled {
     gap: 8px;
 }
 
+.summary-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+}
+
+.summary-grid div {
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    padding: 10px;
+    background: #f8fafc;
+}
+
+.summary-grid span,
+.resource-lane span,
+.lane-empty {
+    display: block;
+    color: #667085;
+    font-size: 12px;
+}
+
+.summary-grid strong {
+    display: block;
+    margin-top: 3px;
+    font-size: 16px;
+}
+
+.resource-lanes {
+    display: grid;
+    gap: 10px;
+}
+
+.resource-lane {
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    padding: 10px;
+    background: #fff;
+}
+
+.resource-lane header,
+.lane-columns {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 8px;
+}
+
+.resource-lane header {
+    align-items: baseline;
+    margin-bottom: 8px;
+}
+
+.resource-lane header span {
+    text-align: right;
+}
+
+.lane-columns > div {
+    display: grid;
+    gap: 6px;
+    min-width: 0;
+}
+
+.lane-item {
+    display: grid;
+    gap: 3px;
+    width: 100%;
+    padding: 8px;
+    border: 1px solid #d7dde5;
+    border-radius: 6px;
+    background: #f8fafc;
+    color: #1f2933;
+    text-align: left;
+}
+
+.lane-item strong,
+.lane-item span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
 .job-item {
     display: grid;
     gap: 4px;
@@ -185,6 +272,21 @@ button:disabled {
 .job-item.selected {
     border-color: #2563eb;
     background: #eff6ff;
+}
+
+.job-item.failed {
+    border-left: 4px solid #e11d48;
+    background: #fff7f8;
+}
+
+.job-item.running,
+.job-item.queued {
+    border-left: 4px solid #2563eb;
+}
+
+.job-item.failed span {
+    color: #9f1239;
+    font-weight: 600;
 }
 
 .job-item strong {
@@ -342,8 +444,15 @@ pre {
 @media (max-width: 980px) {
     .workspace,
     .stats-panel,
-    .info-grid {
+    .info-grid,
+    .summary-grid,
+    .resource-lane header,
+    .lane-columns {
         grid-template-columns: 1fr;
+    }
+
+    .resource-lane header span {
+        text-align: left;
     }
 
     .app-shell {

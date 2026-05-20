@@ -82,6 +82,13 @@ class VideoAnalyzerUI:
             except BridgeError as exc:
                 return jsonify({'error': exc.message}), int(exc.status)
 
+        @self.app.route('/api/video-link/jobs/batch', methods=['POST'])
+        def video_link_create_jobs():
+            try:
+                return jsonify(self.video_link.create_jobs(request.get_json(silent=True) or {})), int(HTTPStatus.CREATED)
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
         @self.app.route('/api/video-link/jobs/<job_id>')
         def video_link_get_job(job_id):
             try:

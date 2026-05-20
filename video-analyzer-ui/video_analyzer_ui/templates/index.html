@@ -23,7 +23,7 @@
                     <form id="jobForm" class="job-form">
                         <label class="wide">
                             <span>视频链接</span>
-                            <input id="videoUrl" name="video_url" type="url" placeholder="https://..." required>
+                            <textarea id="videoUrls" name="video_urls" rows="5" placeholder="一行一个 https:// 链接" required></textarea>
                         </label>
                         <label>
                             <span>分析模式</span>
@@ -63,6 +63,7 @@
                         </details>
                         <button id="createButton" type="submit">启动任务</button>
                         <div id="formError" class="error-text"></div>
+                        <div id="batchResult" class="muted"></div>
                     </form>
                 </section>
 
@@ -72,6 +73,16 @@
                         <button id="refreshJobsButton" class="secondary" type="button">刷新</button>
                     </div>
                     <div id="jobList" class="job-list"></div>
+                </section>
+
+                <section class="panel">
+                    <h2>全局状态</h2>
+                    <div id="globalSummary" class="summary-grid"></div>
+                </section>
+
+                <section class="panel">
+                    <h2>资源队列</h2>
+                    <div id="resourceLanes" class="resource-lanes"></div>
                 </section>
             </aside>
 

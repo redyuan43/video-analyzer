@@ -35,8 +35,12 @@ class VideoAnalyzerUITests(unittest.TestCase):
         html = response.get_data(as_text=True)
         self.assertIn("URL workflow console", html)
         self.assertIn('id="jobForm"', html)
+        self.assertIn('id="videoUrls"', html)
+        self.assertIn('id="globalSummary"', html)
+        self.assertIn('id="resourceLanes"', html)
         self.assertIn('id="jobList"', html)
         self.assertIn('id="copyLogButton"', html)
+        self.assertLess(html.index('id="jobList"'), html.index('id="globalSummary"'))
 
     def test_video_link_api_create_list_get_and_log(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -57,7 +61,29 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertEqual(get_response.status_code, 200)
         self.assertEqual(log_response.status_code, 200)
         self.assertEqual(list_response.get_json()["total"], 1)
+        self.assertIn("resources", list_response.get_json())
         self.assertEqual(get_response.get_json()["dashboard_url"], f"/?job={job['job_id']}")
+
+    def test_video_link_api_batch_create(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp), video_link_auto_resume=False)
+            client = ui.app.test_client()
+
+            create = client.post(
+                "/api/video-link/jobs/batch",
+                json={
+                    "video_urls_text": "https://example.com/one\ninvalid\nhttps://example.com/two",
+                    "analysis_mode": "fast",
+                    "auto_start": False,
+                },
+            )
+            result = create.get_json()
+            list_response = client.get("/api/video-link/jobs")
+
+        self.assertEqual(create.status_code, 201)
+        self.assertEqual(result["created"], 2)
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(list_response.get_json()["total"], 2)
 
     def test_legacy_job_url_redirects_to_home_selection(self):
         with tempfile.TemporaryDirectory() as tmp:

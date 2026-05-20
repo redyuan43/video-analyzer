@@ -17,6 +17,9 @@ const nodes = {
     jobForm: document.getElementById('jobForm'),
     formError: document.getElementById('formError'),
     createButton: document.getElementById('createButton'),
+    batchResult: document.getElementById('batchResult'),
+    globalSummary: document.getElementById('globalSummary'),
+    resourceLanes: document.getElementById('resourceLanes'),
     refreshJobsButton: document.getElementById('refreshJobsButton'),
     jobList: document.getElementById('jobList'),
     runButton: document.getElementById('runButton'),
@@ -43,6 +46,16 @@ const nodes = {
     logText: document.getElementById('logText'),
     copyLogButton: document.getElementById('copyLogButton'),
     copyMessage: document.getElementById('copyMessage')
+};
+
+const jobStatusPriority = {
+    running: 0,
+    queued: 0,
+    failed: 1,
+    created: 2,
+    pending: 2,
+    succeeded: 3,
+    skipped: 3
 };
 
 function setText(node, value) {
@@ -101,7 +114,7 @@ async function loadOptions() {
 
 function jobPayload() {
     return {
-        video_url: document.getElementById('videoUrl').value.trim(),
+        video_urls_text: document.getElementById('videoUrls').value.trim(),
         analysis_mode: document.getElementById('analysisMode').value,
         profile: document.getElementById('profile').value,
         run_name: document.getElementById('runName').value.trim(),
@@ -121,14 +134,21 @@ function jobPayload() {
 async function createJob(event) {
     event.preventDefault();
     nodes.formError.textContent = '';
+    nodes.batchResult.textContent = '';
     nodes.createButton.disabled = true;
     try {
-        const job = await getJson('/api/video-link/jobs', {
+        const result = await getJson('/api/video-link/jobs/batch', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(jobPayload())
         });
-        selectJob(job.job_id, true);
+        const jobs = result.jobs || [];
+        const focusJob = preferredJob(jobs);
+        if (focusJob) selectJob(focusJob.job_id, true);
+        nodes.batchResult.textContent = `已创建 ${result.created || 0}/${result.total || 0} 个任务${result.failed ? `，失败 ${result.failed} 个` : ''}`;
+        if (result.errors?.length) {
+            nodes.formError.textContent = result.errors.map(item => `${item.index || '-'}: ${item.error}`).join('；');
+        }
         nodes.jobForm.reset();
         await loadOptions();
         await refreshJobs();
@@ -150,22 +170,47 @@ function selectJob(jobId, updateUrl = true) {
     refreshSelectedJob();
 }
 
-async function refreshJobs() {
-    const data = await getJson('/api/video-link/jobs?limit=50');
-    const jobs = data.jobs || [];
-    nodes.jobList.innerHTML = jobs.length ? jobs.map(job => {
+function jobTimeValue(job) {
+    const value = job.updated_at || job.created_at || '';
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+function sortJobsForAttention(jobs) {
+    return [...jobs].sort((left, right) => {
+        const leftPriority = jobStatusPriority[left.status || 'created'] ?? 2;
+        const rightPriority = jobStatusPriority[right.status || 'created'] ?? 2;
+        if (leftPriority !== rightPriority) return leftPriority - rightPriority;
+        return jobTimeValue(right) - jobTimeValue(left);
+    });
+}
+
+function preferredJob(jobs) {
+    return sortJobsForAttention(jobs)[0] || null;
+}
+
+function renderJobList(jobs) {
+    const orderedJobs = sortJobsForAttention(jobs);
+    nodes.jobList.innerHTML = orderedJobs.length ? orderedJobs.map(job => {
         const selected = job.job_id === selectedJobId ? ' selected' : '';
+        const statusClass = job.status ? ` ${job.status}` : '';
         const title = escapeHtml(job.video_url || job.job_id);
-        const stage = job.current_stage || job.next_stage || '-';
-        return `<button class="job-item${selected}" type="button" data-job-id="${job.job_id}">
+        const stage = job.current_stage || job.error_summary?.stage || job.next_stage || '-';
+        return `<button class="job-item${selected}${statusClass}" type="button" data-job-id="${job.job_id}">
             <strong>${title}</strong>
             <span>${escapeHtml(job.status || '-')} · ${escapeHtml(stageNames[stage] || stage)}</span>
         </button>`;
     }).join('') : '<div class="empty">暂无任务</div>';
-    document.querySelectorAll('.job-item').forEach(button => {
-        button.addEventListener('click', () => selectJob(button.dataset.jobId));
-    });
-    if (!selectedJobId && jobs[0]) selectJob(jobs[0].job_id, true);
+    bindJobButtons();
+}
+
+async function refreshJobs() {
+    const data = await getJson('/api/video-link/jobs?limit=50');
+    renderGlobal(data);
+    const jobs = data.jobs || [];
+    renderJobList(jobs);
+    const first = preferredJob(jobs);
+    if (!selectedJobId && first) selectJob(first.job_id, true);
 }
 
 async function refreshSelectedJob() {
@@ -184,17 +229,61 @@ async function refreshSelectedJob() {
 
 async function refreshJobsNoSelect() {
     const data = await getJson('/api/video-link/jobs?limit=50');
+    renderGlobal(data);
     const jobs = data.jobs || [];
-    nodes.jobList.innerHTML = jobs.length ? jobs.map(job => {
-        const selected = job.job_id === selectedJobId ? ' selected' : '';
-        const stage = job.current_stage || job.next_stage || '-';
-        return `<button class="job-item${selected}" type="button" data-job-id="${job.job_id}">
-            <strong>${escapeHtml(job.video_url || job.job_id)}</strong>
-            <span>${escapeHtml(job.status || '-')} · ${escapeHtml(stageNames[stage] || stage)}</span>
-        </button>`;
-    }).join('') : '<div class="empty">暂无任务</div>';
-    document.querySelectorAll('.job-item').forEach(button => {
-        button.addEventListener('click', () => selectJob(button.dataset.jobId));
+    renderJobList(jobs);
+}
+
+function renderGlobal(data) {
+    const summary = data.summary || {};
+    const counts = summary.counts || {};
+    const cells = [
+        ['总任务', summary.total ?? data.total ?? 0],
+        ['运行中', counts.running || 0],
+        ['排队中', counts.queued || 0],
+        ['成功', counts.succeeded || 0],
+        ['失败', counts.failed || 0],
+        ['平均进度', `${summary.average_progress || 0}%`]
+    ];
+    nodes.globalSummary.innerHTML = cells.map(([label, value]) => `
+        <div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>
+    `).join('');
+
+    const resources = data.resources || {};
+    const names = Object.keys(resources);
+    nodes.resourceLanes.innerHTML = names.length ? names.map(name => {
+        const info = resources[name] || {};
+        const running = info.running || [];
+        const queued = info.queued || [];
+        const runningText = running.length ? running.map(item => resourceItem(item)).join('') : '<div class="lane-empty">空闲</div>';
+        const queuedText = queued.length ? queued.map(item => resourceItem(item, true)).join('') : '<div class="lane-empty">无排队</div>';
+        return `<section class="resource-lane">
+            <header>
+                <strong>${escapeHtml(name)}</strong>
+                <span>${running.length}/${info.limit || 0} 运行 · ${queued.length} 排队</span>
+            </header>
+            <div class="lane-columns">
+                <div><span>运行</span>${runningText}</div>
+                <div><span>排队</span>${queuedText}</div>
+            </div>
+        </section>`;
+    }).join('') : '<div class="empty">暂无资源状态</div>';
+}
+
+function resourceItem(item, queued = false) {
+    const prefix = queued && item.position ? `#${item.position} · ` : '';
+    const title = item.video_url || item.job_id || '-';
+    return `<button class="lane-item" type="button" data-job-id="${escapeHtml(item.job_id || '')}">
+        <strong>${escapeHtml(prefix + (item.stage_label || item.stage || '-'))}</strong>
+        <span>${escapeHtml(title)} · ${escapeHtml(item.progress_percent ?? 0)}%</span>
+    </button>`;
+}
+
+function bindJobButtons() {
+    document.querySelectorAll('.job-item, .lane-item').forEach(button => {
+        button.addEventListener('click', () => {
+            if (button.dataset.jobId) selectJob(button.dataset.jobId);
+        });
     });
 }
 
@@ -363,7 +452,13 @@ async function boot() {
     await loadOptions();
     await refreshJobs();
     if (selectedJobId) await refreshSelectedJob();
-    refreshTimer = setInterval(refreshSelectedJob, 5000);
+    refreshTimer = setInterval(() => {
+        if (selectedJobId) {
+            refreshSelectedJob();
+        } else {
+            refreshJobs();
+        }
+    }, 5000);
 }
 
 boot().catch(error => {
