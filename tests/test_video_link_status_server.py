@@ -309,7 +309,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(queued["stages"]["analyze-core"]["queue_position"], 1)
         self.assertFalse(thread.is_alive())
 
-    def test_load_job_marks_orphaned_running_stage_failed_when_process_is_gone(self):
+    def test_load_job_requeues_orphaned_running_stage_when_process_is_gone(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
             job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
@@ -319,12 +319,56 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             loaded["stages"]["final-publish"] = {"status": "running"}
             server.save_job(loaded)
 
+            recovered = server.public_job(server.load_job(job["job_id"]))
+
+        self.assertEqual(recovered["status"], "queued")
+        self.assertEqual(recovered["runner"]["status"], "queued")
+        self.assertEqual(recovered["runner"]["queued_for"], "final-publish")
+        self.assertEqual(recovered["stages"]["final-publish"]["status"], "queued")
+        self.assertIn("queued for retry", recovered["runner"]["error"])
+        self.assertEqual(recovered["queue"]["resource"], "final-publish")
+
+    def test_load_job_requeues_legacy_process_gone_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
+            loaded = server.load_job(job["job_id"])
+            loaded["status"] = "failed"
+            loaded["runner"] = {
+                "status": "failed",
+                "current_stage": "analyze-core",
+                "error": server_mod.ORPHANED_PROCESS_GONE_MESSAGE,
+            }
+            loaded["stages"]["analyze-core"] = {"status": "failed", "error": server_mod.ORPHANED_PROCESS_GONE_MESSAGE}
+            server.save_job(loaded)
+
             recovered = server.load_job(job["job_id"])
 
-        self.assertEqual(recovered["status"], "failed")
-        self.assertEqual(recovered["runner"]["status"], "failed")
-        self.assertEqual(recovered["stages"]["final-publish"]["status"], "failed")
-        self.assertIn("process is gone", recovered["runner"]["error"])
+        self.assertEqual(recovered["status"], "queued")
+        self.assertEqual(recovered["runner"]["status"], "queued")
+        self.assertEqual(recovered["runner"]["queued_for"], "core")
+        self.assertEqual(recovered["stages"]["analyze-core"]["status"], "queued")
+        self.assertNotIn("error", recovered["stages"]["analyze-core"])
+
+    def test_auto_resume_starts_requeued_interrupted_job(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
+            loaded = server.load_job(job["job_id"])
+            loaded["status"] = "running"
+            loaded["runner"] = {
+                "status": "running",
+                "current_stage": "analyze-core",
+                "server_pid": 99999999,
+            }
+            loaded["stages"]["analyze-core"] = {"status": "running"}
+            server.save_job(loaded)
+
+            with patch.object(server_mod.VideoLinkStatusServer, "start_run", autospec=True) as start_run:
+                server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT, auto_resume=True)
+
+        start_run.assert_called_once()
+        self.assertEqual(start_run.call_args.args[1], job["job_id"])
 
     def test_load_job_keeps_orphaned_stage_running_when_process_is_alive(self):
         with tempfile.TemporaryDirectory() as tmp:

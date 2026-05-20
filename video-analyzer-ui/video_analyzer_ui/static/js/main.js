@@ -357,9 +357,10 @@ function renderStages(job) {
         const info = job.stages?.[stage] || {};
         const queue = info.queue_position ? `${info.queued_for || ''} #${info.queue_position}` : (info.queued_for || '-');
         const error = info.error ? `<div class="row-error">${escapeHtml(info.error)}</div>` : '';
+        const retry = info.retry_reason ? `<div class="muted">${escapeHtml(info.retry_reason)}</div>` : '';
         const log = info.log_path ? `<button class="log-link" type="button" data-stage="${stage}">查看日志</button>` : '-';
         return `<tr>
-            <td>${escapeHtml(stageNames[stage] || stage)}${error}</td>
+            <td>${escapeHtml(stageNames[stage] || stage)}${error}${retry}</td>
             <td>${statusBadge(info.status)}</td>
             <td>${escapeHtml(duration(info.duration_seconds))}</td>
             <td>${escapeHtml(queue)}</td>

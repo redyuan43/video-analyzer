@@ -100,6 +100,12 @@ EXPECTED_FINAL_EXPORTS = (
     "deep_report_v2.pdf",
     "manual_evidence.pdf",
 )
+ORPHANED_PROCESS_GONE_MESSAGE = (
+    "server stopped while this stage was running; process is gone and artifacts are incomplete; retry to continue"
+)
+ORPHANED_PROCESS_REQUEUE_MESSAGE = (
+    "server stopped while this stage was running; process is gone and artifacts are incomplete; queued for retry"
+)
 CORE_PROGRESS_STEPS = [
     ("ray", "Ray 集群准备", (r"\[jetson-ray\]", r"Ray runtime started")),
     ("context", "页面/评论/素材准备", (r"Extracting cookies", r"\[youtube\]", r"Writing video metadata")),
@@ -973,6 +979,8 @@ class VideoLinkStatusServer:
                 failed_info = info
                 break
         message = failed_info.get("error") or runner.get("error")
+        if runner.get("status") == "queued" and message == ORPHANED_PROCESS_REQUEUE_MESSAGE:
+            return None
         if not failed_stage and not message:
             return None
         return {
@@ -1048,6 +1056,8 @@ class VideoLinkStatusServer:
 
     def recover_orphaned_running_job(self, job: dict[str, Any]) -> dict[str, Any]:
         runner = job.get("runner") or {}
+        if self.should_requeue_legacy_interrupted_job(job):
+            return self.requeue_interrupted_job(job)
         if runner.get("status") not in {"running", "queued"}:
             return job
         active = self.active_runners.get(job["job_id"])
@@ -1104,25 +1114,48 @@ class VideoLinkStatusServer:
             self.save_job(job)
             return job
 
-        message = (
-            "server stopped while this stage was running; process is gone and artifacts are incomplete; retry to continue"
-        )
-        runner["status"] = "failed"
-        runner["error"] = message
+        return self.requeue_interrupted_job(job, stage, stage_info)
+
+    def should_requeue_legacy_interrupted_job(self, job: dict[str, Any]) -> bool:
+        runner = job.get("runner") or {}
+        if runner.get("status") != "failed" or ORPHANED_PROCESS_GONE_MESSAGE not in str(runner.get("error") or ""):
+            return False
+        stage = normalize_stage_name(runner.get("current_stage") or self.next_stage(job) or "")
+        return stage in STAGE_ORDER
+
+    def requeue_interrupted_job(
+        self,
+        job: dict[str, Any],
+        stage: str | None = None,
+        stage_info: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        now = iso_now()
+        raw_stage = stage or (job.get("runner") or {}).get("current_stage") or self.current_stage(job) or self.next_stage(job)
+        stage = normalize_stage_name(raw_stage or "") if raw_stage else None
+        if not stage or stage not in STAGE_ORDER:
+            return job
+        stage_info = dict(stage_info or (job.get("stages") or {}).get(stage) or {})
+        resource = stage_resource(stage)
+        stage_info["status"] = "queued"
+        stage_info["queued_at"] = now
+        stage_info["queued_for"] = resource
+        stage_info["retry_reason"] = ORPHANED_PROCESS_REQUEUE_MESSAGE
+        stage_info["log_path"] = stage_info.get("log_path") or str(self.stage_log_path(job["job_id"], stage))
+        stage_info.pop("process", None)
+        stage_info.pop("finished_at", None)
+        stage_info.pop("exit_code", None)
+        stage_info.pop("error", None)
+        job.setdefault("stages", {})[stage] = stage_info
+        runner = dict(job.get("runner") or {})
+        runner["status"] = "queued"
+        runner["error"] = ORPHANED_PROCESS_REQUEUE_MESSAGE
         runner["updated_at"] = now
-        runner["finished_at"] = now
         runner["current_stage"] = stage
-        runner.pop("queued_for", None)
+        runner["queued_for"] = resource
+        runner["server_pid"] = os.getpid()
+        runner.pop("finished_at", None)
         job["runner"] = runner
-        job["status"] = "failed"
-        if stage and stage in STAGE_ORDER:
-            if stage_info.get("status") in {"running", "queued"}:
-                stage_info["status"] = "failed"
-                stage_info["error"] = message
-                stage_info["finished_at"] = now
-                stage_info["exit_code"] = 1
-                stage_info.pop("process", None)
-                job.setdefault("stages", {})[stage] = stage_info
+        job["status"] = "queued"
         job["updated_at"] = now
         self.save_job(job)
         return job
