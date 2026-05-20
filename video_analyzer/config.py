@@ -10,6 +10,9 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_DEEPSEEK_ENV = Path("~/.config/video-analyzer/deepseek.env").expanduser()
+
+
 class Config:
     def __init__(self, config_dir: str = "config"):
         # Handle user-provided config directory
@@ -265,6 +268,30 @@ def _is_deepseek_api(api_url: str | None) -> bool:
     return host == "api.deepseek.com" or host.endswith(".api.deepseek.com")
 
 
+def load_default_deepseek_env() -> bool:
+    """Load the standard DeepSeek key env file without overriding the shell."""
+    env_path = Path(os.environ.get("VIDEO_ANALYZER_DEEPSEEK_ENV", DEFAULT_DEEPSEEK_ENV)).expanduser()
+    if not env_path.exists():
+        return False
+    try:
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if key.startswith("export "):
+                key = key.split(None, 1)[1].strip()
+            if not key or key in os.environ:
+                continue
+            value = value.strip().strip("'\"")
+            os.environ[key] = value
+        return True
+    except OSError as exc:
+        logger.warning("Could not load DeepSeek env file %s: %s", env_path, exc)
+        return False
+
+
 def resolve_api_key(
     api_key: str | None = None,
     api_key_env: str | None = None,
@@ -277,6 +304,8 @@ def resolve_api_key(
     if not env_name and host.endswith("deepseek.com"):
         env_name = "DEEPSEEK_API_KEY"
     if env_name:
+        if env_name == "DEEPSEEK_API_KEY" and not os.environ.get(env_name):
+            load_default_deepseek_env()
         value = os.environ.get(env_name)
         if value:
             return value

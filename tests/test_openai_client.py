@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient
@@ -21,15 +23,52 @@ class GenericOpenAIAPIClientTests(unittest.TestCase):
         with patch.dict("os.environ", {"DEEPSEEK_API_KEY": "secret"}, clear=True):
             self.assertEqual(resolve_api_key(api_url="https://api.deepseek.com"), "secret")
 
+    def test_deepseek_endpoint_loads_default_env_file(self):
+        with TemporaryDirectory() as tmpdir:
+            env_path = Path(tmpdir) / "deepseek.env"
+            env_path.write_text("export DEEPSEEK_API_KEY=file-secret\n", encoding="utf-8")
+
+            with patch.dict("os.environ", {"VIDEO_ANALYZER_DEEPSEEK_ENV": str(env_path)}, clear=True):
+                self.assertEqual(resolve_api_key(api_url="https://api.deepseek.com"), "file-secret")
+
     def test_local_endpoint_allows_placeholder_key(self):
         self.assertEqual(resolve_api_key(api_url="http://100.90.114.26:18081/v1"), "0")
 
     def test_missing_deepseek_key_reports_env_name(self):
-        with patch.dict("os.environ", {}, clear=True):
-            with self.assertRaises(ValueError) as raised:
-                resolve_api_key(api_url="https://api.deepseek.com")
+        with TemporaryDirectory() as tmpdir:
+            missing_env = str(Path(tmpdir) / "missing.env")
+            env = {"VIDEO_ANALYZER_DEEPSEEK_ENV": missing_env}
+            with patch.dict("os.environ", env, clear=True):
+                with self.assertRaises(ValueError) as raised:
+                    resolve_api_key(api_url="https://api.deepseek.com")
 
         self.assertIn("DEEPSEEK_API_KEY", str(raised.exception))
+
+    def test_deepseek_env_file_does_not_override_shell_key(self):
+        with TemporaryDirectory() as tmpdir:
+            env_path = Path(tmpdir) / "deepseek.env"
+            env_path.write_text("DEEPSEEK_API_KEY=file-secret\n", encoding="utf-8")
+            env = {"VIDEO_ANALYZER_DEEPSEEK_ENV": str(env_path), "DEEPSEEK_API_KEY": "shell-secret"}
+
+            with patch.dict("os.environ", env, clear=True):
+                self.assertEqual(resolve_api_key(api_url="https://api.deepseek.com"), "shell-secret")
+
+    def test_missing_explicit_deepseek_key_reports_env_name(self):
+        with TemporaryDirectory() as tmpdir:
+            missing_env = str(Path(tmpdir) / "missing.env")
+            env = {"VIDEO_ANALYZER_DEEPSEEK_ENV": missing_env}
+            with patch.dict("os.environ", env, clear=True):
+                with self.assertRaises(ValueError) as raised:
+                    resolve_api_key(api_key_env="DEEPSEEK_API_KEY")
+
+        self.assertIn("DEEPSEEK_API_KEY", str(raised.exception))
+
+    def test_missing_non_deepseek_key_reports_env_name(self):
+        with patch.dict("os.environ", {}, clear=True):
+            with self.assertRaises(ValueError) as raised:
+                resolve_api_key(api_key_env="OTHER_API_KEY")
+
+        self.assertIn("OTHER_API_KEY", str(raised.exception))
 
     def test_deepseek_extra_body_disables_thinking(self):
         extra_body = build_openai_extra_body(
