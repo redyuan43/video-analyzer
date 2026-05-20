@@ -69,7 +69,8 @@ function duration(value) {
 
 function statusBadge(status) {
     const value = status || 'pending';
-    return `<span class="status ${value}">${value}</span>`;
+    const spinner = value === 'running' ? '<span class="status-spinner" aria-hidden="true"></span>' : '';
+    return `<span class="status ${value}">${spinner}${escapeHtml(value)}</span>`;
 }
 
 function escapeHtml(value) {
@@ -321,6 +322,7 @@ function runDisabledReason(job) {
 
 function renderJob(job) {
     const progress = job.progress || {};
+    const stageProgress = job.stage_progress || job.core_progress;
     const queue = job.queue || {};
     const reason = runDisabledReason(job);
     const process = activeProcess(job);
@@ -333,7 +335,10 @@ function renderJob(job) {
     setText(nodes.nextStageValue, stageNames[job.next_stage] || job.next_stage);
     const queueText = queue.resource ? `${queue.resource} #${queue.position || '-'}/${queue.size || '-'}` : '-';
     setText(nodes.queueValue, process?.alive ? `${queueText} · PID ${process.pid}` : queueText);
-    nodes.progressText.textContent = `${progress.completed || 0}/${progress.total || 0} · ${progress.percent || 0}%`;
+    const subProgress = stageProgress?.percent != null && job.current_stage === stageProgress.stage
+        ? ` · ${stageProgress.stage_label || stageNames[stageProgress.stage] || stageProgress.stage}约 ${stageProgress.percent}%`
+        : '';
+    nodes.progressText.textContent = `${progress.completed || 0}/${progress.total || 0} · ${progress.percent || 0}%${subProgress}`;
     nodes.progressBar.style.width = `${progress.percent || 0}%`;
     setText(nodes.detailUrl, job.video_url);
     setText(nodes.detailRunDir, job.summary?.run_dir || job.run_dir);
@@ -348,7 +353,7 @@ function renderJob(job) {
         nodes.errorPanel.hidden = true;
     }
     renderStages(job);
-    renderStageProgress(job.stage_progress || job.core_progress);
+    renderStageProgress(stageProgress);
     renderArtifacts(job.summary || {});
     loadSelectedLog(job);
 }
@@ -356,13 +361,14 @@ function renderJob(job) {
 function renderStages(job) {
     nodes.stageRows.innerHTML = (job.stage_order || []).map(stage => {
         const info = job.stages?.[stage] || {};
+        const status = info.status || 'pending';
         const queue = info.queue_position ? `${info.queued_for || ''} #${info.queue_position}` : (info.queued_for || '-');
         const error = info.error ? `<div class="row-error">${escapeHtml(info.error)}</div>` : '';
         const retry = info.retry_reason ? `<div class="muted">${escapeHtml(info.retry_reason)}</div>` : '';
         const log = info.log_path ? `<button class="log-link" type="button" data-stage="${stage}">查看日志</button>` : '-';
-        return `<tr>
+        return `<tr class="stage-row ${escapeHtml(status)}">
             <td>${escapeHtml(stageNames[stage] || stage)}${error}${retry}</td>
-            <td>${statusBadge(info.status)}</td>
+            <td>${statusBadge(status)}</td>
             <td>${escapeHtml(duration(info.duration_seconds))}</td>
             <td>${escapeHtml(queue)}</td>
             <td>${log}</td>
@@ -380,8 +386,19 @@ function renderStageProgress(progress) {
     const hasVisibleStep = progress && (progress.steps || []).some(step => step.status !== 'pending');
     nodes.corePanel.hidden = !hasVisibleStep;
     if (!hasVisibleStep) return;
-    nodes.corePanelTitle.textContent = progress.stage_label ? `${progress.stage_label}子项` : '阶段子项';
-    nodes.coreRows.innerHTML = progress.steps.map(step => `<tr>
+    const percentText = progress.percent != null ? ` · 约 ${progress.percent}%` : '';
+    nodes.corePanelTitle.textContent = progress.stage_label ? `${progress.stage_label}子项${percentText}` : `阶段子项${percentText}`;
+    const summary = progress.summary || progress.current_label || progress.last_signal_label || '';
+    const summaryRow = `<tr class="stage-progress-meta ${progress.live ? 'live' : ''} ${progress.stale ? 'stale' : ''}">
+        <td colspan="4">
+            <div class="stage-progress-head">
+                <span>${escapeHtml(summary)}</span>
+                <strong>${escapeHtml(progress.percent ?? 0)}%</strong>
+            </div>
+            <div class="bar stage-progress-bar"><div style="width:${escapeHtml(progress.percent ?? 0)}%"></div></div>
+        </td>
+    </tr>`;
+    nodes.coreRows.innerHTML = summaryRow + progress.steps.map(step => `<tr class="substep-row ${escapeHtml(step.status || 'pending')} ${progress.stale && step.status !== 'pending' ? 'stale' : ''}">
         <td>${escapeHtml(step.label)}</td>
         <td>${statusBadge(step.status)}</td>
         <td>${escapeHtml(duration(step.duration_seconds))}</td>

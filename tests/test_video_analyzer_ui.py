@@ -95,6 +95,16 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertEqual(response.status_code, 302)
         self.assertEqual(response.headers["Location"], "/?job=0123456789abcdef0123456789abcdef")
 
+    def test_static_ui_marks_running_and_pending_states_visually(self):
+        js = (UI_ROOT / "video_analyzer_ui" / "static" / "js" / "main.js").read_text(encoding="utf-8")
+        css = (UI_ROOT / "video_analyzer_ui" / "static" / "css" / "styles.css").read_text(encoding="utf-8")
+
+        self.assertIn("status-spinner", js)
+        self.assertIn("stage-progress-meta", js)
+        self.assertIn(".status.pending", css)
+        self.assertIn(".job-item.queued", css)
+        self.assertIn("@keyframes status-spin", css)
+
 
 if __name__ == "__main__":
     unittest.main()

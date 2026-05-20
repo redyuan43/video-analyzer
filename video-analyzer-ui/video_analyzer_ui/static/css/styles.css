@@ -279,9 +279,26 @@ button:disabled {
     background: #fff7f8;
 }
 
-.job-item.running,
-.job-item.queued {
+.job-item.running {
     border-left: 4px solid #2563eb;
+}
+
+.job-item.queued,
+.job-item.pending {
+    border-left: 4px solid #f59e0b;
+    background: #fffbeb;
+}
+
+.job-item.running span::before {
+    content: "";
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    margin-right: 6px;
+    border-radius: 999px;
+    background: #2563eb;
+    animation: status-pulse 1s ease-in-out infinite;
+    vertical-align: middle;
 }
 
 .job-item.failed span {
@@ -384,7 +401,10 @@ th {
 }
 
 .status {
-    display: inline-block;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
     min-width: 72px;
     padding: 3px 8px;
     border-radius: 999px;
@@ -405,14 +425,74 @@ th {
     color: #1d4ed8;
 }
 
-.status.queued {
+.status.queued,
+.status.pending {
     background: #fef3c7;
     color: #92400e;
+}
+
+.status-spinner {
+    width: 10px;
+    height: 10px;
+    border: 2px solid rgba(37, 99, 235, .25);
+    border-top-color: #2563eb;
+    border-radius: 999px;
+    animation: status-spin .8s linear infinite;
 }
 
 .status.failed {
     background: #ffe4e6;
     color: #9f1239;
+}
+
+.stage-row.queued,
+.stage-row.pending,
+.substep-row.pending {
+    background: #fffbeb;
+}
+
+.stage-row.running,
+.substep-row.running {
+    background: #eff6ff;
+}
+
+.substep-row.stale td {
+    color: #667085;
+}
+
+.stage-progress-meta td {
+    background: #f8fafc;
+}
+
+.stage-progress-meta.stale td {
+    background: #fffbeb;
+}
+
+.stage-progress-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 8px;
+    color: #475467;
+    font-size: 13px;
+}
+
+.stage-progress-head strong {
+    color: #1f2933;
+}
+
+.stage-progress-bar {
+    height: 8px;
+}
+
+@keyframes status-spin {
+    to { transform: rotate(360deg); }
+}
+
+@keyframes status-pulse {
+    0%, 100% { opacity: .35; transform: scale(.85); }
+    50% { opacity: 1; transform: scale(1); }
 }
 
 .log-link {
