@@ -548,6 +548,65 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(by_id["asr"]["status"], "succeeded")
         self.assertEqual(by_id["frames"]["duration_seconds"], 30.0)
         self.assertEqual(by_id["ocr"]["status"], "running")
+        self.assertGreater(progress["percent"], 40)
+        self.assertLess(progress["percent"], 80)
+
+    def test_core_progress_reports_queued_stale_signals_without_live_current_step(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
+            loaded = server.load_job(job["job_id"])
+            loaded["status"] = "queued"
+            loaded["runner"] = {"status": "queued", "current_stage": "analyze-core", "queued_for": "core"}
+            loaded["stages"]["probe"] = {"status": "succeeded"}
+            loaded["stages"]["prepare"] = {"status": "succeeded"}
+            loaded["stages"]["analyze-core"] = {
+                "status": "queued",
+                "queued_for": "core",
+                "log_path": str(server.stage_log_path(job["job_id"], "analyze-core")),
+            }
+            log_path = server.stage_log_path(job["job_id"], "analyze-core")
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(
+                "\n".join(
+                    [
+                        "2026-05-17 01:12:49,609 - INFO - Transcribing audio...",
+                        "2026-05-17 01:14:00,000 - INFO - ASR succeeded with provider: vibevoice",
+                        "2026-05-17 01:15:00,000 - INFO - Extracting frames from video using model qwen...",
+                        "2026-05-17 01:15:30,000 - INFO - Extracted 72 screen keyframes",
+                        "2026-05-17 01:15:31,000 - INFO - Running OCR on extracted frames...",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            server.save_job(loaded)
+
+            progress = server.public_job(server.load_job(job["job_id"]))["stage_progress"]
+
+        self.assertEqual(progress["status"], "queued")
+        self.assertFalse(progress["live"])
+        self.assertTrue(progress["stale"])
+        self.assertIsNone(progress["current_step"])
+        self.assertEqual(progress["last_signal_label"], "OCR 执行")
+        self.assertIn("等待 core #1/1", progress["summary"])
+        self.assertGreater(progress["percent"], 40)
+
+    def test_core_progress_advances_to_vl_when_vl_signal_appears(self):
+        text = "\n".join(
+            [
+                "2026-05-17 01:12:49,609 - INFO - Transcribing audio...",
+                "2026-05-17 01:14:00,000 - INFO - ASR succeeded with provider: vibevoice",
+                "2026-05-17 01:15:00,000 - INFO - Extracting frames from video using model qwen...",
+                "2026-05-17 01:15:30,000 - INFO - Extracted 72 screen keyframes",
+                "2026-05-17 01:15:31,000 - INFO - Running OCR on extracted frames...",
+                "2026-05-17 01:17:30,000 - INFO - Selecting and analyzing VL frames...",
+            ]
+        )
+
+        progress = server_mod.parse_core_progress(text, "running")
+
+        self.assertEqual(progress["current_step"], "vl")
+        self.assertGreaterEqual(progress["percent"], 70)
 
     def test_prepare_progress_parses_download_and_context_substeps(self):
         text = "\n".join(

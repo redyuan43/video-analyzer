@@ -111,12 +111,29 @@ CORE_PROGRESS_STEPS = [
     ("context", "页面/评论/素材准备", (r"Extracting cookies", r"\[youtube\]", r"Writing video metadata")),
     ("audio", "音频提取", (r"Extracting audio from video",)),
     ("asr", "ASR 转写", (r"Transcribing audio",)),
+    ("asr_done", "ASR 完成", (r"ASR succeeded", r"Using existing transcript file")),
     ("frames", "候选帧抽取", (r"Extracting frames from video", r"Jetson video cache", r"frame worker")),
-    ("ocr", "OCR", (r"Running OCR",)),
+    ("frames_done", "候选帧就绪", (r"Extracted \d+ screen keyframes",)),
+    ("ocr", "OCR 执行", (r"Running OCR",)),
+    ("ocr_ready", "OCR 服务/请求", (r"DotsMOCR endpoint not ready", r"DotsMOCR endpoint ready", r"OpenAI-compatible vision OCR")),
     ("vl", "VL 帧选择/分析", (r"Selecting and analyzing VL frames",)),
     ("manual", "操作手册生成", (r"Generating operation manual",)),
     ("write", "结果写出", (r"Operation manual saved", r"Analysis complete", r"\[done\] run_dir:")),
 ]
+CORE_PROGRESS_WEIGHTS = {
+    "ray": 3,
+    "context": 7,
+    "audio": 5,
+    "asr": 15,
+    "asr_done": 5,
+    "frames": 10,
+    "frames_done": 5,
+    "ocr": 5,
+    "ocr_ready": 20,
+    "vl": 15,
+    "manual": 7,
+    "write": 3,
+}
 STAGE_PROGRESS_STEPS = {
     "probe": [
         ("probe", "探测视频信息", (r"probe stage started", r"duration", r"video duration")),
@@ -959,10 +976,10 @@ class VideoLinkStatusServer:
         public["current_stage"] = self.current_stage(job)
         public["next_stage"] = self.next_stage(job)
         public["error_summary"] = self.error_summary(job)
-        public["core_progress"] = self.core_progress(job)
-        public["stage_progress"] = self.stage_progress(job)
         public["dashboard_url"] = self.dashboard_url(job["job_id"])
         public["queue"] = self.queue_info(public)
+        public["core_progress"] = self.core_progress(public)
+        public["stage_progress"] = self.stage_progress(public)
         queued_stage = public["queue"].get("stage")
         if queued_stage and queued_stage in public["stages"]:
             public["stages"][queued_stage] = dict(public["stages"][queued_stage])
@@ -1012,7 +1029,8 @@ class VideoLinkStatusServer:
             return None
         log_path = Path(stage_info.get("log_path") or self.stage_log_path(job["job_id"], "analyze-core"))
         text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
-        return parse_core_progress(text, stage_info.get("status") or "pending")
+        progress = parse_core_progress(text, stage_info.get("status") or "pending")
+        return self.annotate_stage_progress(job, "analyze-core", progress, stage_info)
 
     def stage_progress(self, job: dict[str, Any]) -> dict[str, Any] | None:
         stage = self.current_stage(job) or (self.error_summary(job) or {}).get("stage") or self.next_stage(job)
@@ -1027,9 +1045,76 @@ class VideoLinkStatusServer:
         if not text:
             text = stage_progress_text(stage, job, stage_info)
         progress = parse_stage_progress(stage, text, stage_info.get("status") or "pending")
-        progress["stage"] = stage
-        progress["stage_label"] = STAGE_LABELS.get(stage, stage)
+        return self.annotate_stage_progress(job, stage, progress, stage_info)
+
+    def annotate_stage_progress(
+        self,
+        job: dict[str, Any],
+        stage: str,
+        progress: dict[str, Any],
+        stage_info: dict[str, Any],
+    ) -> dict[str, Any]:
+        progress = dict(progress)
+        steps = list(progress.get("steps") or [])
+        status = stage_info.get("status") or progress.get("status") or "pending"
+        live = self.stage_is_live(job, stage, stage_info)
+        current_step = progress.get("current_step") if live else None
+        current_label = next((step.get("label") for step in steps if step.get("id") == current_step), None)
+        visible_steps = [step for step in steps if step.get("status") != "pending"]
+        last_signal = visible_steps[-1] if visible_steps else None
+        progress.update(
+            {
+                "stage": stage,
+                "stage_label": STAGE_LABELS.get(stage, stage),
+                "status": status,
+                "live": live,
+                "current_step": current_step,
+                "current_label": current_label,
+                "last_signal_label": last_signal.get("label") if last_signal else None,
+                "stale": bool(status == "queued" and visible_steps and not live),
+                "summary": self.stage_progress_summary(job, stage, status, live, current_label),
+            }
+        )
         return progress
+
+    def stage_is_live(self, job: dict[str, Any], stage: str, stage_info: dict[str, Any]) -> bool:
+        runner = job.get("runner") or {}
+        if runner.get("status") != "running" or stage_info.get("status") != "running":
+            return False
+        active = self.active_runners.get(job.get("job_id"))
+        if active and active.is_alive():
+            return True
+        process_info = stage_info.get("process") or {}
+        pid = process_info.get("pid")
+        if pid:
+            return process_alive(pid)
+        return runner.get("server_pid") == os.getpid()
+
+    def stage_progress_summary(
+        self,
+        job: dict[str, Any],
+        stage: str,
+        status: str,
+        live: bool,
+        current_label: str | None,
+    ) -> str:
+        if status == "queued":
+            queue = job.get("queue") or self.queue_info(job)
+            if queue.get("resource"):
+                return (
+                    f"等待 {queue.get('resource')} #{queue.get('position') or '-'}/{queue.get('size') or '-'}；"
+                    "下方为上次尝试日志信号"
+                )
+            return "等待资源；下方为上次尝试日志信号"
+        if live:
+            return f"正在{current_label or STAGE_LABELS.get(stage, stage)}"
+        if status == "running":
+            return "运行状态待确认；下方为最近日志信号"
+        if status == "failed":
+            return "阶段失败；下方为失败前日志信号"
+        if status in {"succeeded", "skipped"}:
+            return "阶段已完成"
+        return "等待开始"
 
     def error_summary(self, job: dict[str, Any]) -> dict[str, Any] | None:
         runner = job.get("runner") or {}
@@ -1286,7 +1371,7 @@ def process_alive(pid: Any) -> bool:
 
 
 def parse_core_progress(text: str, stage_status: str) -> dict[str, Any]:
-    return parse_progress_steps(text, stage_status, CORE_PROGRESS_STEPS)
+    return parse_progress_steps(text, stage_status, CORE_PROGRESS_STEPS, CORE_PROGRESS_WEIGHTS)
 
 
 def parse_stage_progress(stage: str, text: str, stage_status: str) -> dict[str, Any]:
@@ -1308,7 +1393,12 @@ def stage_progress_text(stage: str, job: dict[str, Any], stage_info: dict[str, A
     return "\n".join(lines)
 
 
-def parse_progress_steps(text: str, stage_status: str, step_specs: list[tuple[str, str, tuple[str, ...]]]) -> dict[str, Any]:
+def parse_progress_steps(
+    text: str,
+    stage_status: str,
+    step_specs: list[tuple[str, str, tuple[str, ...]]],
+    weights: dict[str, int] | None = None,
+) -> dict[str, Any]:
     lines = text.splitlines()
     matches: dict[str, dict[str, Any]] = {}
     for line_number, line in enumerate(lines, start=1):
@@ -1376,11 +1466,41 @@ def parse_progress_steps(text: str, stage_status: str, step_specs: list[tuple[st
         )
     if stage_status == "failed" and current_index is not None:
         current_step = step_specs[current_index][0]
+    percent = progress_percent_from_steps(steps, step_specs, stage_status, weights)
     return {
         "status": stage_status,
         "current_step": current_step,
+        "current_label": next((step["label"] for step in steps if step["id"] == current_step), None),
+        "percent": percent,
         "steps": steps,
     }
+
+
+def progress_percent_from_steps(
+    steps: list[dict[str, Any]],
+    step_specs: list[tuple[str, str, tuple[str, ...]]],
+    stage_status: str,
+    weights: dict[str, int] | None = None,
+) -> int:
+    if not step_specs:
+        return 100 if stage_status in {"succeeded", "skipped"} else 0
+    if stage_status in {"succeeded", "skipped"}:
+        return 100
+    resolved_weights = {step_id: max(0, weights.get(step_id, 0)) for step_id, _label, _patterns in step_specs} if weights else {
+        step_id: 1 for step_id, _label, _patterns in step_specs
+    }
+    total = sum(resolved_weights.values()) or len(step_specs)
+    completed = 0.0
+    for step in steps:
+        weight = resolved_weights.get(step["id"], 1)
+        if step["status"] == "succeeded":
+            completed += weight
+        elif step["status"] in {"running", "failed"}:
+            completed += weight * 0.5
+    percent = int(round((completed / total) * 100))
+    if stage_status == "running":
+        return min(99, max(1 if completed else 0, percent))
+    return max(0, min(100, percent))
 
 
 def parse_log_timestamp(line: str) -> float | None:
