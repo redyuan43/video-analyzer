@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from video_analyzer.resource_locks import DEFAULT_LOCK_DIR
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_JOBS_DIR = REPO_ROOT / "tmp" / "video-link-status" / "jobs"
@@ -88,6 +90,9 @@ STAGE_RESOURCES = {
 RESOURCE_LIMITS = {
     "prepare": 2,
     "core": 1,
+    "asr": 1,
+    "ocr": 1,
+    "vl": 1,
     "verify": 2,
     "multidoc": 1,
     "deep-v2": 1,
@@ -111,13 +116,13 @@ CORE_PROGRESS_STEPS = [
     ("ray", "Ray 集群准备", (r"\[jetson-ray\]", r"Ray runtime started")),
     ("context", "页面/评论/素材准备", (r"Extracting cookies", r"\[youtube\]", r"Writing video metadata")),
     ("audio", "音频提取", (r"Extracting audio from video",)),
-    ("asr", "ASR 转写", (r"Transcribing audio",)),
+    ("asr", "ASR 转写", (r"Transcribing audio", r"\[resource-lock\] (waiting|acquired) resource=asr")),
     ("asr_done", "ASR 完成", (r"ASR succeeded", r"Using existing transcript file")),
     ("frames", "候选帧抽取", (r"Extracting frames from video", r"Jetson video cache", r"frame worker")),
     ("frames_done", "候选帧就绪", (r"Extracted \d+ screen keyframes",)),
-    ("ocr", "OCR 执行", (r"Running OCR",)),
+    ("ocr", "OCR 执行", (r"Running OCR", r"\[resource-lock\] (waiting|acquired) resource=ocr")),
     ("ocr_ready", "OCR 服务/请求", (r"DotsMOCR endpoint not ready", r"DotsMOCR endpoint ready", r"OpenAI-compatible vision OCR")),
-    ("vl", "VL 帧选择/分析", (r"Selecting and analyzing VL frames",)),
+    ("vl", "VL 帧选择/分析", (r"Selecting and analyzing VL frames", r"\[resource-lock\] (waiting|acquired) resource=vl")),
     ("manual", "操作手册生成", (r"Generating operation manual",)),
     ("write", "结果写出", (r"Operation manual saved", r"Analysis complete", r"\[done\] run_dir:")),
 ]
@@ -409,6 +414,11 @@ class VideoLinkStatusServer:
                     entry["pid"] = process.get("pid")
                 resources[resource]["running"].append(entry)
 
+        for resource, entry in self.lock_file_resource_users(jobs):
+            resources.setdefault(resource, {"limit": RESOURCE_LIMITS.get(resource, 1), "running": [], "queued": []})
+            if not any(item.get("pid") == entry.get("pid") for item in resources[resource]["running"]):
+                resources[resource]["running"].append(entry)
+
         for info in resources.values():
             info["running"].sort(key=lambda item: item.get("updated_at") or "")
             info["queued"].sort(key=lambda item: (item.get("position") or 999999, item.get("updated_at") or ""))
@@ -416,6 +426,47 @@ class VideoLinkStatusServer:
             info["queued_count"] = len(info["queued"])
             info["available"] = max(0, int(info.get("limit") or 0) - len(info["running"]))
         return resources
+
+    def lock_file_resource_users(self, jobs: list[dict[str, Any]]) -> list[tuple[str, dict[str, Any]]]:
+        lock_dir_value = os.environ.get("VIDEO_ANALYZER_RESOURCE_LOCK_DIR") or str(DEFAULT_LOCK_DIR)
+        lock_dir = Path(lock_dir_value)
+        if not lock_dir.is_absolute():
+            lock_dir = self.repo_root / lock_dir
+        if not lock_dir.exists():
+            return []
+
+        run_dir_to_job = {str(job.get("run_dir")): job for job in jobs if job.get("run_dir")}
+        users = []
+        for path in lock_dir.glob("*.lock"):
+            try:
+                text = path.read_text(encoding="utf-8").strip()
+                if not text:
+                    continue
+                payload = json.loads(text)
+            except Exception:
+                continue
+            pid = payload.get("pid")
+            if not process_alive(pid):
+                continue
+            resource = str(payload.get("resource") or path.name.split(".", 1)[0])
+            owner = str(payload.get("owner") or "")
+            job = run_dir_to_job.get(owner)
+            users.append(
+                (
+                    resource,
+                    {
+                        "job_id": job.get("job_id") if job else "",
+                        "video_url": job.get("video_url") if job else owner,
+                        "stage": "analyze-core",
+                        "stage_label": f"{resource.upper()} 锁",
+                        "updated_at": job.get("updated_at") if job else payload.get("acquired_at"),
+                        "progress_percent": (job.get("progress") or {}).get("percent") if job else 0,
+                        "pid": pid,
+                        "owner": owner,
+                    },
+                )
+            )
+        return users
 
     def start_run(self, job_id: str) -> dict[str, Any]:
         job = self.load_job(job_id)

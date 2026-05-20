@@ -346,6 +346,17 @@
             "remote_urls": []
         }
     },
+    "resource_locks": {
+        "enabled": true,
+        "dir": "tmp/video-link-status/resource-locks",
+        "poll_seconds": 5,
+        "log_interval_seconds": 30,
+        "limits": {
+            "asr": 1,
+            "ocr": 1,
+            "vl": 1
+        }
+    },
     "keep_frames": false,
     "prompt": ""
 }

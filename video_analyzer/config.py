@@ -177,8 +177,13 @@ class Config:
             manual_config["text_model"] = text_model
             if text_temperature is not None:
                 manual_config["text_temperature"] = text_temperature
-            if profile.get("text_api_key_env"):
+            if profile.get("text_api_key_env") and _is_deepseek_api(text_base_url):
                 manual_config["text_api_key_env"] = profile["text_api_key_env"]
+            elif (
+                not _is_deepseek_api(text_base_url)
+                and not (getattr(self, "user_config_data", {}).get("operation_manual") or {}).get("text_api_key_env")
+            ):
+                manual_config.pop("text_api_key_env", None)
             for extra_key in ("deepseek_thinking", "reasoning_effort"):
                 if profile.get(extra_key):
                     manual_config[extra_key] = profile[extra_key]

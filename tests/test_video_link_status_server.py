@@ -664,6 +664,20 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(progress["current_step"], "vl")
         self.assertGreaterEqual(progress["percent"], 70)
 
+    def test_core_progress_recognizes_resource_lock_wait_signals(self):
+        text = "\n".join(
+            [
+                "2026-05-17 01:12:36,681 - INFO - Extracting audio from video...",
+                "2026-05-17 01:12:49,609 - INFO - [resource-lock] waiting resource=asr limit=1 owner=/tmp/run waited=0.000s",
+            ]
+        )
+
+        progress = server_mod.parse_core_progress(text, "running")
+
+        self.assertEqual(progress["current_step"], "asr")
+        by_id = {step["id"]: step for step in progress["steps"]}
+        self.assertIn("resource=asr", by_id["asr"]["message"])
+
     def test_prepare_progress_parses_download_and_context_substeps(self):
         text = "\n".join(
             [

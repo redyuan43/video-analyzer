@@ -1,13 +1,53 @@
 import unittest
+from argparse import Namespace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient
-from video_analyzer.config import build_openai_extra_body, resolve_api_key, resolve_temperature
+from video_analyzer.config import Config, build_openai_extra_body, resolve_api_key, resolve_temperature
 
 
 class GenericOpenAIAPIClientTests(unittest.TestCase):
+    def _operation_manual_args(self, **overrides):
+        values = {
+            "client": None,
+            "profile": None,
+            "asr_provider": None,
+            "task": "operation_manual",
+            "llm_base_url": "http://100.90.114.26:18081/v1",
+            "vision_base_url": "http://100.96.79.21:18082/v1",
+            "text_base_url": "http://100.90.114.26:18081/v1",
+            "vision_model": "minicpm-v-4.5-v100",
+            "text_model": "local-text-model",
+        }
+        values.update(overrides)
+        return Namespace(**values)
+
+    def test_local_text_endpoint_drops_default_deepseek_key_env(self):
+        config = Config()
+        config.update_from_args(self._operation_manual_args())
+
+        manual_config = config.get("operation_manual")
+
+        self.assertEqual(manual_config["text_base_url"], "http://100.90.114.26:18081/v1")
+        self.assertNotIn("text_api_key_env", manual_config)
+        self.assertEqual(resolve_api_key(api_url=manual_config["text_base_url"]), "0")
+
+    def test_deepseek_text_endpoint_keeps_default_key_env(self):
+        config = Config()
+        config.update_from_args(
+            self._operation_manual_args(
+                llm_base_url="https://api.deepseek.com",
+                text_base_url="https://api.deepseek.com",
+                text_model="deepseek-v4-pro",
+            )
+        )
+
+        manual_config = config.get("operation_manual")
+
+        self.assertEqual(manual_config["text_api_key_env"], "DEEPSEEK_API_KEY")
+
     def test_tailscale_cgnat_bypasses_env_proxy(self):
         client = GenericOpenAIAPIClient("0", "http://100.90.114.26:18081/v1")
 
