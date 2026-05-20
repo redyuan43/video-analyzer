@@ -9,3 +9,5 @@ weasyprint>=66,<67
 pydub>=0.25.1
 audioop-lts>=0.2.2; python_version >= "3.13"
 faster-whisper>=0.6.0
+secretstorage>=3.5.0
+keyring>=25.0.0
