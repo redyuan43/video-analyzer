@@ -40,6 +40,7 @@ const nodes = {
     detailUpdated: document.getElementById('detailUpdated'),
     stageRows: document.getElementById('stageRows'),
     corePanel: document.getElementById('corePanel'),
+    corePanelTitle: document.getElementById('corePanelTitle'),
     coreRows: document.getElementById('coreRows'),
     artifactSummary: document.getElementById('artifactSummary'),
     logHint: document.getElementById('logHint'),
@@ -347,7 +348,7 @@ function renderJob(job) {
         nodes.errorPanel.hidden = true;
     }
     renderStages(job);
-    renderCore(job.core_progress);
+    renderStageProgress(job.stage_progress || job.core_progress);
     renderArtifacts(job.summary || {});
     loadSelectedLog(job);
 }
@@ -375,11 +376,12 @@ function renderStages(job) {
     });
 }
 
-function renderCore(core) {
-    const hasVisibleStep = core && (core.steps || []).some(step => step.status !== 'pending');
+function renderStageProgress(progress) {
+    const hasVisibleStep = progress && (progress.steps || []).some(step => step.status !== 'pending');
     nodes.corePanel.hidden = !hasVisibleStep;
     if (!hasVisibleStep) return;
-    nodes.coreRows.innerHTML = core.steps.map(step => `<tr>
+    nodes.corePanelTitle.textContent = progress.stage_label ? `${progress.stage_label}子项` : '阶段子项';
+    nodes.coreRows.innerHTML = progress.steps.map(step => `<tr>
         <td>${escapeHtml(step.label)}</td>
         <td>${statusBadge(step.status)}</td>
         <td>${escapeHtml(duration(step.duration_seconds))}</td>

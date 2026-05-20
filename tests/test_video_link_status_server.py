@@ -549,6 +549,77 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(by_id["frames"]["duration_seconds"], 30.0)
         self.assertEqual(by_id["ocr"]["status"], "running")
 
+    def test_prepare_progress_parses_download_and_context_substeps(self):
+        text = "\n".join(
+            [
+                "Extracting cookies from chrome",
+                "Extracted 966 cookies from chrome",
+                "[youtube] Extracting URL: https://www.youtube.com/watch?v=abc",
+                "[youtube] abc: Downloading webpage",
+                "[youtube] [jsc:node] Solving JS challenges using node",
+                "[download]  49.3% of   16.21MiB at   44.97MiB/s ETA 00:00",
+                "[Merger] Merging formats into \"download.mp4\"",
+                "[download] video: downloads/url-videos/abc/video.mp4",
+                "[download] context: downloads/url-videos/abc/page_context.md",
+                "[download] subtitle transcript: not available; analyzer will use configured ASR",
+            ]
+        )
+
+        progress = server_mod.parse_stage_progress("prepare", text, "running")
+
+        by_id = {step["id"]: step for step in progress["steps"]}
+        self.assertEqual(progress["current_step"], "transcript")
+        self.assertEqual(by_id["cookies"]["status"], "succeeded")
+        self.assertEqual(by_id["download"]["status"], "succeeded")
+        self.assertEqual(by_id["transcript"]["status"], "running")
+        self.assertIn("subtitle transcript", by_id["transcript"]["message"])
+
+    def test_probe_progress_keeps_mode_resolution_as_distinct_substep(self):
+        text = "probe stage started\nresolved mode: long-talk-fast\n"
+
+        progress = server_mod.parse_stage_progress("probe", text, "succeeded")
+
+        by_id = {step["id"]: step for step in progress["steps"]}
+        self.assertEqual(by_id["probe"]["status"], "succeeded")
+        self.assertEqual(by_id["resolve"]["status"], "succeeded")
+        self.assertIn("long-talk-fast", by_id["resolve"]["message"])
+
+    def test_later_stage_progress_parses_final_publish_substeps(self):
+        text = "\n".join(
+            [
+                "[images] exists: baoyu_images/final/operation_manual_cover.png",
+                "[docs] multidoc",
+                "[docs] deep-v2",
+                "[pdf] operation_manual.md",
+                "[verify] pdf=4",
+                "[summary] /tmp/run/final_publish_summary.json",
+                "[send] skipped",
+            ]
+        )
+
+        progress = server_mod.parse_stage_progress("final-publish", text, "succeeded")
+
+        by_id = {step["id"]: step for step in progress["steps"]}
+        self.assertEqual(by_id["images"]["status"], "succeeded")
+        self.assertEqual(by_id["export"]["status"], "succeeded")
+        self.assertEqual(by_id["verify"]["status"], "succeeded")
+        self.assertEqual(by_id["send"]["status"], "succeeded")
+
+    def test_verify_progress_uses_synthetic_signals_when_stage_has_no_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            loaded["runner"] = {"status": "running", "current_stage": "verify-core", "server_pid": os.getpid()}
+            loaded["stages"]["verify-core"] = {"status": "succeeded"}
+
+            progress = server.public_job(loaded)["stage_progress"]
+
+        by_id = {step["id"]: step for step in progress["steps"]}
+        self.assertEqual(progress["stage"], "verify-core")
+        self.assertEqual(by_id["check"]["status"], "succeeded")
+        self.assertEqual(by_id["complete"]["status"], "succeeded")
+
     def test_create_page_contains_form_fields(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)

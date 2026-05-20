@@ -117,6 +117,51 @@ CORE_PROGRESS_STEPS = [
     ("manual", "操作手册生成", (r"Generating operation manual",)),
     ("write", "结果写出", (r"Operation manual saved", r"Analysis complete", r"\[done\] run_dir:")),
 ]
+STAGE_PROGRESS_STEPS = {
+    "probe": [
+        ("probe", "探测视频信息", (r"probe stage started", r"duration", r"video duration")),
+        ("resolve", "选择分析模式", (r"resolved mode:",)),
+    ],
+    "prepare": [
+        ("cookies", "读取浏览器 Cookie", (r"Extracting cookies from", r"Extracted \d+ cookies")),
+        ("metadata", "读取页面元数据", (r"\[youtube\].*Extracting URL", r"Downloading webpage", r"Downloading .*API JSON")),
+        ("js", "处理 YouTube JS", (r"Solving JS challenges", r"Downloading player")),
+        ("download", "下载视频/音频", (r"^\[download\]\s+\d", r"Destination:")),
+        ("merge", "合并媒体文件", (r"\[Merger\]", r"Deleting original file")),
+        ("context", "写出页面上下文", (r"\[download\] video:", r"\[download\] description:", r"\[download\] context:")),
+        ("transcript", "准备字幕 Transcript", (r"subtitle transcript",)),
+    ],
+    "verify-core": [
+        ("check", "检查核心产物", (r"verifying core artifacts", r"analysis\.json", r"operation_manual\.md", r"manual_evidence\.md")),
+        ("complete", "核心产物可用", (r"core artifacts verified", r"missing core artifact\(s\):")),
+    ],
+    "multidoc": [
+        ("load", "读取核心手册/证据", (r"operation_manual\.md", r"manual_evidence\.md", r"docs_analysis")),
+        ("analyze", "生成多文档分析", (r"run_multidoc_analysis", r"knowledge_notes", r"deep_report")),
+        ("write", "写出多文档产物", (r"docs_analysis", r"\[summary\]", r"saved", r"written")),
+    ],
+    "deep-v2": [
+        ("load", "读取章节证据", (r"load", r"chapters", r"chapter_assets")),
+        ("chapters", "逐章深度报告", (r"\[run\] chapter", r"\[skip\] chapter", r"chapter concurrency")),
+        ("synthesis", "综合/格式化", (r"\[run\] final synthesis", r"\[run\] markdown format", r"\[format\] block")),
+        ("review", "校验深度报告", (r"deep_report_review", r"validate", r"review")),
+        ("write", "写出 deep_report_v2", (r"deep_report_v2\.md", r"deep_report_v2\.pre_format\.md")),
+    ],
+    "image-prompts": [
+        ("load", "读取文档内容", (r"operation_manual", r"knowledge_notes", r"deep_report", r"manual_evidence")),
+        ("prompt", "生成配图提示词", (r"prompt", r"baoyu", r"cover", r"image")),
+        ("write", "写出提示词文件", (r"prompts", r"\.md", r"saved", r"written")),
+    ],
+    "final-publish": [
+        ("images", "生成/复用最终图片", (r"\[images\]", r"augment_video_docs_images")),
+        ("docs", "补齐最终文档", (r"\[docs\]", r"multidoc", r"deep-v2")),
+        ("augment", "插入配图", (r"augment", r"image-augmented", r"baoyu_images")),
+        ("export", "导出 PDF/长图", (r"\[pdf\]", r"export_video_docs", r"\[long-png\]")),
+        ("verify", "校验发布产物", (r"\[verify\]", r"pdf=", r"long_png=")),
+        ("summary", "写出发布摘要", (r"\[summary\]", r"final_publish_summary\.json")),
+        ("send", "发送/跳过发送", (r"\[send\]", r"skipped")),
+    ],
+}
 
 
 class BridgeError(Exception):
@@ -915,6 +960,7 @@ class VideoLinkStatusServer:
         public["next_stage"] = self.next_stage(job)
         public["error_summary"] = self.error_summary(job)
         public["core_progress"] = self.core_progress(job)
+        public["stage_progress"] = self.stage_progress(job)
         public["dashboard_url"] = self.dashboard_url(job["job_id"])
         public["queue"] = self.queue_info(public)
         queued_stage = public["queue"].get("stage")
@@ -967,6 +1013,23 @@ class VideoLinkStatusServer:
         log_path = Path(stage_info.get("log_path") or self.stage_log_path(job["job_id"], "analyze-core"))
         text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
         return parse_core_progress(text, stage_info.get("status") or "pending")
+
+    def stage_progress(self, job: dict[str, Any]) -> dict[str, Any] | None:
+        stage = self.current_stage(job) or (self.error_summary(job) or {}).get("stage") or self.next_stage(job)
+        stage = normalize_stage_name(stage or "")
+        if stage == "analyze-core":
+            return self.core_progress(job)
+        if stage not in STAGE_PROGRESS_STEPS:
+            return None
+        stage_info = (job.get("stages") or {}).get(stage) or {}
+        log_path = Path(stage_info.get("log_path") or self.stage_log_path(job["job_id"], stage))
+        text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+        if not text:
+            text = stage_progress_text(stage, job, stage_info)
+        progress = parse_stage_progress(stage, text, stage_info.get("status") or "pending")
+        progress["stage"] = stage
+        progress["stage_label"] = STAGE_LABELS.get(stage, stage)
+        return progress
 
     def error_summary(self, job: dict[str, Any]) -> dict[str, Any] | None:
         runner = job.get("runner") or {}
@@ -1223,25 +1286,52 @@ def process_alive(pid: Any) -> bool:
 
 
 def parse_core_progress(text: str, stage_status: str) -> dict[str, Any]:
+    return parse_progress_steps(text, stage_status, CORE_PROGRESS_STEPS)
+
+
+def parse_stage_progress(stage: str, text: str, stage_status: str) -> dict[str, Any]:
+    return parse_progress_steps(text, stage_status, STAGE_PROGRESS_STEPS.get(stage, []))
+
+
+def stage_progress_text(stage: str, job: dict[str, Any], stage_info: dict[str, Any]) -> str:
+    lines = []
+    if stage_info and stage == "probe":
+        lines.append("probe stage started")
+    if stage == "probe" and job.get("resolved_mode"):
+        lines.append(f"resolved mode: {job['resolved_mode']}")
+    if stage == "verify-core":
+        lines.append("verifying core artifacts")
+        if stage_info.get("status") == "succeeded":
+            lines.append("core artifacts verified")
+        if stage_info.get("error"):
+            lines.append(stage_info["error"])
+    return "\n".join(lines)
+
+
+def parse_progress_steps(text: str, stage_status: str, step_specs: list[tuple[str, str, tuple[str, ...]]]) -> dict[str, Any]:
     lines = text.splitlines()
     matches: dict[str, dict[str, Any]] = {}
     for line_number, line in enumerate(lines, start=1):
-        for index, (step_id, _label, patterns) in enumerate(CORE_PROGRESS_STEPS):
-            if step_id in matches:
-                continue
+        for index, (step_id, _label, patterns) in enumerate(step_specs):
             if any(re.search(pattern, line) for pattern in patterns):
-                matches[step_id] = {
-                    "index": index,
-                    "line": line_number,
-                    "message": line.strip(),
-                    "timestamp": parse_log_timestamp(line),
-                }
+                if step_id in matches:
+                    matches[step_id]["line"] = line_number
+                    matches[step_id]["message"] = line.strip()
+                    if matches[step_id].get("timestamp") is None:
+                        matches[step_id]["timestamp"] = parse_log_timestamp(line)
+                else:
+                    matches[step_id] = {
+                        "index": index,
+                        "line": line_number,
+                        "message": line.strip(),
+                        "timestamp": parse_log_timestamp(line),
+                    }
                 break
 
     current_index = max((item["index"] for item in matches.values()), default=None)
     current_step = None
     steps = []
-    for index, (step_id, label, _patterns) in enumerate(CORE_PROGRESS_STEPS):
+    for index, (step_id, label, _patterns) in enumerate(step_specs):
         match = matches.get(step_id)
         status = "pending"
         if match:
@@ -1285,7 +1375,7 @@ def parse_core_progress(text: str, stage_status: str) -> dict[str, Any]:
             }
         )
     if stage_status == "failed" and current_index is not None:
-        current_step = CORE_PROGRESS_STEPS[current_index][0]
+        current_step = step_specs[current_index][0]
     return {
         "status": stage_status,
         "current_step": current_step,
