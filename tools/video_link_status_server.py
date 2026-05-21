@@ -26,7 +26,7 @@ from video_analyzer.resource_locks import DEFAULT_LOCK_DIR
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_JOBS_DIR = REPO_ROOT / "tmp" / "video-link-status" / "jobs"
-BAOYU_PROMPT_SCRIPT = Path.home() / ".codex" / "skills" / "video-link" / "scripts" / "prepare_baoyu_image_prompts.py"
+BAOYU_PROMPT_SCRIPT = REPO_ROOT / "tools" / "prepare_baoyu_image_prompts.py"
 ALLOWED_ANALYSIS_MODES = ("auto", "fast", "balanced", "deep", "long-talk-fast")
 ALLOWED_COOKIE_BROWSERS = ("", "chrome", "none", "edge", "firefox", "chromium", "brave")
 DEFAULT_COOKIE_BROWSER = "chrome"

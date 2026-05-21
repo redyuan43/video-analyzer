@@ -177,6 +177,21 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
         self.assertIn("--skip-images", command)
 
+    def test_image_prompts_stage_uses_repo_script(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            loaded["run_dir"] = str(run_dir)
+
+            command = server.image_prompts_command(loaded)
+
+        self.assertEqual(command[0], server_mod.sys.executable)
+        self.assertEqual(command[1], str(REPO_ROOT / "tools" / "prepare_baoyu_image_prompts.py"))
+        self.assertEqual(command[2], str(run_dir))
+
     def test_failed_stage_can_be_retried(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
