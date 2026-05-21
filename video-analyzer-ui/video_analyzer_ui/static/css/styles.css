@@ -156,6 +156,29 @@ button.secondary {
     color: #1f2933;
 }
 
+button.success-action {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    background: #16a34a;
+    color: #fff;
+}
+
+button.success-action::before {
+    content: "\2713";
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, .22);
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1;
+}
+
 button:disabled {
     opacity: .55;
     cursor: default;

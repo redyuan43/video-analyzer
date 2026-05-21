@@ -1126,6 +1126,24 @@ class VideoLinkStatusServer:
             raise BridgeError(HTTPStatus.CONFLICT, f"run_dir does not exist: {path}")
         return path
 
+    def open_run_dir(self, job_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        if job.get("status") != "succeeded":
+            raise BridgeError(HTTPStatus.CONFLICT, "job must be succeeded before opening generated resources")
+        run_dir = self.require_run_dir(job)
+        code_bin = shutil.which("code")
+        if not code_bin:
+            raise BridgeError(HTTPStatus.SERVICE_UNAVAILABLE, "code command is not available on PATH")
+        command = [code_bin, str(run_dir)]
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return {"opened": True, "run_dir": str(run_dir), "command": ["code", str(run_dir)]}
+
     def collect_summary(self, job: dict[str, Any]) -> dict[str, Any]:
         run_dir_value = job.get("run_dir")
         if not run_dir_value:
@@ -2049,10 +2067,12 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
     .errorBox {{ display: none; border-color: #f5c2c7; background: #fff5f5; color: #842029; }}
     .errorBox strong {{ display: block; margin-bottom: 8px; }}
     .hint {{ margin-top: 8px; color: #5f6368; font-size: 13px; }}
-    .actions {{ margin-top: 14px; display: flex; gap: 10px; align-items: center; }}
-    button {{ border: 0; border-radius: 6px; padding: 9px 14px; background: #202124; color: #fff; font-size: 14px; cursor: pointer; }}
-    button.secondary {{ background: #eef2f7; color: #202124; }}
-    button:disabled {{ opacity: .55; cursor: default; }}
+	    .actions {{ margin-top: 14px; display: flex; gap: 10px; align-items: center; }}
+	    button {{ border: 0; border-radius: 6px; padding: 9px 14px; background: #202124; color: #fff; font-size: 14px; cursor: pointer; }}
+	    button.secondary {{ background: #eef2f7; color: #202124; }}
+	    button.success-action {{ display: inline-flex; align-items: center; justify-content: center; gap: 6px; background: #16a34a; color: #fff; }}
+	    button.success-action::before {{ content: "\\2713"; display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 999px; background: rgba(255,255,255,.22); font-size: 12px; font-weight: 700; line-height: 1; }}
+	    button:disabled {{ opacity: .55; cursor: default; }}
     .logLink {{ border: 0; background: transparent; color: #0969da; padding: 0; cursor: pointer; font: inherit; }}
     pre {{ margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.5; max-height: 420px; overflow: auto; }}
     a {{ color: #0969da; }}
@@ -2117,11 +2137,14 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
     </section>
   </main>
   <script>
-    const apiUrl = {json.dumps(api_url)};
-    let logUrl = {json.dumps(log_url)};
-    let selectedLogStage = null;
-    let currentJobId = {json.dumps(job_id)};
-    const stageNames = {json.dumps(STAGE_LABELS, ensure_ascii=False)};
+	    const apiUrl = {json.dumps(api_url)};
+	    const runActionUrl = `${{apiUrl}}/run`;
+	    const openRunDirActionUrl = `${{apiUrl}}/open-run-dir`;
+	    let logUrl = {json.dumps(log_url)};
+	    let selectedLogStage = null;
+	    let currentJobId = {json.dumps(job_id)};
+	    let currentJob = null;
+	    const stageNames = {json.dumps(STAGE_LABELS, ensure_ascii=False)};
     function text(id, value) {{ document.getElementById(id).textContent = value || "-"; }}
     function statusClass(status) {{ return "status " + (status || "pending"); }}
     function duration(value) {{ return value == null ? "-" : `${{value}}s`; }}
@@ -2139,13 +2162,18 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
       return job.current_stage || job.error_summary?.stage || job.next_stage || [...(job.stage_order || [])].reverse().find(stage => job.stages?.[stage]?.log_path);
     }}
     async function refresh() {{
-      const job = await fetch(apiUrl).then(r => r.json());
-      currentJobId = job.job_id;
-      const progress = job.progress || {{}};
-      text("status", job.status);
-      const runButton = document.getElementById("runButton");
-      runButton.disabled = job.status === "running" || job.runner?.status === "running";
-      runButton.textContent = job.status === "failed" ? "重试失败阶段" : "继续运行";
+	      const job = await fetch(apiUrl).then(r => r.json());
+	      currentJob = job;
+	      currentJobId = job.job_id;
+	      const progress = job.progress || {{}};
+	      text("status", job.status);
+	      const runButton = document.getElementById("runButton");
+	      const runDir = job.summary?.run_dir || job.run_dir;
+	      const isSucceeded = job.status === "succeeded";
+	      runButton.disabled = isSucceeded ? !runDir : (job.status === "running" || job.runner?.status === "running");
+	      runButton.classList.toggle("success-action", isSucceeded);
+	      runButton.textContent = isSucceeded ? "成功" : (job.status === "failed" ? "重试失败阶段" : "继续运行");
+	      runButton.title = isSucceeded && runDir ? `打开资源目录：${{runDir}}` : "";
       text("current", stageNames[job.current_stage] || job.current_stage);
       text("next", stageNames[job.next_stage] || job.next_stage);
       text("progressText", `${{progress.completed || 0}}/${{progress.total || 0}} · ${{progress.percent || 0}}%`);
@@ -2222,15 +2250,21 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
     document.getElementById("runButton").addEventListener("click", async () => {{
       const button = document.getElementById("runButton");
       const message = document.getElementById("runMessage");
-      button.disabled = true;
-      message.textContent = "已发送";
-      try {{
-        await fetch(`${{apiUrl}}/run`, {{ method: "POST", headers: {{ "Content-Type": "application/json" }}, body: "{{}}" }}).then(async r => {{
-          if (!r.ok) throw new Error((await r.json()).error || `HTTP ${{r.status}}`);
-          return r.json();
-        }});
-        message.textContent = "运行中";
-        await refresh();
+	      button.disabled = true;
+	      message.textContent = "已发送";
+	      try {{
+	        const action = currentJob?.status === "succeeded" ? "open-run-dir" : "run";
+	        const actionUrl = action === "open-run-dir" ? openRunDirActionUrl : runActionUrl;
+	        await fetch(actionUrl, {{ method: "POST", headers: {{ "Content-Type": "application/json" }}, body: "{{}}" }}).then(async r => {{
+	          if (!r.ok) throw new Error((await r.json()).error || `HTTP ${{r.status}}`);
+	          return r.json();
+	        }});
+	        message.textContent = action === "open-run-dir" ? "已打开资源目录" : "运行中";
+	        if (action === "run") {{
+	          await refresh();
+	        }} else {{
+	          button.disabled = false;
+	        }}
       }} catch (error) {{
         message.textContent = error.message;
         button.disabled = false;
@@ -2307,6 +2341,10 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/run", path)
             if match:
                 self.write_json(self.server_app.start_run(match.group(1)), HTTPStatus.ACCEPTED)
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/open-run-dir", path)
+            if match:
+                self.write_json(self.server_app.open_run_dir(match.group(1)))
                 return
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/stages/([a-z0-9-]+)", path)
             if match:

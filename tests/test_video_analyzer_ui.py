@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -85,6 +86,22 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertEqual(result["failed"], 1)
         self.assertEqual(list_response.get_json()["total"], 2)
 
+    def test_video_link_api_open_run_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp), video_link_auto_resume=False)
+            client = ui.app.test_client()
+            create = client.post(
+                "/api/video-link/jobs",
+                json={"video_url": "https://example.com/video", "analysis_mode": "fast"},
+            )
+            job_id = create.get_json()["job_id"]
+
+            with patch.object(ui.video_link, "open_run_dir", return_value={"opened": True, "run_dir": "/tmp/run"}):
+                response = client.post(f"/api/video-link/jobs/{job_id}/open-run-dir", json={})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["opened"])
+
     def test_legacy_job_url_redirects_to_home_selection(self):
         with tempfile.TemporaryDirectory() as tmp:
             ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp), video_link_auto_resume=False)
@@ -101,7 +118,10 @@ class VideoAnalyzerUITests(unittest.TestCase):
 
         self.assertIn("status-spinner", js)
         self.assertIn("stage-progress-meta", js)
+        self.assertIn("open-run-dir", js)
+        self.assertIn("成功", js)
         self.assertIn(".status.pending", css)
+        self.assertIn("button.success-action", css)
         self.assertIn(".job-item.queued", css)
         self.assertIn("@keyframes status-spin", css)
 

@@ -12,6 +12,7 @@ const stageNames = {
 let selectedJobId = new URLSearchParams(window.location.search).get('job');
 let selectedLogStage = null;
 let refreshTimer = null;
+let currentJob = null;
 
 const nodes = {
     jobForm: document.getElementById('jobForm'),
@@ -290,13 +291,21 @@ function bindJobButtons() {
 }
 
 function renderEmpty() {
+    currentJob = null;
     nodes.runButton.disabled = true;
+    nodes.runButton.classList.remove('success-action');
+    nodes.runButton.dataset.action = 'run';
+    nodes.runButton.title = '';
     nodes.selectedTitle.textContent = '未选择任务';
     nodes.selectedSubtitle.textContent = '创建或选择一个任务后查看进度。';
 }
 
 function renderServiceOffline(error) {
+    currentJob = null;
     nodes.runButton.disabled = true;
+    nodes.runButton.classList.remove('success-action');
+    nodes.runButton.dataset.action = 'run';
+    nodes.runButton.title = '';
     nodes.selectedTitle.textContent = '服务未连接';
     nodes.selectedSubtitle.textContent = error.message;
     setText(nodes.statusValue, 'offline');
@@ -321,15 +330,23 @@ function runDisabledReason(job) {
 }
 
 function renderJob(job) {
+    currentJob = job;
     const progress = job.progress || {};
     const stageProgress = job.stage_progress || job.core_progress;
     const queue = job.queue || {};
     const reason = runDisabledReason(job);
     const process = activeProcess(job);
+    const runDir = job.summary?.run_dir || job.run_dir;
+    const isSucceeded = job.status === 'succeeded';
+    const missingRunDir = isSucceeded && !runDir;
     nodes.selectedTitle.textContent = job.video_url || job.job_id;
-    nodes.selectedSubtitle.textContent = reason ? `任务 ID: ${job.job_id} · ${reason}` : `任务 ID: ${job.job_id}`;
-    nodes.runButton.disabled = Boolean(reason);
-    nodes.runButton.textContent = job.status === 'failed' ? '重试失败阶段' : '继续运行';
+    const subtitleReason = missingRunDir ? '资源目录不可用' : reason;
+    nodes.selectedSubtitle.textContent = subtitleReason ? `任务 ID: ${job.job_id} · ${subtitleReason}` : `任务 ID: ${job.job_id}`;
+    nodes.runButton.disabled = Boolean(subtitleReason);
+    nodes.runButton.dataset.action = isSucceeded ? 'open-run-dir' : 'run';
+    nodes.runButton.classList.toggle('success-action', isSucceeded);
+    nodes.runButton.textContent = isSucceeded ? '成功' : (job.status === 'failed' ? '重试失败阶段' : '继续运行');
+    nodes.runButton.title = isSucceeded && runDir ? `打开资源目录：${runDir}` : '';
     setText(nodes.statusValue, job.status);
     setText(nodes.currentStageValue, stageNames[job.current_stage] || job.current_stage);
     setText(nodes.nextStageValue, stageNames[job.next_stage] || job.next_stage);
@@ -452,12 +469,17 @@ async function runSelectedJob() {
     if (!selectedJobId) return;
     nodes.runButton.disabled = true;
     try {
-        await getJson(`/api/video-link/jobs/${selectedJobId}/run`, {
+        const action = currentJob?.status === 'succeeded' ? 'open-run-dir' : 'run';
+        await getJson(`/api/video-link/jobs/${selectedJobId}/${action}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: '{}'
         });
-        await refreshSelectedJob();
+        if (action === 'run') {
+            await refreshSelectedJob();
+        } else {
+            nodes.runButton.disabled = false;
+        }
     } catch (error) {
         nodes.selectedSubtitle.textContent = error.message;
         nodes.runButton.disabled = false;

@@ -528,6 +528,49 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(recovered["runner"]["status"], "succeeded")
         self.assertEqual(recovered["stages"]["final-publish"]["status"], "succeeded")
 
+    def test_open_run_dir_launches_code_for_succeeded_job(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
+            loaded = server.load_job(job["job_id"])
+            loaded["status"] = "succeeded"
+            loaded["run_dir"] = str(run_dir)
+            server.save_job(loaded)
+
+            with patch.object(server_mod.shutil, "which", return_value="/usr/bin/code"), patch.object(
+                server_mod.subprocess, "Popen"
+            ) as popen:
+                result = server.open_run_dir(job["job_id"])
+
+        self.assertTrue(result["opened"])
+        self.assertEqual(result["run_dir"], str(run_dir.resolve()))
+        self.assertEqual(result["command"], ["code", str(run_dir.resolve())])
+        popen.assert_called_once_with(
+            ["/usr/bin/code", str(run_dir.resolve())],
+            stdin=server_mod.subprocess.DEVNULL,
+            stdout=server_mod.subprocess.DEVNULL,
+            stderr=server_mod.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+    def test_open_run_dir_rejects_incomplete_job(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
+            loaded = server.load_job(job["job_id"])
+            loaded["status"] = "running"
+            loaded["run_dir"] = str(run_dir)
+            server.save_job(loaded)
+
+            with self.assertRaises(server_mod.BridgeError) as raised:
+                server.open_run_dir(job["job_id"])
+
+        self.assertEqual(raised.exception.status, server_mod.HTTPStatus.CONFLICT)
+
     def test_probe_auto_routes_long_video_to_long_talk_fast(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
@@ -832,6 +875,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
         self.assertIn('id="runButton"', html)
         self.assertIn("/run", html)
+        self.assertIn("/open-run-dir", html)
 
     def test_dashboard_contains_log_copy_and_core_progress_ui(self):
         with tempfile.TemporaryDirectory() as tmp:
