@@ -114,6 +114,7 @@ ORPHANED_PROCESS_REQUEUE_MESSAGE = (
 RESOURCE_WAIT_SECONDS = 5.0
 AUTO_RETRY_DELAY_SECONDS = float(os.environ.get("VIDEO_LINK_AUTO_RETRY_DELAY_SECONDS", "60"))
 AUTO_RETRY_POLL_SECONDS = float(os.environ.get("VIDEO_LINK_AUTO_RETRY_POLL_SECONDS", "5"))
+ANALYSIS_PROGRESS_FILENAME = "progress.json"
 CORE_PROGRESS_STEPS = [
     ("ray", "Ray 集群准备", (r"\[jetson-ray\]", r"Ray runtime started")),
     ("context", "页面/评论/素材准备", (r"Extracting cookies", r"\[youtube\]", r"Writing video metadata")),
@@ -889,17 +890,12 @@ class VideoLinkStatusServer:
             process = subprocess.Popen(
                 command,
                 cwd=str(self.repo_root),
-                stdout=subprocess.PIPE,
+                stdout=log_file,
                 stderr=subprocess.STDOUT,
-                text=True,
                 env=env,
             )
             if on_start:
                 on_start(process)
-            assert process.stdout is not None
-            for line in process.stdout:
-                log_file.write(line)
-                log_file.flush()
             return_code = process.wait()
         text = Path(log_path).read_text(encoding="utf-8", errors="replace")
         if return_code != 0:
@@ -1121,6 +1117,28 @@ class VideoLinkStatusServer:
                 return path
         return None
 
+    def core_progress_snapshot(self, job: dict[str, Any]) -> dict[str, Any] | None:
+        run_dir = self.discover_run_dir(job)
+        if not run_dir:
+            return None
+
+        snapshot: dict[str, Any] = {}
+        progress_path = run_dir / ANALYSIS_PROGRESS_FILENAME
+        if progress_path.is_file():
+            try:
+                loaded = json.loads(progress_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    snapshot.update(loaded)
+            except Exception:
+                pass
+
+        inferred = infer_core_progress_from_artifacts(run_dir)
+        if is_later_core_step(inferred.get("current_step"), snapshot.get("current_step")):
+            snapshot.update(inferred)
+        elif inferred and not snapshot:
+            snapshot.update(inferred)
+        return snapshot or None
+
     def core_artifacts_complete(self, run_dir: Path) -> bool:
         required = [
             run_dir / "analysis.json",
@@ -1316,11 +1334,14 @@ class VideoLinkStatusServer:
 
     def core_progress(self, job: dict[str, Any]) -> dict[str, Any] | None:
         stage_info = (job.get("stages") or {}).get("analyze-core") or {}
-        if not stage_info and not self.stage_log_path(job["job_id"], "analyze-core").exists():
+        snapshot = self.core_progress_snapshot(job)
+        if not stage_info and not self.stage_log_path(job["job_id"], "analyze-core").exists() and not snapshot:
             return None
         log_path = Path(stage_info.get("log_path") or self.stage_log_path(job["job_id"], "analyze-core"))
         text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
         progress = parse_core_progress(text, stage_info.get("status") or "pending")
+        if snapshot:
+            progress = merge_core_progress_snapshot(progress, snapshot, stage_info.get("status") or "pending")
         return self.annotate_stage_progress(job, "analyze-core", progress, stage_info)
 
     def stage_progress(self, job: dict[str, Any]) -> dict[str, Any] | None:
@@ -1679,6 +1700,101 @@ def process_alive(pid: Any) -> bool:
 
 def parse_core_progress(text: str, stage_status: str) -> dict[str, Any]:
     return parse_progress_steps(text, stage_status, CORE_PROGRESS_STEPS, CORE_PROGRESS_WEIGHTS)
+
+
+def core_step_index(step_id: Any) -> int | None:
+    for index, (candidate, _label, _patterns) in enumerate(CORE_PROGRESS_STEPS):
+        if candidate == step_id:
+            return index
+    return None
+
+
+def is_later_core_step(candidate: Any, current: Any) -> bool:
+    candidate_index = core_step_index(candidate)
+    if candidate_index is None:
+        return False
+    current_index = core_step_index(current)
+    return current_index is None or candidate_index > current_index
+
+
+def infer_core_progress_from_artifacts(run_dir: Path) -> dict[str, Any]:
+    signals = [
+        ("asr_done", run_dir / "transcript.md", "transcript file exists"),
+        ("asr_done", run_dir / "orin" / "transcript.md", "transcript file exists"),
+        ("frames_done", run_dir / "frame_manifest.json", "frame manifest exists"),
+        ("ocr_ready", run_dir / "orin" / "ocr_events.json", "OCR artifacts exist"),
+        ("vl", run_dir / "orin" / "frame_analyses.json", "VL artifacts exist"),
+        ("write", run_dir / "analysis.json", "analysis output exists"),
+    ]
+    best: dict[str, Any] = {}
+    for step_id, path, message in signals:
+        if path.is_file() and path.stat().st_size > 0 and is_later_core_step(step_id, best.get("current_step")):
+            best = {
+                "current_step": step_id,
+                "status": "running",
+                "message": message,
+                "artifacts": {step_id: str(path)},
+            }
+    required = [run_dir / "analysis.json", run_dir / "operation_manual.md", run_dir / "manual_evidence.md"]
+    if all(path.is_file() and path.stat().st_size > 0 for path in required):
+        best = {
+            "current_step": "write",
+            "status": "succeeded",
+            "message": "core artifacts complete",
+            "artifacts": {"analysis_json": str(run_dir / "analysis.json")},
+        }
+    return best
+
+
+def merge_core_progress_snapshot(
+    progress: dict[str, Any],
+    snapshot: dict[str, Any],
+    stage_status: str,
+) -> dict[str, Any]:
+    current_step = snapshot.get("current_step")
+    snapshot_index = core_step_index(current_step)
+    if snapshot_index is None:
+        return progress
+
+    parsed_index = max(
+        (
+            core_step_index(step.get("id")) or 0
+            for step in progress.get("steps", [])
+            if step.get("status") != "pending"
+        ),
+        default=None,
+    )
+    if parsed_index is not None and parsed_index > snapshot_index:
+        return progress
+
+    snapshot_status = str(snapshot.get("status") or "running")
+    merged = dict(progress)
+    steps = []
+    for index, step in enumerate(progress.get("steps") or []):
+        item = dict(step)
+        if snapshot_status == "succeeded":
+            item["status"] = "succeeded"
+        elif index < snapshot_index:
+            item["status"] = "succeeded"
+        elif index == snapshot_index:
+            item["status"] = "failed" if snapshot_status == "failed" else "running"
+            if snapshot.get("message") and not item.get("message"):
+                item["message"] = str(snapshot["message"])
+        elif item.get("status") != "pending":
+            item["status"] = "pending"
+        steps.append(item)
+
+    effective_status = "succeeded" if snapshot_status == "succeeded" else stage_status
+    if snapshot_status == "failed":
+        effective_status = "failed"
+    merged["status"] = effective_status
+    merged["current_step"] = None if effective_status in {"succeeded", "skipped"} else current_step
+    merged["current_label"] = next((step["label"] for step in steps if step["id"] == merged["current_step"]), None)
+    merged["percent"] = progress_percent_from_steps(steps, CORE_PROGRESS_STEPS, effective_status, CORE_PROGRESS_WEIGHTS)
+    merged["steps"] = steps
+    merged["source"] = "progress_json"
+    merged["progress_updated_at"] = snapshot.get("updated_at")
+    return merged
 
 
 def parse_stage_progress(stage: str, text: str, stage_status: str) -> dict[str, Any]:

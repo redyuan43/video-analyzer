@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 TRANSCRIPT_LINE_RE = re.compile(
     r"^-\s+\[(?P<start>\d\d:\d\d:\d\d)\s+-\s+(?P<end>\d\d:\d\d:\d\d)\]\s+(?P<text>.*)$"
 )
+PROGRESS_FILENAME = "progress.json"
 
 def get_log_level(level_str: str) -> int:
     """Convert string log level to logging constant."""
@@ -128,6 +129,33 @@ def cleanup_files(output_dir: Path):
             logger.debug(f"Cleaned up audio file: {audio_file}")
     except Exception as e:
         logger.error(f"Error during cleanup: {e}")
+
+
+def write_analysis_progress(
+    output_dir: Path,
+    current_step: str,
+    status: str = "running",
+    message: str | None = None,
+    artifacts: dict[str, str] | None = None,
+) -> None:
+    """Best-effort durable progress for status UIs; never fail analysis work."""
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "stage": "analyze-core",
+            "current_step": current_step,
+            "status": status,
+            "message": message,
+            "artifacts": artifacts or {},
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
+        }
+        progress_path = output_dir / PROGRESS_FILENAME
+        tmp_path = output_dir / f".{PROGRESS_FILENAME}.tmp"
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.replace(progress_path)
+    except Exception:
+        logger.debug("Could not write analysis progress", exc_info=True)
 
 
 def parse_auto_int_arg(value: str) -> int | str:
@@ -376,6 +404,7 @@ def main():
     # Initialize components
     video_path = Path(args.video_path)
     output_dir = Path(config.get("output_dir"))
+    output_dir.mkdir(parents=True, exist_ok=True)
     client = create_client(config)
     model = get_model(config)
     prompt_loader = PromptLoader(config.get("prompt_dir"), config.get("prompts", []))
@@ -399,11 +428,15 @@ def main():
         selected_frame_numbers = set()
         frame_decisions = []
         total_started = time.perf_counter()
+        current_progress_step = "audio"
+        write_analysis_progress(output_dir, current_progress_step, message="analysis started")
         
         # Stage 1: Frame and Audio Processing
         if args.start_stage <= 1:
             stage_started = time.perf_counter()
             if args.transcript_file:
+                current_progress_step = "asr"
+                write_analysis_progress(output_dir, current_progress_step, message="using existing transcript file")
                 transcript_path = Path(args.transcript_file)
                 logger.info("Using existing transcript file: %s", transcript_path)
                 transcript = read_transcript_markdown(transcript_path)
@@ -414,7 +447,16 @@ def main():
                     providers_run=["external_transcript_file"],
                 )
                 transcript_markdown_path = write_transcript_markdown(transcript, output_dir / "transcript.md")
+                current_progress_step = "asr_done"
+                write_analysis_progress(
+                    output_dir,
+                    current_progress_step,
+                    message="transcript ready",
+                    artifacts={"transcript": str(transcript_markdown_path)} if transcript_markdown_path else {},
+                )
             else:
+                current_progress_step = "audio"
+                write_analysis_progress(output_dir, current_progress_step, message="extracting audio")
                 logger.info("Extracting audio from video...")
                 try:
                     audio_path = extract_audio_to_wav(video_path, output_dir)
@@ -426,6 +468,8 @@ def main():
                     logger.debug("No audio found in video - skipping transcription")
                     transcript = None
                 else:
+                    current_progress_step = "asr"
+                    write_analysis_progress(output_dir, current_progress_step, message="transcribing audio")
                     logger.info("Transcribing audio...")
                     asr_config = config.get("asr", {})
                     provider = asr_config.get("provider", "faster_whisper")
@@ -481,8 +525,17 @@ def main():
                         logger.warning("Could not generate reliable transcript. Proceeding with video analysis only.")
                     else:
                         transcript_markdown_path = write_transcript_markdown(transcript, output_dir / "transcript.md")
+                        current_progress_step = "asr_done"
+                        write_analysis_progress(
+                            output_dir,
+                            current_progress_step,
+                            message="transcript ready",
+                            artifacts={"transcript": str(transcript_markdown_path)} if transcript_markdown_path else {},
+                        )
             timings["asr_seconds"] = round(time.perf_counter() - stage_started, 3)
             
+            current_progress_step = "frames"
+            write_analysis_progress(output_dir, current_progress_step, message="extracting candidate frames")
             logger.info(f"Extracting frames from video using model {model}...")
             stage_started = time.perf_counter()
             processor = VideoProcessor(
@@ -542,6 +595,13 @@ def main():
                     source=str(frame_extraction_metadata.get("backend", "unknown")),
                 )
                 frame_extraction_metadata["frame_manifest"] = str(frame_manifest_path)
+                current_progress_step = "frames_done"
+                write_analysis_progress(
+                    output_dir,
+                    current_progress_step,
+                    message="candidate frames ready",
+                    artifacts={"frame_manifest": str(frame_manifest_path)},
+                )
                 frame_selection_metadata = {
                     "pipeline_mode": args.pipeline_mode,
                     "video_duration_seconds": video_duration,
@@ -557,9 +617,18 @@ def main():
                 )
                 frame_manifest_path = write_frame_manifest(frames, output_dir, source="local_keyframes")
                 frame_extraction_metadata["frame_manifest"] = str(frame_manifest_path)
+                current_progress_step = "frames_done"
+                write_analysis_progress(
+                    output_dir,
+                    current_progress_step,
+                    message="candidate frames ready",
+                    artifacts={"frame_manifest": str(frame_manifest_path)},
+                )
             timings["candidate_frame_extraction_seconds"] = round(time.perf_counter() - stage_started, 3)
 
             if task == "operation_manual":
+                current_progress_step = "ocr"
+                write_analysis_progress(output_dir, current_progress_step, message="running OCR")
                 logger.info("Running OCR on extracted frames...")
                 stage_started = time.perf_counter()
                 ocr_config = config.get("ocr", {})
@@ -620,9 +689,13 @@ def main():
                     "cache_disabled": sum(1 for event in ocr_events if event.cache_status == "disabled"),
                 }
                 timings["ocr_seconds"] = round(time.perf_counter() - stage_started, 3)
+                current_progress_step = "ocr_ready"
+                write_analysis_progress(output_dir, current_progress_step, message="OCR results ready")
             
         # Stage 2: Frame Analysis
         if args.start_stage <= 2:
+            current_progress_step = "vl"
+            write_analysis_progress(output_dir, current_progress_step, message="selecting and analyzing VL frames")
             logger.info("Selecting and analyzing VL frames...")
             stage_started = time.perf_counter()
             analyzer = VideoAnalyzer(
@@ -678,6 +751,8 @@ def main():
         # Stage 3: Video Reconstruction
         if args.start_stage <= 3:
             if task == "operation_manual":
+                current_progress_step = "manual"
+                write_analysis_progress(output_dir, current_progress_step, message="generating operation manual")
                 logger.info("Generating operation manual...")
                 stage_started = time.perf_counter()
                 manual_config = config.get("operation_manual", {})
@@ -732,6 +807,8 @@ def main():
                 )
         
         output_dir.mkdir(parents=True, exist_ok=True)
+        current_progress_step = "write"
+        write_analysis_progress(output_dir, current_progress_step, message="writing analysis outputs")
         timings["total_seconds"] = round(time.perf_counter() - total_started, 3)
         results = {
             "metadata": {
@@ -821,9 +898,17 @@ def main():
             cleanup_files(output_dir)
         
         logger.info(f"Analysis complete. Results saved to {output_dir / 'analysis.json'}")
+        write_analysis_progress(
+            output_dir,
+            "write",
+            status="succeeded",
+            message="analysis complete",
+            artifacts={"analysis_json": str(output_dir / "analysis.json")},
+        )
             
     except Exception as e:
         logger.error(f"Error during video analysis: {e}")
+        write_analysis_progress(output_dir, current_progress_step, status="failed", message=str(e))
         if not config.get("keep_frames"):
             cleanup_files(output_dir)
         raise

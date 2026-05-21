@@ -835,6 +835,68 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         by_id = {step["id"]: step for step in progress["steps"]}
         self.assertIn("resource=asr", by_id["asr"]["message"])
 
+    def test_core_progress_prefers_progress_json_over_stale_asr_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "run_name": "operation-manual"})
+            loaded = server.load_job(job["job_id"])
+            video_dir = Path(tmp) / "video"
+            run_dir = video_dir / "operation-manual"
+            run_dir.mkdir(parents=True)
+            (run_dir / "progress.json").write_text(
+                json.dumps({"current_step": "frames", "status": "running", "message": "extracting candidate frames"}),
+                encoding="utf-8",
+            )
+            loaded["video_dir"] = str(video_dir)
+            loaded["status"] = "running"
+            loaded["runner"] = {"status": "running", "current_stage": "analyze-core"}
+            loaded["stages"]["analyze-core"] = {
+                "status": "running",
+                "process": {"pid": os.getpid()},
+                "log_path": str(server.stage_log_path(job["job_id"], "analyze-core")),
+            }
+            log_path = server.stage_log_path(job["job_id"], "analyze-core")
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text("2026-05-17 01:12:49,609 - INFO - Transcribing audio...\n", encoding="utf-8")
+            server.save_job(loaded)
+
+            progress = server.public_job(server.load_job(job["job_id"]))["stage_progress"]
+
+        by_id = {step["id"]: step for step in progress["steps"]}
+        self.assertEqual(progress["current_step"], "frames")
+        self.assertEqual(by_id["asr_done"]["status"], "succeeded")
+        self.assertEqual(by_id["frames"]["status"], "running")
+        self.assertEqual(progress["source"], "progress_json")
+
+    def test_core_progress_infers_asr_done_from_transcript_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "run_name": "operation-manual"})
+            loaded = server.load_job(job["job_id"])
+            video_dir = Path(tmp) / "video"
+            run_dir = video_dir / "operation-manual"
+            run_dir.mkdir(parents=True)
+            (run_dir / "transcript.md").write_text("# Transcript\n", encoding="utf-8")
+            loaded["video_dir"] = str(video_dir)
+            loaded["status"] = "running"
+            loaded["runner"] = {"status": "running", "current_stage": "analyze-core"}
+            loaded["stages"]["analyze-core"] = {
+                "status": "running",
+                "process": {"pid": os.getpid()},
+                "log_path": str(server.stage_log_path(job["job_id"], "analyze-core")),
+            }
+            log_path = server.stage_log_path(job["job_id"], "analyze-core")
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text("2026-05-17 01:12:49,609 - INFO - Transcribing audio...\n", encoding="utf-8")
+            server.save_job(loaded)
+
+            progress = server.public_job(server.load_job(job["job_id"]))["stage_progress"]
+
+        by_id = {step["id"]: step for step in progress["steps"]}
+        self.assertEqual(progress["current_step"], "asr_done")
+        self.assertEqual(by_id["asr"]["status"], "succeeded")
+        self.assertEqual(by_id["asr_done"]["status"], "running")
+
     def test_prepare_progress_parses_download_and_context_substeps(self):
         text = "\n".join(
             [
