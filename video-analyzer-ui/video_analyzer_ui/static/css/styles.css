@@ -659,6 +659,17 @@ th {
     white-space: nowrap;
 }
 
+.preview-success-link {
+    min-width: 0;
+    border: 0;
+    cursor: pointer;
+    pointer-events: auto;
+}
+
+.preview-success-link:hover {
+    filter: brightness(.95);
+}
+
 .scan-line {
     position: absolute;
     top: -22%;

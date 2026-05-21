@@ -516,6 +516,13 @@ function renderPreviewGrid(jobs) {
     updateScanFrames();
 }
 
+function previewStatusControl(job) {
+    if (job.status === 'succeeded') {
+        return `<button class="status succeeded preview-success-link" type="button" data-job-id="${escapeHtml(job.job_id)}" title="打开资源目录">succeeded</button>`;
+    }
+    return statusBadge(videoLoadErrors[job.job_id] ? 'failed' : job.status);
+}
+
 function renderPreviewCard(job) {
     const preview = job.preview || {};
     const ready = Boolean(preview.video_ready && preview.video_url && !videoLoadErrors[job.job_id]);
@@ -537,7 +544,7 @@ function renderPreviewCard(job) {
             ${video}
             <div class="scan-line" aria-hidden="true"></div>
             <div class="preview-status-row">
-                ${statusBadge(videoLoadErrors[job.job_id] ? 'failed' : job.status)}
+                ${previewStatusControl(job)}
                 <span>${escapeHtml(previewStage(job))}</span>
             </div>
         </div>
@@ -570,6 +577,9 @@ function bindPreviewControls() {
     document.querySelectorAll('.preview-play').forEach(button => {
         button.addEventListener('click', () => togglePreviewPlayback(button.dataset.jobId));
     });
+    document.querySelectorAll('.preview-success-link').forEach(button => {
+        button.addEventListener('click', () => openPreviewRunDir(button.dataset.jobId));
+    });
     document.querySelectorAll('.video-seek').forEach(input => {
         input.addEventListener('input', () => seekPreviewVideo(input));
     });
@@ -596,6 +606,26 @@ async function togglePreviewPlayback(jobId) {
         await video.play().catch(() => markPreviewVideoError(video));
     } else {
         video.pause();
+    }
+}
+
+async function openPreviewRunDir(jobId) {
+    if (!jobId) return;
+    const button = document.querySelector(`.preview-success-link[data-job-id="${CSS.escape(jobId)}"]`);
+    if (button) button.disabled = true;
+    try {
+        await getJson(`/api/video-link/jobs/${jobId}/open-run-dir`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}'
+        });
+    } catch (error) {
+        if (button) {
+            button.textContent = '打开失败';
+            button.title = error.message;
+        }
+    } finally {
+        if (button) button.disabled = false;
     }
 }
 
