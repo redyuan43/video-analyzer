@@ -18,6 +18,7 @@ SKIP_SEND=0
 LONG_PNG=0
 WECHAT_TO="${WECLAW_TO:-}"
 WECLAW_API_URL="${WECLAW_API_URL:-http://127.0.0.1:18011}"
+IMAGE_CODEX_SANDBOX="${VIDEO_DOC_IMAGE_CODEX_SANDBOX:-danger-full-access}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -127,7 +128,7 @@ generate_one_final_image() {
     local marker
     marker="$(mktemp)"
     touch "$marker"
-    echo "[images] codex exec image_gen: $(basename "$prompt_file")"
+    echo "[images] codex exec image_gen: $(basename "$prompt_file") sandbox=$IMAGE_CODEX_SANDBOX"
     local log_file
     log_file="$IMAGE_LOG_DIR/$prompt_base.codex.log"
     : > "$log_file"
@@ -146,7 +147,7 @@ generate_one_final_image() {
       )
     fi
     local codex_cmd=(
-      codex exec --cd "$RUN_DIR" --skip-git-repo-check --sandbox read-only "$(cat <<EOF
+      codex exec --cd "$RUN_DIR" --skip-git-repo-check --sandbox "$IMAGE_CODEX_SANDBOX" "$(cat <<EOF
 Use the \$imagegen skill with the built-in image_gen tool to generate exactly one PNG image from this prompt file:
 $prompt_file
 
