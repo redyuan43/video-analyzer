@@ -48,6 +48,7 @@ const nodes = {
     detailMode: document.getElementById('detailMode'),
     detailUpdated: document.getElementById('detailUpdated'),
     stageRows: document.getElementById('stageRows'),
+    stageDurationSummary: document.getElementById('stageDurationSummary'),
     corePanel: document.getElementById('corePanel'),
     corePanelTitle: document.getElementById('corePanelTitle'),
     coreRows: document.getElementById('coreRows'),
@@ -77,6 +78,28 @@ function setText(node, value) {
 
 function duration(value) {
     return value == null ? '-' : `${value}s`;
+}
+
+function durationMinutes(value) {
+    const seconds = Number(value);
+    if (!Number.isFinite(seconds) || seconds <= 0) return '-';
+    const minutes = seconds / 60;
+    if (minutes < 1) return `${seconds.toFixed(1)} 秒`;
+    return `${minutes.toFixed(1)} 分钟`;
+}
+
+function totalStageDuration(job) {
+    return (job.stage_order || []).reduce((total, stage) => {
+        const value = Number(job.stages?.[stage]?.duration_seconds);
+        return Number.isFinite(value) && value > 0 ? total + value : total;
+    }, 0);
+}
+
+function stageDurationSummary(job) {
+    const videoSeconds = Number(job.preview?.duration_seconds);
+    const videoText = `原视频长度：${durationMinutes(videoSeconds)}`;
+    const stageText = `阶段总耗时：${durationMinutes(totalStageDuration(job))}`;
+    return `${videoText} · ${stageText}`;
 }
 
 function formatClock(value) {
@@ -349,6 +372,7 @@ function renderEmpty() {
     nodes.runButton.title = '';
     nodes.selectedTitle.textContent = '未选择任务';
     nodes.selectedSubtitle.textContent = '创建或选择一个任务后查看进度。';
+    nodes.stageDurationSummary.textContent = '原视频长度：- · 阶段总耗时：-';
 }
 
 function renderServiceOffline(error) {
@@ -363,6 +387,7 @@ function renderServiceOffline(error) {
     setText(nodes.currentStageValue, '-');
     setText(nodes.nextStageValue, '-');
     setText(nodes.queueValue, '-');
+    nodes.stageDurationSummary.textContent = '原视频长度：- · 阶段总耗时：-';
     nodes.progressText.textContent = '0/0 · 0%';
     nodes.progressBar.style.width = '0%';
 }
@@ -448,6 +473,7 @@ function renderStages(job) {
             loadSelectedLog(job);
         });
     });
+    nodes.stageDurationSummary.textContent = stageDurationSummary(job);
 }
 
 function renderStageProgress(progress) {

@@ -2391,6 +2391,7 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
         <thead><tr><th>阶段</th><th>状态</th><th>耗时</th><th>日志</th></tr></thead>
         <tbody id="stages"></tbody>
       </table>
+      <div class="hint" id="stageDurationSummary">原视频长度：- · 阶段总耗时：-</div>
     </section>
     <section class="panel" id="corePanel" style="display:none">
       <h2>核心分析子项</h2>
@@ -2425,6 +2426,25 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
     function text(id, value) {{ document.getElementById(id).textContent = value || "-"; }}
     function statusClass(status) {{ return "status " + (status || "pending"); }}
     function duration(value) {{ return value == null ? "-" : `${{value}}s`; }}
+    function durationMinutes(value) {{
+      const seconds = Number(value);
+      if (!Number.isFinite(seconds) || seconds <= 0) return "-";
+      const minutes = seconds / 60;
+      if (minutes < 1) return `${{seconds.toFixed(1)}} 秒`;
+      return `${{minutes.toFixed(1)}} 分钟`;
+    }}
+    function totalStageDuration(job) {{
+      return (job.stage_order || []).reduce((total, stage) => {{
+        const value = Number(job.stages?.[stage]?.duration_seconds);
+        return Number.isFinite(value) && value > 0 ? total + value : total;
+      }}, 0);
+    }}
+    function stageDurationSummary(job) {{
+      const videoSeconds = Number(job.preview?.duration_seconds);
+      const videoText = `原视频长度：${{durationMinutes(videoSeconds)}}`;
+      const stageText = `阶段总耗时：${{durationMinutes(totalStageDuration(job))}}`;
+      return `${{videoText}} · ${{stageText}}`;
+    }}
     function escapeHtml(value) {{
       return String(value ?? "").replace(/[&<>"']/g, char => {{
         if (char === "&") return "&amp;";
@@ -2474,6 +2494,7 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
         const logCell = info.log_path ? `<button class="logLink" type="button" data-stage="${{stage}}">查看日志</button>` : "-";
         return `<tr><td>${{stageNames[stage] || stage}}${{errorText}}</td><td><span class="${{statusClass(info.status)}}">${{info.status || "pending"}}</span></td><td>${{duration(info.duration_seconds)}}</td><td>${{logCell}}</td></tr>`;
       }}).join("");
+      text("stageDurationSummary", stageDurationSummary(job));
       document.querySelectorAll(".logLink").forEach(button => {{
         button.addEventListener("click", async () => {{
           selectedLogStage = button.dataset.stage;
