@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -463,7 +464,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(recovered["stages"]["analyze-core"]["status"], "queued")
         self.assertNotIn("error", recovered["stages"]["analyze-core"])
 
-    def test_auto_resume_starts_requeued_interrupted_job(self):
+    def test_auto_resume_delays_requeued_interrupted_job(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
             job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
@@ -478,10 +479,66 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             server.save_job(loaded)
 
             with patch.object(server_mod.VideoLinkStatusServer, "start_run", autospec=True) as start_run:
-                server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT, auto_resume=True)
+                resumed = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT, auto_resume=True)
+                recovered = resumed.load_job(job["job_id"])
 
-        start_run.assert_called_once()
-        self.assertEqual(start_run.call_args.args[1], job["job_id"])
+        start_run.assert_not_called()
+        self.assertEqual(recovered["status"], "queued")
+        self.assertTrue(resumed.auto_retry_info(recovered).get("auto_retry"))
+
+    def test_auto_retry_starts_ready_interrupted_job(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
+            loaded = server.load_job(job["job_id"])
+            loaded["status"] = "queued"
+            loaded["runner"] = {
+                "status": "queued",
+                "current_stage": "final-publish",
+                "queued_for": "final-publish",
+                "error": server_mod.ORPHANED_PROCESS_REQUEUE_MESSAGE,
+                "server_pid": os.getpid(),
+            }
+            loaded["stages"]["final-publish"] = {
+                "status": "queued",
+                "queued_at": "2000-01-01T00:00:00+0800",
+                "queued_for": "final-publish",
+                "retry_reason": server_mod.ORPHANED_PROCESS_REQUEUE_MESSAGE,
+            }
+            server.save_job(loaded)
+
+            with patch.object(server, "resource_has_running_work", return_value=False), patch.object(server, "start_run") as start_run:
+                started = server.auto_retry_queued_jobs_once(now=time.time())
+
+        self.assertEqual(started, [job["job_id"]])
+        start_run.assert_called_once_with(job["job_id"])
+
+    def test_auto_retry_waits_until_resource_is_idle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
+            loaded = server.load_job(job["job_id"])
+            loaded["status"] = "queued"
+            loaded["runner"] = {
+                "status": "queued",
+                "current_stage": "final-publish",
+                "queued_for": "final-publish",
+                "error": server_mod.ORPHANED_PROCESS_REQUEUE_MESSAGE,
+                "server_pid": os.getpid(),
+            }
+            loaded["stages"]["final-publish"] = {
+                "status": "queued",
+                "queued_at": "2000-01-01T00:00:00+0800",
+                "queued_for": "final-publish",
+                "retry_reason": server_mod.ORPHANED_PROCESS_REQUEUE_MESSAGE,
+            }
+            server.save_job(loaded)
+
+            with patch.object(server, "resource_has_running_work", return_value=True), patch.object(server, "start_run") as start_run:
+                started = server.auto_retry_queued_jobs_once(now=time.time())
+
+        self.assertEqual(started, [])
+        start_run.assert_not_called()
 
     def test_load_job_keeps_orphaned_stage_running_when_process_is_alive(self):
         with tempfile.TemporaryDirectory() as tmp:

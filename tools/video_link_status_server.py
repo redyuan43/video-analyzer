@@ -112,6 +112,8 @@ ORPHANED_PROCESS_REQUEUE_MESSAGE = (
     "server stopped while this stage was running; process is gone and artifacts are incomplete; queued for retry"
 )
 RESOURCE_WAIT_SECONDS = 5.0
+AUTO_RETRY_DELAY_SECONDS = float(os.environ.get("VIDEO_LINK_AUTO_RETRY_DELAY_SECONDS", "60"))
+AUTO_RETRY_POLL_SECONDS = float(os.environ.get("VIDEO_LINK_AUTO_RETRY_POLL_SECONDS", "5"))
 CORE_PROGRESS_STEPS = [
     ("ray", "Ray 集群准备", (r"\[jetson-ray\]", r"Ray runtime started")),
     ("context", "页面/评论/素材准备", (r"Extracting cookies", r"\[youtube\]", r"Writing video metadata")),
@@ -200,10 +202,13 @@ class VideoLinkStatusServer:
         self.repo_root = repo_root
         self.runner_lock = threading.Lock()
         self.active_runners: dict[str, threading.Thread] = {}
+        self.auto_retry_stop = threading.Event()
+        self.auto_retry_thread: threading.Thread | None = None
         self.resource_locks = {name: threading.BoundedSemaphore(limit) for name, limit in RESOURCE_LIMITS.items()}
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         if auto_resume:
             self.recover_interrupted_jobs(auto_start=True)
+            self.start_auto_retry_loop()
 
     def options(self) -> dict[str, Any]:
         profiles = runtime_profile_names()
@@ -518,8 +523,88 @@ class VideoLinkStatusServer:
             return
         for recovered in recovered_jobs:
             recovered_runner = recovered.get("runner") or {}
-            if auto_start and recovered.get("status") == "queued" and recovered_runner.get("status") == "queued":
-                self.start_run(recovered["job_id"])
+            if not (auto_start and recovered.get("status") == "queued" and recovered_runner.get("status") == "queued"):
+                continue
+            if self.is_auto_retry_job(recovered):
+                continue
+            self.start_run(recovered["job_id"])
+
+    def start_auto_retry_loop(self) -> None:
+        if self.auto_retry_thread and self.auto_retry_thread.is_alive():
+            return
+        thread = threading.Thread(target=self._auto_retry_loop, daemon=True)
+        self.auto_retry_thread = thread
+        thread.start()
+
+    def _auto_retry_loop(self) -> None:
+        while not self.auto_retry_stop.wait(max(1.0, AUTO_RETRY_POLL_SECONDS)):
+            try:
+                self.auto_retry_queued_jobs_once()
+            except Exception:
+                continue
+
+    def auto_retry_queued_jobs_once(self, now: float | None = None) -> list[str]:
+        now = time.time() if now is None else now
+        candidates: list[dict[str, Any]] = []
+        for path in sorted(self.jobs_dir.glob("*/job.json")):
+            try:
+                job = self.load_job(path.parent.name)
+            except Exception:
+                continue
+            retry = self.auto_retry_info(job, now)
+            if retry.get("ready"):
+                job["_auto_retry"] = retry
+                candidates.append(job)
+
+        candidates.sort(key=lambda item: ((item.get("_auto_retry") or {}).get("queued_at_ts") or 0, item.get("job_id") or ""))
+        started: list[str] = []
+        started_resources: set[str] = set()
+        for job in candidates:
+            retry = job.get("_auto_retry") or {}
+            resource = str(retry.get("resource") or "")
+            if not resource or resource in started_resources or self.resource_has_running_work(resource):
+                continue
+            job_id = str(job.get("job_id") or "")
+            if not job_id:
+                continue
+            self.start_run(job_id)
+            started.append(job_id)
+            started_resources.add(resource)
+        return started
+
+    def is_auto_retry_job(self, job: dict[str, Any]) -> bool:
+        return bool(self.auto_retry_info(job).get("auto_retry"))
+
+    def auto_retry_info(self, job: dict[str, Any], now: float | None = None) -> dict[str, Any]:
+        runner = job.get("runner") or {}
+        stage = normalize_stage_name(runner.get("current_stage") or self.current_stage(job) or "")
+        if job.get("status") != "queued" or runner.get("status") != "queued" or not stage:
+            return {}
+        stage_info = (job.get("stages") or {}).get(stage) or {}
+        if runner.get("error") != ORPHANED_PROCESS_REQUEUE_MESSAGE and stage_info.get("retry_reason") != ORPHANED_PROCESS_REQUEUE_MESSAGE:
+            return {}
+        queued_at = stage_info.get("queued_at") or runner.get("updated_at") or job.get("updated_at")
+        queued_at_ts = parse_iso_timestamp(queued_at)
+        if queued_at_ts is None:
+            queued_at_ts = time.time()
+        now = time.time() if now is None else now
+        delay = max(0.0, AUTO_RETRY_DELAY_SECONDS)
+        retry_after = max(0.0, queued_at_ts + delay - now)
+        resource = runner.get("queued_for") or stage_info.get("queued_for") or stage_resource(stage)
+        return {
+            "auto_retry": True,
+            "ready": retry_after <= 0,
+            "retry_after_seconds": int(round(retry_after)),
+            "retry_delay_seconds": int(round(delay)),
+            "queued_at_ts": queued_at_ts,
+            "resource": resource,
+            "stage": stage,
+        }
+
+    def resource_has_running_work(self, resource: str) -> bool:
+        resources = self.resource_summary()
+        info = resources.get(resource) or {}
+        return int(info.get("running_count") or 0) > 0
 
     def _run_remaining_stages(self, job_id: str) -> None:
         try:
@@ -1217,7 +1302,17 @@ class VideoLinkStatusServer:
                 queued.append(candidate)
         queued.sort(key=lambda item: item.get("updated_at") or item.get("created_at") or "")
         position = next((index + 1 for index, item in enumerate(queued) if item.get("job_id") == job.get("job_id")), None)
-        return {"stage": stage, "resource": resource, "position": position, "size": len(queued)}
+        info = {"stage": stage, "resource": resource, "position": position, "size": len(queued)}
+        retry = self.auto_retry_info(job)
+        if retry.get("auto_retry"):
+            info.update(
+                {
+                    "auto_retry": True,
+                    "retry_after_seconds": retry.get("retry_after_seconds"),
+                    "retry_delay_seconds": retry.get("retry_delay_seconds"),
+                }
+            )
+        return info
 
     def core_progress(self, job: dict[str, Any]) -> dict[str, Any] | None:
         stage_info = (job.get("stages") or {}).get("analyze-core") or {}
@@ -1890,6 +1985,15 @@ def tail_lines(text: str, limit: int = 40) -> list[str]:
 
 def iso_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def parse_iso_timestamp(value: Any) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S%z").timestamp()
+    except ValueError:
+        return None
 
 
 def render_create_page(options: dict[str, Any]) -> str:
