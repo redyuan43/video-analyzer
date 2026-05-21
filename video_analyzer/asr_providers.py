@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 CAPSWRITER_URL = "http://spark-31d6.taild500c8.ts.net:8001/api/asr/transcribe"
 REMOTE_VIBEVOICE_URLS = [
     "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
+    "http://edgexpert-4353.taild500c8.ts.net:8012/api/asr/transcribe",
 ]
 REMOTE_ASR_URLS = [
     "http://spark-31d6.taild500c8.ts.net:8001/api/asr/transcribe",
@@ -29,9 +30,17 @@ REMOTE_ASR_URLS = [
 
 DEEP_ASR_MIN_SECONDS = 180.0
 VIBEVOICE_DISTRIBUTED_MIN_SECONDS = 420.0
-HTTP_ASR_RETRY_STATUSES = {429, 502, 503, 504}
+HTTP_ASR_RETRY_STATUSES = {429, 500, 502, 503, 504}
 HTTP_ASR_MAX_ATTEMPTS = 6
 HTTP_ASR_RETRY_DELAY_SECONDS = 10.0
+HTTP_ASR_CONNECT_TIMEOUT_SECONDS = 30.0
+HTTP_ASR_READ_TIMEOUT_SECONDS = 900.0
+VIBEVOICE_REMOTE_MAX_ATTEMPTS = 3
+VIBEVOICE_REMOTE_RETRY_DELAY_SECONDS = 60.0
+VIBEVOICE_NATIVE_SINGLE_PASS_MAX_SECONDS = 420.0
+VIBEVOICE_NATIVE_CHUNK_SECONDS = 120.0
+VIBEVOICE_NATIVE_CHUNK_OVERLAP_SECONDS = 10.0
+VIBEVOICE_NATIVE_CHUNK_PARALLEL_WORKERS = 2
 
 
 @dataclass
@@ -99,18 +108,23 @@ def transcribe_with_http_asr(
     url: str,
     hotword: str = "",
     extra_data: Optional[Dict[str, object]] = None,
+    timeout: Optional[Tuple[float, float]] = None,
+    max_attempts: int = HTTP_ASR_MAX_ATTEMPTS,
+    retry_delay_seconds: float = HTTP_ASR_RETRY_DELAY_SECONDS,
 ) -> Optional[AudioTranscript]:
     form_data = {"hotword": hotword}
     if extra_data:
         form_data.update({key: str(value) for key, value in extra_data.items() if value is not None})
-    for attempt in range(1, HTTP_ASR_MAX_ATTEMPTS + 1):
+    request_timeout = timeout or (HTTP_ASR_CONNECT_TIMEOUT_SECONDS, HTTP_ASR_READ_TIMEOUT_SECONDS)
+    attempts = max(1, int(max_attempts))
+    for attempt in range(1, attempts + 1):
         try:
             with audio_path.open("rb") as audio_file:
                 response = requests.post(
                     url,
                     files={"audio": (audio_path.name, audio_file, "audio/wav")},
                     data=form_data,
-                    timeout=(30, 900),
+                    timeout=request_timeout,
                 )
             response.raise_for_status()
             payload = response.json()
@@ -124,30 +138,30 @@ def transcribe_with_http_asr(
             )
         except requests.HTTPError as exc:
             status_code = exc.response.status_code if exc.response is not None else None
-            if status_code in HTTP_ASR_RETRY_STATUSES and attempt < HTTP_ASR_MAX_ATTEMPTS:
+            if status_code in HTTP_ASR_RETRY_STATUSES and attempt < attempts:
                 logger.warning(
                     "HTTP ASR unavailable from %s: %s; retrying in %.0fs (%d/%d)",
                     url,
                     exc,
-                    HTTP_ASR_RETRY_DELAY_SECONDS,
+                    retry_delay_seconds,
                     attempt,
-                    HTTP_ASR_MAX_ATTEMPTS,
+                    attempts,
                 )
-                time.sleep(HTTP_ASR_RETRY_DELAY_SECONDS)
+                time.sleep(retry_delay_seconds)
                 continue
             logger.warning("HTTP ASR unavailable from %s: %s", url, exc)
             return None
         except requests.RequestException as exc:
-            if attempt < HTTP_ASR_MAX_ATTEMPTS:
+            if attempt < attempts:
                 logger.warning(
                     "HTTP ASR unavailable from %s: %s; retrying in %.0fs (%d/%d)",
                     url,
                     exc,
-                    HTTP_ASR_RETRY_DELAY_SECONDS,
+                    retry_delay_seconds,
                     attempt,
-                    HTTP_ASR_MAX_ATTEMPTS,
+                    attempts,
                 )
-                time.sleep(HTTP_ASR_RETRY_DELAY_SECONDS)
+                time.sleep(retry_delay_seconds)
                 continue
             logger.warning("HTTP ASR unavailable from %s: %s", url, exc)
             return None
@@ -183,16 +197,52 @@ def transcribe_with_vibevoice_remote(
     options = options or {}
     duration = _wav_duration(audio_path)
     distributed_min_seconds = float(options.get("distributed_min_seconds") or VIBEVOICE_DISTRIBUTED_MIN_SECONDS)
-    if len(urls) > 1 and duration >= distributed_min_seconds:
+    use_native_chunking = _truthy_option(options.get("use_native_chunking"), default=True)
+    if not use_native_chunking and len(urls) > 1 and duration >= distributed_min_seconds:
         transcript = transcribe_with_vibevoice_distributed(audio_path, urls, options)
         if transcript and transcript.text.strip():
             return transcript
-    for url in urls:
-        transcript = transcribe_with_http_asr(audio_path, url, extra_data=options)
-        if transcript and transcript.text.strip():
-            transcript.segments = transcript.segments or []
-            transcript.segments.append({"provider": "vibevoice_remote", "provider_url": url})
-            return transcript
+    request_options = _vibevoice_request_options(options)
+    request_timeout = _http_timeout_for_audio(duration, request_options)
+    max_attempts = max(1, int(options.get("remote_max_attempts") or VIBEVOICE_REMOTE_MAX_ATTEMPTS))
+    retry_delay = float(options.get("remote_retry_delay_seconds") or VIBEVOICE_REMOTE_RETRY_DELAY_SECONDS)
+    for attempt in range(1, max_attempts + 1):
+        for url in urls:
+            logger.info(
+                "Requesting VibeVoice ASR from %s (attempt %d/%d, audio %.1fs, read timeout %.0fs)",
+                url,
+                attempt,
+                max_attempts,
+                duration,
+                request_timeout[1],
+            )
+            transcript = transcribe_with_http_asr(
+                audio_path,
+                url,
+                extra_data=request_options,
+                timeout=request_timeout,
+                max_attempts=1,
+            )
+            if transcript and transcript.text.strip():
+                transcript.segments = transcript.segments or []
+                transcript.segments.append(
+                    {
+                        "provider": "vibevoice_remote",
+                        "provider_url": url,
+                        "attempt": attempt,
+                        "audio_duration_seconds": duration,
+                        "read_timeout_seconds": request_timeout[1],
+                    }
+                )
+                return transcript
+        if attempt < max_attempts:
+            logger.warning(
+                "All VibeVoice endpoints failed; retrying endpoint set in %.0fs (%d/%d)",
+                retry_delay,
+                attempt,
+                max_attempts,
+            )
+            time.sleep(retry_delay)
     return None
 
 
@@ -239,11 +289,17 @@ def transcribe_with_vibevoice_distributed(
         return _merge_distributed_vibevoice_results(results)
 
 
-def transcribe_with_vibevoice(audio_path: Path, config: Optional[Dict[str, str]] = None) -> Optional[AudioTranscript]:
+def transcribe_with_vibevoice(audio_path: Path, config: Optional[Dict[str, object]] = None) -> Optional[AudioTranscript]:
     config = config or {}
     remote_urls = config["deep_remote_urls"] if "deep_remote_urls" in config else None
     options = {
         "use_native_chunking": config.get("use_native_chunking", True),
+        "single_pass_max_duration_sec": config.get("single_pass_max_duration_sec"),
+        "chunk_duration_sec": config.get("chunk_duration_sec"),
+        "chunk_overlap_sec": config.get("chunk_overlap_sec"),
+        "chunk_parallel_workers": config.get("chunk_parallel_workers"),
+        "remote_max_attempts": config.get("remote_max_attempts"),
+        "remote_retry_delay_seconds": config.get("remote_retry_delay_seconds"),
         "distributed_min_seconds": config.get("distributed_min_seconds", VIBEVOICE_DISTRIBUTED_MIN_SECONDS),
         "distributed_workers": config.get("distributed_workers"),
     }
@@ -256,7 +312,7 @@ def transcribe_with_provider(
     language: str,
     whisper_model: str,
     device: str,
-    vibevoice_config: Optional[Dict[str, str]] = None,
+    vibevoice_config: Optional[Dict[str, object]] = None,
 ) -> Optional[AudioTranscript]:
     return transcribe_with_provider_result(
         provider=provider,
@@ -274,7 +330,7 @@ def transcribe_with_provider_result(
     language: str,
     whisper_model: str,
     device: str,
-    vibevoice_config: Optional[Dict[str, str]] = None,
+    vibevoice_config: Optional[Dict[str, object]] = None,
 ) -> ASRStrategyResult:
     vibevoice_config = vibevoice_config or {}
     result = ASRStrategyResult(strategy=f"provider:{provider}", transcript=None)
@@ -322,7 +378,7 @@ def transcribe_with_strategy(
     language: str,
     whisper_model: str,
     device: str,
-    vibevoice_config: Optional[Dict[str, str]] = None,
+    vibevoice_config: Optional[Dict[str, object]] = None,
 ) -> ASRStrategyResult:
     """Run the dual-ASR strategy used by operation_manual.
 
@@ -554,6 +610,53 @@ def _shift_segment_time(segment: Dict[str, object], key: str, offset: float) -> 
         segment[key] = float(segment[key]) + offset
     except (TypeError, ValueError):
         return
+
+
+def _truthy_option(value: object, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "no", "off"}
+    return bool(value)
+
+
+def _vibevoice_request_options(options: Dict[str, object]) -> Dict[str, object]:
+    request_options = dict(options)
+    if _truthy_option(request_options.get("use_native_chunking"), default=True):
+        request_options["use_native_chunking"] = True
+        _set_default_when_empty(request_options, "single_pass_max_duration_sec", VIBEVOICE_NATIVE_SINGLE_PASS_MAX_SECONDS)
+        _set_default_when_empty(request_options, "chunk_duration_sec", VIBEVOICE_NATIVE_CHUNK_SECONDS)
+        _set_default_when_empty(request_options, "chunk_overlap_sec", VIBEVOICE_NATIVE_CHUNK_OVERLAP_SECONDS)
+        _set_default_when_empty(request_options, "chunk_parallel_workers", VIBEVOICE_NATIVE_CHUNK_PARALLEL_WORKERS)
+    for key in ("distributed_min_seconds", "distributed_workers", "remote_max_attempts", "remote_retry_delay_seconds"):
+        request_options.pop(key, None)
+    return request_options
+
+
+def _set_default_when_empty(options: Dict[str, object], key: str, default: object) -> None:
+    if options.get(key) is None or options.get(key) == "":
+        options[key] = default
+
+
+def _http_timeout_for_audio(duration_seconds: float, options: Optional[Dict[str, object]] = None) -> Tuple[float, float]:
+    options = options or {}
+    if duration_seconds <= 0:
+        return (HTTP_ASR_CONNECT_TIMEOUT_SECONDS, HTTP_ASR_READ_TIMEOUT_SECONDS)
+    try:
+        configured = float(options.get("read_timeout_seconds") or 0)
+    except (TypeError, ValueError):
+        configured = 0.0
+    if configured > 0:
+        read_timeout = configured
+    else:
+        warmup_buffer = 180.0
+        read_timeout = duration_seconds + warmup_buffer
+    read_timeout = min(max(read_timeout, 300.0), 7200.0)
+    return (HTTP_ASR_CONNECT_TIMEOUT_SECONDS, read_timeout)
 
 
 def _should_run_deep_asr(audio_path: Path, fast_transcript: Optional[AudioTranscript]) -> bool:

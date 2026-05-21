@@ -225,9 +225,13 @@ class OperationManualTests(unittest.TestCase):
             self.assertEqual(config.get("asr")["vibevoice"]["remote_urls"], [])
             self.assertEqual(
                 config.get("asr")["vibevoice"]["deep_remote_urls"],
-                ["http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe"],
+                [
+                    "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
+                    "http://edgexpert-4353.taild500c8.ts.net:8012/api/asr/transcribe",
+                ],
             )
             self.assertTrue(config.get("asr")["vibevoice"]["use_native_chunking"])
+            self.assertEqual(config.get("asr")["vibevoice"]["chunk_parallel_workers"], 2)
             self.assertEqual(
                 config.get("ocr")["fallback_model"],
                 "hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
@@ -956,10 +960,16 @@ class OperationManualTests(unittest.TestCase):
             ],
         )
 
-    def test_asr_default_endpoints_use_spark_tailscale_only(self):
+    def test_asr_default_endpoints_use_spark_edge_tailscale(self):
         self.assertEqual(REMOTE_ASR_URLS, ["http://spark-31d6.taild500c8.ts.net:8001/api/asr/transcribe"])
-        self.assertEqual(REMOTE_VIBEVOICE_URLS, ["http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe"])
-        self.assertTrue(all("spark-31d6.taild500c8.ts.net" in url for url in [*REMOTE_ASR_URLS, *REMOTE_VIBEVOICE_URLS]))
+        self.assertEqual(
+            REMOTE_VIBEVOICE_URLS,
+            [
+                "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
+                "http://edgexpert-4353.taild500c8.ts.net:8012/api/asr/transcribe",
+            ],
+        )
+        self.assertTrue(all("spark-31d6.taild500c8.ts.net" in url for url in REMOTE_ASR_URLS))
 
     def test_ocr_provider_parses_dots_mocr_json(self):
         if cv2 is None:
@@ -1648,11 +1658,46 @@ class OperationManualTests(unittest.TestCase):
 
         self.assertEqual(transcript.text, "native chunk text")
         self.assertEqual(post.call_args.kwargs["data"]["use_native_chunking"], "True")
-        self.assertNotIn("chunk_parallel_workers", post.call_args.kwargs["data"])
-        self.assertNotIn("chunk_duration_sec", post.call_args.kwargs["data"])
+        self.assertEqual(post.call_args.kwargs["data"]["single_pass_max_duration_sec"], "420.0")
+        self.assertEqual(post.call_args.kwargs["data"]["chunk_parallel_workers"], "2")
+        self.assertEqual(post.call_args.kwargs["data"]["chunk_duration_sec"], "120.0")
         audio_path.unlink()
 
-    def test_vibevoice_distributes_long_audio_across_remote_workers(self):
+    def test_vibevoice_native_chunking_uses_endpoint_failover_instead_of_client_split(self):
+        audio_path = Path(tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name)
+        with wave.open(str(audio_path), "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(16000)
+            wav_file.writeframes(b"\x00\x00" * 16000 * 500)
+        failed = Mock()
+        failed.raise_for_status.side_effect = RuntimeError("offline")
+        ok = Mock()
+        ok.raise_for_status.return_value = None
+        ok.json.return_value = {
+            "success": True,
+            "text": "edge native chunk text",
+            "language": "zh",
+            "segments": [{"mode": "ray_chunk_reconcile"}],
+        }
+
+        with patch("video_analyzer.asr_providers._split_audio_evenly") as split_audio, patch(
+            "video_analyzer.asr_providers.requests.post", side_effect=[failed, ok]
+        ) as post, patch("video_analyzer.asr_providers.time.sleep"):
+            transcript = transcribe_with_vibevoice_remote(
+                audio_path,
+                ["http://spark/vibevoice", "http://edge/vibevoice"],
+                {"use_native_chunking": True, "distributed_min_seconds": 420, "distributed_workers": 2},
+            )
+
+        self.assertEqual(transcript.text, "edge native chunk text")
+        split_audio.assert_not_called()
+        self.assertEqual([call.args[0] for call in post.call_args_list], ["http://spark/vibevoice", "http://edge/vibevoice"])
+        self.assertEqual(post.call_args.kwargs["data"]["chunk_parallel_workers"], "2")
+        self.assertEqual(post.call_args.kwargs["timeout"], (30.0, 680.0))
+        audio_path.unlink()
+
+    def test_vibevoice_distributes_long_audio_across_remote_workers_when_native_chunking_disabled(self):
         audio_path = Path(tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name)
         with wave.open(str(audio_path), "wb") as wav_file:
             wav_file.setnchannels(1)
@@ -1669,7 +1714,7 @@ class OperationManualTests(unittest.TestCase):
             transcript = transcribe_with_vibevoice_remote(
                 audio_path,
                 ["http://spark/vibevoice", "http://edge/vibevoice"],
-                {"use_native_chunking": True, "distributed_min_seconds": 420, "distributed_workers": 2},
+                {"use_native_chunking": False, "distributed_min_seconds": 420, "distributed_workers": 2},
             )
 
         self.assertEqual(transcript.text, "spark half\nedge half")

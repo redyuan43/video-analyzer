@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--duration", type=float, help="Optional duration in seconds to process")
     parser.add_argument("--manual-language")
     parser.add_argument("--asr-provider", choices=["none", "vibevoice"], help="Analyzer ASR provider when no subtitle transcript is used")
-    parser.add_argument("--vibevoice-url", help="Remote GPU VibeVoice ASR endpoint")
+    parser.add_argument("--vibevoice-url", action="append", help="Remote GPU VibeVoice ASR endpoint; can be provided multiple times")
     parser.add_argument("--ocr-base-url", action="append", help="DotsMOCR OpenAI-compatible base URL; can be provided multiple times")
     parser.add_argument("--ocr-concurrency", help="OCR concurrency per endpoint, or auto")
     parser.add_argument("--ocr-cache", choices=["on", "off", "refresh"], help="OCR cache mode")
@@ -122,7 +122,7 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
         "vl_context_max_gap": profile.get("vl_context_max_gap", "auto"),
         "manual_language": profile.get("manual_language", "zh-CN"),
         "asr_provider": profile.get("asr_provider", "vibevoice"),
-        "vibevoice_url": profile.get("vibevoice_url"),
+        "vibevoice_url": profile.get("vibevoice_urls") or profile.get("vibevoice_url"),
         "ocr_base_url": profile.get("ocr_base_urls") or profile.get("ocr_base_url"),
         "ocr_concurrency": profile.get("ocr_concurrency", "auto"),
         "ocr_cache": profile.get("ocr_cache", "on"),
@@ -781,26 +781,28 @@ def build_analyzer_command(args: argparse.Namespace, video_path: Path, context_p
     if getattr(args, "transcript_file", None):
         command.extend(["--transcript-file", args.transcript_file, "--asr-provider", "none"])
     else:
-        command.extend(["--asr-provider", args.asr_provider or "vibevoice"])
-        if (args.asr_provider or "vibevoice") == "vibevoice":
-            command.extend(["--vibevoice-url", args.vibevoice_url])
+        asr_provider = getattr(args, "asr_provider", None) or "vibevoice"
+        command.extend(["--asr-provider", asr_provider])
+        if asr_provider == "vibevoice":
+            for vibevoice_url in _as_list(args.vibevoice_url):
+                command.extend(["--vibevoice-url", vibevoice_url])
     command.extend(
         [
             "--frame-extractor",
-            args.frame_extractor,
+            getattr(args, "frame_extractor", "local"),
             "--jetson-frame-hosts",
-            args.jetson_frame_hosts,
+            getattr(args, "jetson_frame_hosts", "nx2,nx3"),
             "--jetson-frame-backend",
-            args.jetson_frame_backend,
+            getattr(args, "jetson_frame_backend", "auto"),
             "--jetson-sample-fps",
-            str(args.jetson_sample_fps),
+            str(getattr(args, "jetson_sample_fps", "auto")),
             "--jetson-chunk-overlap-seconds",
-            str(args.jetson_chunk_overlap_seconds),
+            str(getattr(args, "jetson_chunk_overlap_seconds", 2.0)),
         ]
     )
-    if args.jetson_frame_weights:
+    if getattr(args, "jetson_frame_weights", ""):
         command.extend(["--jetson-frame-weights", args.jetson_frame_weights])
-    if args.jetson_require_hwdec:
+    if getattr(args, "jetson_require_hwdec", False):
         command.append("--jetson-require-hwdec")
     for endpoint in normalize_cli_list(args.ocr_base_url):
         command.extend(["--ocr-base-url", endpoint])
@@ -881,6 +883,14 @@ def shell_quote(value: str) -> str:
     if re.fullmatch(r"[A-Za-z0-9_./:=@?+-]+", value):
         return value
     return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def _as_list(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value if item]
+    return [str(value)]
 
 
 if __name__ == "__main__":
