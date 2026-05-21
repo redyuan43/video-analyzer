@@ -726,6 +726,31 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(result["error_summary"]["stage"], "analyze-core")
         self.assertIn("ASR endpoint timed out", result["error_summary"]["message"])
 
+    def test_public_job_includes_video_preview_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            video = Path(tmp) / "video.mp4"
+            video.write_bytes(b"fake video")
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            loaded["video_path"] = str(video)
+            loaded["stages"]["probe"] = {"status": "succeeded", "artifacts": {"duration_seconds": 125}}
+            result = server.public_job(loaded)
+
+        self.assertTrue(result["preview"]["video_ready"])
+        self.assertEqual(result["preview"]["video_url"], f"/api/video-link/jobs/{job['job_id']}/video")
+        self.assertEqual(result["preview"]["duration_seconds"], 125)
+
+    def test_preview_video_file_rejects_missing_video(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+
+            with self.assertRaises(server_mod.BridgeError) as raised:
+                server.preview_video_file(job["job_id"])
+
+        self.assertEqual(raised.exception.status, server_mod.HTTPStatus.CONFLICT)
+
     def test_stage_log_can_return_tail_or_full_text(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)

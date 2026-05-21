@@ -82,17 +82,23 @@ EXPORT_DIR="$RUN_DIR/exports"
 mkdir -p "$FINAL_DIR" "$IMAGE_LOG_DIR" "$EXPORT_DIR"
 
 declare -a FINAL_IMAGES=(
-  "01-image-cards-operation-manual.png"
   "02-infographic-knowledge-notes.png"
   "03-infographic-deep-report.png"
   "04-infographic-manual-evidence.png"
 )
 
 declare -a PROMPTS=(
-  "01-image-cards-operation-manual.md"
   "02-infographic-knowledge-notes.md"
   "03-infographic-deep-report.md"
   "04-infographic-manual-evidence.md"
+)
+
+declare -a DEPRECATED_FINAL_IMAGES=(
+  "01-image-cards-operation-manual.png"
+)
+
+declare -a DEPRECATED_PROMPTS=(
+  "01-image-cards-operation-manual.md"
 )
 
 declare -a DOCS=(
@@ -101,6 +107,15 @@ declare -a DOCS=(
   "deep_report_v2"
   "manual_evidence"
 )
+
+cleanup_deprecated_image_outputs() {
+  for name in "${DEPRECATED_FINAL_IMAGES[@]}"; do
+    rm -f "$FINAL_DIR/$name"
+  done
+  for name in "${DEPRECATED_PROMPTS[@]}"; do
+    rm -f "$PROMPT_DIR/$name" "$IMAGE_LOG_DIR/${name%.md}.codex.log"
+  done
+}
 
 generate_final_images() {
   if [ ! -d "$PROMPT_DIR" ]; then
@@ -280,6 +295,7 @@ send_outputs() {
 }
 
 cd "$ROOT_DIR"
+cleanup_deprecated_image_outputs
 
 if [ "$SKIP_IMAGES" -eq 0 ]; then
   generate_final_images &

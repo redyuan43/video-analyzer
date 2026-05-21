@@ -12,9 +12,17 @@ const stageNames = {
 let selectedJobId = new URLSearchParams(window.location.search).get('job');
 let selectedLogStage = null;
 let refreshTimer = null;
+let scanAnimationFrame = null;
 let currentJob = null;
+let latestJobs = [];
+let currentView = new URLSearchParams(window.location.search).get('view') === 'preview' ? 'preview' : 'console';
+const videoLoadErrors = {};
 
 const nodes = {
+    consoleTab: document.getElementById('consoleTab'),
+    previewTab: document.getElementById('previewTab'),
+    consoleView: document.getElementById('consoleView'),
+    previewView: document.getElementById('previewView'),
     jobForm: document.getElementById('jobForm'),
     formError: document.getElementById('formError'),
     createButton: document.getElementById('createButton'),
@@ -47,7 +55,10 @@ const nodes = {
     logHint: document.getElementById('logHint'),
     logText: document.getElementById('logText'),
     copyLogButton: document.getElementById('copyLogButton'),
-    copyMessage: document.getElementById('copyMessage')
+    copyMessage: document.getElementById('copyMessage'),
+    refreshPreviewButton: document.getElementById('refreshPreviewButton'),
+    previewSummary: document.getElementById('previewSummary'),
+    previewGrid: document.getElementById('previewGrid')
 };
 
 const jobStatusPriority = {
@@ -66,6 +77,20 @@ function setText(node, value) {
 
 function duration(value) {
     return value == null ? '-' : `${value}s`;
+}
+
+function formatClock(value) {
+    const seconds = Math.max(0, Number.isFinite(value) ? Math.floor(value) : 0);
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const remaining = seconds % 60;
+    if (hours) return `${hours}:${String(minutes).padStart(2, '0')}:${String(remaining).padStart(2, '0')}`;
+    return `${minutes}:${String(remaining).padStart(2, '0')}`;
+}
+
+function clampPercent(value) {
+    if (!Number.isFinite(value)) return 0;
+    return Math.max(0, Math.min(100, value));
 }
 
 function statusBadge(status) {
@@ -168,9 +193,31 @@ function selectJob(jobId, updateUrl = true) {
     if (updateUrl) {
         const url = new URL(window.location.href);
         url.searchParams.set('job', jobId);
+        if (currentView === 'preview') url.searchParams.set('view', 'preview');
         window.history.replaceState({}, '', url);
     }
     refreshSelectedJob();
+}
+
+function setView(view, updateUrl = true) {
+    currentView = view === 'preview' ? 'preview' : 'console';
+    nodes.consoleView.hidden = currentView !== 'console';
+    nodes.previewView.hidden = currentView !== 'preview';
+    nodes.consoleView.classList.toggle('active', currentView === 'console');
+    nodes.previewView.classList.toggle('active', currentView === 'preview');
+    nodes.consoleTab.classList.toggle('active', currentView === 'console');
+    nodes.previewTab.classList.toggle('active', currentView === 'preview');
+    if (updateUrl) {
+        const url = new URL(window.location.href);
+        if (currentView === 'preview') {
+            url.searchParams.set('view', 'preview');
+        } else {
+            url.searchParams.delete('view');
+        }
+        window.history.replaceState({}, '', url);
+    }
+    renderPreviewGrid(latestJobs);
+    if (currentView === 'preview') startScanAnimation();
 }
 
 function jobTimeValue(job) {
@@ -211,7 +258,9 @@ async function refreshJobs() {
     const data = await getJson('/api/video-link/jobs?limit=50');
     renderGlobal(data);
     const jobs = data.jobs || [];
+    latestJobs = jobs;
     renderJobList(jobs);
+    renderPreviewGrid(jobs);
     const first = preferredJob(jobs);
     if (!selectedJobId && first) selectJob(first.job_id, true);
 }
@@ -234,7 +283,9 @@ async function refreshJobsNoSelect() {
     const data = await getJson('/api/video-link/jobs?limit=50');
     renderGlobal(data);
     const jobs = data.jobs || [];
+    latestJobs = jobs;
     renderJobList(jobs);
+    renderPreviewGrid(jobs);
 }
 
 function renderGlobal(data) {
@@ -432,6 +483,187 @@ function renderArtifacts(summary) {
     ].join('<br>');
 }
 
+function previewStage(job) {
+    const stage = job.current_stage || job.error_summary?.stage || job.next_stage || '-';
+    return stageNames[stage] || stage;
+}
+
+function scanStartTime(job) {
+    const stage = job.current_stage || job.next_stage;
+    const stageInfo = job.stages?.[stage] || {};
+    return stageInfo.started_at || job.runner?.started_at || job.updated_at || job.created_at || '';
+}
+
+function scanPercent(job, now = Date.now()) {
+    const status = job.status || 'created';
+    const baseProgress = clampPercent(job.progress?.percent || 0);
+    if (videoLoadErrors[job.job_id]) return baseProgress;
+    if (status === 'succeeded') return 100;
+    if (status !== 'running') return baseProgress;
+    const durationSeconds = Number(job.preview?.duration_seconds || 0) || 600;
+    const startedAt = Date.parse(scanStartTime(job));
+    if (Number.isNaN(startedAt)) return Math.min(99, baseProgress);
+    const elapsedSeconds = Math.max(0, (now - startedAt) / 1000);
+    return Math.min(99, Math.max(baseProgress, (elapsedSeconds / durationSeconds) * 100));
+}
+
+function renderPreviewGrid(jobs) {
+    if (!nodes.previewGrid) return;
+    const visibleJobs = jobs || [];
+    nodes.previewSummary.textContent = visibleJobs.length ? `最近 ${visibleJobs.length} 个任务` : '暂无任务';
+    nodes.previewGrid.innerHTML = visibleJobs.length ? visibleJobs.map(job => renderPreviewCard(job)).join('') : '<div class="empty preview-empty">暂无任务</div>';
+    bindPreviewControls();
+    updateScanFrames();
+}
+
+function renderPreviewCard(job) {
+    const preview = job.preview || {};
+    const ready = Boolean(preview.video_ready && preview.video_url && !videoLoadErrors[job.job_id]);
+    const failed = job.status === 'failed' || Boolean(videoLoadErrors[job.job_id]);
+    const scanning = job.status === 'running' && !failed;
+    const percent = scanPercent(job);
+    const durationSeconds = Number(preview.duration_seconds || 0);
+    const video = ready
+        ? `<video class="preview-video" preload="metadata" playsinline src="${escapeHtml(preview.video_url)}"></video>`
+        : `<div class="preview-placeholder">${failed ? '加载停止' : '等待视频'}</div>`;
+    const buttonLabel = ready ? '播放' : (failed ? '失败' : '等待');
+    return `<article class="preview-card ${escapeHtml(job.status || 'created')} ${scanning ? 'scanning' : ''} ${failed ? 'preview-failed' : ''}"
+        data-job-id="${escapeHtml(job.job_id)}"
+        data-status="${escapeHtml(job.status || 'created')}"
+        data-duration="${escapeHtml(durationSeconds || '')}"
+        data-started-at="${escapeHtml(scanStartTime(job))}"
+        data-progress="${escapeHtml(job.progress?.percent || 0)}">
+        <div class="preview-frame">
+            ${video}
+            <div class="scan-line" aria-hidden="true"></div>
+            <div class="preview-status-row">
+                ${statusBadge(videoLoadErrors[job.job_id] ? 'failed' : job.status)}
+                <span>${escapeHtml(previewStage(job))}</span>
+            </div>
+        </div>
+        <div class="preview-body">
+            <strong title="${escapeHtml(job.video_url || job.job_id)}">${escapeHtml(job.video_url || job.job_id)}</strong>
+            <div class="video-controls">
+                <button class="preview-play" type="button" data-job-id="${escapeHtml(job.job_id)}" ${ready ? '' : 'disabled'}>${buttonLabel}</button>
+                <span class="preview-time" data-job-id="${escapeHtml(job.job_id)}">0:00 / ${escapeHtml(formatClock(durationSeconds))}</span>
+            </div>
+            <input class="video-seek" data-job-id="${escapeHtml(job.job_id)}" type="range" min="0" max="1000" value="0" ${ready ? '' : 'disabled'} aria-label="视频进度">
+            <div class="scan-meter">
+                <div class="scan-meter-head">
+                    <span>扫描</span>
+                    <strong class="scan-percent">${Math.round(percent)}%</strong>
+                </div>
+                <div class="bar scan-bar"><div class="preview-scan-progress" style="width:${percent}%"></div></div>
+            </div>
+        </div>
+    </article>`;
+}
+
+function bindPreviewControls() {
+    document.querySelectorAll('.preview-video').forEach(video => {
+        video.addEventListener('loadedmetadata', () => updateVideoControls(video));
+        video.addEventListener('timeupdate', () => updateVideoControls(video));
+        video.addEventListener('play', () => setPreviewButton(video, '暂停'));
+        video.addEventListener('pause', () => setPreviewButton(video, '播放'));
+        video.addEventListener('error', () => markPreviewVideoError(video));
+    });
+    document.querySelectorAll('.preview-play').forEach(button => {
+        button.addEventListener('click', () => togglePreviewPlayback(button.dataset.jobId));
+    });
+    document.querySelectorAll('.video-seek').forEach(input => {
+        input.addEventListener('input', () => seekPreviewVideo(input));
+    });
+}
+
+function previewCard(jobId) {
+    return document.querySelector(`.preview-card[data-job-id="${CSS.escape(jobId)}"]`);
+}
+
+function previewVideo(jobId) {
+    return previewCard(jobId)?.querySelector('video');
+}
+
+function setPreviewButton(video, label) {
+    const jobId = video.closest('.preview-card')?.dataset.jobId;
+    const button = jobId ? document.querySelector(`.preview-play[data-job-id="${CSS.escape(jobId)}"]`) : null;
+    if (button && !button.disabled) button.textContent = label;
+}
+
+async function togglePreviewPlayback(jobId) {
+    const video = previewVideo(jobId);
+    if (!video) return;
+    if (video.paused) {
+        await video.play().catch(() => markPreviewVideoError(video));
+    } else {
+        video.pause();
+    }
+}
+
+function seekPreviewVideo(input) {
+    const video = previewVideo(input.dataset.jobId);
+    if (!video || !Number.isFinite(video.duration) || video.duration <= 0) return;
+    video.currentTime = (Number(input.value) / 1000) * video.duration;
+    updateVideoControls(video);
+}
+
+function updateVideoControls(video) {
+    const card = video.closest('.preview-card');
+    const jobId = card?.dataset.jobId;
+    if (!jobId) return;
+    const durationSeconds = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : Number(card.dataset.duration || 0);
+    const input = document.querySelector(`.video-seek[data-job-id="${CSS.escape(jobId)}"]`);
+    const time = document.querySelector(`.preview-time[data-job-id="${CSS.escape(jobId)}"]`);
+    if (input && durationSeconds > 0) input.value = String(Math.round((video.currentTime / durationSeconds) * 1000));
+    if (time) time.textContent = `${formatClock(video.currentTime)} / ${formatClock(durationSeconds)}`;
+}
+
+function markPreviewVideoError(video) {
+    const jobId = video.closest('.preview-card')?.dataset.jobId;
+    if (!jobId) return;
+    videoLoadErrors[jobId] = true;
+    const card = previewCard(jobId);
+    if (card) {
+        card.classList.add('preview-failed');
+        card.classList.remove('scanning');
+        const button = card.querySelector('.preview-play');
+        if (button) {
+            button.disabled = true;
+            button.textContent = '失败';
+        }
+    }
+}
+
+function startScanAnimation() {
+    if (scanAnimationFrame) return;
+    const tick = () => {
+        updateScanFrames();
+        scanAnimationFrame = requestAnimationFrame(tick);
+    };
+    scanAnimationFrame = requestAnimationFrame(tick);
+}
+
+function updateScanFrames(now = Date.now()) {
+    if (!nodes.previewGrid) return;
+    document.querySelectorAll('.preview-card').forEach(card => {
+        const status = card.dataset.status || 'created';
+        const failed = card.classList.contains('preview-failed');
+        const baseProgress = clampPercent(Number(card.dataset.progress || 0));
+        let percent = baseProgress;
+        if (status === 'succeeded') {
+            percent = 100;
+        } else if (status === 'running' && !failed) {
+            const durationSeconds = Number(card.dataset.duration || 0) || 600;
+            const startedAt = Date.parse(card.dataset.startedAt || '');
+            const elapsed = Number.isNaN(startedAt) ? 0 : Math.max(0, (now - startedAt) / 1000);
+            percent = Math.min(99, Math.max(baseProgress, (elapsed / durationSeconds) * 100));
+        }
+        const bar = card.querySelector('.preview-scan-progress');
+        const label = card.querySelector('.scan-percent');
+        if (bar) bar.style.width = `${percent}%`;
+        if (label) label.textContent = `${Math.round(percent)}%`;
+    });
+}
+
 function chooseLogStage(job) {
     if (selectedLogStage) return selectedLogStage;
     return job.current_stage || job.error_summary?.stage || job.next_stage || [...(job.stage_order || [])].reverse().find(stage => job.stages?.[stage]?.log_path);
@@ -487,13 +719,18 @@ async function runSelectedJob() {
 }
 
 async function boot() {
+    nodes.consoleTab.addEventListener('click', () => setView('console'));
+    nodes.previewTab.addEventListener('click', () => setView('preview'));
     nodes.jobForm.addEventListener('submit', createJob);
     nodes.refreshJobsButton.addEventListener('click', refreshJobs);
+    nodes.refreshPreviewButton.addEventListener('click', refreshJobs);
     nodes.runButton.addEventListener('click', runSelectedJob);
     nodes.copyLogButton.addEventListener('click', copySelectedLog);
     await loadOptions();
+    setView(currentView, false);
     await refreshJobs();
     if (selectedJobId) await refreshSelectedJob();
+    startScanAnimation();
     refreshTimer = setInterval(() => {
         if (selectedJobId) {
             refreshSelectedJob();

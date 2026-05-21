@@ -41,6 +41,9 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn('id="resourceLanes"', html)
         self.assertIn('id="jobList"', html)
         self.assertIn('id="copyLogButton"', html)
+        self.assertIn('id="previewView"', html)
+        self.assertIn('id="previewGrid"', html)
+        self.assertIn('id="previewTab"', html)
         self.assertLess(html.index('id="jobList"'), html.index('id="globalSummary"'))
 
     def test_video_link_api_create_list_get_and_log(self):
@@ -102,6 +105,42 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.get_json()["opened"])
 
+    def test_video_link_preview_video_route_streams_ready_video(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp) / "jobs", video_link_auto_resume=False)
+            client = ui.app.test_client()
+            video = Path(tmp) / "video.mp4"
+            video.write_bytes(b"0123456789")
+            create = client.post(
+                "/api/video-link/jobs",
+                json={"video_url": "https://example.com/video", "analysis_mode": "fast"},
+            )
+            job_id = create.get_json()["job_id"]
+            loaded = ui.video_link.load_job(job_id)
+            loaded["video_path"] = str(video)
+            ui.video_link.save_job(loaded)
+
+            response = client.get(f"/api/video-link/jobs/{job_id}/video", headers={"Range": "bytes=0-3"})
+            body = response.get_data()
+            response.close()
+
+        self.assertIn(response.status_code, {200, 206})
+        self.assertEqual(body[:4], b"0123")
+
+    def test_video_link_preview_video_route_waits_for_prepare(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp), video_link_auto_resume=False)
+            client = ui.app.test_client()
+            create = client.post(
+                "/api/video-link/jobs",
+                json={"video_url": "https://example.com/video", "analysis_mode": "fast"},
+            )
+            job_id = create.get_json()["job_id"]
+
+            response = client.get(f"/api/video-link/jobs/{job_id}/video")
+
+        self.assertEqual(response.status_code, 409)
+
     def test_legacy_job_url_redirects_to_home_selection(self):
         with tempfile.TemporaryDirectory() as tmp:
             ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp), video_link_auto_resume=False)
@@ -119,10 +158,15 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn("status-spinner", js)
         self.assertIn("stage-progress-meta", js)
         self.assertIn("open-run-dir", js)
+        self.assertIn("renderPreviewGrid", js)
+        self.assertIn("video-seek", js)
+        self.assertIn("scan-line", js)
         self.assertIn("成功", js)
         self.assertIn(".status.pending", css)
         self.assertIn("button.success-action", css)
         self.assertIn(".job-item.queued", css)
+        self.assertIn(".preview-grid", css)
+        self.assertIn("@keyframes scan-sweep", css)
         self.assertIn("@keyframes status-spin", css)
 
 

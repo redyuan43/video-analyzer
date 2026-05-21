@@ -10,13 +10,6 @@ from pathlib import Path
 
 DOCS = [
     (
-        "01-image-cards-operation-manual.md",
-        "baoyu-image-cards",
-        "operation_manual.md",
-        "生成一组适合微信图文/小红书的中文图文卡片，强调视频中可复用的操作路径、判断框架和关键结论。",
-        "四张纵向卡片堆叠在一张海报里；每张卡片一个主题；手绘教育风；清晰中文标题；不要出现真实人物肖像。",
-    ),
-    (
         "02-infographic-knowledge-notes.md",
         "baoyu-infographic",
         "docs_analysis/knowledge_notes.md",
@@ -38,6 +31,8 @@ DOCS = [
         "技术仪表盘风格；分区展示输入来源、证据强度、时间线覆盖、风险提醒；不要堆满小字。",
     ),
 ]
+
+DEPRECATED_PROMPTS = ("01-image-cards-operation-manual.md",)
 
 
 def parse_args() -> argparse.Namespace:
@@ -103,6 +98,9 @@ def main() -> int:
     run_dir = Path(args.run_dir).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else run_dir / "baoyu_images" / "prompts"
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    for filename in DEPRECATED_PROMPTS:
+        (output_dir / filename).unlink(missing_ok=True)
 
     for filename, skill_name, source_rel, goal, visual_direction in DOCS:
         source_path = run_dir / source_rel

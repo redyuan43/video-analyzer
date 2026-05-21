@@ -13,10 +13,13 @@
                 <h1>Video Analyzer</h1>
                 <p>URL workflow console</p>
             </div>
-            <a class="ghost-link" href="/">首页</a>
+            <nav class="view-tabs" aria-label="视图切换">
+                <button id="consoleTab" class="view-tab active" type="button" data-view="console">控制台</button>
+                <button id="previewTab" class="view-tab" type="button" data-view="preview">预览</button>
+            </nav>
         </header>
 
-        <section class="workspace">
+        <section id="consoleView" class="workspace view-panel active">
             <aside class="sidebar">
                 <section class="panel">
                     <h2>新建任务</h2>
@@ -164,6 +167,17 @@
                     <div id="copyMessage" class="muted"></div>
                 </section>
             </section>
+        </section>
+
+        <section id="previewView" class="preview-view view-panel" hidden>
+            <section class="panel preview-toolbar">
+                <div>
+                    <h2>视频预览</h2>
+                    <p id="previewSummary">最近任务</p>
+                </div>
+                <button id="refreshPreviewButton" class="secondary" type="button">刷新</button>
+            </section>
+            <section id="previewGrid" class="preview-grid"></section>
         </section>
     </main>
     <script src="{{ url_for('static', filename='js/main.js') }}"></script>

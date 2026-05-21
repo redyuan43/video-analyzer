@@ -11,10 +11,16 @@ from pathlib import Path
 
 
 DOCS = [
-    ("operation_manual.md", "01-image-cards-operation-manual.png", "操作手册视觉摘要", r"^## 4\. 图文操作步骤\s*$"),
-    ("docs_analysis_chapters/knowledge_notes_v2.md", "02-infographic-knowledge-notes.png", "逐章知识笔记视觉摘要", r"^## 01\. .+$"),
-    ("docs_analysis_chapters/deep_report_v2.md", "03-infographic-deep-report.png", "逐章深度报告视觉摘要", r"^## 逐章分析\s*$"),
-    ("manual_evidence.md", "04-infographic-manual-evidence.png", "证据索引视觉摘要", r"^## 0\.00s / Frame 0\s*$"),
+    (
+        "operation_manual.md",
+        "02-infographic-knowledge-notes.png",
+        "操作手册视觉摘要",
+        r"^## 1\. 概览\s*$",
+        ("01-image-cards-operation-manual.png",),
+    ),
+    ("docs_analysis_chapters/knowledge_notes_v2.md", "02-infographic-knowledge-notes.png", "逐章知识笔记视觉摘要", r"^## 01\. .+$", ()),
+    ("docs_analysis_chapters/deep_report_v2.md", "03-infographic-deep-report.png", "逐章深度报告视觉摘要", r"^## 逐章分析\s*$", ()),
+    ("manual_evidence.md", "04-infographic-manual-evidence.png", "证据索引视觉摘要", r"^## 0\.00s / Frame 0\s*$", ()),
 ]
 
 
@@ -35,14 +41,14 @@ def main() -> int:
     chapter_assets = load_chapter_assets(run_dir)
     frame_assets = load_frame_assets(run_dir, args.max_frame_images)
     changed = []
-    for rel, final_name, title, target_heading in DOCS:
+    for rel, final_name, title, target_heading, deprecated_image_names in DOCS:
         path = run_dir / rel
         if not path.exists():
             print(f"[skip missing] {rel}")
             continue
         final_image = final_dir / final_name
         text = path.read_text(encoding="utf-8")
-        text = ensure_final_image(text, path, final_image, title, target_heading)
+        text = ensure_final_image(text, path, final_image, title, target_heading, deprecated_image_names)
         text = ensure_representative_images(text, path, chapter_assets, frame_assets)
         path.write_text(normalize_spacing(text), encoding="utf-8")
         changed.append(rel)
@@ -78,7 +84,15 @@ def load_frame_assets(run_dir: Path, limit: int) -> list[Path]:
     return selected
 
 
-def ensure_final_image(text: str, md_path: Path, image_path: Path, title: str, target_heading: str) -> str:
+def ensure_final_image(
+    text: str,
+    md_path: Path,
+    image_path: Path,
+    title: str,
+    target_heading: str,
+    deprecated_image_names: tuple[str, ...] = (),
+) -> str:
+    text = remove_deprecated_image_refs(text, deprecated_image_names)
     if not image_path.exists():
         print(f"[warn] final image missing: {image_path}")
         return text
@@ -95,7 +109,23 @@ def remove_final_image_block(text: str, title: str) -> str:
         rf"(?:^|\n)## {re.escape(title)}\s*\n+\s*!\[{re.escape(title)}\]\([^)]+\)\s*\n+",
         flags=re.MULTILINE,
     )
-    return block_re.sub("\n", text)
+    text = block_re.sub("\n", text)
+    image_re = re.compile(
+        rf"(?:^|\n)\s*!\[{re.escape(title)}\]\([^)]+\)\s*\n*",
+        flags=re.MULTILINE,
+    )
+    text = image_re.sub("\n", text)
+    return text
+
+
+def remove_deprecated_image_refs(text: str, deprecated_image_names: tuple[str, ...]) -> str:
+    for name in deprecated_image_names:
+        deprecated_re = re.compile(
+            rf"(?:^|\n)\s*!\[[^\]]*\]\([^)]*{re.escape(name)}\)\s*\n*",
+            flags=re.MULTILINE,
+        )
+        text = deprecated_re.sub("\n", text)
+    return text
 
 
 def insert_after_heading(text: str, heading_pattern: str, block: str) -> str:

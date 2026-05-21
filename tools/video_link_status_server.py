@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import mimetypes
 import os
 import re
 import shutil
@@ -105,6 +106,7 @@ EXPECTED_FINAL_EXPORTS = (
     "deep_report_v2.pdf",
     "manual_evidence.pdf",
 )
+VIDEO_PREVIEW_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 ORPHANED_PROCESS_GONE_MESSAGE = (
     "server stopped while this stage was running; process is gone and artifacts are incomplete; retry to continue"
 )
@@ -1266,6 +1268,60 @@ class VideoLinkStatusServer:
             else [],
         }
 
+    def preview_video_candidate(self, job: dict[str, Any]) -> Path | None:
+        artifacts = job.get("artifacts") or {}
+        stages = job.get("stages") or {}
+        values = [
+            job.get("video_path"),
+            (artifacts.get("video_path") or {}).get("value"),
+            ((stages.get("prepare") or {}).get("artifacts") or {}).get("video_path"),
+        ]
+        for value in values:
+            if value:
+                return self.resolve_output_path(str(value))
+        return None
+
+    def preview_duration_seconds(self, job: dict[str, Any]) -> int | None:
+        artifacts = job.get("artifacts") or {}
+        probe_artifacts = ((job.get("stages") or {}).get("probe") or {}).get("artifacts") or {}
+        for value in (
+            job.get("duration_seconds"),
+            (artifacts.get("duration_seconds") or {}).get("value"),
+            (artifacts.get("duration") or {}).get("value"),
+            probe_artifacts.get("duration_seconds"),
+            probe_artifacts.get("duration"),
+        ):
+            if value in (None, ""):
+                continue
+            try:
+                seconds = int(float(value))
+            except (TypeError, ValueError):
+                continue
+            if seconds > 0:
+                return seconds
+        return None
+
+    def preview_metadata(self, job: dict[str, Any]) -> dict[str, Any]:
+        video_path = self.preview_video_candidate(job)
+        valid_extension = bool(video_path and video_path.suffix.lower() in VIDEO_PREVIEW_EXTENSIONS)
+        video_ready = bool(valid_extension and video_path and video_path.is_file())
+        return {
+            "video_ready": video_ready,
+            "video_url": f"/api/video-link/jobs/{job['job_id']}/video" if video_ready else None,
+            "duration_seconds": self.preview_duration_seconds(job),
+        }
+
+    def preview_video_file(self, job_id: str) -> tuple[Path, str | None]:
+        job = self.load_job(job_id)
+        video_path = self.preview_video_candidate(job)
+        if not video_path:
+            raise BridgeError(HTTPStatus.CONFLICT, "video is not available yet")
+        if video_path.suffix.lower() not in VIDEO_PREVIEW_EXTENSIONS:
+            raise BridgeError(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "preview file is not a supported video type")
+        if not video_path.is_file():
+            raise BridgeError(HTTPStatus.NOT_FOUND, f"video file does not exist: {video_path}")
+        return video_path, mimetypes.guess_type(str(video_path))[0]
+
     def public_job(self, job: dict[str, Any]) -> dict[str, Any]:
         public = dict(job)
         public["stages"] = dict(job.get("stages") or {})
@@ -1279,6 +1335,7 @@ class VideoLinkStatusServer:
         public["queue"] = self.queue_info(public)
         public["core_progress"] = self.core_progress(public)
         public["stage_progress"] = self.stage_progress(public)
+        public["preview"] = self.preview_metadata(public)
         queued_stage = public["queue"].get("stage")
         if queued_stage and queued_stage in public["stages"]:
             public["stages"][queued_stage] = dict(public["stages"][queued_stage])

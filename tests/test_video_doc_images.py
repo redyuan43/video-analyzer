@@ -11,6 +11,7 @@ from tools.md_to_mobile_pdf import render_markdown
 from tools.md_to_mobile_pdf import render_mermaid_blocks
 from tools.md_to_mobile_pdf import wrap_final_images
 from tools.pdf_to_long_png import main as long_png_main
+from tools.prepare_baoyu_image_prompts import main as prepare_prompts_main
 from tools.prepare_video_doc_export import rewrite_image_paths
 
 
@@ -66,6 +67,90 @@ class VideoDocImageTests(unittest.TestCase):
                 sys.argv = old_argv
             text_again = doc.read_text(encoding="utf-8")
             self.assertEqual(text_again.count("02-infographic-knowledge-notes.png"), 1)
+
+    def test_operation_manual_reuses_knowledge_notes_image_and_removes_legacy_01(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            final_dir = run_dir / "baoyu_images" / "final"
+            final_dir.mkdir(parents=True)
+            (final_dir / "02-infographic-knowledge-notes.png").write_bytes(b"png")
+            (final_dir / "01-image-cards-operation-manual.png").write_bytes(b"stale")
+            doc = run_dir / "operation_manual.md"
+            doc.write_text(
+                "# 操作手册\n\n"
+                "## 1. 概览\n\n"
+                "正文。\n\n"
+                "## 4. 图文操作步骤\n\n"
+                "![操作手册视觉摘要](baoyu_images/final/01-image-cards-operation-manual.png)\n\n"
+                "步骤。\n",
+                encoding="utf-8",
+            )
+
+            import sys
+
+            old_argv = sys.argv
+            try:
+                sys.argv = ["augment_video_docs_images.py", str(run_dir)]
+                augment_main()
+            finally:
+                sys.argv = old_argv
+
+            text = doc.read_text(encoding="utf-8")
+            self.assertIn("baoyu_images/final/02-infographic-knowledge-notes.png", text)
+            self.assertNotIn("01-image-cards-operation-manual.png", text)
+            self.assertEqual(text.count("02-infographic-knowledge-notes.png"), 1)
+            self.assertLess(text.index("02-infographic-knowledge-notes.png"), text.index("## 4. 图文操作步骤"))
+
+    def test_operation_manual_removes_legacy_01_even_when_replacement_image_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "baoyu_images" / "final").mkdir(parents=True)
+            doc = run_dir / "operation_manual.md"
+            doc.write_text(
+                "# 操作手册\n\n"
+                "## 1. 概览\n\n"
+                "正文。\n\n"
+                "![操作手册视觉摘要](baoyu_images/final/01-image-cards-operation-manual.png)\n",
+                encoding="utf-8",
+            )
+
+            import sys
+
+            old_argv = sys.argv
+            try:
+                sys.argv = ["augment_video_docs_images.py", str(run_dir)]
+                augment_main()
+            finally:
+                sys.argv = old_argv
+
+            text = doc.read_text(encoding="utf-8")
+            self.assertNotIn("01-image-cards-operation-manual.png", text)
+            self.assertNotIn("02-infographic-knowledge-notes.png", text)
+
+    def test_prepare_baoyu_prompts_drops_operation_manual_image_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "docs_analysis").mkdir()
+            (run_dir / "docs_analysis" / "knowledge_notes.md").write_text("# 知识笔记\n\n内容\n", encoding="utf-8")
+            (run_dir / "docs_analysis" / "deep_report.md").write_text("# 深度报告\n\n内容\n", encoding="utf-8")
+            (run_dir / "manual_evidence.md").write_text("# 证据\n\n内容\n", encoding="utf-8")
+            prompt_dir = run_dir / "baoyu_images" / "prompts"
+            prompt_dir.mkdir(parents=True)
+            (prompt_dir / "01-image-cards-operation-manual.md").write_text("stale", encoding="utf-8")
+
+            import sys
+
+            old_argv = sys.argv
+            try:
+                sys.argv = ["prepare_baoyu_image_prompts.py", str(run_dir)]
+                prepare_prompts_main()
+            finally:
+                sys.argv = old_argv
+
+            self.assertFalse((prompt_dir / "01-image-cards-operation-manual.md").exists())
+            self.assertTrue((prompt_dir / "02-infographic-knowledge-notes.md").exists())
+            self.assertTrue((prompt_dir / "03-infographic-deep-report.md").exists())
+            self.assertTrue((prompt_dir / "04-infographic-manual-evidence.md").exists())
 
     def test_export_rewrite_removes_parent_directory_image_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
