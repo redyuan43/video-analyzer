@@ -364,16 +364,20 @@ class VideoLinkStatusServerTests(unittest.TestCase):
     def test_stage_waits_for_live_persisted_resource_user_after_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
-            blocker = server.create_job({"video_url": "https://example.com/blocker", "analysis_mode": "fast"})
+            blockers = [
+                server.create_job({"video_url": f"https://example.com/blocker-{index}", "analysis_mode": "fast"})
+                for index in range(server_mod.RESOURCE_LIMITS["core"])
+            ]
             waiting = server.create_job({"video_url": "https://example.com/waiting", "analysis_mode": "fast"})
-            blocker_loaded = server.load_job(blocker["job_id"])
-            blocker_loaded["status"] = "running"
-            blocker_loaded["runner"] = {"status": "running", "current_stage": "analyze-core"}
-            blocker_loaded["stages"]["analyze-core"] = {
-                "status": "running",
-                "process": {"pid": os.getpid()},
-            }
-            server.save_job(blocker_loaded)
+            for blocker in blockers:
+                blocker_loaded = server.load_job(blocker["job_id"])
+                blocker_loaded["status"] = "running"
+                blocker_loaded["runner"] = {"status": "running", "current_stage": "analyze-core"}
+                blocker_loaded["stages"]["analyze-core"] = {
+                    "status": "running",
+                    "process": {"pid": os.getpid()},
+                }
+                server.save_job(blocker_loaded)
             waiting_loaded = server.load_job(waiting["job_id"])
             waiting_loaded["resolved_mode"] = "fast"
             waiting_loaded["stages"]["probe"] = {"status": "succeeded"}
@@ -383,11 +387,12 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
             def release_blocker(_seconds):
                 sleep_calls.append(_seconds)
-                released = server.load_job(blocker["job_id"])
-                released["status"] = "succeeded"
-                released["runner"] = {"status": "succeeded", "current_stage": None}
-                released["stages"]["analyze-core"] = {"status": "succeeded"}
-                server.save_job(released)
+                for blocker in blockers:
+                    released = server.load_job(blocker["job_id"])
+                    released["status"] = "succeeded"
+                    released["runner"] = {"status": "succeeded", "current_stage": None}
+                    released["stages"]["analyze-core"] = {"status": "succeeded"}
+                    server.save_job(released)
 
             def fake_locked(job_id, stage):
                 current = server.load_job(job_id)

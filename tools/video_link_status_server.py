@@ -89,15 +89,15 @@ STAGE_RESOURCES = {
 }
 RESOURCE_LIMITS = {
     "prepare": 2,
-    "core": 1,
+    "core": 3,
     "asr": 1,
     "ocr": 1,
     "vl": 1,
-    "verify": 2,
-    "multidoc": 1,
-    "deep-v2": 1,
-    "image-prompts": 1,
-    "final-publish": 1,
+    "verify": 3,
+    "multidoc": 3,
+    "deep-v2": 3,
+    "image-prompts": 3,
+    "final-publish": 3,
 }
 EXPECTED_FINAL_EXPORTS = (
     "operation_manual.pdf",
