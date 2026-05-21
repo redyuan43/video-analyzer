@@ -173,6 +173,9 @@ def main() -> int:
     page_context_path = video_dir / "page_context.md"
     if args.keep_existing and video_path.exists() and page_context_path.exists() and not args.refresh_context:
         print(f"[download] reusing {video_path}")
+        print(f"[download] video: {video_path}")
+        print(f"[download] description: {description_path}")
+        print(f"[download] context: {page_context_path}")
         info = load_downloaded_info(video_dir) or info
     else:
         if args.keep_existing and video_path.exists():

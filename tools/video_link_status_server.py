@@ -737,6 +737,10 @@ class VideoLinkStatusServer:
         text = Path(log_path).read_text(encoding="utf-8", errors="replace")
         video_path = parse_prefixed_path(text, "[download] video:")
         page_context = parse_prefixed_path(text, "[download] context:")
+        if not video_path:
+            video_path = parse_prefixed_path(text, "[download] reusing")
+        if video_path and not page_context:
+            page_context = str(Path(video_path).parent / "page_context.md")
         if not video_path or not page_context:
             raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, "prepare stage did not produce video/context paths")
         job["video_path"] = str(self.resolve_output_path(video_path))
@@ -1011,6 +1015,91 @@ class VideoLinkStatusServer:
             except Exception:
                 pass
         return artifacts
+
+    def discover_run_dir(self, job: dict[str, Any]) -> Path | None:
+        candidates: list[Any] = [
+            job.get("run_dir"),
+            ((job.get("artifacts") or {}).get("run_dir") or {}).get("value"),
+        ]
+        run_name = (job.get("options") or {}).get("run_name")
+        for base in (job.get("video_dir"), Path(job["video_path"]).parent if job.get("video_path") else None):
+            if base and run_name:
+                candidates.append(Path(str(base)) / str(run_name))
+        for value in candidates:
+            if not value:
+                continue
+            path = Path(str(value)).expanduser()
+            if not path.is_absolute():
+                path = self.repo_root / path
+            path = path.resolve()
+            if path.is_dir():
+                return path
+        return None
+
+    def core_artifacts_complete(self, run_dir: Path) -> bool:
+        required = [
+            run_dir / "analysis.json",
+            run_dir / "operation_manual.md",
+            run_dir / "manual_evidence.md",
+        ]
+        transcript_candidates = [run_dir / "transcript.md", run_dir / "orin" / "transcript.md"]
+        if any(not path.is_file() or path.stat().st_size <= 0 for path in required):
+            return False
+        if not any(path.is_file() and path.stat().st_size > 0 for path in transcript_candidates):
+            return False
+        try:
+            json.loads((run_dir / "analysis.json").read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        return True
+
+    def reconcile_completed_core_stage(
+        self,
+        job: dict[str, Any],
+        stage_info: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        run_dir = self.discover_run_dir(job)
+        if not run_dir or not self.core_artifacts_complete(run_dir):
+            return None
+
+        now = iso_now()
+        job["run_dir"] = str(run_dir)
+        stage_info = dict(stage_info or (job.get("stages") or {}).get("analyze-core") or {})
+        artifacts = {"run_dir": str(run_dir), **self.collect_core_artifacts(run_dir)}
+        stage_info.update(
+            {
+                "status": "succeeded",
+                "exit_code": 0,
+                "finished_at": stage_info.get("finished_at") or now,
+                "recovered_at": now,
+                "recovery_reason": "core artifacts already exist in run_dir",
+                "artifacts": {**dict(stage_info.get("artifacts") or {}), **artifacts},
+            }
+        )
+        stage_info.pop("process", None)
+        stage_info.pop("error", None)
+        stage_info.pop("retry_reason", None)
+        job.setdefault("stages", {})["analyze-core"] = stage_info
+        self.update_job_artifacts(job, "analyze-core", artifacts)
+
+        next_stage = self.next_stage(job)
+        runner = dict(job.get("runner") or {})
+        runner["status"] = "queued" if next_stage else "succeeded"
+        runner["current_stage"] = next_stage
+        runner["queued_for"] = stage_resource(next_stage) if next_stage else None
+        runner["error"] = None
+        runner["updated_at"] = now
+        runner["server_pid"] = os.getpid()
+        if not next_stage:
+            runner["finished_at"] = now
+        else:
+            runner.pop("finished_at", None)
+        job["runner"] = runner
+        job["status"] = "queued" if next_stage else "succeeded"
+        job["summary"] = self.collect_summary(job)
+        job["updated_at"] = now
+        self.save_job(job)
+        return job
 
     def resolve_output_path(self, value: str) -> Path:
         path = Path(value).expanduser()
@@ -1294,6 +1383,9 @@ class VideoLinkStatusServer:
     def recover_orphaned_running_job(self, job: dict[str, Any]) -> dict[str, Any]:
         runner = job.get("runner") or {}
         if self.should_requeue_legacy_interrupted_job(job):
+            recovered = self.reconcile_completed_core_stage(job)
+            if recovered:
+                return recovered
             return self.requeue_interrupted_job(job)
         if runner.get("status") not in {"running", "queued"}:
             return job
@@ -1301,6 +1393,10 @@ class VideoLinkStatusServer:
         if active and active.is_alive():
             return job
         if runner.get("server_pid") == os.getpid():
+            if normalize_stage_name(runner.get("current_stage") or "") == "analyze-core":
+                recovered = self.reconcile_completed_core_stage(job)
+                if recovered:
+                    return recovered
             return job
 
         raw_stage = runner.get("current_stage") or self.current_stage(job) or self.next_stage(job)
@@ -1351,6 +1447,11 @@ class VideoLinkStatusServer:
             self.save_job(job)
             return job
 
+        if stage == "analyze-core":
+            recovered = self.reconcile_completed_core_stage(job, stage_info)
+            if recovered:
+                return recovered
+
         return self.requeue_interrupted_job(job, stage, stage_info)
 
     def should_requeue_legacy_interrupted_job(self, job: dict[str, Any]) -> bool:
@@ -1372,6 +1473,10 @@ class VideoLinkStatusServer:
         if not stage or stage not in STAGE_ORDER:
             return job
         stage_info = dict(stage_info or (job.get("stages") or {}).get(stage) or {})
+        if stage == "analyze-core":
+            recovered = self.reconcile_completed_core_stage(job, stage_info)
+            if recovered:
+                return recovered
         resource = stage_resource(stage)
         stage_info["status"] = "queued"
         stage_info["queued_at"] = now

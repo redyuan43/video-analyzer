@@ -196,6 +196,43 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(result["stages"]["prepare"]["status"], "succeeded")
         self.assertNotIn("old error", json.dumps(result["stages"]["prepare"], ensure_ascii=False))
 
+    def test_queued_core_reconciles_existing_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "run_name": "operation-manual-reset-003"})
+            loaded = server.load_job(job["job_id"])
+            video_dir = Path(tmp) / "video"
+            run_dir = video_dir / "operation-manual-reset-003"
+            (run_dir / "orin").mkdir(parents=True)
+            (run_dir / "analysis.json").write_text(json.dumps({"metadata": {}, "ocr_events": [], "frame_analyses": []}), encoding="utf-8")
+            (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
+            (run_dir / "manual_evidence.md").write_text("# Evidence\n", encoding="utf-8")
+            (run_dir / "transcript.md").write_text("# Transcript\n", encoding="utf-8")
+            loaded["video_dir"] = str(video_dir)
+            loaded["stages"]["probe"] = {"status": "succeeded"}
+            loaded["stages"]["prepare"] = {"status": "succeeded"}
+            loaded["stages"]["analyze-core"] = {
+                "status": "queued",
+                "queued_for": "core",
+                "retry_reason": "server stopped while this stage was running",
+            }
+            loaded["runner"] = {
+                "status": "queued",
+                "current_stage": "analyze-core",
+                "queued_for": "core",
+                "server_pid": os.getpid(),
+            }
+            loaded["status"] = "queued"
+            server.save_job(loaded)
+
+            recovered = server.load_job(job["job_id"])
+
+        self.assertEqual(recovered["stages"]["analyze-core"]["status"], "succeeded")
+        self.assertEqual(recovered["run_dir"], str(run_dir.resolve()))
+        self.assertEqual(recovered["runner"]["current_stage"], "verify-core")
+        self.assertEqual(recovered["runner"]["queued_for"], "verify")
+        self.assertEqual(recovered["artifacts"]["operation_manual"]["value"], str(run_dir.resolve() / "operation_manual.md"))
+
     def test_list_jobs_returns_recent_public_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
