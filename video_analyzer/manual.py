@@ -493,6 +493,11 @@ def _clean_asset_images_from_line(line: str) -> str:
 def _render_asset_references(manual_text: str) -> str:
     """Convert model-emitted asset paths into real Markdown images."""
     manual_text = re.sub(
+        r"！(?=\[[^\]]*\]\(manual_assets/[^)]+\))",
+        "!",
+        manual_text,
+    )
+    manual_text = re.sub(
         r"`\s*(!\[[^\]]*\]\(manual_assets/[^)]+\))\s*`",
         r"\1",
         manual_text,
