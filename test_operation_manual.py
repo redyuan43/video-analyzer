@@ -22,6 +22,8 @@ from video_analyzer.manual import (
 from video_analyzer.asr_providers import (
     REMOTE_ASR_URLS,
     REMOTE_VIBEVOICE_URLS,
+    default_capswriter_url,
+    default_vibevoice_urls,
     merge_asr_transcripts,
     transcribe_with_provider,
     transcribe_with_provider_result,
@@ -30,7 +32,7 @@ from video_analyzer.asr_providers import (
     transcribe_with_strategy,
     transcribe_with_vibevoice,
 )
-from video_analyzer.ocr import DOTS_MOCR_ENDPOINTS, DotsMOCRVLLMProvider, run_ocr
+from video_analyzer.ocr import DOTS_MOCR_ENDPOINTS, DotsMOCRVLLMProvider, default_ocr_endpoints, run_ocr
 from video_analyzer.audio_processor import AudioTranscript
 from video_analyzer.doc_chat import ask_video_docs, build_doc_chat_prompt, load_video_docs
 from video_analyzer.frame import Frame
@@ -214,11 +216,11 @@ class OperationManualTests(unittest.TestCase):
             )
             self.assertEqual(
                 config.get("operation_manual")["text_base_url"],
-                "http://100.90.114.26:18081/v1",
+                "https://api.deepseek.com",
             )
             self.assertEqual(
                 config.get("operation_manual")["text_model"],
-                "hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
+                "deepseek-v4-pro",
             )
             self.assertEqual(config.get("asr")["provider"], "auto")
             self.assertEqual(config.get("asr")["strategy"], "balanced")
@@ -226,12 +228,16 @@ class OperationManualTests(unittest.TestCase):
             self.assertEqual(
                 config.get("asr")["vibevoice"]["deep_remote_urls"],
                 [
+                    "http://edge.taild500c8.ts.net:8012/api/asr/transcribe",
                     "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
-                    "http://edgexpert-4353.taild500c8.ts.net:8012/api/asr/transcribe",
                 ],
             )
             self.assertTrue(config.get("asr")["vibevoice"]["use_native_chunking"])
             self.assertEqual(config.get("asr")["vibevoice"]["chunk_parallel_workers"], 2)
+            self.assertEqual(
+                config.get("asr")["vibevoice"]["capswriter_url"],
+                "http://spark-31d6.taild500c8.ts.net:8001/api/asr/transcribe",
+            )
             self.assertEqual(
                 config.get("ocr")["fallback_model"],
                 "hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
@@ -240,7 +246,7 @@ class OperationManualTests(unittest.TestCase):
                 config.get("ocr")["base_urls"],
                 [
                     "http://spark-31d6.taild500c8.ts.net:8000/v1",
-                    "http://edgexpert-4353.taild500c8.ts.net:8000/v1",
+                    "http://edge.taild500c8.ts.net:8000/v1",
                 ],
             )
             self.assertEqual(config.get("ocr")["concurrency"], "auto")
@@ -318,6 +324,86 @@ class OperationManualTests(unittest.TestCase):
             self.assertEqual(args.ocr_base_url, "http://lab.local/ocr")
             self.assertEqual(args.output_root, "downloads/url-videos")
             self.assertEqual(args.ytdlp_js_runtimes, "auto")
+
+    def test_endpoint_host_override_updates_runtime_services(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_dir = Path(temp_dir)
+            (config_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "endpoints": {
+                            "hosts": {
+                                "edge": "edge-new.taild500c8.ts.net",
+                                "spark": "spark-new.taild500c8.ts.net",
+                            }
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            config = Config(str(config_dir))
+            profile = config.get_runtime_profile("deepseek_v4_pro")
+
+            self.assertEqual(
+                profile["vibevoice_urls"],
+                [
+                    "http://edge-new.taild500c8.ts.net:8012/api/asr/transcribe",
+                    "http://spark-new.taild500c8.ts.net:8012/api/asr/transcribe",
+                ],
+            )
+            self.assertEqual(
+                profile["ocr_base_urls"],
+                [
+                    "http://spark-new.taild500c8.ts.net:8000/v1",
+                    "http://edge-new.taild500c8.ts.net:8000/v1",
+                ],
+            )
+            self.assertEqual(
+                config.get("asr")["vibevoice"]["deep_remote_urls"],
+                profile["vibevoice_urls"],
+            )
+            self.assertEqual(
+                default_vibevoice_urls(config.config),
+                [
+                    "http://edge-new.taild500c8.ts.net:8012/api/asr/transcribe",
+                    "http://spark-new.taild500c8.ts.net:8012/api/asr/transcribe",
+                ],
+            )
+            self.assertEqual(
+                default_ocr_endpoints(config.config),
+                [
+                    "http://spark-new.taild500c8.ts.net:8000/v1",
+                    "http://edge-new.taild500c8.ts.net:8000/v1",
+                ],
+            )
+            self.assertEqual(
+                default_capswriter_url(config.config),
+                "http://spark-new.taild500c8.ts.net:8001/api/asr/transcribe",
+            )
+
+    def test_unknown_endpoint_placeholder_fails_fast(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_dir = Path(temp_dir)
+            (config_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "runtime_profiles": {
+                            "broken": {
+                                "llm_base_url": "http://{missing_host}:1234/v1",
+                                "vibevoice_url": "http://lab.local/asr",
+                                "ocr_base_url": "http://lab.local/ocr",
+                            }
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "missing_host"):
+                Config(str(config_dir))
 
     def test_url_runner_adds_node_js_runtime_for_youtube_challenges(self):
         args = argparse.Namespace(ytdlp_js_runtimes="auto")
@@ -658,7 +744,7 @@ class OperationManualTests(unittest.TestCase):
             vibevoice_url="http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
             ocr_base_url=[
                 "http://spark-31d6.taild500c8.ts.net:8000/v1",
-                "http://edgexpert-4353.taild500c8.ts.net:8000/v1",
+                "http://edge.taild500c8.ts.net:8000/v1",
             ],
             ocr_concurrency="auto",
             ocr_cache="on",
@@ -695,7 +781,7 @@ class OperationManualTests(unittest.TestCase):
         self.assertIn("vibevoice", command)
         self.assertIn("http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe", command)
         self.assertIn("http://spark-31d6.taild500c8.ts.net:8000/v1", command)
-        self.assertIn("http://edgexpert-4353.taild500c8.ts.net:8000/v1", command)
+        self.assertIn("http://edge.taild500c8.ts.net:8000/v1", command)
         self.assertIn("--vision-base-url", command)
         self.assertIn("http://100.96.79.21:18082/v1", command)
         self.assertIn("--text-base-url", command)
@@ -956,7 +1042,7 @@ class OperationManualTests(unittest.TestCase):
             DOTS_MOCR_ENDPOINTS,
             [
                 "http://spark-31d6.taild500c8.ts.net:8000/v1",
-                "http://edgexpert-4353.taild500c8.ts.net:8000/v1",
+                "http://edge.taild500c8.ts.net:8000/v1",
             ],
         )
 
@@ -965,8 +1051,8 @@ class OperationManualTests(unittest.TestCase):
         self.assertEqual(
             REMOTE_VIBEVOICE_URLS,
             [
+                "http://edge.taild500c8.ts.net:8012/api/asr/transcribe",
                 "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
-                "http://edgexpert-4353.taild500c8.ts.net:8012/api/asr/transcribe",
             ],
         )
         self.assertTrue(all("spark-31d6.taild500c8.ts.net" in url for url in REMOTE_ASR_URLS))

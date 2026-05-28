@@ -16,17 +16,40 @@ except ModuleNotFoundError:
     AudioSegment = None
 
 from .audio_processor import AudioProcessor, AudioTranscript
+from .config import Config, normalize_string_list
 
 logger = logging.getLogger(__name__)
 
-CAPSWRITER_URL = "http://spark-31d6.taild500c8.ts.net:8001/api/asr/transcribe"
-REMOTE_VIBEVOICE_URLS = [
+FALLBACK_CAPSWRITER_URL = "http://spark-31d6.taild500c8.ts.net:8001/api/asr/transcribe"
+FALLBACK_REMOTE_VIBEVOICE_URLS = [
+    "http://edge.taild500c8.ts.net:8012/api/asr/transcribe",
     "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
-    "http://edgexpert-4353.taild500c8.ts.net:8012/api/asr/transcribe",
 ]
-REMOTE_ASR_URLS = [
-    "http://spark-31d6.taild500c8.ts.net:8001/api/asr/transcribe",
-]
+
+
+def default_endpoint_service(name: str, fallback: object, config: Optional[Dict[str, object]] = None) -> object:
+    if config is not None:
+        return ((config.get("endpoints") or {}).get("services") or {}).get(name) or fallback
+    try:
+        return (Config().get("endpoints") or {}).get("services", {}).get(name) or fallback
+    except Exception as exc:
+        logger.debug("Could not load endpoint service %s from config: %s", name, exc)
+        return fallback
+
+
+def default_capswriter_url(config: Optional[Dict[str, object]] = None) -> str:
+    return str(default_endpoint_service("capswriter_url", FALLBACK_CAPSWRITER_URL, config))
+
+
+def default_vibevoice_urls(config: Optional[Dict[str, object]] = None) -> list[str]:
+    return normalize_string_list(default_endpoint_service("vibevoice_urls", FALLBACK_REMOTE_VIBEVOICE_URLS, config))
+
+
+CAPSWRITER_URL = default_capswriter_url()
+REMOTE_VIBEVOICE_URLS = normalize_string_list(
+    default_endpoint_service("vibevoice_urls", FALLBACK_REMOTE_VIBEVOICE_URLS)
+)
+REMOTE_ASR_URLS = [CAPSWRITER_URL]
 
 DEEP_ASR_MIN_SECONDS = 180.0
 VIBEVOICE_DISTRIBUTED_MIN_SECONDS = 420.0
@@ -171,12 +194,12 @@ def transcribe_with_http_asr(
     return None
 
 
-def transcribe_with_capswriter(audio_path: Path, hotword: str = "") -> Optional[AudioTranscript]:
-    return transcribe_with_http_asr(audio_path, CAPSWRITER_URL, hotword=hotword)
+def transcribe_with_capswriter(audio_path: Path, hotword: str = "", url: Optional[str] = None) -> Optional[AudioTranscript]:
+    return transcribe_with_http_asr(audio_path, url or default_capswriter_url(), hotword=hotword)
 
 
 def transcribe_with_remote_http(audio_path: Path, urls: Optional[list[str]] = None) -> Optional[AudioTranscript]:
-    urls = REMOTE_ASR_URLS if urls is None else urls
+    urls = [default_capswriter_url()] if urls is None else urls
     for url in urls:
         transcript = transcribe_with_http_asr(audio_path, url)
         if transcript and transcript.text.strip():
@@ -190,7 +213,7 @@ def transcribe_with_vibevoice_remote(
     urls: Optional[list[str]] = None,
     options: Optional[Dict[str, object]] = None,
 ) -> Optional[AudioTranscript]:
-    urls = [url for url in (REMOTE_VIBEVOICE_URLS if urls is None else urls) if url]
+    urls = [url for url in (default_vibevoice_urls() if urls is None else urls) if url]
     if not urls:
         logger.warning("No remote GPU VibeVoice endpoint is configured")
         return None
@@ -346,7 +369,11 @@ def transcribe_with_provider_result(
                 lambda: transcribe_with_remote_http(audio_path, vibevoice_config.get("remote_urls")),
             )
         elif candidate == "capswriter_http":
-            transcript = _timed_transcribe(result, candidate, lambda: transcribe_with_capswriter(audio_path))
+            transcript = _timed_transcribe(
+                result,
+                candidate,
+                lambda: transcribe_with_capswriter(audio_path, url=str(vibevoice_config.get("capswriter_url") or "")),
+            )
         elif candidate == "vibevoice":
             transcript = _timed_transcribe(result, candidate, lambda: transcribe_with_vibevoice(audio_path, vibevoice_config))
         elif candidate == "faster_whisper":

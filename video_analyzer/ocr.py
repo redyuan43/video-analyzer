@@ -17,14 +17,31 @@ from urllib.parse import urlsplit, urlunsplit
 import requests
 from PIL import Image
 
+from .config import Config, normalize_string_list
 from .frame import Frame
 
 logger = logging.getLogger(__name__)
 
-DOTS_MOCR_ENDPOINTS = [
+FALLBACK_DOTS_MOCR_ENDPOINTS = [
     "http://spark-31d6.taild500c8.ts.net:8000/v1",
-    "http://edgexpert-4353.taild500c8.ts.net:8000/v1",
+    "http://edge.taild500c8.ts.net:8000/v1",
 ]
+
+
+def default_ocr_endpoints(config: Optional[Dict[str, Any]] = None) -> list[str]:
+    if config is not None:
+        values = normalize_string_list(((config.get("endpoints") or {}).get("services") or {}).get("ocr_base_urls"))
+        return values or FALLBACK_DOTS_MOCR_ENDPOINTS
+    try:
+        endpoints = (Config().get("endpoints") or {}).get("services", {}).get("ocr_base_urls")
+        values = normalize_string_list(endpoints)
+        return values or FALLBACK_DOTS_MOCR_ENDPOINTS
+    except Exception as exc:
+        logger.debug("Could not load OCR endpoints from config: %s", exc)
+        return FALLBACK_DOTS_MOCR_ENDPOINTS
+
+
+DOTS_MOCR_ENDPOINTS = default_ocr_endpoints()
 
 PROMPTS = {
     "prompt_scene_spotting": (
@@ -219,7 +236,7 @@ class DotsMOCRVLLMProvider:
         self.session = _make_session(self.base_url)
 
     def probe(self) -> Optional[str]:
-        endpoints = DOTS_MOCR_ENDPOINTS if self.base_url == "auto" else [self.base_url]
+        endpoints = default_ocr_endpoints() if self.base_url == "auto" else [self.base_url]
         self.diagnostics = []
         started = time.monotonic()
         deadline = started + max(0, self.warmup_timeout_seconds)
@@ -507,7 +524,7 @@ def _resolve_dots_endpoints(base_url: str, base_urls: Optional[List[str]] = None
     if base_urls:
         endpoints = base_urls
     elif base_url == "auto":
-        endpoints = DOTS_MOCR_ENDPOINTS
+        endpoints = default_ocr_endpoints()
     else:
         endpoints = [item.strip() for item in base_url.split(",") if item.strip()]
     normalized = []

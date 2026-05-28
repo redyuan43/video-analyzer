@@ -72,7 +72,7 @@ tools/run_operation_manual_from_url.sh "URL" --candidate-frames auto --max-vl-fr
 # Use two DotsMOCR endpoints and keep OCR cache enabled.
 tools/run_operation_manual_from_url.sh "URL" \
   --ocr-base-url http://spark-31d6.taild500c8.ts.net:8000/v1 \
-  --ocr-base-url http://edgexpert-4353.taild500c8.ts.net:8000/v1 \
+  --ocr-base-url http://edge.taild500c8.ts.net:8000/v1 \
   --ocr-concurrency auto \
   --ocr-cache on
 
@@ -112,7 +112,7 @@ To switch or customize endpoints/models, use a runtime profile:
       "ocr_base_url": "http://spark-31d6.taild500c8.ts.net:8000/v1",
       "ocr_base_urls": [
         "http://spark-31d6.taild500c8.ts.net:8000/v1",
-        "http://edgexpert-4353.taild500c8.ts.net:8000/v1"
+        "http://edge.taild500c8.ts.net:8000/v1"
       ],
       "ocr_concurrency": "auto",
       "ocr_cache": "on",

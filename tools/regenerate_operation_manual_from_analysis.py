@@ -17,7 +17,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from video_analyzer.audio_processor import AudioTranscript
 from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient
-from video_analyzer.config import build_openai_extra_body, resolve_api_key
+from video_analyzer.config import Config, build_openai_extra_body, resolve_api_key
 from video_analyzer.frame import Frame
 from video_analyzer.manual import (
     DEFAULT_MAX_FRAME_EVIDENCE_CHARS,
@@ -60,8 +60,9 @@ def load_frames(run_dir: Path, ocr_events: list[OCREvent]) -> list[Frame]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("analysis_json", type=Path)
+    parser.add_argument("--config", default="config")
     parser.add_argument("--context-file", type=Path)
-    parser.add_argument("--text-base-url", default="http://100.90.114.26:18081/v1")
+    parser.add_argument("--text-base-url")
     parser.add_argument("--text-model", default="hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive")
     parser.add_argument("--manual-language", default="zh-CN")
     parser.add_argument("--temperature", type=float)
@@ -69,6 +70,8 @@ def main() -> int:
     parser.add_argument("--timeout-seconds", type=int, default=600)
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
     args = parser.parse_args()
+    services = (Config(args.config).get("endpoints") or {}).get("services", {})
+    args.text_base_url = args.text_base_url or services.get("amd_fast_base_url")
 
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s - %(levelname)s - %(message)s")
     bypass_proxy_environment()

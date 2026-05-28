@@ -45,8 +45,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    profile = Config(args.config).get_runtime_profile(args.profile)
-    base_url = args.llm_base_url or profile.get("llm_base_url") or "http://spark-31d6.taild500c8.ts.net:1234/v1"
+    config = Config(args.config)
+    profile = config.get_runtime_profile(args.profile)
+    default_base_url = (config.get("endpoints") or {}).get("services", {}).get("amd_fast_base_url")
+    base_url = args.llm_base_url or profile.get("llm_base_url") or default_base_url
     model = args.text_model or profile.get("text_model")
     if not model:
         raise ValueError("Runtime profile must provide text_model, or pass --text-model")

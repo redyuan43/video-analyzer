@@ -20,11 +20,11 @@
   Use this same OpenAI-compatible model for frame vision analysis and final text/manual generation. Do not route this project through the generic SayAnything Gateway unless the user explicitly asks for a cross-service comparison.
 - For long or strict ASR runs, use the VibeVoice HTTP endpoint on either:
   - `http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe`
-  - `http://edgexpert-4353.taild500c8.ts.net:8012/api/asr/transcribe`
+  - `http://edge.taild500c8.ts.net:8012/api/asr/transcribe`
 - Both `8012` endpoints are lazy proxies. They should keep the VibeVoice backend unloaded until a request arrives.
 - The persistent VibeVoice Ray pool is:
   - Spark Ray head: `vibevoice-ray-head.service` on `spark-31d6`, `10.31.36.1:6379`
-  - Edge Ray worker: `vibevoice-ray-worker.service` on `edgexpert-4353`, `10.31.36.2`
+  - Edge Ray worker: `vibevoice-ray-worker.service` on `edge`, `10.31.36.2`
   - Ray resources: `vibevoice_spark:1`, `vibevoice_edge:1`, `GPU:2`
 - Both VibeVoice backend services should use Ray mode:
   - `VIBEVOICE_WORKER_BACKEND=ray`
@@ -50,7 +50,7 @@ ssh dgx@spark-31d6.taild500c8.ts.net \
 Expected resources include both `vibevoice_spark` and `vibevoice_edge`.
 
 ```bash
-ssh admin@edgexpert-4353.taild500c8.ts.net \
+ssh admin@edge.taild500c8.ts.net \
   "curl -fsS http://127.0.0.1:8012/api/health | python3 -m json.tool"
 ssh dgx@spark-31d6.taild500c8.ts.net \
   "curl -fsS http://127.0.0.1:8012/api/health | python3 -m json.tool"

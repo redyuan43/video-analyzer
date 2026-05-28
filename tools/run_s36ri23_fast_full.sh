@@ -12,6 +12,38 @@ RUN_NAME="${RUN_NAME:-operation-manual-fast-full-$(date +%Y%m%d-%H%M%S)}"
 OUTPUT_DIR="${OUTPUT_DIR:-downloads/url-videos/S36ri23-l60/${RUN_NAME}}"
 OCR_CACHE="${OCR_CACHE:-on}"
 
+AMD_FAST_BASE_URL="$(".venv/bin/python" - <<'PY'
+from video_analyzer.config import Config
+print(Config("config").get("endpoints")["services"]["amd_fast_base_url"])
+PY
+)"
+MINICPM_V100_BASE_URL="$(".venv/bin/python" - <<'PY'
+from video_analyzer.config import Config
+print(Config("config").get("endpoints")["services"]["minicpm_v100_base_url"])
+PY
+)"
+mapfile -t VIBEVOICE_URLS < <(".venv/bin/python" - <<'PY'
+from video_analyzer.config import Config
+for url in Config("config").get("endpoints")["services"]["vibevoice_urls"]:
+    print(url)
+PY
+)
+mapfile -t OCR_BASE_URLS < <(".venv/bin/python" - <<'PY'
+from video_analyzer.config import Config
+for url in Config("config").get("endpoints")["services"]["ocr_base_urls"]:
+    print(url)
+PY
+)
+
+VIBEVOICE_ARGS=()
+for url in "${VIBEVOICE_URLS[@]}"; do
+  VIBEVOICE_ARGS+=(--vibevoice-url "$url")
+done
+OCR_ARGS=()
+for url in "${OCR_BASE_URLS[@]}"; do
+  OCR_ARGS+=(--ocr-base-url "$url")
+done
+
 if [[ ! -f "$VIDEO_PATH" ]]; then
   echo "Video not found: $VIDEO_PATH" >&2
   exit 1
@@ -46,15 +78,14 @@ echo "[run] frame extractor: jetson nx2,nx3"
   --jetson-sample-fps auto \
   --jetson-chunk-overlap-seconds 2 \
   --asr-provider vibevoice \
-  --vibevoice-url "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe" \
+  "${VIBEVOICE_ARGS[@]}" \
   --ocr-provider auto \
-  --ocr-base-url "http://spark-31d6.taild500c8.ts.net:8000/v1" \
-  --ocr-base-url "http://edgexpert-4353.taild500c8.ts.net:8000/v1" \
+  "${OCR_ARGS[@]}" \
   --ocr-concurrency auto \
   --ocr-cache "$OCR_CACHE" \
-  --llm-base-url "http://100.90.114.26:18081/v1" \
-  --vision-base-url "http://100.96.79.21:18082/v1" \
-  --text-base-url "http://100.90.114.26:18081/v1" \
+  --llm-base-url "$AMD_FAST_BASE_URL" \
+  --vision-base-url "$MINICPM_V100_BASE_URL" \
+  --text-base-url "$AMD_FAST_BASE_URL" \
   --vision-model "minicpm-v-4.5-v100" \
   --text-model "hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive" \
   --vl-concurrency 3 \

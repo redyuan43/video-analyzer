@@ -14,7 +14,6 @@ from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient
 from video_analyzer.config import Config, build_openai_extra_body, resolve_api_key, resolve_temperature
 
 
-DEFAULT_LLM_BASE_URL = "http://spark-31d6.taild500c8.ts.net:1234/v1"
 DEFAULT_TEXT_MODEL = "redhatai_qwen3.6-35b-a3b-nvfp4"
 DEFAULT_DOC_TYPES = ["knowledge_notes", "deep_report", "operation_manual_review"]
 DOC_FILENAMES = {
@@ -40,17 +39,20 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    profile = Config(args.config).get_runtime_profile(args.profile)
+    config = Config(args.config)
+    profile = config.get_runtime_profile(args.profile)
+    default_base_url = (config.get("endpoints") or {}).get("services", {}).get("amd_fast_base_url")
+    llm_base_url = args.llm_base_url or profile.get("llm_base_url") or default_base_url
     run_multidoc_analysis(
         run_dir=Path(args.run_dir),
         output_dir=Path(args.output) if args.output else None,
         doc_types=parse_doc_types(args.doc_types, profile),
         language=args.language,
-        llm_base_url=args.llm_base_url or profile.get("llm_base_url"),
+        llm_base_url=llm_base_url,
         text_model=args.text_model or profile.get("text_model"),
         temperature=args.temperature if args.temperature is not None else resolve_temperature(profile, 0.2),
         api_key_env=profile.get("text_api_key_env") or profile.get("api_key_env"),
-        extra_body=build_openai_extra_body(profile, args.llm_base_url or profile.get("llm_base_url")),
+        extra_body=build_openai_extra_body(profile, llm_base_url),
     )
     return 0
 
@@ -78,7 +80,7 @@ def run_multidoc_analysis(
     analysis = read_json(run_dir / "analysis.json")
     metadata = analysis.get("metadata") or {}
     model = text_model or metadata.get("text_model") or DEFAULT_TEXT_MODEL
-    base_url = llm_base_url or metadata.get("llm_base_url") or DEFAULT_LLM_BASE_URL
+    base_url = llm_base_url or metadata.get("llm_base_url") or _default_llm_base_url()
     client = client or GenericOpenAIAPIClient(
         resolve_api_key(api_key_env=api_key_env, api_url=base_url),
         base_url,
@@ -148,6 +150,10 @@ def run_multidoc_analysis(
     }
     write_json(output_dir / "analysis.json", summary)
     return summary
+
+
+def _default_llm_base_url() -> str:
+    return (Config("config").get("endpoints") or {}).get("services", {}).get("amd_fast_base_url")
 
 
 def validate_run_dir(run_dir: Path) -> None:

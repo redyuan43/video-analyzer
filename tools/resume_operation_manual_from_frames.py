@@ -314,9 +314,9 @@ def main() -> int:
     parser.add_argument("--ocr-cache", choices=["on", "off", "refresh"], default="refresh")
     parser.add_argument("--ocr-cache-dir", default=".cache/video-analyzer/ocr")
     parser.add_argument("--ocr-timeout-seconds", type=float, default=30)
-    parser.add_argument("--llm-base-url", default="http://100.90.114.26:18081/v1")
-    parser.add_argument("--vision-base-url", default="http://100.96.79.21:18082/v1")
-    parser.add_argument("--text-base-url", default="http://100.90.114.26:18081/v1")
+    parser.add_argument("--llm-base-url")
+    parser.add_argument("--vision-base-url")
+    parser.add_argument("--text-base-url")
     parser.add_argument("--vision-model", default="minicpm-v-4.5-v100")
     parser.add_argument("--text-model", default="hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive")
     parser.add_argument("--text-temperature", type=float)
@@ -333,6 +333,10 @@ def main() -> int:
     parser.add_argument("--vl-context-after", type=int, default=0)
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
     args = parser.parse_args()
+    services = (Config(args.config).get("endpoints") or {}).get("services", {})
+    args.llm_base_url = args.llm_base_url or services.get("amd_fast_base_url")
+    args.vision_base_url = args.vision_base_url or services.get("minicpm_v100_base_url") or args.llm_base_url
+    args.text_base_url = args.text_base_url or services.get("amd_fast_base_url") or args.llm_base_url
 
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s - %(levelname)s - %(message)s")
     bypass_proxy_environment()

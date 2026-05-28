@@ -2,6 +2,8 @@ import argparse
 from pathlib import Path
 import json
 import os
+import copy
+import re
 from typing import Any
 import logging
 from importlib import resources
@@ -11,6 +13,7 @@ from urllib.parse import urlparse
 logger = logging.getLogger(__name__)
 
 DEFAULT_DEEPSEEK_ENV = Path("~/.config/video-analyzer/deepseek.env").expanduser()
+ENDPOINT_REF_RE = re.compile(r"\{([A-Za-z0-9_.-]+)\}")
 
 
 class Config:
@@ -53,6 +56,7 @@ class Config:
             else:
                 logger.debug("No user config found, using default config")
                 self.config = default_config
+            self.config = resolve_endpoint_config(self.config)
                     
             # Ensure prompts is a list
             if not isinstance(self.config.get("prompts", []), list):
@@ -160,8 +164,11 @@ class Config:
         if self.config.get("task") == "operation_manual" and not args.client:
             manual_config = self.config.setdefault("operation_manual", {})
             profile = self.get_runtime_profile(getattr(args, "profile", None))
+            default_llm_base_url = (self.config.get("endpoints") or {}).get("services", {}).get(
+                "amd_fast_base_url"
+            )
             llm_base_url = manual_config.get("llm_base_url") or profile.get(
-                "llm_base_url", "http://100.90.114.26:18081/v1"
+                "llm_base_url", default_llm_base_url
             )
             vision_base_url = manual_config.get("vision_base_url") or profile.get("vision_base_url") or llm_base_url
             text_base_url = manual_config.get("text_base_url") or profile.get("text_base_url") or llm_base_url
@@ -196,6 +203,10 @@ class Config:
             user_config_asr_provider = "provider" in (getattr(self, "user_config_data", {}).get("asr") or {})
             if not getattr(args, "asr_provider", None) and not user_config_asr_provider:
                 self.config.setdefault("asr", {})["provider"] = "auto"
+            services = (self.config.get("endpoints") or {}).get("services") or {}
+            vibevoice = self.config.setdefault("asr", {}).setdefault("vibevoice", {})
+            if services.get("capswriter_url"):
+                vibevoice.setdefault("capswriter_url", services["capswriter_url"])
 
     def save_user_config(self):
         """Save current configuration to user config file."""
@@ -236,6 +247,66 @@ def normalize_string_list(value: Any) -> list[str]:
             if cleaned and cleaned not in values:
                 values.append(cleaned)
     return values
+
+
+def resolve_endpoint_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Resolve endpoint placeholders in configuration sections that contain URLs."""
+    resolved = copy.deepcopy(config)
+    registry = build_endpoint_registry(resolved)
+    for key in ("clients", "operation_manual", "runtime_profiles", "ocr", "asr"):
+        if key in resolved:
+            resolved[key] = resolve_endpoint_refs(resolved[key], registry)
+    if "endpoints" in resolved:
+        resolved["endpoints"] = resolve_endpoint_refs(resolved["endpoints"], registry)
+    return resolved
+
+
+def build_endpoint_registry(config: dict[str, Any]) -> dict[str, Any]:
+    endpoints = config.get("endpoints") or {}
+    hosts = endpoints.get("hosts") or {}
+    services = endpoints.get("services") or {}
+    registry: dict[str, Any] = {}
+    for name, value in hosts.items():
+        registry[name] = value
+        registry[f"hosts.{name}"] = value
+    for name, value in services.items():
+        resolved_value = resolve_endpoint_refs(value, registry)
+        registry[name] = resolved_value
+        registry[f"services.{name}"] = resolved_value
+    return registry
+
+
+def resolve_endpoint_refs(value: Any, registry: dict[str, Any]) -> Any:
+    if isinstance(value, dict):
+        return {key: resolve_endpoint_refs(item, registry) for key, item in value.items()}
+    if isinstance(value, list):
+        resolved: list[Any] = []
+        for item in value:
+            item_value = resolve_endpoint_refs(item, registry)
+            if isinstance(item_value, list):
+                resolved.extend(item_value)
+            else:
+                resolved.append(item_value)
+        return resolved
+    if not isinstance(value, str):
+        return value
+    match = ENDPOINT_REF_RE.fullmatch(value)
+    if match:
+        key = match.group(1)
+        if key not in registry:
+            raise ValueError(f"Unknown endpoint placeholder {{{key}}}")
+        return copy.deepcopy(registry[key])
+
+    def replace(match: re.Match[str]) -> str:
+        key = match.group(1)
+        if key not in registry:
+            raise ValueError(f"Unknown endpoint placeholder {{{key}}}")
+        replacement = registry[key]
+        if isinstance(replacement, (dict, list)):
+            raise ValueError(f"Endpoint placeholder {{{key}}} cannot be embedded in a string")
+        return str(replacement)
+
+    return ENDPOINT_REF_RE.sub(replace, value)
 
 
 def get_runtime_profile(config: dict[str, Any], profile_name: str | None = None) -> dict[str, Any]:

@@ -27,11 +27,11 @@ The Spark/Edge VibeVoice ASR deployment is persisted as a shared Ray pool:
 | Role | Host | Service | Address |
 |------|------|---------|---------|
 | Ray head | `spark-31d6` | `vibevoice-ray-head.service` | `10.31.36.1:6379` |
-| Ray worker | `edgexpert-4353` | `vibevoice-ray-worker.service` | `10.31.36.2` |
+| Ray worker | `edge` | `vibevoice-ray-worker.service` | `10.31.36.2` |
 | Lazy API | `spark-31d6` | `vibevoice-asr-lazy-proxy.service` | `:8012` |
-| Lazy API | `edgexpert-4353` | `vibevoice-asr-lazy-proxy.service` | `:8012` |
+| Lazy API | `edge` | `vibevoice-asr-lazy-proxy.service` | `:8012` |
 
-Either `spark:8012` or `edgexpert:8012` can be used as the API entry point.
+Either `spark:8012` or `edge:8012` can be used as the API entry point.
 The backend should connect to the same Ray cluster and create two actors named
 `spark` and `edge`.
 
@@ -81,7 +81,7 @@ Passing response shape:
 
 Observed timings:
 
-- `edgexpert:8012`: about 160 seconds end to end.
+- `edge:8012`: about 160 seconds end to end.
 - `spark:8012`: about 159 seconds end to end.
 
 ## Debug Checklist
@@ -100,7 +100,7 @@ Expected: `GPU: 2`, `vibevoice_spark: 1`, and `vibevoice_edge: 1`.
 ```bash
 ssh dgx@spark-31d6.taild500c8.ts.net \
   "curl -fsS http://127.0.0.1:8012/api/health | python3 -m json.tool"
-ssh admin@edgexpert-4353.taild500c8.ts.net \
+ssh admin@edge.taild500c8.ts.net \
   "curl -fsS http://127.0.0.1:8012/api/health | python3 -m json.tool"
 ```
 
@@ -121,7 +121,7 @@ cold start and `ray::VibeVoiceChunkWorker.transcribe_chunk` during inference.
   processes do not have `VibeVoice-bench` on `PYTHONPATH`.
 - Hugging Face path errors using `/home/admin/...` on Spark: the driver passed a
   machine-specific model path. Use `/tmp/vibevoice-model`.
-- `ray.enabled=false` on edgexpert: check
+- `ray.enabled=false` on edge: check
   `~/.config/systemd/user/vibevoice-asr-backend.service.d/override.conf`; an
   old override may still force `VIBEVOICE_WORKER_BACKEND=local_single`.
 - `8012` health timeout while a request is running: first inspect GPU processes

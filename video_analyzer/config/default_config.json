@@ -12,13 +12,13 @@
         "openai_api": {
             "api_key": "",
             "model": "hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
-            "api_url": "http://100.90.114.26:18081/v1",
+            "api_url": "{amd_fast_base_url}",
             "timeout_seconds": 600
         }
     },
     "operation_manual": {
         "llm_base_url": "https://api.deepseek.com",
-        "vision_base_url": "http://100.96.79.21:18082/v1",
+        "vision_base_url": "{minicpm_v100_base_url}",
         "text_base_url": "https://api.deepseek.com",
         "text_api_key_env": "DEEPSEEK_API_KEY",
         "vision_model": "minicpm-v-4.5-v100",
@@ -26,23 +26,44 @@
         "frame_no_think": true,
         "manual_no_think": true
     },
+    "endpoints": {
+        "hosts": {
+            "amd_fast": "100.90.114.26",
+            "minicpm_v100": "100.96.79.21",
+            "spark": "spark-31d6.taild500c8.ts.net",
+            "edge": "edge.taild500c8.ts.net"
+        },
+        "services": {
+            "amd_fast_base_url": "http://{amd_fast}:18081/v1",
+            "minicpm_v100_base_url": "http://{minicpm_v100}:18082/v1",
+            "capswriter_url": "http://{spark}:8001/api/asr/transcribe",
+            "vibevoice_urls": [
+                "http://{edge}:8012/api/asr/transcribe",
+                "http://{spark}:8012/api/asr/transcribe"
+            ],
+            "ocr_base_urls": [
+                "http://{spark}:8000/v1",
+                "http://{edge}:8000/v1"
+            ]
+        }
+    },
     "active_runtime_profile": "deepseek_v4_pro",
     "runtime_profiles": {
         "ivan_minicpm_v100": {
-            "llm_base_url": "http://100.90.114.26:18081/v1",
-            "vision_base_url": "http://100.96.79.21:18082/v1",
-            "text_base_url": "http://100.90.114.26:18081/v1",
+            "llm_base_url": "{amd_fast_base_url}",
+            "vision_base_url": "{minicpm_v100_base_url}",
+            "text_base_url": "{amd_fast_base_url}",
             "vision_model": "minicpm-v-4.5-v100",
             "text_model": "hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
-            "vibevoice_url": "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
+            "vibevoice_url": "http://{edge}:8012/api/asr/transcribe",
             "vibevoice_urls": [
-                "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
-                "http://edgexpert-4353.taild500c8.ts.net:8012/api/asr/transcribe"
+                "http://{edge}:8012/api/asr/transcribe",
+                "http://{spark}:8012/api/asr/transcribe"
             ],
-            "ocr_base_url": "http://spark-31d6.taild500c8.ts.net:8000/v1",
+            "ocr_base_url": "http://{spark}:8000/v1",
             "ocr_base_urls": [
-                "http://spark-31d6.taild500c8.ts.net:8000/v1",
-                "http://edgexpert-4353.taild500c8.ts.net:8000/v1"
+                "http://{spark}:8000/v1",
+                "http://{edge}:8000/v1"
             ],
             "ocr_concurrency": "auto",
             "ocr_cache": "on",
@@ -72,20 +93,20 @@
             "multidoc_output_name": "docs_analysis"
         },
         "amd_fast": {
-            "llm_base_url": "http://100.90.114.26:18081/v1",
-            "vision_base_url": "http://100.90.114.26:18081/v1",
-            "text_base_url": "http://100.90.114.26:18081/v1",
+            "llm_base_url": "{amd_fast_base_url}",
+            "vision_base_url": "{amd_fast_base_url}",
+            "text_base_url": "{amd_fast_base_url}",
             "vision_model": "hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
             "text_model": "hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
-            "vibevoice_url": "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
+            "vibevoice_url": "http://{edge}:8012/api/asr/transcribe",
             "vibevoice_urls": [
-                "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
-                "http://edgexpert-4353.taild500c8.ts.net:8012/api/asr/transcribe"
+                "http://{edge}:8012/api/asr/transcribe",
+                "http://{spark}:8012/api/asr/transcribe"
             ],
-            "ocr_base_url": "http://spark-31d6.taild500c8.ts.net:8000/v1",
+            "ocr_base_url": "http://{spark}:8000/v1",
             "ocr_base_urls": [
-                "http://spark-31d6.taild500c8.ts.net:8000/v1",
-                "http://edgexpert-4353.taild500c8.ts.net:8000/v1"
+                "http://{spark}:8000/v1",
+                "http://{edge}:8000/v1"
             ],
             "ocr_concurrency": "auto",
             "ocr_cache": "on",
@@ -116,7 +137,7 @@
         },
         "deepseek_v4_pro": {
             "llm_base_url": "https://api.deepseek.com",
-            "vision_base_url": "http://100.96.79.21:18082/v1",
+            "vision_base_url": "{minicpm_v100_base_url}",
             "text_base_url": "https://api.deepseek.com",
             "text_api_key_env": "DEEPSEEK_API_KEY",
             "vision_model": "minicpm-v-4.5-v100",
@@ -126,15 +147,15 @@
             "deepseek_thinking": "disabled",
             "review_deepseek_thinking": "enabled",
             "review_reasoning_effort": "high",
-            "vibevoice_url": "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
+            "vibevoice_url": "http://{edge}:8012/api/asr/transcribe",
             "vibevoice_urls": [
-                "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
-                "http://edgexpert-4353.taild500c8.ts.net:8012/api/asr/transcribe"
+                "http://{edge}:8012/api/asr/transcribe",
+                "http://{spark}:8012/api/asr/transcribe"
             ],
-            "ocr_base_url": "http://spark-31d6.taild500c8.ts.net:8000/v1",
+            "ocr_base_url": "http://{spark}:8000/v1",
             "ocr_base_urls": [
-                "http://spark-31d6.taild500c8.ts.net:8000/v1",
-                "http://edgexpert-4353.taild500c8.ts.net:8000/v1"
+                "http://{spark}:8000/v1",
+                "http://{edge}:8000/v1"
             ],
             "ocr_concurrency": "auto",
             "ocr_cache": "on",
@@ -165,7 +186,7 @@
         },
         "deepseek_v4_flash": {
             "llm_base_url": "https://api.deepseek.com",
-            "vision_base_url": "http://100.96.79.21:18082/v1",
+            "vision_base_url": "{minicpm_v100_base_url}",
             "text_base_url": "https://api.deepseek.com",
             "text_api_key_env": "DEEPSEEK_API_KEY",
             "vision_model": "minicpm-v-4.5-v100",
@@ -175,15 +196,15 @@
             "deepseek_thinking": "disabled",
             "review_deepseek_thinking": "enabled",
             "review_reasoning_effort": "high",
-            "vibevoice_url": "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
+            "vibevoice_url": "http://{edge}:8012/api/asr/transcribe",
             "vibevoice_urls": [
-                "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
-                "http://edgexpert-4353.taild500c8.ts.net:8012/api/asr/transcribe"
+                "http://{edge}:8012/api/asr/transcribe",
+                "http://{spark}:8012/api/asr/transcribe"
             ],
-            "ocr_base_url": "http://spark-31d6.taild500c8.ts.net:8000/v1",
+            "ocr_base_url": "http://{spark}:8000/v1",
             "ocr_base_urls": [
-                "http://spark-31d6.taild500c8.ts.net:8000/v1",
-                "http://edgexpert-4353.taild500c8.ts.net:8000/v1"
+                "http://{spark}:8000/v1",
+                "http://{edge}:8000/v1"
             ],
             "ocr_concurrency": "auto",
             "ocr_cache": "on",
@@ -213,20 +234,20 @@
             "multidoc_output_name": "docs_analysis"
         },
         "spark": {
-            "llm_base_url": "http://100.90.114.26:18081/v1",
-            "vision_base_url": "http://100.90.114.26:18081/v1",
-            "text_base_url": "http://100.90.114.26:18081/v1",
+            "llm_base_url": "{amd_fast_base_url}",
+            "vision_base_url": "{amd_fast_base_url}",
+            "text_base_url": "{amd_fast_base_url}",
             "vision_model": "hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
             "text_model": "hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
-            "vibevoice_url": "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
+            "vibevoice_url": "http://{edge}:8012/api/asr/transcribe",
             "vibevoice_urls": [
-                "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
-                "http://edgexpert-4353.taild500c8.ts.net:8012/api/asr/transcribe"
+                "http://{edge}:8012/api/asr/transcribe",
+                "http://{spark}:8012/api/asr/transcribe"
             ],
-            "ocr_base_url": "http://spark-31d6.taild500c8.ts.net:8000/v1",
+            "ocr_base_url": "http://{spark}:8000/v1",
             "ocr_base_urls": [
-                "http://spark-31d6.taild500c8.ts.net:8000/v1",
-                "http://edgexpert-4353.taild500c8.ts.net:8000/v1"
+                "http://{spark}:8000/v1",
+                "http://{edge}:8000/v1"
             ],
             "ocr_concurrency": "auto",
             "ocr_cache": "on",
@@ -256,20 +277,20 @@
             "multidoc_output_name": "docs_analysis"
         },
         "local_lan": {
-            "llm_base_url": "http://100.90.114.26:18081/v1",
-            "vision_base_url": "http://100.90.114.26:18081/v1",
-            "text_base_url": "http://100.90.114.26:18081/v1",
+            "llm_base_url": "{amd_fast_base_url}",
+            "vision_base_url": "{amd_fast_base_url}",
+            "text_base_url": "{amd_fast_base_url}",
             "vision_model": "hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
             "text_model": "hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
-            "vibevoice_url": "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
+            "vibevoice_url": "http://{edge}:8012/api/asr/transcribe",
             "vibevoice_urls": [
-                "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
-                "http://edgexpert-4353.taild500c8.ts.net:8012/api/asr/transcribe"
+                "http://{edge}:8012/api/asr/transcribe",
+                "http://{spark}:8012/api/asr/transcribe"
             ],
-            "ocr_base_url": "http://spark-31d6.taild500c8.ts.net:8000/v1",
+            "ocr_base_url": "http://{spark}:8000/v1",
             "ocr_base_urls": [
-                "http://spark-31d6.taild500c8.ts.net:8000/v1",
-                "http://edgexpert-4353.taild500c8.ts.net:8000/v1"
+                "http://{spark}:8000/v1",
+                "http://{edge}:8000/v1"
             ],
             "ocr_concurrency": "auto",
             "ocr_cache": "on",
@@ -303,8 +324,8 @@
         "provider": "auto",
         "base_url": "auto",
         "base_urls": [
-            "http://spark-31d6.taild500c8.ts.net:8000/v1",
-            "http://edgexpert-4353.taild500c8.ts.net:8000/v1"
+            "http://{spark}:8000/v1",
+            "http://{edge}:8000/v1"
         ],
         "model": "model",
         "prompt_mode": "prompt_scene_spotting",
@@ -317,7 +338,7 @@
         "probe_timeout_seconds": 5,
         "warmup_timeout_seconds": 180,
         "warmup_retry_interval_seconds": 5,
-        "fallback_base_url": "http://100.90.114.26:18081/v1",
+        "fallback_base_url": "{amd_fast_base_url}",
         "fallback_model": "hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
         "fallback_api_key": "0"
     },
@@ -362,8 +383,8 @@
         "require_transcript": true,
         "vibevoice": {
             "deep_remote_urls": [
-                "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
-                "http://edgexpert-4353.taild500c8.ts.net:8012/api/asr/transcribe"
+                "http://{edge}:8012/api/asr/transcribe",
+                "http://{spark}:8012/api/asr/transcribe"
             ],
             "use_native_chunking": true,
             "single_pass_max_duration_sec": 420,
