@@ -16,6 +16,7 @@ let scanAnimationFrame = null;
 let currentJob = null;
 let latestJobs = [];
 let currentView = new URLSearchParams(window.location.search).get('view') === 'preview' ? 'preview' : 'console';
+let pendingUrls = [];
 const videoLoadErrors = {};
 
 const nodes = {
@@ -27,6 +28,10 @@ const nodes = {
     formError: document.getElementById('formError'),
     createButton: document.getElementById('createButton'),
     batchResult: document.getElementById('batchResult'),
+    videoUrlInput: document.getElementById('videoUrlInput'),
+    addUrlButton: document.getElementById('addUrlButton'),
+    videoUrls: document.getElementById('videoUrls'),
+    urlList: document.getElementById('urlList'),
     globalSummary: document.getElementById('globalSummary'),
     resourceLanes: document.getElementById('resourceLanes'),
     refreshJobsButton: document.getElementById('refreshJobsButton'),
@@ -145,6 +150,60 @@ function fillSelect(id, values, selected) {
     node.value = selected || '';
 }
 
+function splitUrlInput(value) {
+    return String(value || '').split(/[\s,]+/).map(item => item.trim()).filter(Boolean);
+}
+
+function syncUrlField() {
+    nodes.videoUrls.value = pendingUrls.map(item => item.url).join('\n');
+}
+
+function focusPromptMap() {
+    return Object.fromEntries(pendingUrls.map(item => [item.url, item.focus_prompt || '']));
+}
+
+function renderUrlList() {
+    syncUrlField();
+    nodes.urlList.innerHTML = pendingUrls.length ? pendingUrls.map((item, index) => `
+        <div class="url-item">
+            <span title="${escapeHtml(item.url)}">${escapeHtml(item.url)}</span>
+            <button class="icon-button light remove-url" type="button" data-index="${index}" title="移除链接" aria-label="移除链接">×</button>
+            <label class="url-focus">
+                <span>关注重点</span>
+                <textarea class="url-focus-input" data-index="${index}" rows="3" placeholder="这条视频分析时要特别关注的内容"></textarea>
+            </label>
+        </div>
+    `).join('') : '<div class="muted">暂无链接</div>';
+    document.querySelectorAll('.url-focus-input').forEach(textarea => {
+        const item = pendingUrls[Number(textarea.dataset.index)];
+        textarea.value = item?.focus_prompt || '';
+        textarea.addEventListener('input', () => {
+            const current = pendingUrls[Number(textarea.dataset.index)];
+            if (current) current.focus_prompt = textarea.value;
+        });
+    });
+    document.querySelectorAll('.remove-url').forEach(button => {
+        button.addEventListener('click', () => {
+            pendingUrls.splice(Number(button.dataset.index), 1);
+            renderUrlList();
+        });
+    });
+}
+
+function addPendingUrls() {
+    const urls = splitUrlInput(nodes.videoUrlInput.value);
+    if (!urls.length) return;
+    const known = new Set(pendingUrls.map(item => item.url));
+    urls.forEach(url => {
+        if (!known.has(url)) {
+            pendingUrls.push({ url, focus_prompt: '' });
+            known.add(url);
+        }
+    });
+    nodes.videoUrlInput.value = '';
+    renderUrlList();
+}
+
 async function loadOptions() {
     const options = await getJson('/api/video-link/options');
     const defaults = options.defaults || {};
@@ -164,8 +223,10 @@ async function loadOptions() {
 }
 
 function jobPayload() {
+    addPendingUrls();
     return {
-        video_urls_text: document.getElementById('videoUrls').value.trim(),
+        video_urls_text: pendingUrls.map(item => item.url).join('\n'),
+        focus_prompts: focusPromptMap(),
         analysis_mode: document.getElementById('analysisMode').value,
         profile: document.getElementById('profile').value,
         run_name: document.getElementById('runName').value.trim(),
@@ -201,6 +262,8 @@ async function createJob(event) {
             nodes.formError.textContent = result.errors.map(item => `${item.index || '-'}: ${item.error}`).join('；');
         }
         nodes.jobForm.reset();
+        pendingUrls = [];
+        renderUrlList();
         await loadOptions();
         await refreshJobs();
     } catch (error) {
@@ -442,6 +505,13 @@ function renderJob(job) {
         nodes.errorPanel.hidden = false;
         nodes.errorTitle.textContent = `流程失败：${job.error_summary.stage_label || job.error_summary.stage || '未知阶段'}`;
         nodes.errorMessage.textContent = job.error_summary.message || '未提供错误信息';
+    } else if ((job.warnings || []).length) {
+        nodes.errorPanel.hidden = false;
+        nodes.errorTitle.textContent = '已生成，部分环节有警告';
+        nodes.errorMessage.textContent = job.warnings.map(item => {
+            const stage = stageNames[item.stage] || item.stage || '流程';
+            return `${stage}: ${item.message || '-'}`;
+        }).join('；');
     } else {
         nodes.errorPanel.hidden = true;
     }
@@ -457,10 +527,11 @@ function renderStages(job) {
         const status = info.status || 'pending';
         const queue = info.queue_position ? `${info.queued_for || ''} #${info.queue_position}` : (info.queued_for || '-');
         const error = info.error ? `<div class="row-error">${escapeHtml(info.error)}</div>` : '';
+        const warning = info.warning ? `<div class="row-warning">${escapeHtml(info.warning)}</div>` : '';
         const retry = info.retry_reason ? `<div class="muted">${escapeHtml(info.retry_reason)}</div>` : '';
         const log = info.log_path ? `<button class="log-link" type="button" data-stage="${stage}">查看日志</button>` : '-';
         return `<tr class="stage-row ${escapeHtml(status)}">
-            <td>${escapeHtml(stageNames[stage] || stage)}${error}${retry}</td>
+            <td>${escapeHtml(stageNames[stage] || stage)}${error}${warning}${retry}</td>
             <td>${statusBadge(status)}</td>
             <td>${escapeHtml(duration(info.duration_seconds))}</td>
             <td>${escapeHtml(queue)}</td>
@@ -778,6 +849,14 @@ async function boot() {
     nodes.consoleTab.addEventListener('click', () => setView('console'));
     nodes.previewTab.addEventListener('click', () => setView('preview'));
     nodes.jobForm.addEventListener('submit', createJob);
+    nodes.addUrlButton.addEventListener('click', addPendingUrls);
+    nodes.videoUrlInput.addEventListener('keydown', event => {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            addPendingUrls();
+        }
+    });
+    renderUrlList();
     nodes.refreshJobsButton.addEventListener('click', refreshJobs);
     nodes.refreshPreviewButton.addEventListener('click', refreshJobs);
     nodes.runButton.addEventListener('click', runSelectedJob);

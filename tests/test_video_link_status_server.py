@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SERVER_PATH = REPO_ROOT / "tools" / "video_link_status_server.py"
+URL_CONTEXT_PATH = REPO_ROOT / "video_analyzer" / "url_context.py"
 
 
 def load_module(path: Path, name: str):
@@ -21,9 +22,24 @@ def load_module(path: Path, name: str):
 
 
 server_mod = load_module(SERVER_PATH, "video_link_status_server")
+url_context_mod = load_module(URL_CONTEXT_PATH, "video_analyzer_url_context")
 
 
 class VideoLinkStatusServerTests(unittest.TestCase):
+    def test_focus_prompt_materializes_analysis_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context = Path(tmp) / "page_context.md"
+            run_dir = Path(tmp) / "run"
+            context.write_text("# Context\n", encoding="utf-8")
+
+            focused = url_context_mod.materialize_analysis_context(context, run_dir, "重点关注 CLI 参数")
+            self.assertEqual(focused.name, "input_page_context.md")
+            text = focused.read_text(encoding="utf-8")
+            self.assertIn("## 用户关注重点", text)
+            self.assertIn("重点关注 CLI 参数", text)
+            self.assertIn("不能覆盖视频", text)
+            self.assertEqual((focused.parent / "user_focus_prompt.md").read_text(encoding="utf-8"), "重点关注 CLI 参数\n")
+
     def test_options_include_defaults_and_profiles(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
@@ -53,6 +69,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
                     "maxComments": "12",
                     "subtitleLangs": "en,zh",
                     "refreshContext": True,
+                    "focusPrompt": "重点关注部署参数和失败恢复",
                 }
             )
 
@@ -67,6 +84,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(job["options"]["max_comments"], 12)
         self.assertEqual(job["options"]["subtitle_langs"], "en,zh")
         self.assertTrue(job["options"]["refresh_context"])
+        self.assertEqual(job["options"]["focus_prompt"], "重点关注部署参数和失败恢复")
 
     def test_command_mapping_for_collection_options(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -84,6 +102,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
                     "max_comments": 8,
                     "subtitle_langs": "en-US,en",
                     "refresh_context": True,
+                    "focus_prompt": "只关注配置变更",
                 }
             )
             loaded = server.load_job(job["job_id"])
@@ -99,8 +118,27 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertIn("8", command)
         self.assertIn("--subtitle-langs", command)
         self.assertIn("en-US,en", command)
+        self.assertIn("--focus-prompt", command)
+        self.assertIn("只关注配置变更", command)
         self.assertNotIn("--keep-existing", command)
         self.assertNotIn("--cookies-from-browser", command)
+
+    def test_create_jobs_batch_assigns_focus_prompt_per_url(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            result = server.create_jobs(
+                {
+                    "video_urls_text": "https://example.com/one\nhttps://example.com/two",
+                    "run_name": "batch",
+                    "focus_prompts": {
+                        "https://example.com/one": "关注安装",
+                        "https://example.com/two": "关注排错",
+                    },
+                    "auto_start": False,
+                }
+            )
+
+        self.assertEqual([job["options"]["focus_prompt"] for job in result["jobs"]], ["关注安装", "关注排错"])
 
     def test_command_mapping_defaults_keep_downloads_and_browser_cookies(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -248,6 +286,79 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(recovered["runner"]["current_stage"], "verify-core")
         self.assertEqual(recovered["runner"]["queued_for"], "verify")
         self.assertEqual(recovered["artifacts"]["operation_manual"]["value"], str(run_dir.resolve() / "operation_manual.md"))
+
+    def test_verify_core_accepts_quality_failed_manual_with_warning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "run_name": "operation-manual"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "video" / "operation-manual"
+            run_dir.mkdir(parents=True)
+            (run_dir / "analysis.json").write_text("{}", encoding="utf-8")
+            (run_dir / "manual_evidence.md").write_text("# Evidence\n", encoding="utf-8")
+            (run_dir / "operation_manual.quality_failed.md").write_text("# Review artifact\n", encoding="utf-8")
+            loaded["run_dir"] = str(run_dir)
+
+            result = server.stage_verify_core(loaded)
+
+        self.assertEqual(result["artifacts"]["missing"], [])
+        self.assertIn("failed quality gate", result["artifacts"]["warnings"][0]["message"])
+        self.assertIn("operation_manual.quality_failed.md", result["artifacts"]["warnings"][0]["message"])
+
+    def test_analyze_core_accepts_quality_failed_manual_with_warning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "run_name": "operation-manual"})
+            loaded = server.load_job(job["job_id"])
+            loaded["resolved_mode"] = "balanced"
+            run_dir = Path(tmp) / "video" / "operation-manual"
+            run_dir.mkdir(parents=True)
+            (run_dir / "analysis.json").write_text("{}", encoding="utf-8")
+            (run_dir / "manual_evidence.md").write_text("# Evidence\n", encoding="utf-8")
+            (run_dir / "operation_manual.quality_failed.md").write_text("# Review artifact\n", encoding="utf-8")
+            log_path = server.stage_log_path(job["job_id"], "analyze-core")
+
+            def fake_run_command(*_args, **_kwargs):
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_path.write_text(f"[done] run_dir: {run_dir}\n", encoding="utf-8")
+                return {"stdout_tail": ["[done] run_dir: " + str(run_dir)]}
+
+            with patch.object(server, "run_command", fake_run_command):
+                result = server.stage_analyze_core(loaded, str(log_path))
+
+        self.assertIn("operation_manual.quality_failed.md", result["artifacts"]["operation_manual"])
+        self.assertEqual(loaded["warnings"][0]["stage"], "analyze-core")
+        self.assertIn("failed quality gate", loaded["warnings"][0]["message"])
+
+    def test_optional_stage_failure_becomes_warning_when_core_markdown_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "run_name": "operation-manual"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "video" / "operation-manual"
+            run_dir.mkdir(parents=True)
+            (run_dir / "analysis.json").write_text("{}", encoding="utf-8")
+            (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
+            (run_dir / "manual_evidence.md").write_text("# Evidence\n", encoding="utf-8")
+            loaded["run_dir"] = str(run_dir)
+            loaded["stages"] = {
+                "probe": {"status": "succeeded"},
+                "prepare": {"status": "succeeded"},
+                "analyze-core": {"status": "succeeded"},
+                "verify-core": {"status": "succeeded"},
+                "multidoc": {"status": "skipped"},
+                "deep-v2": {"status": "skipped"},
+                "image-prompts": {"status": "skipped"},
+            }
+            server.save_job(loaded)
+
+            with patch.object(server, "run_command", side_effect=RuntimeError("publisher unavailable")):
+                result = server.run_stage(job["job_id"], "final-publish")
+
+        self.assertEqual(result["stages"]["final-publish"]["status"], "skipped")
+        self.assertTrue(result["stages"]["final-publish"]["soft_failed"])
+        self.assertEqual(result["warnings"][0]["stage"], "final-publish")
+        self.assertIn("publisher unavailable", result["warnings"][0]["message"])
 
     def test_list_jobs_returns_recent_public_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:

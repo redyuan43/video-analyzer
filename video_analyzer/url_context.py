@@ -25,7 +25,6 @@ from video_analyzer.config import Config
 FALLBACK_OUTPUT_ROOT = "downloads/url-videos"
 FALLBACK_RUN_NAME = "operation-manual"
 FALLBACK_SUBTITLE_LANGS = "zh-CN,zh-Hans,zh,en"
-FALLBACK_LLM_BASE_URL = "http://spark-31d6.taild500c8.ts.net:1234/v1"
 FALLBACK_VISION_MODEL = "qwen/qwen3-vl-30b"
 FALLBACK_TEXT_MODEL = "redhatai_qwen3.6-35b-a3b-nvfp4"
 
@@ -99,6 +98,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-comments", type=int, help="Maximum selected comments to include")
     parser.add_argument("--subtitle-langs", help="Comma-separated subtitle language priority")
+    parser.add_argument("--focus-prompt", default="", help="User focus prompt to emphasize during analysis")
+    parser.add_argument("--focus-prompt-file", help="Path to a file containing the user focus prompt")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
     parser.add_argument("--python", default=sys.executable, help="Python executable used to run video_analyzer.cli")
     args = parser.parse_args()
@@ -107,7 +108,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
-    profile = Config(args.config).get_runtime_profile(args.profile)
+    config = Config(args.config)
+    profile = config.get_runtime_profile(args.profile)
+    default_llm_base_url = (config.get("endpoints") or {}).get("services", {}).get("amd_fast_base_url")
     defaults = {
         "output_root": profile.get("output_root", FALLBACK_OUTPUT_ROOT),
         "run_name": profile.get("run_name", FALLBACK_RUN_NAME),
@@ -127,7 +130,7 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
         "ocr_concurrency": profile.get("ocr_concurrency", "auto"),
         "ocr_cache": profile.get("ocr_cache", "on"),
         "ocr_cache_dir": profile.get("ocr_cache_dir", ".cache/video-analyzer/ocr"),
-        "llm_base_url": profile.get("llm_base_url", FALLBACK_LLM_BASE_URL),
+        "llm_base_url": profile.get("llm_base_url", default_llm_base_url),
         "vision_base_url": profile.get("vision_base_url"),
         "text_base_url": profile.get("text_base_url"),
         "vision_model": profile.get("vision_model", FALLBACK_VISION_MODEL),
@@ -213,7 +216,8 @@ def main() -> int:
     if run_dir.exists():
         shutil.rmtree(run_dir)
 
-    command = build_analyzer_command(args, video_path, page_context_path, run_dir)
+    context_for_analysis = materialize_analysis_context(page_context_path, run_dir, read_focus_prompt(args))
+    command = build_analyzer_command(args, video_path, context_for_analysis, run_dir)
     print("[analyze] " + " ".join(shell_quote(part) for part in command))
     subprocess.run(command, check=True)
     analysis_path = run_dir / "analysis.json"
@@ -823,6 +827,39 @@ def build_analyzer_command(args: argparse.Namespace, video_path: Path, context_p
     if not args.no_keep_frames:
         command.append("--keep-frames")
     return command
+
+
+def read_focus_prompt(args: argparse.Namespace) -> str:
+    parts = []
+    if getattr(args, "focus_prompt_file", None):
+        path = Path(args.focus_prompt_file).expanduser()
+        if path.exists():
+            parts.append(path.read_text(encoding="utf-8"))
+    if getattr(args, "focus_prompt", ""):
+        parts.append(str(args.focus_prompt))
+    return "\n\n".join(part.strip() for part in parts if part and part.strip()).strip()
+
+
+def materialize_analysis_context(context_path: Path, run_dir: Path, focus_prompt: str) -> Path:
+    if not focus_prompt:
+        return context_path
+    base_context = context_path.read_text(encoding="utf-8")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    focused_context = run_dir / "input_page_context.md"
+    focused_context.write_text(
+        "\n\n".join(
+            [
+                base_context.rstrip(),
+                "## 用户关注重点",
+                "分析这个视频时，请把下面的用户关注点作为高优先级意图；它用于选择分析角度、组织重点和标注遗漏，但不能覆盖视频、OCR、字幕、ASR 或页面上下文证据。",
+                focus_prompt.strip(),
+            ]
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (run_dir / "user_focus_prompt.md").write_text(focus_prompt.strip() + "\n", encoding="utf-8")
+    return focused_context
 
 
 def safe_slug(value: str) -> str:

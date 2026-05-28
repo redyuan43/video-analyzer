@@ -106,6 +106,7 @@ EXPECTED_FINAL_EXPORTS = (
     "deep_report_v2.pdf",
     "manual_evidence.pdf",
 )
+SOFT_FAILURE_STAGES = {"multidoc", "deep-v2", "image-prompts", "final-publish"}
 VIDEO_PREVIEW_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 ORPHANED_PROCESS_GONE_MESSAGE = (
     "server stopped while this stage was running; process is gone and artifacts are incomplete; retry to continue"
@@ -230,6 +231,7 @@ class VideoLinkStatusServer:
                 "max_comments": 30,
                 "subtitle_langs": DEFAULT_SUBTITLE_LANGS,
                 "refresh_context": False,
+                "focus_prompt": "",
             },
             "choices": {
                 "analysis_modes": list(ALLOWED_ANALYSIS_MODES),
@@ -274,6 +276,7 @@ class VideoLinkStatusServer:
         refresh_context = parse_bool_option(payload, "refresh_context", "refreshContext", defaults["refresh_context"])
         max_comments = parse_int_option(payload.get("max_comments") if "max_comments" in payload else payload.get("maxComments"), defaults["max_comments"])
         subtitle_langs = str(payload.get("subtitle_langs") or payload.get("subtitleLangs") or defaults["subtitle_langs"]).strip()
+        focus_prompt = normalize_focus_prompt(payload.get("focus_prompt") if "focus_prompt" in payload else payload.get("focusPrompt", ""))
 
         job_id = uuid.uuid4().hex
         job_dir = self.job_dir(job_id)
@@ -297,12 +300,14 @@ class VideoLinkStatusServer:
                 "max_comments": max_comments,
                 "subtitle_langs": subtitle_langs,
                 "refresh_context": refresh_context,
+                "focus_prompt": focus_prompt,
             },
             "resolved_mode": None,
             "run_dir": None,
             "artifacts": {},
             "stages": {},
             "modules": {},
+            "warnings": [],
             "runner": {"status": "idle", "current_stage": None, "error": None},
         }
         self.save_job(job)
@@ -330,6 +335,7 @@ class VideoLinkStatusServer:
             batch_payload["video_url"] = url
             batch_payload["run_name"] = f"{base_run_name}-{index:03d}"
             batch_payload["auto_start"] = False
+            batch_payload["focus_prompt"] = focus_prompt_for_url(payload, url, index)
             try:
                 job = self.create_job(batch_payload)
                 created.append(job)
@@ -622,12 +628,22 @@ class VideoLinkStatusServer:
                 self.run_stage(job_id, stage)
         except BridgeError as exc:
             job = self.load_job(job_id)
-            job["status"] = "failed"
-            self.update_runner(job, "failed", error=exc.message, finished=True)
+            if self.runner_failure_can_finish_with_warning(job):
+                self.add_warning(job, "runner", exc.message)
+                job["status"] = "succeeded"
+                self.update_runner(job, "succeeded", error=None, current_stage=None, finished=True)
+            else:
+                job["status"] = "failed"
+                self.update_runner(job, "failed", error=exc.message, finished=True)
         except Exception as exc:
             job = self.load_job(job_id)
-            job["status"] = "failed"
-            self.update_runner(job, "failed", error=str(exc), finished=True)
+            if self.runner_failure_can_finish_with_warning(job):
+                self.add_warning(job, "runner", str(exc))
+                job["status"] = "succeeded"
+                self.update_runner(job, "succeeded", error=None, current_stage=None, finished=True)
+            else:
+                job["status"] = "failed"
+                self.update_runner(job, "failed", error=str(exc), finished=True)
         finally:
             with self.runner_lock:
                 self.active_runners.pop(job_id, None)
@@ -689,6 +705,7 @@ class VideoLinkStatusServer:
             blockers = self.live_resource_users(resource, exclude_job_id=job_id)
             if len(blockers) < limit:
                 return
+            self.touch_queued_runner(job_id, resource, len(blockers), limit)
             time.sleep(RESOURCE_WAIT_SECONDS)
 
     def live_resource_users(self, resource: str, exclude_job_id: str | None = None) -> list[dict[str, Any]]:
@@ -767,7 +784,14 @@ class VideoLinkStatusServer:
             stage_info["finished_at"] = iso_now()
             stage_info["error"] = str(exc)
             stage_info.pop("process", None)
-            job["status"] = "failed"
+            if self.stage_can_soft_fail(job, stage):
+                warning = self.add_warning(job, stage, str(exc))
+                stage_info["status"] = "skipped"
+                stage_info["warning"] = warning["message"]
+                stage_info["soft_failed"] = True
+                job["status"] = "running"
+            else:
+                job["status"] = "failed"
         job["updated_at"] = iso_now()
         job["stages"][stage] = stage_info
         job["summary"] = self.collect_summary(job)
@@ -775,6 +799,22 @@ class VideoLinkStatusServer:
         if stage_info["status"] == "failed":
             raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, f"{stage} failed: {stage_info.get('error')}")
         return self.public_job(job)
+
+    def touch_queued_runner(self, job_id: str, resource: str, blocker_count: int, limit: int) -> None:
+        try:
+            job = self.load_job(job_id)
+        except BridgeError:
+            return
+        runner = dict(job.get("runner") or {})
+        if runner.get("status") != "queued":
+            return
+        now = iso_now()
+        runner["updated_at"] = now
+        runner["wait_reason"] = f"waiting for {resource}: {blocker_count}/{limit} slot(s) in use"
+        runner["server_pid"] = os.getpid()
+        job["runner"] = runner
+        job["updated_at"] = now
+        self.save_job(job)
 
     def mark_stage_queued(self, job: dict[str, Any], stage: str, resource: str) -> None:
         now = iso_now()
@@ -852,15 +892,21 @@ class VideoLinkStatusServer:
             raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, "operation stage did not print a run directory")
         job["run_dir"] = str(self.resolve_output_path(run_dir))
         artifacts = {"run_dir": job["run_dir"], "command": command, **self.collect_core_artifacts(Path(job["run_dir"]))}
+        warning = self.core_quality_warning(Path(job["run_dir"]))
+        if warning:
+            self.add_warning(job, "analyze-core", warning)
         return {"artifacts": artifacts, "stdout_tail": result["stdout_tail"]}
 
     def stage_verify_core(self, job: dict[str, Any]) -> dict[str, Any]:
         run_dir = self.require_run_dir(job)
-        required = ["analysis.json", "operation_manual.md", "manual_evidence.md"]
-        missing = [name for name in required if not (run_dir / name).exists()]
+        missing = self.missing_core_artifacts(run_dir)
         if missing:
             raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, f"missing core artifact(s): {', '.join(missing)}")
-        return {"artifacts": {"required": required, "missing": []}}
+        warning = self.core_quality_warning(run_dir)
+        warnings = []
+        if warning:
+            warnings.append(self.add_warning(job, "verify-core", warning))
+        return {"artifacts": {"required": ["analysis.json", "operation_manual.md|operation_manual.quality_failed.md", "manual_evidence.md"], "missing": [], "warnings": warnings}}
 
     def run_command_stage(
         self,
@@ -994,6 +1040,8 @@ class VideoLinkStatusServer:
             command.extend(["--max-comments", str(opts["max_comments"])])
         if opts.get("subtitle_langs"):
             command.extend(["--subtitle-langs", opts["subtitle_langs"]])
+        if opts.get("focus_prompt"):
+            command.extend(["--focus-prompt", opts["focus_prompt"]])
 
     def multidoc_command(self, job: dict[str, Any]) -> list[str]:
         return ["tools/run_multidoc_analysis.sh", str(self.require_run_dir(job)), "--profile", job["options"]["profile"]]
@@ -1099,6 +1147,52 @@ class VideoLinkStatusServer:
                 pass
         return artifacts
 
+    def core_manual_path(self, run_dir: Path) -> Path | None:
+        for path in (run_dir / "operation_manual.md", run_dir / "operation_manual.quality_failed.md"):
+            if path.is_file() and path.stat().st_size > 0:
+                return path
+        return None
+
+    def missing_core_artifacts(self, run_dir: Path) -> list[str]:
+        missing = []
+        if not (run_dir / "analysis.json").is_file() or (run_dir / "analysis.json").stat().st_size <= 0:
+            missing.append("analysis.json")
+        if not self.core_manual_path(run_dir):
+            missing.append("operation_manual.md or operation_manual.quality_failed.md")
+        if not (run_dir / "manual_evidence.md").is_file() or (run_dir / "manual_evidence.md").stat().st_size <= 0:
+            missing.append("manual_evidence.md")
+        if "analysis.json" not in missing:
+            try:
+                json.loads((run_dir / "analysis.json").read_text(encoding="utf-8"))
+            except Exception:
+                missing.append("analysis.json (invalid JSON)")
+        return missing
+
+    def core_quality_warning(self, run_dir: Path) -> str | None:
+        quality_failed_path = run_dir / "operation_manual.quality_failed.md"
+        if quality_failed_path.is_file() and not (run_dir / "operation_manual.md").is_file():
+            return f"operation manual failed quality gate; review artifact: {quality_failed_path}"
+        return None
+
+    def core_markdown_available_for_job(self, job: dict[str, Any]) -> bool:
+        run_dir = self.discover_run_dir(job)
+        return bool(run_dir and self.core_manual_path(run_dir))
+
+    def stage_can_soft_fail(self, job: dict[str, Any], stage: str) -> bool:
+        return normalize_stage_name(stage) in SOFT_FAILURE_STAGES and self.core_markdown_available_for_job(job)
+
+    def runner_failure_can_finish_with_warning(self, job: dict[str, Any]) -> bool:
+        stage = normalize_stage_name((job.get("runner") or {}).get("current_stage") or self.current_stage(job) or self.next_stage(job) or "")
+        return stage in SOFT_FAILURE_STAGES and self.core_markdown_available_for_job(job)
+
+    def add_warning(self, job: dict[str, Any], stage: str, message: str) -> dict[str, Any]:
+        warning = {"stage": normalize_stage_name(stage), "message": str(message), "updated_at": iso_now()}
+        warnings = list(job.get("warnings") or [])
+        if not any(item.get("stage") == warning["stage"] and item.get("message") == warning["message"] for item in warnings):
+            warnings.append(warning)
+        job["warnings"] = warnings
+        return warning
+
     def discover_run_dir(self, job: dict[str, Any]) -> Path | None:
         candidates: list[Any] = [
             job.get("run_dir"),
@@ -1142,19 +1236,7 @@ class VideoLinkStatusServer:
         return snapshot or None
 
     def core_artifacts_complete(self, run_dir: Path) -> bool:
-        required = [
-            run_dir / "analysis.json",
-            run_dir / "operation_manual.md",
-            run_dir / "manual_evidence.md",
-        ]
-        transcript_candidates = [run_dir / "transcript.md", run_dir / "orin" / "transcript.md"]
-        if any(not path.is_file() or path.stat().st_size <= 0 for path in required):
-            return False
-        if not any(path.is_file() and path.stat().st_size > 0 for path in transcript_candidates):
-            return False
-        try:
-            json.loads((run_dir / "analysis.json").read_text(encoding="utf-8"))
-        except Exception:
+        if self.missing_core_artifacts(run_dir):
             return False
         return True
 
@@ -1171,6 +1253,9 @@ class VideoLinkStatusServer:
         job["run_dir"] = str(run_dir)
         stage_info = dict(stage_info or (job.get("stages") or {}).get("analyze-core") or {})
         artifacts = {"run_dir": str(run_dir), **self.collect_core_artifacts(run_dir)}
+        warning = self.core_quality_warning(run_dir)
+        if warning:
+            self.add_warning(job, "analyze-core", warning)
         stage_info.update(
             {
                 "status": "succeeded",
@@ -1336,6 +1421,7 @@ class VideoLinkStatusServer:
         public["core_progress"] = self.core_progress(public)
         public["stage_progress"] = self.stage_progress(public)
         public["preview"] = self.preview_metadata(public)
+        public["warnings"] = list(job.get("warnings") or [])
         queued_stage = public["queue"].get("stage")
         if queued_stage and queued_stage in public["stages"]:
             public["stages"][queued_stage] = dict(public["stages"][queued_stage])
@@ -2059,6 +2145,23 @@ def parse_int_option(value: Any, default: int) -> int:
     except (TypeError, ValueError) as exc:
         raise BridgeError(HTTPStatus.BAD_REQUEST, "max_comments must be an integer") from exc
     return max(0, parsed)
+
+
+def normalize_focus_prompt(value: Any, max_chars: int = 4000) -> str:
+    text = str(normalize_optional_template(value) or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    return text[:max_chars]
+
+
+def focus_prompt_for_url(payload: dict[str, Any], url: str, index: int) -> str:
+    prompts = payload.get("focus_prompts") if "focus_prompts" in payload else payload.get("focusPrompts")
+    if isinstance(prompts, dict):
+        return normalize_focus_prompt(prompts.get(url, ""))
+    if isinstance(prompts, list) and index - 1 < len(prompts):
+        item = prompts[index - 1]
+        if isinstance(item, dict):
+            return normalize_focus_prompt(item.get("focus_prompt") if "focus_prompt" in item else item.get("focusPrompt", ""))
+        return normalize_focus_prompt(item)
+    return normalize_focus_prompt(payload.get("focus_prompt") if "focus_prompt" in payload else payload.get("focusPrompt", ""))
 
 
 def normalize_optional_template(value: Any) -> Any:

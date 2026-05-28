@@ -139,6 +139,57 @@ textarea {
     line-height: 1.45;
 }
 
+.url-add-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 38px;
+    gap: 8px;
+    align-items: center;
+}
+
+.url-list {
+    display: grid;
+    gap: 6px;
+    min-height: 32px;
+}
+
+.url-item {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 30px;
+    gap: 6px;
+    align-items: center;
+    padding: 7px 8px;
+    border: 1px solid #e2e8f0;
+    border-radius: 6px;
+    background: #f8fafc;
+}
+
+.url-item span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 13px;
+}
+
+.url-focus {
+    grid-column: 1 / -1;
+    gap: 5px;
+}
+
+.url-focus span {
+    white-space: normal;
+}
+
+.url-focus textarea {
+    min-height: 72px;
+    font-size: 13px;
+}
+
+.option-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px 10px;
+}
+
 .check {
     grid-template-columns: auto 1fr;
     align-items: center;
@@ -175,6 +226,26 @@ button {
     color: #fff;
     font-size: 14px;
     cursor: pointer;
+}
+
+.icon-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 38px;
+    height: 38px;
+    padding: 0;
+    font-size: 22px;
+    font-weight: 600;
+    line-height: 1;
+}
+
+.icon-button.light {
+    width: 30px;
+    height: 30px;
+    background: #eef2f7;
+    color: #475467;
+    font-size: 18px;
 }
 
 button.secondary {
@@ -214,6 +285,10 @@ button:disabled {
 .row-error,
 .error-panel {
     color: #9f1239;
+}
+
+.row-warning {
+    color: #a16207;
 }
 
 .error-text {
@@ -781,6 +856,7 @@ pre {
     .stats-panel,
     .info-grid,
     .summary-grid,
+    .option-grid,
     .resource-lane header,
     .lane-columns,
     .preview-grid {

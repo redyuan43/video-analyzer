@@ -24,15 +24,20 @@
                 <section class="panel">
                     <h2>新建任务</h2>
                     <form id="jobForm" class="job-form">
-                        <label class="wide">
+                        <label class="wide url-entry">
                             <span>视频链接</span>
-                            <textarea id="videoUrls" name="video_urls" rows="5" placeholder="一行一个 https:// 链接" required></textarea>
+                            <div class="url-add-row">
+                                <input id="videoUrlInput" name="video_url_input" type="text" inputmode="url" placeholder="https://">
+                                <button id="addUrlButton" class="icon-button" type="button" title="添加链接" aria-label="添加链接">+</button>
+                            </div>
                         </label>
+                        <textarea id="videoUrls" name="video_urls" hidden></textarea>
+                        <div id="urlList" class="url-list" aria-live="polite"></div>
                         <label>
                             <span>分析模式</span>
                             <select id="analysisMode" name="analysis_mode"></select>
                         </label>
-                        <label>
+                        <label hidden>
                             <span>运行配置</span>
                             <select id="profile" name="profile"></select>
                         </label>
@@ -48,13 +53,15 @@
                             <input id="skipImages" name="skip_images" type="checkbox">
                             <span>跳过配图提示词</span>
                         </label>
-                        <details class="advanced">
-                            <summary>采集选项</summary>
+                        <div class="option-grid">
                             <label class="check"><input id="keepExisting" type="checkbox"><span>复用已有下载</span></label>
                             <label class="check"><input id="includeSubtitles" type="checkbox"><span>纳入字幕</span></label>
-                            <label class="check"><input id="preferSubtitleTranscript" type="checkbox"><span>优先字幕 transcript</span></label>
                             <label class="check"><input id="includeComments" type="checkbox"><span>纳入评论</span></label>
                             <label class="check"><input id="refreshContext" type="checkbox"><span>刷新上下文</span></label>
+                        </div>
+                        <details class="advanced">
+                            <summary>更多参数</summary>
+                            <label class="check"><input id="preferSubtitleTranscript" type="checkbox"><span>优先字幕 transcript</span></label>
                             <label>
                                 <span>最多评论数</span>
                                 <input id="maxComments" type="number" min="0" step="1">
