@@ -139,6 +139,22 @@ def diff_score(path, previous):
     return float(np.mean(np.abs(current - previous))), current
 
 
+def textness_score(path):
+    with Image.open(path) as image:
+        if image.mode != "L":
+            image = image.convert("L")
+        if image.size != (320, 180):
+            image = image.resize((320, 180))
+        current = np.asarray(image, dtype=np.float32)
+    horizontal = np.abs(np.diff(current, axis=1))
+    vertical = np.abs(np.diff(current, axis=0))
+    edge_density = min((float(np.mean(horizontal > 28)) + float(np.mean(vertical > 28))) * 3.0, 1.0)
+    dark = current < max(30.0, float(np.mean(current) - np.std(current) * 0.55))
+    ink_density = min(float(np.mean(dark)) * 10.0, 1.0)
+    sharpness = min(float(np.var(horizontal)) / 1500.0, 1.0)
+    return min((0.45 * edge_density) + (0.35 * ink_density) + (0.20 * sharpness), 1.0)
+
+
 def gst_framerate(value):
     fraction = Fraction(float(value)).limit_denominator(1000)
     return f"{fraction.numerator}/{fraction.denominator}"
@@ -416,8 +432,10 @@ def select_candidates(image_paths, segment_start, segment_duration, sample_fps, 
         if timestamp < segment_start or timestamp > segment_end:
             continue
         score, current = diff_score(path, previous)
-        if not candidates or (score >= change_threshold and timestamp - last_selected_ts >= min_gap_seconds):
-            candidates.append({"path": str(path), "timestamp": timestamp, "score": score})
+        textness = textness_score(path)
+        combined_score = score + (textness * 30.0)
+        if not candidates or ((score >= change_threshold or textness >= 0.28) and timestamp - last_selected_ts >= min_gap_seconds):
+            candidates.append({"path": str(path), "timestamp": timestamp, "score": combined_score, "visual_score": score, "textness_score": textness})
             last_selected_ts = timestamp
         previous = current
 
@@ -638,7 +656,7 @@ def extract_frames_with_jetson_workers(
                 max_frames=max_frames_per_worker,
             )
             for worker, manifest in remote_manifests:
-                local_worker_dir = Path(pull_root) / _safe_host_name(worker.host)
+                local_worker_dir = Path(pull_root) / worker.output_dir.name
                 local_worker_dir.mkdir(parents=True, exist_ok=True)
                 _pull_remote_candidates(worker.host, manifest, local_worker_dir)
                 manifests.append((worker, manifest, local_worker_dir))
@@ -657,7 +675,7 @@ def extract_frames_with_jetson_workers(
                 for future in as_completed(futures):
                     worker = futures[future]
                     manifest = future.result()
-                    local_worker_dir = Path(pull_root) / _safe_host_name(worker.host)
+                    local_worker_dir = Path(pull_root) / worker.output_dir.name
                     local_worker_dir.mkdir(parents=True, exist_ok=True)
                     _pull_remote_candidates(worker.host, manifest, local_worker_dir)
                     manifests.append((worker, manifest, local_worker_dir))
@@ -708,9 +726,13 @@ def extract_local_screen_keyframes(
         duration=duration,
         max_frames=max_frames,
     )
+    metadata = {"backend": "local", "total_seconds": round(time.perf_counter() - started, 3)}
+    metadata.update(getattr(processor, "last_extraction_metadata", {}) or {})
+    metadata.setdefault("scan_frames_count", len(frames))
+    metadata.setdefault("candidate_budget", max_frames)
     return JetsonFrameExtractionResult(
         frames=frames,
-        metadata={"backend": "local", "total_seconds": round(time.perf_counter() - started, 3)},
+        metadata=metadata,
     )
 
 
@@ -761,11 +783,8 @@ def _install_remote_worker(host: str) -> None:
 def _sync_video_to_host(host: str, video_path: Path, remote_video: str) -> None:
     logger.info("Syncing video to Jetson worker %s via local rsync", host)
     _run_ssh(host, "mkdir -p ~/.cache/video-analyzer/frame-worker/videos")
-    subprocess.run(
-        ["rsync", "-a", "--info=progress2", str(video_path), f"{_rsync_host(host)}:{remote_video}"],
-        check=True,
-        stdout=subprocess.DEVNULL,
-    )
+    command = ["rsync", "-a", "--info=progress2", *_rsync_ssh_args(host), str(video_path), f"{_rsync_host(host)}:{remote_video}"]
+    subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
 
 
 def _sync_video_to_workers(hosts: list[str], video_path: Path, remote_video: str) -> None:
@@ -926,6 +945,7 @@ def _run_ray_extractions(
     head = "agx" if any(worker.host == "agx" for worker in workers) else workers[0].host
     specs = [
         {
+            "id": str(index),
             "host": worker.host,
             "host_resource": f"host_{_safe_host_name(worker.host)}",
             "remote_video": remote_video,
@@ -935,7 +955,7 @@ def _run_ray_extractions(
             "sample_fps": sample_fps,
             "max_frames": max_frames,
         }
-        for worker in workers
+        for index, worker in enumerate(workers)
     ]
     driver = r"""
 import json
@@ -975,7 +995,7 @@ def run_frame_worker(spec):
             )
         )
     manifest = json.loads(result.stdout.strip().splitlines()[-1])
-    return {"host": spec["host"], "manifest": manifest}
+    return {"id": spec["id"], "host": spec["host"], "manifest": manifest}
 
 
 def main():
@@ -1004,8 +1024,8 @@ if __name__ == "__main__":
             f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
         )
     rows = json.loads(result.stdout.strip().splitlines()[-1])
-    by_host = {row["host"]: row["manifest"] for row in rows}
-    return [(worker, by_host[worker.host]) for worker in workers]
+    by_id = {row["id"]: row["manifest"] for row in rows}
+    return [(worker, by_id[str(index)]) for index, worker in enumerate(workers)]
 
 
 def _pull_remote_candidates(host: str, manifest: dict[str, Any], local_dir: Path) -> None:
@@ -1015,7 +1035,7 @@ def _pull_remote_candidates(host: str, manifest: dict[str, Any], local_dir: Path
     local_dir.mkdir(parents=True, exist_ok=True)
     for path in paths:
         subprocess.run(
-            ["rsync", "-a", f"{_rsync_host(host)}:{path.as_posix()}", str(local_dir / path.name)],
+            ["rsync", "-a", *_rsync_ssh_args(host), f"{_rsync_host(host)}:{path.as_posix()}", str(local_dir / path.name)],
             check=True,
             stdout=subprocess.DEVNULL,
         )
@@ -1032,15 +1052,41 @@ def _run_ssh(host: str, command: str, timeout: int = 120) -> subprocess.Complete
 
 
 def _ssh_host_args(host: str) -> list[str]:
+    base = [
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "ConnectionAttempts=1",
+        "-o",
+        "ServerAliveInterval=10",
+        "-o",
+        "ServerAliveCountMax=3",
+    ]
+    if host == "agx":
+        return [*base, "-o", "HostKeyAlias=agx-lan", "agx@192.168.2.110"]
     if host == "nx3":
-        return ["-o", "ProxyCommand=none", "nx@nx3.taild500c8.ts.net"]
-    return [host]
+        return [*base, "-o", "ProxyCommand=none", "nx@nx3.taild500c8.ts.net"]
+    return [*base, host]
 
 
 def _rsync_host(host: str) -> str:
+    if host == "agx":
+        return "agx@192.168.2.110"
     if host == "nx3":
         return "nx@nx3.taild500c8.ts.net"
     return host
+
+
+def _rsync_ssh_args(host: str) -> list[str]:
+    if host == "agx":
+        return [
+            "-e",
+            "ssh -o BatchMode=yes -o ConnectTimeout=10 -o ConnectionAttempts=1 "
+            "-o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o HostKeyAlias=agx-lan",
+        ]
+    return []
 
 
 def _safe_host_name(host: str) -> str:

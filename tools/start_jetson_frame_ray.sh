@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-NETWORK="${JETSON_RAY_NETWORK:-tailscale}"
+NETWORK="${JETSON_RAY_NETWORK:-lan}"
 HEAD_HOST="${JETSON_RAY_HEAD_HOST:-agx}"
 RAY_PORT="${JETSON_RAY_PORT:-6379}"
 READY_TIMEOUT="${JETSON_RAY_READY_TIMEOUT:-90}"
 SSH_TIMEOUT="${JETSON_RAY_SSH_TIMEOUT:-5}"
 ACTIVE_HOSTS_FILE="${JETSON_RAY_ACTIVE_HOSTS_FILE:-tmp/video-link-status/jetson-ray-active-hosts}"
+HEAD_FRAME_WORKERS="${JETSON_RAY_HEAD_FRAME_WORKERS:-2}"
 
 NO_PROXY_ENV=(
   env
@@ -21,28 +22,26 @@ NO_PROXY_ENV=(
 
 case "$NETWORK" in
   tailscale)
+    DEFAULT_HEAD_SSH="$HEAD_HOST"
     HEAD_IP="${JETSON_RAY_HEAD_IP:-100.103.199.121}"
-    WORKERS=(
-      "nx1:100.119.5.57:1"
-      "nx2:100.123.222.45:1"
-      "nx3:100.127.71.86:1"
-      "nx4:100.82.227.71:1"
-    )
+    WORKERS=()
     ;;
   lan)
-    HEAD_IP="${JETSON_RAY_HEAD_IP:-192.168.31.201}"
-    WORKERS=(
-      "nx1:192.168.31.40:1"
-      "nx2:192.168.31.68:1"
-      "nx3:192.168.31.35:1"
-      "nx4:192.168.31.10:1"
-    )
+    DEFAULT_HEAD_SSH="agx@192.168.2.110"
+    HEAD_IP="${JETSON_RAY_HEAD_IP:-192.168.2.110}"
+    WORKERS=()
     ;;
   *)
     echo "JETSON_RAY_NETWORK must be tailscale or lan, got: $NETWORK" >&2
     exit 2
     ;;
 esac
+
+HEAD_SSH_TARGET="${JETSON_RAY_HEAD_SSH:-$DEFAULT_HEAD_SSH}"
+HEAD_SSH_OPTIONS=(-o BatchMode=yes -o ConnectTimeout="$SSH_TIMEOUT" -o ConnectionAttempts=1)
+if [[ "$NETWORK" == "lan" ]]; then
+  HEAD_SSH_OPTIONS+=(-o HostKeyAlias=agx-lan)
+fi
 
 if [[ -n "${JETSON_RAY_WORKERS:-}" ]]; then
   IFS=, read -r -a WORKERS <<<"$JETSON_RAY_WORKERS"
@@ -61,7 +60,7 @@ for item in "${ACTIVE_WORKERS[@]}"; do
 done
 
 ray_status() {
-  ssh -o BatchMode=yes "$HEAD_HOST" "PATH=\$HOME/.local/bin:\$PATH ray status" 2>/dev/null || true
+  ssh "${HEAD_SSH_OPTIONS[@]}" "$HEAD_SSH_TARGET" "PATH=\$HOME/.local/bin:\$PATH ray status" 2>/dev/null || true
 }
 
 cluster_ready() {
@@ -104,7 +103,11 @@ select_active_workers() {
 }
 
 active_hosts_csv() {
-  local hosts=("$HEAD_HOST")
+  local hosts=()
+  local index
+  for ((index = 0; index < HEAD_FRAME_WORKERS; index++)); do
+    hosts+=("$HEAD_HOST")
+  done
   local item host
   for item in "${ACTIVE_WORKERS[@]}"; do
     host="${item%%:*}"
@@ -139,8 +142,8 @@ wait_cluster_ready() {
 
 start_head() {
   local resources
-  resources="$(resource_json "$HEAD_HOST" 2)"
-  ssh -o BatchMode=yes "$HEAD_HOST" \
+  resources="$(resource_json "$HEAD_HOST" "$HEAD_FRAME_WORKERS")"
+  ssh "${HEAD_SSH_OPTIONS[@]}" "$HEAD_SSH_TARGET" \
     "PATH=\$HOME/.local/bin:\$PATH ${NO_PROXY_ENV[*]} ray start --head --node-ip-address=$HEAD_IP --port=$RAY_PORT --dashboard-host=0.0.0.0 --resources='$resources' --disable-usage-stats"
 }
 
@@ -150,7 +153,7 @@ start_worker() {
   local frame_workers="$3"
   local resources
   resources="$(resource_json "$host" "$frame_workers")"
-  ssh -o BatchMode=yes "$host" \
+  ssh -o BatchMode=yes -o ConnectTimeout="$SSH_TIMEOUT" -o ConnectionAttempts=1 "$host" \
     "PATH=\$HOME/.local/bin:\$PATH ${NO_PROXY_ENV[*]} ray start --address=$ADDRESS --node-ip-address=$ip --resources='$resources' --disable-usage-stats"
 }
 
@@ -162,15 +165,16 @@ resource_json() {
 
 stop_all() {
   local item host
-  for item in "${ACTIVE_WORKERS[@]}" "$HEAD_HOST:$HEAD_IP:2"; do
+  for item in "${ACTIVE_WORKERS[@]}"; do
     host="${item%%:*}"
-    ssh -o BatchMode=yes "$host" "PATH=\$HOME/.local/bin:\$PATH ray stop -f >/dev/null 2>&1 || true" &
+    ssh -o BatchMode=yes -o ConnectTimeout="$SSH_TIMEOUT" -o ConnectionAttempts=1 "$host" "PATH=\$HOME/.local/bin:\$PATH ray stop -f >/dev/null 2>&1 || true" &
   done
+  ssh "${HEAD_SSH_OPTIONS[@]}" "$HEAD_SSH_TARGET" "PATH=\$HOME/.local/bin:\$PATH ray stop -f >/dev/null 2>&1 || true" &
   wait
 }
 
-if ! host_reachable "$HEAD_HOST"; then
-  echo "[jetson-ray] Ray head is offline: $HEAD_HOST" >&2
+if ! ssh "${HEAD_SSH_OPTIONS[@]}" "$HEAD_SSH_TARGET" true >/dev/null 2>&1; then
+  echo "[jetson-ray] Ray head is offline: $HEAD_SSH_TARGET" >&2
   exit 1
 fi
 
@@ -182,7 +186,7 @@ if cluster_ready "$status"; then
   exit 0
 fi
 
-echo "[jetson-ray] starting AGX Ray head and NX workers over $NETWORK ($ADDRESS)"
+echo "[jetson-ray] starting AGX Ray head and optional workers over $NETWORK ($ADDRESS)"
 stop_all
 start_head
 for item in "${ACTIVE_WORKERS[@]}"; do

@@ -11,15 +11,14 @@ Use this skill when long-video candidate frame extraction is the bottleneck in
 ## Default Policy
 
 - Prefer Jetson offload for long videos instead of local OpenCV full-frame scanning.
-- Use `nx2,nx3` as the default dual worker pair.
+- Use `agx,agx` as the default AGX dual worker pair. NX1-NX4 are manual override workers only.
 - Use `--frame-extractor jetson` for strict Jetson mode; do not silently fall back to local extraction when the user explicitly wants Jetson.
-- Use `--jetson-frame-backend auto` or `ssh`. Ray is only a future transport path here; the current validated path is SSH concurrent workers.
-- `nx3` should be addressed as `nx3` only after verifying the SSH alias. If alias issues appear, use `nx@nx3.taild500c8.ts.net` with `ProxyCommand=none`.
+- Use `--jetson-frame-backend ray` for the default AGX long-video path.
 - For detailed operations and maintenance procedures, read `docs/JETSON_FRAME_WORKERS.md`.
 
 ## Operating Model
 
-- There is no persistent service to start on the NX devices.
+- The AGX Ray head can be kept warm; extraction jobs are still created per run.
 - The local pipeline pushes `worker.py` on demand, caches the source video,
   runs both workers concurrently, pulls candidate frames back, and merges them.
 - Human operators should normally use the local one-command script rather than
@@ -27,32 +26,25 @@ Use this skill when long-video candidate frame extraction is the bottleneck in
 
 ## Known Device State
 
-- `nx2` has Jetson Linux R36.5, `ffmpeg`, Python OpenCV, GStreamer, `nvv4l2decoder`, and `nvjpegenc`.
-- `nx3` was missing extraction dependencies and has been provisioned with:
-  - `ffmpeg`
-  - `python3-opencv`
-  - `gstreamer1.0-tools`
-  - `gstreamer1.0-plugins-good`
-  - `gstreamer1.0-plugins-bad`
-  - `gstreamer1.0-libav`
-- Both workers currently use the SSH backend and `ffmpeg` decode path.
+- AGX is the default frame extraction device and runs two Ray frame workers by default.
+- NX1-NX4 are not used by the default operation-manual path.
 
 ## Commands
 
 Run the long-video fast script with Jetson workers:
 
 ```bash
-cd /home/ivan/github/video-analyzer
-OCR_CACHE=refresh tools/run_s36ri23_fast_full.sh
+cd /home/ai/github/video-analyzer
+tools/run_long_talk_fast_from_url.sh URL --keep-existing
 ```
 
 Core CLI flags for manual runs:
 
 ```bash
 --frame-extractor jetson \
---jetson-frame-hosts nx2,nx3 \
---jetson-frame-backend auto \
---jetson-sample-fps auto \
+--jetson-frame-hosts agx,agx \
+--jetson-frame-backend ray \
+--jetson-sample-fps 0.5 \
 --jetson-chunk-overlap-seconds 2
 ```
 
@@ -65,13 +57,7 @@ tools/check_jetson_frame_workers.sh
 Manual check:
 
 ```bash
-ssh nx2 'command -v ffmpeg; python3 - << "PY"
-import importlib.util
-for name in ["cv2", "numpy", "PIL"]:
-    print(name, bool(importlib.util.find_spec(name)))
-PY'
-
-ssh -o ProxyCommand=none nx@nx3.taild500c8.ts.net 'command -v ffmpeg; python3 - << "PY"
+ssh -o HostKeyAlias=agx-lan agx@192.168.2.142 'command -v ffmpeg; python3 - << "PY"
 import importlib.util
 for name in ["cv2", "numpy", "PIL"]:
     print(name, bool(importlib.util.find_spec(name)))
@@ -83,23 +69,21 @@ PY'
 Validated on:
 
 ```text
-downloads/url-videos/S36ri23-l60/video.mp4
-duration: 1386.121 seconds
-candidate budget: 93
+downloads/url-videos/3W36pd50Wqw/video.mp4
+duration: 3472.181 seconds
+candidate budget: 232
 ```
 
 Measured extraction-only comparison:
 
 ```text
-local CPU/OpenCV candidate_frame_extraction_seconds: 648.495s
-Jetson dual worker first run: 149.467s
-Jetson dual worker warm run: 105.583s
-nx2 remote extraction: ~54.7s
-nx3 remote extraction: ~55.9s
+AGX 1 worker, 10-minute window: 104.358s, 5.75x realtime
+AGX 2 workers, 10-minute window: 85.966s, 6.98x realtime
+AGX 2 workers, full 58-minute video: 467.121s, 7.43x realtime
 ```
 
-Rule of thumb: expect about `4x` speedup including first video sync and about
-`6x` speedup after the video is cached on Jetsons.
+Rule of thumb: keep AGX at two workers by default; increase worker count only
+for explicit benchmarking.
 
 ## Verification
 
@@ -112,8 +96,9 @@ jq '.metadata.timings, .metadata.frame_extraction, .metadata.frame_selection' RU
 Expected signs:
 
 - `metadata.frame_extraction.backend == "jetson"`
-- `metadata.frame_extraction.per_host` contains both `nx2` and `nx3`
-- `metadata.frame_extraction.sample_fps == 1.0` for fast mode with `auto`
+- `metadata.frame_extraction.per_host` contains AGX workers only
+- `metadata.frame_extraction.transport == "ray"`
+- `metadata.frame_extraction.sample_fps == 0.5` for the long-talk fast wrapper
 - `metadata.frame_selection.candidate_frames_count` matches the dynamic budget
 - Fast mode keeps `metadata.frame_selection.vl_frames_count == 0`
 
@@ -123,21 +108,18 @@ Use these CLI flags to connect the local pipeline to Jetson workers:
 
 ```bash
 --frame-extractor local|jetson|auto
---jetson-frame-hosts nx2,nx3
+--jetson-frame-hosts agx,agx
 --jetson-frame-backend auto|ssh|ray
 --jetson-sample-fps auto|N
 --jetson-chunk-overlap-seconds N
 ```
 
 `jetson` is strict and should fail if a requested worker is unhealthy. `auto`
-may fall back to local extraction. `ray` is reserved and currently uses the SSH
-worker path.
+may fall back to local extraction. `ray` is the default AGX long-video transport.
 
 ## Failure Handling
 
 - If strict Jetson mode fails health checks, fix the worker dependency instead of falling back to local.
-- If `nx3` alias fails with `%` expansion or ProxyCommand errors, use direct host:
-  `ssh -o ProxyCommand=none nx@nx3.taild500c8.ts.net`.
 - If a benchmark seems slow, distinguish:
   - remote extraction time: `metadata.frame_extraction.per_host[].timings.total_seconds`
   - end-to-end extraction time: `metadata.frame_extraction.total_seconds`
