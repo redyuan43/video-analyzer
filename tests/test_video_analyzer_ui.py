@@ -22,6 +22,7 @@ def load_ui_module():
 
 
 ui_mod = load_ui_module()
+from tools import video_link_status_server as status_server
 
 
 class VideoAnalyzerUITests(unittest.TestCase):
@@ -40,6 +41,7 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn('id="addUrlButton"', html)
         self.assertIn('id="urlList"', html)
         self.assertIn('id="videoUrls"', html)
+        self.assertIn('id="focusPrompt"', html)
         self.assertIn("关注重点", (UI_ROOT / "video_analyzer_ui" / "static" / "js" / "main.js").read_text(encoding="utf-8"))
         self.assertIn('<label hidden>', html)
         self.assertIn('id="globalSummary"', html)
@@ -50,6 +52,11 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn('id="previewView"', html)
         self.assertIn('id="previewGrid"', html)
         self.assertIn('id="previewTab"', html)
+        self.assertIn('id="vscodeView"', html)
+        self.assertIn('id="vscodeTab"', html)
+        self.assertIn('id="vscodeFrame"', html)
+        self.assertIn('id="docList"', html)
+        self.assertIn('id="docPreviewBody"', html)
         self.assertLess(html.index('id="jobList"'), html.index('id="globalSummary"'))
 
     def test_video_link_api_create_list_get_and_log(self):
@@ -111,6 +118,114 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.get_json()["opened"])
 
+    def test_video_link_resource_route_serves_run_dir_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp) / "jobs", video_link_auto_resume=False)
+            client = ui.app.test_client()
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            (run_dir / "operation_manual.md").write_text("# 标题\n正文", encoding="utf-8")
+            create = client.post(
+                "/api/video-link/jobs",
+                json={"video_url": "https://example.com/video", "analysis_mode": "fast"},
+            )
+            job_id = create.get_json()["job_id"]
+            loaded = ui.video_link.load_job(job_id)
+            loaded["run_dir"] = str(run_dir)
+            ui.video_link.save_job(loaded)
+
+            response = client.get(f"/api/video-link/jobs/{job_id}/resource?path=operation_manual.md")
+            escaped = client.get(f"/api/video-link/jobs/{job_id}/resource?path=../secret.md")
+            body = response.get_data(as_text=True)
+            response.close()
+            escaped.close()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("# 标题", body)
+        self.assertEqual(escaped.status_code, 403)
+
+    def test_video_link_api_starts_vscode_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp) / "jobs", video_link_auto_resume=False)
+            client = ui.app.test_client()
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            create = client.post(
+                "/api/video-link/jobs",
+                json={"video_url": "https://example.com/video", "analysis_mode": "fast"},
+            )
+            job_id = create.get_json()["job_id"]
+            loaded = ui.video_link.load_job(job_id)
+            loaded["run_dir"] = str(run_dir)
+            ui.video_link.save_job(loaded)
+
+            fake_process = type("FakeProcess", (), {"pid": 12345})()
+            with patch("tools.video_link_status_server.find_code_server_binary", return_value={"server": "code-server", "command": ["/bin/true"]}), \
+                patch("tools.video_link_status_server.allocate_vscode_port", return_value=19000), \
+                patch("tools.video_link_status_server.discover_global_vscode_session", return_value=None), \
+                patch("tools.video_link_status_server.stop_managed_vscode_sessions", return_value=0), \
+                patch("tools.video_link_status_server.subprocess.Popen", return_value=fake_process), \
+                patch("tools.video_link_status_server.local_tailscale_host", return_value=None), \
+                patch("tools.video_link_status_server.process_alive", return_value=True):
+                response = client.post(f"/api/video-link/jobs/{job_id}/vscode-session", json={})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["ready"])
+        self.assertEqual(payload["port"], 19000)
+        self.assertTrue(payload["url"].startswith("http://localhost:19000/?folder="))
+        self.assertIn("run", payload["url"])
+        self.assertEqual(payload["server"], "code-server")
+
+    def test_video_link_job_detail_discovers_global_vscode_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp) / "jobs", video_link_auto_resume=False)
+            client = ui.app.test_client()
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            create = client.post(
+                "/api/video-link/jobs",
+                json={"video_url": "https://example.com/video", "analysis_mode": "fast"},
+            )
+            job_id = create.get_json()["job_id"]
+            loaded = ui.video_link.load_job(job_id)
+            loaded["run_dir"] = str(run_dir)
+            ui.video_link.save_job(loaded)
+
+            discovered = {
+                "job_id": job_id,
+                "pid": 12345,
+                "port": 19005,
+                "run_dir": None,
+                "server": "code-server",
+                "started_at": "2026-05-29T00:00:00+0800",
+            }
+            with patch("tools.video_link_status_server.discover_global_vscode_session", return_value=discovered), \
+                patch("tools.video_link_status_server.local_tailscale_host", return_value="100.91.42.28"), \
+                patch("tools.video_link_status_server.process_alive", return_value=True):
+                response = client.get(f"/api/video-link/jobs/{job_id}")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()["vscode_preview"]
+        self.assertTrue(payload["ready"])
+        self.assertTrue(payload["url"].startswith("http://100.91.42.28:19005/?folder="))
+        self.assertIn("run", payload["url"])
+
+    def test_vscode_process_discovery_matches_exact_run_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "operation-manual"
+            sibling_dir = Path(tmp) / "operation-manual-agx"
+            run_dir.mkdir()
+            sibling_dir.mkdir()
+            ps_output = (
+                f"101 101 node /bin/code-server --bind-addr 0.0.0.0:19000 {run_dir}\n"
+                f"202 202 node /bin/code-server --bind-addr 0.0.0.0:19003 {sibling_dir}\n"
+            )
+            with patch("tools.video_link_status_server.subprocess.check_output", return_value=ps_output):
+                matches = status_server.discover_vscode_processes(run_dir)
+
+        self.assertEqual([{key: matches[0][key] for key in ("pid", "pgid", "port")}], [{"pid": 101, "pgid": 101, "port": 19000}])
+
     def test_video_link_preview_video_route_streams_ready_video(self):
         with tempfile.TemporaryDirectory() as tmp:
             ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp) / "jobs", video_link_auto_resume=False)
@@ -165,7 +280,9 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn("pendingUrls", js)
         self.assertIn("addPendingUrls", js)
         self.assertIn("focusPromptMap", js)
+        self.assertIn("focus_prompt", js)
         self.assertIn("focus_prompts", js)
+        self.assertIn("focusPrompt", js)
         self.assertIn(".url-focus-input", js)
         self.assertIn("renderUrlList", js)
         self.assertIn("stage-progress-meta", js)
@@ -176,6 +293,13 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn(".stage-duration-summary", css)
         self.assertIn("open-run-dir", js)
         self.assertIn("renderPreviewGrid", js)
+        self.assertIn("renderVscodePanel", js)
+        self.assertIn("ensureVscodeSession", js)
+        self.assertIn("vscode-session", js)
+        self.assertIn("renderDocPreviewPanel", js)
+        self.assertIn("renderMarkdown", js)
+        self.assertIn(".doc-preview-body", css)
+        self.assertIn(".doc-list", css)
         self.assertIn("video-seek", js)
         self.assertIn("scan-line", js)
         self.assertIn("preview-success-link", js)
@@ -187,11 +311,13 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn(".url-add-row", css)
         self.assertIn(".url-list", css)
         self.assertIn(".url-focus", css)
+        self.assertIn(".focus-prompt", css)
         self.assertIn(".option-grid", css)
         self.assertIn(".row-warning", css)
         self.assertIn("button.success-action", css)
         self.assertIn(".job-item.queued", css)
         self.assertIn(".preview-grid", css)
+        self.assertIn(".vscode-shell", css)
         self.assertIn(".preview-success-link", css)
         self.assertIn("@keyframes scan-sweep", css)
         self.assertIn("@keyframes status-spin", css)

@@ -5,25 +5,37 @@ const stageNames = {
     'verify-core': '校验产物',
     multidoc: '多文档分析',
     'deep-v2': '章节深度报告',
+    'study-guide': '学习证据账本',
+    'evidence-review': '证据复核/发布门禁',
     'image-prompts': '生成配图提示词',
     'final-publish': '最终定稿/发布'
 };
 
-let selectedJobId = new URLSearchParams(window.location.search).get('job');
+const initialParams = new URLSearchParams(window.location.search);
+let selectedJobId = initialParams.get('job') || document.querySelector('.app-shell')?.dataset.initialJob || null;
 let selectedLogStage = null;
 let refreshTimer = null;
 let scanAnimationFrame = null;
 let currentJob = null;
 let latestJobs = [];
-let currentView = new URLSearchParams(window.location.search).get('view') === 'preview' ? 'preview' : 'console';
+let currentView = ['preview', 'vscode'].includes(initialParams.get('view'))
+    ? initialParams.get('view')
+    : 'console';
 let pendingUrls = [];
+let vscodeStarting = false;
+let selectedDocPath = '';
+let renderedDocListKey = '';
+let loadedDocPreviewKey = '';
+let loadedStudyKey = '';
 const videoLoadErrors = {};
 
 const nodes = {
     consoleTab: document.getElementById('consoleTab'),
     previewTab: document.getElementById('previewTab'),
+    vscodeTab: document.getElementById('vscodeTab'),
     consoleView: document.getElementById('consoleView'),
     previewView: document.getElementById('previewView'),
+    vscodeView: document.getElementById('vscodeView'),
     jobForm: document.getElementById('jobForm'),
     formError: document.getElementById('formError'),
     createButton: document.getElementById('createButton'),
@@ -32,6 +44,7 @@ const nodes = {
     addUrlButton: document.getElementById('addUrlButton'),
     videoUrls: document.getElementById('videoUrls'),
     urlList: document.getElementById('urlList'),
+    focusPrompt: document.getElementById('focusPrompt'),
     globalSummary: document.getElementById('globalSummary'),
     resourceLanes: document.getElementById('resourceLanes'),
     refreshJobsButton: document.getElementById('refreshJobsButton'),
@@ -64,7 +77,24 @@ const nodes = {
     copyMessage: document.getElementById('copyMessage'),
     refreshPreviewButton: document.getElementById('refreshPreviewButton'),
     previewSummary: document.getElementById('previewSummary'),
-    previewGrid: document.getElementById('previewGrid')
+    previewGrid: document.getElementById('previewGrid'),
+    vscodeSummary: document.getElementById('vscodeSummary'),
+    startVscodeButton: document.getElementById('startVscodeButton'),
+    openVscodeLink: document.getElementById('openVscodeLink'),
+    restartVscodeButton: document.getElementById('restartVscodeButton'),
+    stopVscodeButton: document.getElementById('stopVscodeButton'),
+    vscodePlaceholder: document.getElementById('vscodePlaceholder'),
+    vscodeFrame: document.getElementById('vscodeFrame'),
+    docPreviewSummary: document.getElementById('docPreviewSummary'),
+    docList: document.getElementById('docList'),
+    docPreviewPanel: document.querySelector('.doc-preview-panel'),
+    docPreviewTitle: document.getElementById('docPreviewTitle'),
+    docOpenLink: document.getElementById('docOpenLink'),
+    docPreviewClose: document.getElementById('docPreviewClose'),
+    docPreviewBody: document.getElementById('docPreviewBody'),
+    studySummary: document.getElementById('studySummary'),
+    studyDecision: document.getElementById('studyDecision'),
+    studyBody: document.getElementById('studyBody')
 };
 
 const jobStatusPriority = {
@@ -159,7 +189,11 @@ function syncUrlField() {
 }
 
 function focusPromptMap() {
-    return Object.fromEntries(pendingUrls.map(item => [item.url, item.focus_prompt || '']));
+    return Object.fromEntries(
+        pendingUrls
+            .filter(item => String(item.focus_prompt || '').trim())
+            .map(item => [item.url, item.focus_prompt])
+    );
 }
 
 function renderUrlList() {
@@ -211,6 +245,7 @@ async function loadOptions() {
     fillSelect('analysisMode', choices.analysis_modes, defaults.analysis_mode);
     fillSelect('profile', choices.profiles, defaults.profile);
     fillSelect('cookieBrowser', choices.cookie_browsers, defaults.cookies_from_browser);
+    fillSelect('downloadDevice', choices.download_devices, defaults.download_device);
     document.getElementById('runName').value = defaults.run_name || 'operation-manual';
     document.getElementById('skipImages').checked = Boolean(defaults.skip_images);
     document.getElementById('keepExisting').checked = Boolean(defaults.keep_existing);
@@ -218,7 +253,8 @@ async function loadOptions() {
     document.getElementById('preferSubtitleTranscript').checked = Boolean(defaults.prefer_subtitle_transcript);
     document.getElementById('includeComments').checked = Boolean(defaults.include_comments);
     document.getElementById('refreshContext').checked = Boolean(defaults.refresh_context);
-    document.getElementById('maxComments').value = defaults.max_comments ?? 30;
+    nodes.focusPrompt.value = defaults.focus_prompt || '';
+    document.getElementById('maxComments').value = defaults.max_comments ?? 3000;
     document.getElementById('subtitleLangs').value = defaults.subtitle_langs || '';
 }
 
@@ -226,11 +262,13 @@ function jobPayload() {
     addPendingUrls();
     return {
         video_urls_text: pendingUrls.map(item => item.url).join('\n'),
+        focus_prompt: nodes.focusPrompt.value.trim(),
         focus_prompts: focusPromptMap(),
         analysis_mode: document.getElementById('analysisMode').value,
         profile: document.getElementById('profile').value,
         run_name: document.getElementById('runName').value.trim(),
         cookies_from_browser: document.getElementById('cookieBrowser').value,
+        download_device: document.getElementById('downloadDevice').value,
         skip_images: document.getElementById('skipImages').checked,
         keep_existing: document.getElementById('keepExisting').checked,
         include_subtitles: document.getElementById('includeSubtitles').checked,
@@ -279,24 +317,27 @@ function selectJob(jobId, updateUrl = true) {
     if (updateUrl) {
         const url = new URL(window.location.href);
         url.searchParams.set('job', jobId);
-        if (currentView === 'preview') url.searchParams.set('view', 'preview');
+        if (currentView !== 'console') url.searchParams.set('view', currentView);
         window.history.replaceState({}, '', url);
     }
     refreshSelectedJob();
 }
 
 function setView(view, updateUrl = true) {
-    currentView = view === 'preview' ? 'preview' : 'console';
+    currentView = ['preview', 'vscode'].includes(view) ? view : 'console';
     nodes.consoleView.hidden = currentView !== 'console';
     nodes.previewView.hidden = currentView !== 'preview';
+    nodes.vscodeView.hidden = currentView !== 'vscode';
     nodes.consoleView.classList.toggle('active', currentView === 'console');
     nodes.previewView.classList.toggle('active', currentView === 'preview');
+    nodes.vscodeView.classList.toggle('active', currentView === 'vscode');
     nodes.consoleTab.classList.toggle('active', currentView === 'console');
     nodes.previewTab.classList.toggle('active', currentView === 'preview');
+    nodes.vscodeTab.classList.toggle('active', currentView === 'vscode');
     if (updateUrl) {
         const url = new URL(window.location.href);
-        if (currentView === 'preview') {
-            url.searchParams.set('view', 'preview');
+        if (currentView !== 'console') {
+            url.searchParams.set('view', currentView);
         } else {
             url.searchParams.delete('view');
         }
@@ -304,6 +345,7 @@ function setView(view, updateUrl = true) {
     }
     renderPreviewGrid(latestJobs);
     if (currentView === 'preview') startScanAnimation();
+    renderVscodePanel(currentJob);
 }
 
 function jobTimeValue(job) {
@@ -346,6 +388,8 @@ async function refreshJobs() {
     const jobs = data.jobs || [];
     latestJobs = jobs;
     renderJobList(jobs);
+    const selectedFromList = selectedJobId ? jobs.find(job => job.job_id === selectedJobId) : null;
+    if (selectedFromList) renderJob(selectedFromList);
     renderPreviewGrid(jobs);
     const first = preferredJob(jobs);
     if (!selectedJobId && first) selectJob(first.job_id, true);
@@ -371,6 +415,8 @@ async function refreshJobsNoSelect() {
     const jobs = data.jobs || [];
     latestJobs = jobs;
     renderJobList(jobs);
+    const selectedFromList = selectedJobId ? jobs.find(job => job.job_id === selectedJobId) : null;
+    if (selectedFromList) renderJob(selectedFromList);
     renderPreviewGrid(jobs);
 }
 
@@ -518,6 +564,7 @@ function renderJob(job) {
     renderStages(job);
     renderStageProgress(stageProgress);
     renderArtifacts(job.summary || {});
+    renderVscodePanel(job);
     loadSelectedLog(job);
 }
 
@@ -572,12 +619,564 @@ function renderStageProgress(progress) {
 }
 
 function renderArtifacts(summary) {
+    const counts = summary.core_counts || {};
+    const countRows = [
+        ['扫描帧', counts.scan_frames],
+        ['OCR候选帧', counts.ocr_candidate_frames],
+        ['实际OCR帧', counts.ocr_keyframes],
+        ['OCR文本事件', counts.ocr_text_events],
+        ['VL帧', counts.vl_frames]
+    ].filter(([, value]) => value !== undefined && value !== null);
     nodes.artifactSummary.innerHTML = [
+        ...countRows.map(([label, value]) => `${label}: ${escapeHtml(value)}`),
         `Markdown: ${(summary.markdown_files || []).length}`,
         `导出文件: ${(summary.export_files || []).length}`,
         `配图提示词: ${(summary.prompt_files || []).length}`,
         `最终图片: ${(summary.final_images || []).length}`
     ].join('<br>');
+}
+
+function renderVscodePanel(job) {
+    if (!nodes.vscodeView) return;
+    const runDir = job?.summary?.run_dir || job?.run_dir || job?.vscode_preview?.run_dir || '';
+    const preview = job?.vscode_preview || {};
+    const ready = Boolean(preview.ready && preview.url);
+    nodes.startVscodeButton.disabled = !job || !runDir || vscodeStarting;
+    nodes.restartVscodeButton.disabled = !job || !runDir || vscodeStarting;
+    nodes.stopVscodeButton.disabled = !job || !ready || vscodeStarting;
+    nodes.openVscodeLink.hidden = !ready;
+    if (ready) {
+        nodes.openVscodeLink.href = preview.url;
+    } else {
+        nodes.openVscodeLink.removeAttribute('href');
+    }
+    if (!job) {
+        nodes.vscodeSummary.textContent = '选择一个已生成资源包的任务';
+        resetVscodeShell();
+        renderStudyPanel(job);
+        renderDocPreviewPanel(job);
+        return;
+    }
+    if (!runDir) {
+        nodes.vscodeSummary.textContent = '资源包目录尚未生成';
+        resetVscodeShell();
+        renderStudyPanel(job);
+        renderDocPreviewPanel(job);
+        return;
+    }
+    nodes.vscodeSummary.textContent = ready
+        ? `WebIDE 已就绪 · PID ${preview.pid} · ${runDir}`
+        : `${vscodeStarting ? '正在启动 WebIDE' : '资源包目录'} · ${runDir}`;
+    resetVscodeShell();
+    renderStudyPanel(job);
+    renderDocPreviewPanel(job);
+}
+
+function resetVscodeShell() {
+    if (nodes.vscodeFrame) {
+        nodes.vscodeFrame.hidden = true;
+        nodes.vscodeFrame.src = 'about:blank';
+    }
+    if (nodes.vscodePlaceholder) {
+        nodes.vscodePlaceholder.hidden = false;
+        nodes.vscodePlaceholder.textContent = '';
+    }
+}
+
+function showVscodePlaceholder(message) {
+    nodes.vscodeFrame.hidden = true;
+    nodes.vscodePlaceholder.hidden = false;
+    nodes.vscodePlaceholder.textContent = message;
+}
+
+function renderStudyPanel(job) {
+    if (!nodes.studyBody) return;
+    const study = job?.summary?.study || {};
+    const decision = study.publish_decision || {};
+    nodes.studySummary.textContent = study.available
+        ? `${study.chapter_count || 0} 章 · ${study.evidence_count || 0} 条证据`
+        : '等待 study guide';
+    const status = decision.status || '-';
+    nodes.studyDecision.textContent = status;
+    nodes.studyDecision.className = `study-decision ${escapeHtml(status)}`;
+    if (!job?.job_id || !study.available) {
+        loadedStudyKey = '';
+        nodes.studyBody.innerHTML = '<div class="doc-empty">暂无结构化学习数据</div>';
+        return;
+    }
+    loadStudyGuide(job.job_id);
+}
+
+async function loadStudyGuide(jobId) {
+    if (loadedStudyKey === jobId) return;
+    nodes.studyBody.innerHTML = '<div class="doc-empty">加载学习视图...</div>';
+    try {
+        const guide = await getJson(`/api/video-link/jobs/${jobId}/study-guide`);
+        if (currentJob?.job_id !== jobId) return;
+        nodes.studyBody.innerHTML = renderStudyGuide(guide, jobId);
+        nodes.studyBody.querySelectorAll('.study-jump').forEach(button => {
+            button.addEventListener('click', () => jumpToVideoTime(button.dataset.jobId, Number(button.dataset.seconds || 0)));
+        });
+        loadedStudyKey = jobId;
+    } catch (error) {
+        nodes.studyBody.innerHTML = `<div class="doc-empty">学习视图加载失败：${escapeHtml(error.message)}</div>`;
+        loadedStudyKey = '';
+    }
+}
+
+function renderStudyGuide(guide, jobId) {
+    const chapters = guide.chapters || [];
+    const overview = guide.overview || {};
+    const decision = guide.publish_decision || {};
+    const gaps = guide.evidence_gaps?.summary || {};
+    const html = [
+        `<p class="study-overview">${escapeHtml(overview.summary || '暂无学习总览')}</p>`,
+        `<p class="study-overview">发布门禁：${escapeHtml(decision.status || '-')} · 证据缺口：${escapeHtml(gaps.total ?? 0)} 条</p>`
+    ];
+    chapters.slice(0, 30).forEach(chapter => {
+        const evidence = (chapter.evidence || []).filter(item => item.text).slice(0, 3);
+        html.push(`<article class="study-chapter">
+            <h4>${escapeHtml(String(chapter.index || '').padStart(2, '0'))}. ${escapeHtml(chapter.title || '未命名章节')}</h4>
+            <p>${escapeHtml(chapter.start || '')} - ${escapeHtml(chapter.end || '')}</p>
+            <p>${escapeHtml(chapter.summary || '')}</p>
+            <button class="study-jump" type="button" data-job-id="${escapeHtml(jobId)}" data-seconds="${escapeHtml(chapter.start_sec || 0)}">跳到视频</button>
+            <div class="study-evidence-list">
+                ${evidence.map(item => `<div class="study-evidence">
+                    <strong>${escapeHtml(item.timestamp_label || '')} · ${escapeHtml(item.source_type || '')}</strong>
+                    <span>${escapeHtml(item.text || '')}</span>
+                </div>`).join('')}
+            </div>
+        </article>`);
+    });
+    return html.join('');
+}
+
+async function jumpToVideoTime(jobId, seconds) {
+    if (!jobId || !Number.isFinite(seconds)) return;
+    setView('preview');
+    await refreshJobs();
+    const video = previewVideo(jobId);
+    if (!video) return;
+    const seek = () => {
+        video.currentTime = Math.max(0, seconds);
+        updateVideoControls(video);
+        video.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    };
+    if (Number.isFinite(video.duration) && video.duration > 0) {
+        seek();
+    } else {
+        video.addEventListener('loadedmetadata', seek, { once: true });
+        video.load();
+    }
+}
+
+function resourceUrl(jobId, path) {
+    return `/api/video-link/jobs/${jobId}/resource?path=${encodeURIComponent(path)}`;
+}
+
+function previewableDocs(job) {
+    const summary = job?.summary || {};
+    const markdownFiles = (summary.markdown_files || []).map(path => ({ path, kind: 'markdown' }));
+    const pdfFiles = (summary.export_files || [])
+        .filter(path => path.toLowerCase().endsWith('.pdf'))
+        .map(path => ({ path, kind: 'pdf' }));
+    const preferred = [
+        'study_overview.md',
+        'study_cards.md',
+        'evidence_index.md',
+        'review_notes.md',
+        'exports/operation_manual.pdf',
+        'operation_manual.md',
+        'exports/knowledge_notes_v2.pdf',
+        'docs_analysis_chapters/knowledge_notes_v2.md',
+        'exports/deep_report_v2.pdf',
+        'docs_analysis_chapters/deep_report_v2.md',
+        'exports/manual_evidence.pdf',
+        'manual_evidence.md'
+    ];
+    return [...markdownFiles, ...pdfFiles].sort((left, right) => {
+        const leftIndex = preferred.indexOf(left.path);
+        const rightIndex = preferred.indexOf(right.path);
+        const leftRank = leftIndex === -1 ? 1000 : leftIndex;
+        const rightRank = rightIndex === -1 ? 1000 : rightIndex;
+        if (leftRank !== rightRank) return leftRank - rightRank;
+        if (left.kind !== right.kind) return left.kind === 'pdf' ? -1 : 1;
+        return left.path.localeCompare(right.path);
+    });
+}
+
+function renderDocPreviewPanel(job) {
+    if (!nodes.docList) return;
+    const docs = previewableDocs(job);
+    nodes.docPreviewSummary.textContent = docs.length ? `${docs.length} 个文档` : '无文档';
+    if (!job || !docs.length) {
+        selectedDocPath = '';
+        renderedDocListKey = '';
+        loadedDocPreviewKey = '';
+        nodes.docList.innerHTML = '<div class="doc-empty">暂无 Markdown/PDF</div>';
+        hideDocPreview();
+        return;
+    }
+    if (selectedDocPath && !docs.some(doc => doc.path === selectedDocPath)) selectedDocPath = '';
+    const listKey = `${job.job_id}|${selectedDocPath}|${docs.map(doc => `${doc.kind}:${doc.path}`).join('|')}`;
+    if (renderedDocListKey !== listKey) {
+        renderedDocListKey = listKey;
+        nodes.docList.innerHTML = docs.map(doc => {
+            const active = doc.path === selectedDocPath ? ' active' : '';
+            const label = doc.kind === 'pdf' ? 'PDF' : 'MD';
+            return `<button class="doc-item${active}" type="button" data-doc-path="${escapeHtml(doc.path)}">
+                <span>${escapeHtml(label)}</span>
+                <strong>${escapeHtml(doc.path)}</strong>
+            </button>`;
+        }).join('');
+        nodes.docList.querySelectorAll('.doc-item').forEach(button => {
+            button.addEventListener('click', () => {
+                selectedDocPath = button.dataset.docPath || '';
+                loadedDocPreviewKey = '';
+                renderedDocListKey = '';
+                renderDocPreviewPanel(currentJob);
+            });
+        });
+    }
+    if (!selectedDocPath) {
+        hideDocPreview();
+        return;
+    }
+    showDocPreviewPanel();
+    loadDocPreview(job, selectedDocPath);
+}
+
+function showDocPreview(title, contentHtml) {
+    showDocPreviewPanel();
+    nodes.docPreviewTitle.textContent = title;
+    nodes.docOpenLink.hidden = true;
+    nodes.docOpenLink.removeAttribute('href');
+    nodes.docPreviewBody.className = 'doc-preview-body';
+    nodes.docPreviewBody.innerHTML = typeof contentHtml === 'string' ? contentHtml : '';
+}
+
+function showDocPreviewPanel() {
+    if (nodes.docPreviewPanel) nodes.docPreviewPanel.hidden = false;
+    nodes.vscodeView?.querySelector('.vscode-docs')?.classList.add('preview-open');
+}
+
+function hideDocPreview() {
+    if (nodes.docPreviewPanel) nodes.docPreviewPanel.hidden = true;
+    nodes.vscodeView?.querySelector('.vscode-docs')?.classList.remove('preview-open');
+    nodes.docPreviewTitle.textContent = '选择文档';
+    nodes.docOpenLink.hidden = true;
+    nodes.docOpenLink.removeAttribute('href');
+    nodes.docPreviewBody.className = 'doc-preview-body';
+    nodes.docPreviewBody.innerHTML = '';
+}
+
+function closeDocPreview() {
+    selectedDocPath = '';
+    loadedDocPreviewKey = '';
+    renderedDocListKey = '';
+    renderDocPreviewPanel(currentJob);
+}
+
+async function loadDocPreview(job, path) {
+    if (!job?.job_id || !path) return;
+    const previewKey = `${job.job_id}|${path}`;
+    if (loadedDocPreviewKey === previewKey) return;
+    const url = resourceUrl(job.job_id, path);
+    nodes.docPreviewTitle.textContent = path;
+    nodes.docOpenLink.href = url;
+    nodes.docOpenLink.hidden = false;
+    if (path.toLowerCase().endsWith('.pdf')) {
+        nodes.docPreviewBody.className = 'doc-preview-body pdf';
+        nodes.docPreviewBody.innerHTML = `<iframe title="${escapeHtml(path)}" src="${escapeHtml(url)}"></iframe>`;
+        loadedDocPreviewKey = previewKey;
+        return;
+    }
+    nodes.docPreviewBody.className = 'doc-preview-body markdown loading';
+    nodes.docPreviewBody.textContent = '加载中...';
+    try {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+        const markdown = await response.text();
+        if (selectedDocPath !== path) return;
+        nodes.docPreviewBody.className = 'doc-preview-body markdown';
+        nodes.docPreviewBody.innerHTML = renderMarkdown(markdown, job.job_id, path);
+        loadedDocPreviewKey = previewKey;
+    } catch (error) {
+        nodes.docPreviewBody.className = 'doc-preview-body markdown';
+        nodes.docPreviewBody.textContent = `加载失败：${error.message}`;
+        loadedDocPreviewKey = '';
+    }
+}
+
+function renderMarkdown(markdown, jobId = '', docPath = '') {
+    const lines = String(markdown || '').split(/\r?\n/);
+    const html = [];
+    let paragraph = [];
+    let listOpen = false;
+    let codeOpen = false;
+    let codeLang = '';
+    let codeLines = [];
+    const flushParagraph = () => {
+        if (paragraph.length) {
+            html.push(`<p>${inlineMarkdown(paragraph.join(' '), jobId, docPath)}</p>`);
+            paragraph = [];
+        }
+    };
+    const closeList = () => {
+        if (listOpen) {
+            html.push('</ul>');
+            listOpen = false;
+        }
+    };
+    for (const line of lines) {
+        if (line.trim().startsWith('```')) {
+            if (codeOpen) {
+                const codeText = codeLines.join('\n');
+                const flowHtml = codeLang === 'mermaid' ? renderSimpleMermaidFlowchart(codeText) : '';
+                html.push(flowHtml || `<pre><code>${escapeHtml(codeText)}</code></pre>`);
+                codeOpen = false;
+                codeLang = '';
+                codeLines = [];
+            } else {
+                flushParagraph();
+                closeList();
+                codeOpen = true;
+                codeLang = line.trim().slice(3).trim().toLowerCase();
+                codeLines = [];
+            }
+            continue;
+        }
+        if (codeOpen) {
+            codeLines.push(line);
+            continue;
+        }
+        const heading = line.match(/^(#{1,4})\s+(.+)$/);
+        if (heading) {
+            flushParagraph();
+            closeList();
+            html.push(`<h${heading[1].length}>${inlineMarkdown(heading[2], jobId, docPath)}</h${heading[1].length}>`);
+            continue;
+        }
+        const bullet = line.match(/^\s*[-*]\s+(.+)$/);
+        if (bullet) {
+            flushParagraph();
+            if (!listOpen) {
+                html.push('<ul>');
+                listOpen = true;
+            }
+            html.push(`<li>${inlineMarkdown(bullet[1], jobId, docPath)}</li>`);
+            continue;
+        }
+        if (!line.trim()) {
+            flushParagraph();
+            closeList();
+            continue;
+        }
+        paragraph.push(line.trim());
+    }
+    flushParagraph();
+    closeList();
+    if (codeOpen) html.push(`<pre><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`);
+    return html.join('\n');
+}
+
+function inlineMarkdown(text, jobId = '', docPath = '') {
+    const value = String(text ?? '');
+    let html = '';
+    let lastIndex = 0;
+    const imagePattern = /!\[([^\]]*)\]\(([^)]+)\)/g;
+    for (const match of value.matchAll(imagePattern)) {
+        html += escapeHtml(value.slice(lastIndex, match.index));
+        const alt = match[1] || '';
+        const imagePath = markdownAssetPath(docPath, match[2] || '');
+        const src = imagePath && jobId ? resourceUrl(jobId, imagePath) : imagePath;
+        html += src
+            ? `<figure class="markdown-image"><img src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" loading="lazy"><figcaption>${escapeHtml(alt)}</figcaption></figure>`
+            : escapeHtml(match[0]);
+        lastIndex = (match.index || 0) + match[0].length;
+    }
+    html += escapeHtml(value.slice(lastIndex));
+    return html
+        .replace(/`([^`]+)`/g, '<code>$1</code>')
+        .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+}
+
+function markdownAssetPath(docPath, rawPath) {
+    let assetPath = String(rawPath || '').trim();
+    if (!assetPath) return '';
+    assetPath = assetPath.replace(/^<|>$/g, '');
+    const titleMatch = assetPath.match(/^([^"'\s]+)(?:\s+["'][^"']*["'])?$/);
+    if (titleMatch) assetPath = titleMatch[1];
+    if (/^(https?:|data:|blob:)/i.test(assetPath)) return assetPath;
+    if (assetPath.startsWith('/')) return assetPath.replace(/^\/+/, '');
+    const baseParts = String(docPath || '').split('/').slice(0, -1);
+    const parts = [...baseParts, ...assetPath.split('/')];
+    const normalized = [];
+    parts.forEach(part => {
+        if (!part || part === '.') return;
+        if (part === '..') {
+            normalized.pop();
+            return;
+        }
+        normalized.push(part);
+    });
+    return normalized.join('/');
+}
+
+function parseMermaidNode(rawNode) {
+    const cleaned = String(rawNode || '').trim().replace(/;$/, '');
+    const match = cleaned.match(/^([A-Za-z][A-Za-z0-9_]*)(?:([\[\{\(])(.*)([\]\}\)]))?$/);
+    if (!match) return { id: cleaned, label: '', shape: 'box' };
+    let label = match[3] || '';
+    label = label.trim();
+    if (label.length >= 2 && label[0] === '"' && label[label.length - 1] === '"') {
+        label = label.slice(1, -1);
+    }
+    return {
+        id: match[1],
+        label,
+        shape: match[2] === '{' ? 'decision' : 'box'
+    };
+}
+
+function mermaidLabelHtml(label) {
+    return escapeHtml(label).replace(/&lt;br\s*\/?&gt;/gi, '<br>');
+}
+
+function renderSimpleMermaidFlowchart(diagram) {
+    const lines = String(diagram || '')
+        .split(/\r?\n/)
+        .map(line => line.trim())
+        .filter(line => line && !line.startsWith('%%'));
+    if (!lines.length) return '';
+    if (!/^(flowchart\s+(TB|TD|LR|RL)|graph\s+(TB|TD|LR|RL))\b/i.test(lines[0])) return '';
+
+    const labels = new Map();
+    const shapes = new Map();
+    const edges = [];
+    const nodeOrder = [];
+    const rememberNode = node => {
+        if (!node.id) return;
+        if (node.id.includes('{') || node.id.includes('}') || node.id.includes('(') || node.id.includes(')')) return;
+        if (!nodeOrder.includes(node.id)) nodeOrder.push(node.id);
+        if (node.label) labels.set(node.id, node.label);
+        if (!shapes.has(node.id)) shapes.set(node.id, node.shape);
+    };
+    for (const line of lines.slice(1)) {
+        if (/^(subgraph|end\b|direction\b|style\b|classDef\b|class\b)/i.test(line)) continue;
+        if (/^[};\s]+$/.test(line)) continue;
+        const edgeMatch = line.match(/^(.+?)\s*-->\s*(?:\|.*?\|\s*)?(.+?)\s*;?$/);
+        if (!edgeMatch) return '';
+        const left = parseMermaidNode(edgeMatch[1]);
+        const right = parseMermaidNode(edgeMatch[2]);
+        if (/[{}()[\]]/.test(left.id) || /[{}()[\]]/.test(right.id)) continue;
+        rememberNode(left);
+        rememberNode(right);
+        edges.push([left.id, right.id]);
+    }
+    if (!edges.length) return '';
+
+    const nodes = new Set();
+    const outgoing = new Map();
+    const incoming = new Map();
+    edges.forEach(([left, right]) => {
+        nodes.add(left);
+        nodes.add(right);
+        if (!outgoing.has(left)) outgoing.set(left, []);
+        outgoing.get(left).push(right);
+        incoming.set(right, (incoming.get(right) || 0) + 1);
+        if (!incoming.has(left)) incoming.set(left, incoming.get(left) || 0);
+    });
+    const orderIndex = new Map(nodeOrder.map((node, index) => [node, index]));
+    const starts = [...nodes]
+        .filter(node => (incoming.get(node) || 0) === 0)
+        .sort((left, right) => (orderIndex.get(left) ?? 1e9) - (orderIndex.get(right) ?? 1e9));
+    if (!starts.length) return '';
+
+    const remainingIncoming = new Map(incoming);
+    const queue = [...starts];
+    const topological = [];
+    while (queue.length) {
+        const node = queue.shift();
+        topological.push(node);
+        (outgoing.get(node) || []).forEach(next => {
+            remainingIncoming.set(next, (remainingIncoming.get(next) || 0) - 1);
+            if (remainingIncoming.get(next) === 0) {
+                queue.push(next);
+                queue.sort((left, right) => (orderIndex.get(left) ?? 1e9) - (orderIndex.get(right) ?? 1e9));
+            }
+        });
+    }
+    if (topological.length !== nodes.size) return '';
+
+    const levels = new Map(starts.map(node => [node, 0]));
+    topological.forEach(node => {
+        const baseLevel = levels.get(node) || 0;
+        (outgoing.get(node) || []).forEach(next => {
+            levels.set(next, Math.max(levels.get(next) || 0, baseLevel + 1));
+        });
+    });
+    const maxLevel = Math.max(...[...levels.values()]);
+    const grouped = Array.from({ length: maxLevel + 1 }, () => []);
+    topological.forEach(node => grouped[levels.get(node) || 0].push(node));
+
+    let index = 1;
+    const parts = ['<div class="mobile-flowchart" aria-label="流程图">'];
+    grouped.forEach((row, level) => {
+        if (!row.length) return;
+        parts.push('<div class="flow-row">');
+        row.forEach(node => {
+            const shape = shapes.get(node) === 'decision' ? ' decision' : '';
+            const label = mermaidLabelHtml(labels.get(node) || node);
+            parts.push(`<div class="flow-node${shape}"><span class="flow-index">${index}</span>${label}</div>`);
+            index += 1;
+        });
+        parts.push('</div>');
+        if (level < maxLevel) parts.push('<div class="flow-arrow">↓</div>');
+    });
+    parts.push('</div>');
+    return parts.join('\n');
+}
+
+async function ensureVscodeSession(restart = false) {
+    if (!selectedJobId || vscodeStarting) return;
+    const runDir = currentJob?.summary?.run_dir || currentJob?.run_dir || currentJob?.vscode_preview?.run_dir;
+    if (!runDir) {
+        renderVscodePanel(currentJob);
+        return;
+    }
+    vscodeStarting = true;
+    renderVscodePanel(currentJob);
+    try {
+        const session = await getJson(`/api/video-link/jobs/${selectedJobId}/vscode-session`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ restart })
+        });
+        currentJob = {
+            ...(currentJob || {}),
+            vscode_preview: session
+        };
+        renderVscodePanel(currentJob);
+    } catch (error) {
+        nodes.vscodeSummary.textContent = `WebIDE 启动失败：${error.message}`;
+    } finally {
+        vscodeStarting = false;
+        renderVscodePanel(currentJob);
+    }
+}
+
+async function stopVscodeSession() {
+    if (!selectedJobId) return;
+    nodes.stopVscodeButton.disabled = true;
+    try {
+        await getJson(`/api/video-link/jobs/${selectedJobId}/vscode-session`, { method: 'DELETE' });
+        if (currentJob?.vscode_preview) currentJob.vscode_preview.ready = false;
+        resetVscodeShell();
+        renderVscodePanel(currentJob);
+    } catch (error) {
+        showVscodePlaceholder(`停止失败：${error.message}`);
+    }
 }
 
 function previewStage(job) {
@@ -848,6 +1447,7 @@ async function runSelectedJob() {
 async function boot() {
     nodes.consoleTab.addEventListener('click', () => setView('console'));
     nodes.previewTab.addEventListener('click', () => setView('preview'));
+    nodes.vscodeTab.addEventListener('click', () => setView('vscode'));
     nodes.jobForm.addEventListener('submit', createJob);
     nodes.addUrlButton.addEventListener('click', addPendingUrls);
     nodes.videoUrlInput.addEventListener('keydown', event => {
@@ -859,6 +1459,10 @@ async function boot() {
     renderUrlList();
     nodes.refreshJobsButton.addEventListener('click', refreshJobs);
     nodes.refreshPreviewButton.addEventListener('click', refreshJobs);
+    nodes.startVscodeButton.addEventListener('click', () => ensureVscodeSession(false));
+    nodes.restartVscodeButton.addEventListener('click', () => ensureVscodeSession(true));
+    nodes.stopVscodeButton.addEventListener('click', stopVscodeSession);
+    nodes.docPreviewClose.addEventListener('click', closeDocPreview);
     nodes.runButton.addEventListener('click', runSelectedJob);
     nodes.copyLogButton.addEventListener('click', copySelectedLog);
     await loadOptions();

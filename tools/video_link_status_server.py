@@ -9,11 +9,14 @@ import json
 import mimetypes
 import os
 import re
+import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
+from urllib.parse import urlencode
 import uuid
 from datetime import datetime
 from http import HTTPStatus
@@ -30,8 +33,81 @@ DEFAULT_JOBS_DIR = REPO_ROOT / "tmp" / "video-link-status" / "jobs"
 BAOYU_PROMPT_SCRIPT = REPO_ROOT / "tools" / "prepare_baoyu_image_prompts.py"
 ALLOWED_ANALYSIS_MODES = ("auto", "fast", "balanced", "deep", "long-talk-fast")
 ALLOWED_COOKIE_BROWSERS = ("", "chrome", "none", "edge", "firefox", "chromium", "brave")
-DEFAULT_COOKIE_BROWSER = "chrome"
-DEFAULT_PROFILE = "deepseek_v4_pro"
+ALLOWED_DOWNLOAD_DEVICES = ("local", "mi")
+DEFAULT_COOKIE_BROWSER = ""
+DEFAULT_PROFILE = "deepseek_v4_flash"
+CORE_ANALYSIS_ERROR_PATTERNS = (
+    "Error analyzing frame",
+    "model-resource-busy",
+    "ActorDiedError",
+)
+AUTO_MODE_LONG_SECONDS = 2700
+AUTO_MODE_FAST_KEYWORDS = (
+    "快速",
+    "先看",
+    "大概",
+    "概览",
+    "摘要",
+    "简短",
+    "粗略",
+    "测试",
+    "quick",
+    "fast",
+    "summary",
+    "overview",
+    "smoke",
+    "tldr",
+    "tl;dr",
+)
+AUTO_MODE_DEEP_KEYWORDS = (
+    "深度",
+    "详细",
+    "完整",
+    "最终",
+    "发布",
+    "不能漏",
+    "不要漏",
+    "全量",
+    "严谨",
+    "复核",
+    "精确",
+    "逐步",
+    "每一步",
+    "操作手册",
+    "教程",
+    "排错",
+    "风险",
+    "参数",
+    "代码",
+    "命令",
+    "高质量",
+    "deep",
+    "detailed",
+    "complete",
+    "exhaustive",
+    "final",
+    "precise",
+    "troubleshoot",
+    "debug",
+    "production",
+)
+AUTO_MODE_LONG_TALK_KEYWORDS = (
+    "长视频",
+    "播客",
+    "访谈",
+    "演讲",
+    "讲座",
+    "会议",
+    "字幕",
+    "转写",
+    "章节",
+    "podcast",
+    "talk",
+    "lecture",
+    "transcript",
+    "subtitle",
+    "chapter",
+)
 DEFAULT_RUN_NAME = "operation-manual"
 DEFAULT_SUBTITLE_LANGS = "zh-CN,zh-Hans,zh,en"
 MODULE_ORDER = [
@@ -39,8 +115,10 @@ MODULE_ORDER = [
     "prepare",
     "analyze-core",
     "verify-core",
+    "study-guide",
     "multidoc",
     "deep-v2",
+    "evidence-review",
     "image-prompts",
     "final-publish",
 ]
@@ -49,8 +127,10 @@ MODULE_LABELS = {
     "prepare": "下载/上下文",
     "analyze-core": "核心分析",
     "verify-core": "校验产物",
+    "study-guide": "学习证据账本",
     "multidoc": "多文档分析",
     "deep-v2": "章节深度报告",
+    "evidence-review": "证据复核/发布门禁",
     "image-prompts": "生成配图提示词",
     "final-publish": "最终定稿/发布",
 }
@@ -62,8 +142,16 @@ MODULE_SPECS = {
         "produces": ["run_dir", "analysis_json", "operation_manual", "transcript", "frames", "ocr_events", "frame_analyses"],
     },
     "verify-core": {"requires": ["run_dir"], "produces": ["verified_core"]},
-    "multidoc": {"requires": ["run_dir", "verified_core"], "produces": ["docs_analysis"]},
-    "deep-v2": {"requires": ["run_dir", "verified_core"], "produces": ["chapter_deep_report"]},
+    "study-guide": {
+        "requires": ["run_dir", "verified_core"],
+        "produces": ["study_guide", "evidence_gaps"],
+    },
+    "multidoc": {"requires": ["run_dir", "verified_core", "study_guide"], "produces": ["docs_analysis"]},
+    "deep-v2": {"requires": ["run_dir", "verified_core", "study_guide"], "produces": ["chapter_deep_report"]},
+    "evidence-review": {
+        "requires": ["run_dir", "verified_core", "study_guide"],
+        "produces": ["evidence_review", "publish_decision"],
+    },
     "image-prompts": {"requires": ["run_dir"], "produces": ["image_prompts"]},
     "final-publish": {"requires": ["run_dir", "verified_core"], "produces": ["exports"]},
 }
@@ -73,6 +161,10 @@ STAGE_ALIASES = {
     "operation": "analyze-core",
     "verify_core": "verify-core",
     "deep_v2": "deep-v2",
+    "study": "study-guide",
+    "study_guide": "study-guide",
+    "review": "evidence-review",
+    "evidence_review": "evidence-review",
     "export": "final-publish",
     "export_docs": "final-publish",
     "image_prompts": "image-prompts",
@@ -83,18 +175,21 @@ STAGE_RESOURCES = {
     "prepare": "prepare",
     "analyze-core": "core",
     "verify-core": "verify",
+    "study-guide": "study-guide",
     "multidoc": "multidoc",
     "deep-v2": "deep-v2",
+    "evidence-review": "study-guide",
     "image-prompts": "image-prompts",
     "final-publish": "final-publish",
 }
 RESOURCE_LIMITS = {
     "prepare": 2,
-    "core": 3,
+    "core": 1,
     "asr": 1,
     "ocr": 1,
     "vl": 1,
     "verify": 3,
+    "study-guide": 3,
     "multidoc": 3,
     "deep-v2": 3,
     "image-prompts": 3,
@@ -108,6 +203,11 @@ EXPECTED_FINAL_EXPORTS = (
 )
 SOFT_FAILURE_STAGES = {"multidoc", "deep-v2", "image-prompts", "final-publish"}
 VIDEO_PREVIEW_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
+VSCODE_PORT_RANGE = tuple(
+    int(part)
+    for part in os.environ.get("VIDEO_LINK_VSCODE_PORT_RANGE", "19000-19100").split("-", 1)
+)
+VSCODE_PORT = int(os.environ.get("VIDEO_LINK_VSCODE_PORT", str(VSCODE_PORT_RANGE[0])))
 ORPHANED_PROCESS_GONE_MESSAGE = (
     "server stopped while this stage was running; process is gone and artifacts are incomplete; retry to continue"
 )
@@ -122,13 +222,14 @@ CORE_PROGRESS_STEPS = [
     ("ray", "Ray 集群准备", (r"\[jetson-ray\]", r"Ray runtime started")),
     ("context", "页面/评论/素材准备", (r"Extracting cookies", r"\[youtube\]", r"Writing video metadata")),
     ("audio", "音频提取", (r"Extracting audio from video",)),
+    ("local_model", "本机模型资源等待", (r"\[local-model-lock\] (waiting|acquired) stage=core",)),
     ("asr", "ASR 转写", (r"Transcribing audio", r"\[resource-lock\] (waiting|acquired) resource=asr")),
     ("asr_done", "ASR 完成", (r"ASR succeeded", r"Using existing transcript file")),
-    ("frames", "候选帧抽取", (r"Extracting frames from video", r"Jetson video cache", r"frame worker")),
+    ("frames", "扫描/候选帧抽取", (r"Extracting frames from video", r"Jetson video cache", r"frame worker")),
     ("frames_done", "候选帧就绪", (r"Extracted \d+ screen keyframes",)),
-    ("ocr", "OCR 执行", (r"Running OCR", r"\[resource-lock\] (waiting|acquired) resource=ocr")),
-    ("ocr_ready", "OCR 服务/请求", (r"DotsMOCR endpoint not ready", r"DotsMOCR endpoint ready", r"OpenAI-compatible vision OCR")),
-    ("vl", "VL 帧选择/分析", (r"Selecting and analyzing VL frames", r"\[resource-lock\] (waiting|acquired) resource=vl")),
+    ("ocr", "OCR关键帧选择/执行", (r"Selected \d+ OCR keyframes", r"Running OCR", r"\[resource-lock\] (waiting|acquired) resource=ocr")),
+    ("ocr_ready", "OCR文本事件就绪", (r"DotsMOCR endpoint not ready", r"DotsMOCR endpoint ready", r"OpenAI-compatible vision OCR", r"OCR results ready")),
+    ("vl", "VL解释帧选择/分析", (r"Selecting and analyzing VL frames", r"\[resource-lock\] (waiting|acquired) resource=vl")),
     ("manual", "操作手册生成", (r"Generating operation manual",)),
     ("write", "结果写出", (r"Operation manual saved", r"Analysis complete", r"\[done\] run_dir:")),
 ]
@@ -136,6 +237,7 @@ CORE_PROGRESS_WEIGHTS = {
     "ray": 3,
     "context": 7,
     "audio": 5,
+    "local_model": 1,
     "asr": 15,
     "asr_done": 5,
     "frames": 10,
@@ -176,6 +278,16 @@ STAGE_PROGRESS_STEPS = {
         ("review", "校验深度报告", (r"deep_report_review", r"validate", r"review")),
         ("write", "写出 deep_report_v2", (r"deep_report_v2\.md", r"deep_report_v2\.pre_format\.md")),
     ],
+    "study-guide": [
+        ("load", "读取多模态证据", (r"study_guide", r"evidence", r"analysis\.json")),
+        ("gaps", "检查证据缺口", (r"evidence_gaps", r"gap", r"missing")),
+        ("write", "写出学习视图产物", (r"study_overview\.md", r"study_cards\.md", r"evidence_index\.md")),
+    ],
+    "evidence-review": [
+        ("load", "读取学习证据账本", (r"study_guide", r"evidence_gaps", r"study_chapters")),
+        ("review", "模型复核缺口影响", (r"evidence_review", r"review", r"publish_decision")),
+        ("gate", "写出发布门禁", (r"publish_decision", r"publishable", r"blocked")),
+    ],
     "image-prompts": [
         ("load", "读取文档内容", (r"operation_manual", r"knowledge_notes", r"deep_report", r"manual_evidence")),
         ("prompt", "生成配图提示词", (r"prompt", r"baoyu", r"cover", r"image")),
@@ -206,6 +318,8 @@ class VideoLinkStatusServer:
         self.repo_root = repo_root
         self.runner_lock = threading.Lock()
         self.active_runners: dict[str, threading.Thread] = {}
+        self.vscode_sessions: dict[str, dict[str, Any]] = {}
+        self.vscode_lock = threading.Lock()
         self.auto_retry_stop = threading.Event()
         self.auto_retry_thread: threading.Thread | None = None
         self.resource_locks = {name: threading.BoundedSemaphore(limit) for name, limit in RESOURCE_LIMITS.items()}
@@ -222,21 +336,23 @@ class VideoLinkStatusServer:
                 "analysis_mode": "auto",
                 "profile": default_profile,
                 "run_name": DEFAULT_RUN_NAME,
-                "cookies_from_browser": DEFAULT_COOKIE_BROWSER,
+                "cookies_from_browser": "none",
+                "download_device": "local",
                 "skip_images": False,
                 "keep_existing": True,
                 "include_subtitles": True,
-                "prefer_subtitle_transcript": False,
+                "prefer_subtitle_transcript": True,
                 "include_comments": True,
-                "max_comments": 30,
+                "max_comments": 3000,
                 "subtitle_langs": DEFAULT_SUBTITLE_LANGS,
-                "refresh_context": False,
+                "refresh_context": True,
                 "focus_prompt": "",
             },
             "choices": {
                 "analysis_modes": list(ALLOWED_ANALYSIS_MODES),
                 "profiles": profiles,
                 "cookie_browsers": [item for item in ALLOWED_COOKIE_BROWSERS if item],
+                "download_devices": list(ALLOWED_DOWNLOAD_DEVICES),
             },
         }
 
@@ -255,6 +371,9 @@ class VideoLinkStatusServer:
                 HTTPStatus.BAD_REQUEST,
                 f"cookies_from_browser must be one of {sorted(ALLOWED_COOKIE_BROWSERS)} or none",
             )
+        download_device = str(payload.get("download_device") or payload.get("downloadDevice") or "local").strip() or "local"
+        if download_device not in ALLOWED_DOWNLOAD_DEVICES:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, f"download_device must be one of {sorted(ALLOWED_DOWNLOAD_DEVICES)}")
 
         defaults = self.options()["defaults"]
         run_name = sanitize_run_name(str(payload.get("run_name") or payload.get("runName") or defaults["run_name"]))
@@ -292,6 +411,7 @@ class VideoLinkStatusServer:
                 "profile": profile,
                 "run_name": run_name,
                 "cookies_from_browser": cookie_browser,
+                "download_device": download_device,
                 "skip_images": skip_images,
                 "keep_existing": keep_existing,
                 "include_subtitles": include_subtitles,
@@ -684,6 +804,28 @@ class VideoLinkStatusServer:
         job = self.load_job(job_id)
         self.ensure_dependencies(job, stage)
         current_status = job.get("stages", {}).get(stage, {}).get("status")
+        if stage == "final-publish" and current_status == "skipped" and self.export_outputs_complete(job):
+            now = iso_now()
+            stage_info = dict(job.get("stages", {}).get(stage) or {})
+            stage_info["status"] = "succeeded"
+            stage_info["exit_code"] = 0
+            stage_info["finished_at"] = now
+            stage_info.pop("error", None)
+            stage_info.pop("warning", None)
+            stage_info.pop("soft_failed", None)
+            job.setdefault("stages", {})[stage] = stage_info
+            runner = dict(job.get("runner") or {})
+            runner["status"] = "succeeded"
+            runner["current_stage"] = None
+            runner["error"] = None
+            runner["finished_at"] = now
+            runner["updated_at"] = now
+            job["runner"] = runner
+            job["status"] = "succeeded"
+            job["summary"] = self.collect_summary(job)
+            job["updated_at"] = now
+            self.save_job(job)
+            return self.public_job(job)
         if current_status in {"succeeded", "skipped"}:
             return self.public_job(job)
         if stage == "image-prompts" and job["options"].get("skip_images"):
@@ -765,6 +907,10 @@ class VideoLinkStatusServer:
                 result = self.run_command_stage(job, stage, self.multidoc_command(job), stage_info["log_path"], stage_info)
             elif stage == "deep-v2":
                 result = self.run_command_stage(job, stage, self.deep_v2_command(job), stage_info["log_path"], stage_info)
+            elif stage == "study-guide":
+                result = self.run_command_stage(job, stage, self.study_guide_command(job), stage_info["log_path"], stage_info)
+            elif stage == "evidence-review":
+                result = self.run_command_stage(job, stage, self.evidence_review_command(job), stage_info["log_path"], stage_info)
             elif stage == "image-prompts":
                 result = self.run_command_stage(job, stage, self.image_prompts_command(job), stage_info["log_path"], stage_info)
             else:
@@ -847,12 +993,14 @@ class VideoLinkStatusServer:
     def stage_probe(self, job: dict[str, Any]) -> dict[str, Any]:
         duration = probe_duration_seconds(job["video_url"])
         requested_mode = job["options"]["analysis_mode"]
-        if requested_mode == "auto":
-            resolved_mode = "long-talk-fast" if duration is not None and duration >= 2700 else "balanced"
-        else:
-            resolved_mode = requested_mode
+        resolved_mode, reason = resolve_auto_analysis_mode(
+            requested_mode=requested_mode,
+            duration_seconds=duration,
+            focus_prompt=(job.get("options") or {}).get("focus_prompt") or "",
+        )
         job["resolved_mode"] = resolved_mode
-        return {"artifacts": {"duration_seconds": duration, "resolved_mode": resolved_mode}}
+        job["resolved_mode_reason"] = reason
+        return {"artifacts": {"duration_seconds": duration, "resolved_mode": resolved_mode, "resolved_mode_reason": reason}}
 
     def stage_operation(self, job: dict[str, Any], log_path: str) -> dict[str, Any]:
         return self.stage_analyze_core(job, log_path)
@@ -1030,6 +1178,8 @@ class VideoLinkStatusServer:
             command.append("--keep-existing")
         if opts.get("cookies_from_browser"):
             command.extend(["--cookies-from-browser", opts["cookies_from_browser"]])
+        if opts.get("download_device") and opts.get("download_device") != "local":
+            command.extend(["--download-device", opts["download_device"]])
         command.append("--include-subtitles" if opts.get("include_subtitles") else "--no-include-subtitles")
         command.append("--include-comments" if opts.get("include_comments") else "--no-include-comments")
         if opts.get("prefer_subtitle_transcript"):
@@ -1058,10 +1208,30 @@ class VideoLinkStatusServer:
             "--no-format-markdown-final",
         ]
 
+    def study_guide_command(self, job: dict[str, Any]) -> list[str]:
+        return [
+            sys.executable,
+            "tools/run_study_guide.py",
+            str(self.require_run_dir(job)),
+            "--profile",
+            job["options"].get("profile") or DEFAULT_PROFILE,
+            "--skip-review",
+        ]
+
+    def evidence_review_command(self, job: dict[str, Any]) -> list[str]:
+        return [
+            sys.executable,
+            "tools/run_study_guide.py",
+            str(self.require_run_dir(job)),
+            "--profile",
+            job["options"].get("profile") or DEFAULT_PROFILE,
+        ]
+
     def export_command(self, job: dict[str, Any]) -> list[str]:
         return ["tools/export_video_docs.sh", str(self.require_run_dir(job)), "--final-only", "--jobs", "3"]
 
     def final_publish_command(self, job: dict[str, Any]) -> list[str]:
+        self.ensure_publish_not_blocked(job)
         command = [
             "tools/run_video_doc_final_publish.sh",
             str(self.require_run_dir(job)),
@@ -1077,9 +1247,23 @@ class VideoLinkStatusServer:
         return command
 
     def image_prompts_command(self, job: dict[str, Any]) -> list[str]:
+        self.ensure_publish_not_blocked(job)
         if not BAOYU_PROMPT_SCRIPT.exists():
             raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, f"missing Baoyu prompt script: {BAOYU_PROMPT_SCRIPT}")
         return [sys.executable, str(BAOYU_PROMPT_SCRIPT), str(self.require_run_dir(job))]
+
+    def ensure_publish_not_blocked(self, job: dict[str, Any]) -> None:
+        run_dir = self.require_run_dir(job)
+        decision_path = run_dir / "publish_decision.json"
+        if not decision_path.is_file():
+            return
+        try:
+            decision = json.loads(decision_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if decision.get("status") == "blocked":
+            reason = decision.get("reason") or "evidence review blocked publishing"
+            raise BridgeError(HTTPStatus.CONFLICT, f"publish blocked by evidence gate: {reason}")
 
     def mark_stage_skipped(self, job: dict[str, Any], stage: str, reason: str) -> dict[str, Any]:
         stage = normalize_stage_name(stage)
@@ -1110,6 +1294,11 @@ class VideoLinkStatusServer:
                 }
         if stage == "probe":
             artifact_store["resolved_mode"] = {"value": job.get("resolved_mode"), "module": stage, "updated_at": iso_now()}
+            artifact_store["resolved_mode_reason"] = {
+                "value": job.get("resolved_mode_reason"),
+                "module": stage,
+                "updated_at": iso_now(),
+            }
         job["artifacts"] = artifact_store
 
     def collect_core_artifacts(self, run_dir: Path) -> dict[str, Any]:
@@ -1131,14 +1320,28 @@ class VideoLinkStatusServer:
             path = next((candidate for candidate in paths if candidate.exists()), None)
             if path:
                 artifacts[name] = str(path)
+        study_candidates = {
+            "study_guide": run_dir / "study_guide.json",
+            "evidence_gaps": run_dir / "evidence_gaps.json",
+            "evidence_review": run_dir / "evidence_review.json",
+            "publish_decision": run_dir / "publish_decision.json",
+        }
+        for name, path in study_candidates.items():
+            if path.exists():
+                artifacts[name] = str(path)
         if analysis_path.exists():
             try:
                 payload = json.loads(analysis_path.read_text(encoding="utf-8"))
                 metadata = payload.get("metadata") or {}
+                ocr_keyframes = metadata.get("ocr_keyframes") or {}
                 artifacts["frames"] = artifacts.get("frames") or metadata.get("frame_extraction", {}).get("frame_manifest")
                 artifacts["transcript"] = artifacts.get("transcript") or metadata.get("transcript_markdown")
                 artifacts["core_counts"] = {
                     "frames_extracted": metadata.get("frames_extracted"),
+                    "scan_frames": ocr_keyframes.get("scan_frames_count"),
+                    "ocr_candidate_frames": ocr_keyframes.get("ocr_candidate_frames_count"),
+                    "ocr_keyframes": ocr_keyframes.get("ocr_frames_count"),
+                    "ocr_text_events": ocr_keyframes.get("ocr_text_events_count"),
                     "ocr_events": len(payload.get("ocr_events") or []),
                     "frame_analyses": len(payload.get("frame_analyses") or []),
                     "timings": metadata.get("timings") or {},
@@ -1166,13 +1369,43 @@ class VideoLinkStatusServer:
                 json.loads((run_dir / "analysis.json").read_text(encoding="utf-8"))
             except Exception:
                 missing.append("analysis.json (invalid JSON)")
+        core_errors = self.core_analysis_errors(run_dir)
+        if core_errors:
+            missing.append(f"core analysis errors: {len(core_errors)} VL/resource failure(s)")
         return missing
 
     def core_quality_warning(self, run_dir: Path) -> str | None:
         quality_failed_path = run_dir / "operation_manual.quality_failed.md"
         if quality_failed_path.is_file() and not (run_dir / "operation_manual.md").is_file():
             return f"operation manual failed quality gate; review artifact: {quality_failed_path}"
+        core_errors = self.core_analysis_errors(run_dir)
+        if core_errors:
+            sample = "; ".join(core_errors[:3])
+            return f"core analysis contains VL/resource failure(s): {sample}"
         return None
+
+    def core_analysis_errors(self, run_dir: Path) -> list[str]:
+        candidates = [
+            run_dir / "analysis.json",
+            run_dir / "orin" / "frame_analyses.json",
+            run_dir / "orin" / "visual_events.json",
+        ]
+        errors: list[str] = []
+        seen: set[str] = set()
+        for path in candidates:
+            if not path.is_file():
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            for text in iter_nested_strings(payload):
+                if any(pattern in text for pattern in CORE_ANALYSIS_ERROR_PATTERNS):
+                    normalized = " ".join(text.split())
+                    if normalized and normalized not in seen:
+                        seen.add(normalized)
+                        errors.append(normalized[:240])
+        return errors
 
     def core_markdown_available_for_job(self, job: dict[str, Any]) -> bool:
         run_dir = self.discover_run_dir(job)
@@ -1334,13 +1567,156 @@ class VideoLinkStatusServer:
         )
         return {"opened": True, "run_dir": str(run_dir), "command": ["code", str(run_dir)]}
 
+    def start_vscode_session(
+        self,
+        job_id: str,
+        public_host: str | None = None,
+        restart: bool = False,
+    ) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        code_server = find_code_server_binary()
+        if not code_server:
+            raise BridgeError(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "Web VS Code server is not available; install code-server/openvscode-server or keep npx available",
+            )
+
+        with self.vscode_lock:
+            existing = self.vscode_sessions.get(job_id)
+            if restart and existing:
+                stop_managed_vscode_sessions(self.jobs_dir)
+                self.vscode_sessions.clear()
+                existing = None
+            if existing and process_alive(existing.get("pid")):
+                existing["run_dir"] = str(run_dir)
+                return self.public_vscode_session(existing, public_host)
+
+            discovered = discover_global_vscode_session(self.jobs_dir)
+            if discovered:
+                discovered["job_id"] = job_id
+                discovered["run_dir"] = str(run_dir)
+                self.vscode_sessions[job_id] = discovered
+                return self.public_vscode_session(discovered, public_host)
+
+            stop_managed_vscode_sessions(self.jobs_dir)
+            port = allocate_vscode_port(VSCODE_PORT)
+            host = os.environ.get("VIDEO_LINK_VSCODE_BIND_HOST", "0.0.0.0")
+            data_dir = self.jobs_dir / "_vscode-server-data"
+            user_dir = self.jobs_dir / "_vscode-user-data"
+            extensions_dir = self.jobs_dir / "_vscode-extensions"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            user_dir.mkdir(parents=True, exist_ok=True)
+            extensions_dir.mkdir(parents=True, exist_ok=True)
+            socket_path = user_dir / "code-server-ipc.sock"
+            if socket_path.exists():
+                socket_path.unlink()
+            command = build_code_server_command(code_server, host, port, user_dir, extensions_dir, None)
+            log_path = self.jobs_dir / "_vscode-server.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("wb") as log_file:
+                process = subprocess.Popen(
+                    command,
+                    cwd=self.repo_root,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            session = {
+                "job_id": job_id,
+                "pid": process.pid,
+                "port": port,
+                "run_dir": str(run_dir),
+                "log_path": str(log_path),
+                "server": code_server.get("server"),
+                "command": command[:3],
+                "started_at": iso_now(),
+            }
+            self.vscode_sessions[job_id] = session
+            return self.public_vscode_session(session, public_host)
+
+    def stop_vscode_session(self, job_id: str) -> dict[str, Any]:
+        with self.vscode_lock:
+            stopped = self._stop_vscode_session_locked(job_id)
+        return {"stopped": stopped, "job_id": job_id}
+
+    def _stop_vscode_session_locked(self, job_id: str) -> bool:
+        session = self.vscode_sessions.pop(job_id, None)
+        if not session:
+            return False
+        pid = session.get("pid")
+        if pid and process_alive(pid):
+            try:
+                os.killpg(os.getpgid(int(pid)), 15)
+            except ProcessLookupError:
+                pass
+            except Exception:
+                try:
+                    os.kill(int(pid), 15)
+                except Exception:
+                    pass
+        return True
+
+    def public_vscode_session(self, session: dict[str, Any], public_host: str | None = None) -> dict[str, Any]:
+        host = public_vscode_host(public_host)
+        port = int(session["port"])
+        query = urlencode({"folder": str(session.get("run_dir") or "")})
+        url = f"http://{host}:{port}/?{query}" if query else f"http://{host}:{port}/"
+        return {
+            "ready": process_alive(session.get("pid")),
+            "url": url,
+            "pid": session.get("pid"),
+            "port": port,
+            "run_dir": session.get("run_dir"),
+            "server": session.get("server"),
+            "started_at": session.get("started_at"),
+            "log_path": session.get("log_path"),
+        }
+
+    def vscode_preview_metadata(self, job: dict[str, Any], public_host: str | None = None) -> dict[str, Any]:
+        run_dir = job.get("run_dir") or (((job.get("artifacts") or {}).get("run_dir") or {}).get("value"))
+        session = self.vscode_sessions.get(job["job_id"])
+        if not session and run_dir:
+            try:
+                discovered = discover_global_vscode_session(self.jobs_dir)
+            except Exception:
+                discovered = None
+            if discovered:
+                discovered["job_id"] = job["job_id"]
+                discovered["run_dir"] = str(Path(run_dir).expanduser().resolve())
+                self.vscode_sessions[job["job_id"]] = discovered
+                session = discovered
+        if not session:
+            return {"ready": False, "url": None, "run_dir": run_dir}
+        return self.public_vscode_session(session, public_host)
+
     def collect_summary(self, job: dict[str, Any]) -> dict[str, Any]:
         run_dir_value = job.get("run_dir")
         if not run_dir_value:
             return {}
         run_dir = Path(run_dir_value)
+        core_counts = {}
+        analysis_path = run_dir / "analysis.json"
+        if analysis_path.is_file():
+            try:
+                metadata = (json.loads(analysis_path.read_text(encoding="utf-8")).get("metadata") or {})
+                ocr_keyframes = metadata.get("ocr_keyframes") or {}
+                core_counts = {
+                    "frames_extracted": metadata.get("frames_extracted"),
+                    "scan_frames": ocr_keyframes.get("scan_frames_count"),
+                    "ocr_candidate_frames": ocr_keyframes.get("ocr_candidate_frames_count"),
+                    "ocr_keyframes": ocr_keyframes.get("ocr_frames_count"),
+                    "ocr_text_events": ocr_keyframes.get("ocr_text_events_count"),
+                    "vl_frames": metadata.get("vl_frames_processed"),
+                }
+            except Exception:
+                core_counts = {}
         return {
             "run_dir": str(run_dir),
+            "core_counts": core_counts,
+            "study": self.study_summary(run_dir),
             "markdown_files": sorted(str(path.relative_to(run_dir)) for path in run_dir.glob("**/*.md") if path.is_file()),
             "export_files": sorted(str(path.relative_to(run_dir)) for path in (run_dir / "exports").glob("*") if path.is_file())
             if (run_dir / "exports").is_dir()
@@ -1352,6 +1728,41 @@ class VideoLinkStatusServer:
             if (run_dir / "baoyu_images" / "final").is_dir()
             else [],
         }
+
+    def study_summary(self, run_dir: Path) -> dict[str, Any]:
+        guide_path = run_dir / "study_guide.json"
+        gaps_path = run_dir / "evidence_gaps.json"
+        decision_path = run_dir / "publish_decision.json"
+        summary: dict[str, Any] = {"available": guide_path.is_file()}
+        if guide_path.is_file():
+            try:
+                guide = json.loads(guide_path.read_text(encoding="utf-8"))
+                summary.update(
+                    {
+                        "title": guide.get("title"),
+                        "chapter_count": len(guide.get("chapters") or []),
+                        "evidence_count": len(guide.get("evidence") or []),
+                    }
+                )
+            except Exception:
+                summary["error"] = "study_guide.json is invalid"
+        if gaps_path.is_file():
+            try:
+                gaps = json.loads(gaps_path.read_text(encoding="utf-8"))
+                summary["gaps"] = gaps.get("summary") or {}
+            except Exception:
+                summary["gaps_error"] = "evidence_gaps.json is invalid"
+        if decision_path.is_file():
+            try:
+                decision = json.loads(decision_path.read_text(encoding="utf-8"))
+                summary["publish_decision"] = {
+                    "status": decision.get("status"),
+                    "reason": decision.get("reason"),
+                    "risk_level": decision.get("risk_level"),
+                }
+            except Exception:
+                summary["publish_decision_error"] = "publish_decision.json is invalid"
+        return summary
 
     def preview_video_candidate(self, job: dict[str, Any]) -> Path | None:
         artifacts = job.get("artifacts") or {}
@@ -1407,7 +1818,44 @@ class VideoLinkStatusServer:
             raise BridgeError(HTTPStatus.NOT_FOUND, f"video file does not exist: {video_path}")
         return video_path, mimetypes.guess_type(str(video_path))[0]
 
-    def public_job(self, job: dict[str, Any]) -> dict[str, Any]:
+    def resource_file(self, job_id: str, relative_path: str) -> tuple[Path, str | None]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        value = str(relative_path or "").strip()
+        if not value:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "resource path is required")
+        candidate = Path(value)
+        if candidate.is_absolute():
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "resource path must be relative")
+        path = (run_dir / candidate).resolve()
+        try:
+            path.relative_to(run_dir)
+        except ValueError as exc:
+            raise BridgeError(HTTPStatus.FORBIDDEN, "resource path escapes run_dir") from exc
+        if not path.is_file():
+            raise BridgeError(HTTPStatus.NOT_FOUND, "resource file is not available")
+        return path, mimetypes.guess_type(str(path))[0]
+
+    def study_guide(self, job_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        path = run_dir / "study_guide.json"
+        if not path.is_file():
+            raise BridgeError(HTTPStatus.NOT_FOUND, "study guide is not available")
+        try:
+            guide = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, "study guide is invalid") from exc
+        for name in ("evidence_gaps", "evidence_review", "publish_decision"):
+            sidecar = run_dir / f"{name}.json"
+            if sidecar.is_file():
+                try:
+                    guide[name] = json.loads(sidecar.read_text(encoding="utf-8"))
+                except Exception:
+                    guide[name] = {"status": "invalid"}
+        return guide
+
+    def public_job(self, job: dict[str, Any], public_host: str | None = None) -> dict[str, Any]:
         public = dict(job)
         public["stages"] = dict(job.get("stages") or {})
         public["summary"] = self.collect_summary(job)
@@ -1421,6 +1869,7 @@ class VideoLinkStatusServer:
         public["core_progress"] = self.core_progress(public)
         public["stage_progress"] = self.stage_progress(public)
         public["preview"] = self.preview_metadata(public)
+        public["vscode_preview"] = self.vscode_preview_metadata(public, public_host)
         public["warnings"] = list(job.get("warnings") or [])
         queued_stage = public["queue"].get("stage")
         if queued_stage and queued_stage in public["stages"]:
@@ -1782,7 +2231,7 @@ class VideoLinkStatusServer:
     def save_job(self, job: dict[str, Any]) -> None:
         path = self.job_path(job["job_id"])
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_suffix(".json.tmp")
+        tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         tmp_path.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp_path.replace(path)
 
@@ -1950,6 +2399,8 @@ def stage_progress_text(stage: str, job: dict[str, Any], stage_info: dict[str, A
         lines.append("probe stage started")
     if stage == "probe" and job.get("resolved_mode"):
         lines.append(f"resolved mode: {job['resolved_mode']}")
+        if job.get("resolved_mode_reason"):
+            lines.append(f"mode reason: {job['resolved_mode_reason']}")
     if stage == "verify-core":
         lines.append("verifying core artifacts")
         if stage_info.get("status") == "succeeded":
@@ -2088,6 +2539,292 @@ def pipeline_mode_for(analysis_mode: str) -> str:
     return "fast" if analysis_mode == "long-talk-fast" else analysis_mode
 
 
+def resolve_auto_analysis_mode(requested_mode: str, duration_seconds: int | float | None, focus_prompt: str) -> tuple[str, str]:
+    if requested_mode != "auto":
+        return requested_mode, "explicit mode selected"
+
+    prompt = str(focus_prompt or "").strip().lower()
+    is_long = duration_seconds is not None and duration_seconds >= AUTO_MODE_LONG_SECONDS
+    if not prompt:
+        if is_long:
+            return "long-talk-fast", f"duration >= {AUTO_MODE_LONG_SECONDS}s"
+        return "balanced", "default auto mode"
+
+    fast_score = keyword_score(prompt, AUTO_MODE_FAST_KEYWORDS)
+    deep_score = keyword_score(prompt, AUTO_MODE_DEEP_KEYWORDS)
+    long_talk_score = keyword_score(prompt, AUTO_MODE_LONG_TALK_KEYWORDS)
+
+    if is_long:
+        if deep_score > max(fast_score, long_talk_score):
+            return "deep", "focus prompt asks for deep/high-detail analysis"
+        if fast_score or long_talk_score:
+            return "long-talk-fast", "long video with speed/subtitle/talk intent"
+        return "long-talk-fast", f"duration >= {AUTO_MODE_LONG_SECONDS}s"
+
+    if deep_score > fast_score:
+        return "deep", "focus prompt asks for deep/high-detail analysis"
+    if fast_score > 0:
+        return "fast", "focus prompt asks for quick/summary analysis"
+    return "balanced", "focus prompt has no strong mode hint"
+
+
+def keyword_score(text: str, keywords: tuple[str, ...]) -> int:
+    return sum(1 for keyword in keywords if keyword in text)
+
+
+def find_code_server_binary() -> dict[str, Any] | None:
+    configured = os.environ.get("VIDEO_LINK_CODE_SERVER_BIN")
+    if configured and Path(configured).is_file():
+        return {"server": "code-server", "command": [str(Path(configured))]}
+
+    path_code_server = shutil.which("code-server")
+    if path_code_server:
+        return {"server": "code-server", "command": [path_code_server]}
+
+    path_openvscode = shutil.which("openvscode-server")
+    if path_openvscode:
+        return {"server": "openvscode-server", "command": [path_openvscode]}
+
+    # Microsoft's ~/.vscode-server/.../server/bin/code-server is only a remote
+    # extension-host backend here; it returns 404 for the Web workbench root.
+    # Coder code-server is the lightest available direct Web workbench fallback.
+    path_npx = shutil.which("npx")
+    if path_npx and os.environ.get("VIDEO_LINK_DISABLE_NPX_CODE_SERVER") != "1":
+        return {"server": "code-server", "command": [path_npx, "--yes", "code-server"]}
+    return None
+
+
+def build_code_server_command(
+    server: dict[str, Any],
+    host: str,
+    port: int,
+    user_dir: Path,
+    extensions_dir: Path,
+    run_dir: Path | None,
+) -> list[str]:
+    base_command = [str(part) for part in server["command"]]
+    bind_addr = f"{host}:{port}"
+    if server["server"] == "openvscode-server":
+        command = base_command + [
+            "--host",
+            host,
+            "--port",
+            str(port),
+            "--without-connection-token",
+            "--user-data-dir",
+            str(user_dir),
+            "--extensions-dir",
+            str(extensions_dir),
+        ]
+        if run_dir:
+            command.append(str(run_dir))
+        return command
+    command = base_command + [
+        "--bind-addr",
+        bind_addr,
+        "--auth",
+        "none",
+        "--disable-telemetry",
+        "--disable-update-check",
+        "--disable-workspace-trust",
+        "--user-data-dir",
+        str(user_dir),
+        "--extensions-dir",
+        str(extensions_dir),
+    ]
+    if run_dir:
+        command.append(str(run_dir))
+    return command
+
+
+def discover_vscode_session(job_id: str, run_dir: Path) -> dict[str, Any] | None:
+    matches = discover_vscode_processes(run_dir)
+    if not matches:
+        return None
+    match = max(matches, key=lambda item: item["pgid"])
+    return {
+        "job_id": job_id,
+        "pid": match["pgid"],
+        "port": match["port"],
+        "run_dir": str(run_dir),
+        "log_path": None,
+        "server": "code-server",
+        "started_at": iso_now(),
+    }
+
+
+def discover_global_vscode_session(jobs_dir: Path) -> dict[str, Any] | None:
+    matches = [
+        match for match in discover_managed_vscode_processes(jobs_dir)
+        if "_vscode-user-data" in match.get("command", "")
+    ]
+    if not matches:
+        return None
+    match = sorted(matches, key=lambda item: (item["port"] != VSCODE_PORT, item["pgid"]))[0]
+    return {
+        "job_id": None,
+        "pid": match["pgid"],
+        "port": match["port"],
+        "run_dir": None,
+        "log_path": str(jobs_dir / "_vscode-server.log"),
+        "server": "code-server",
+        "started_at": iso_now(),
+    }
+
+
+def stop_discovered_vscode_sessions(run_dir: Path) -> int:
+    stopped = 0
+    for match in discover_vscode_processes(run_dir):
+        try:
+            os.killpg(int(match["pgid"]), 15)
+            stopped += 1
+        except ProcessLookupError:
+            pass
+        except Exception:
+            try:
+                os.kill(int(match["pid"]), 15)
+                stopped += 1
+            except Exception:
+                pass
+    return stopped
+
+
+def stop_managed_vscode_sessions(jobs_dir: Path) -> int:
+    stopped = 0
+    for match in discover_managed_vscode_processes(jobs_dir):
+        try:
+            os.killpg(int(match["pgid"]), 15)
+            stopped += 1
+        except ProcessLookupError:
+            pass
+        except Exception:
+            try:
+                os.kill(int(match["pid"]), 15)
+                stopped += 1
+            except Exception:
+                pass
+    if stopped:
+        time.sleep(0.5)
+    return stopped
+
+
+def discover_vscode_processes(run_dir: Path) -> list[dict[str, Any]]:
+    try:
+        output = subprocess.check_output(
+            ["ps", "-eo", "pid=,pgid=,cmd="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return []
+    run_dir_text = str(run_dir)
+    groups: dict[int, dict[str, Any]] = {}
+    for line in output.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) != 3:
+            continue
+        try:
+            pid = int(parts[0])
+            pgid = int(parts[1])
+        except ValueError:
+            continue
+        command = parts[2]
+        if "code-server" not in command:
+            continue
+        try:
+            command_args = shlex.split(command)
+        except ValueError:
+            command_args = command.split()
+        if run_dir_text not in command_args:
+            continue
+        port_match = re.search(r"--bind-addr\s+\S+:(\d+)", command) or re.search(r"--port\s+(\d+)", command)
+        if not port_match:
+            continue
+        groups.setdefault(pgid, {"pid": pid, "pgid": pgid, "port": int(port_match.group(1)), "command": command})
+    return list(groups.values())
+
+
+def discover_managed_vscode_processes(jobs_dir: Path) -> list[dict[str, Any]]:
+    try:
+        output = subprocess.check_output(
+            ["ps", "-eo", "pid=,pgid=,cmd="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return []
+    jobs_dir_text = str(jobs_dir)
+    groups: dict[int, dict[str, Any]] = {}
+    for line in output.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) != 3:
+            continue
+        try:
+            pid = int(parts[0])
+            pgid = int(parts[1])
+        except ValueError:
+            continue
+        command = parts[2]
+        if "code-server" not in command or jobs_dir_text not in command:
+            continue
+        port_match = re.search(r"--bind-addr\s+\S+:(\d+)", command) or re.search(r"--port\s+(\d+)", command)
+        if not port_match:
+            continue
+        groups.setdefault(pgid, {"pid": pid, "pgid": pgid, "port": int(port_match.group(1)), "command": command})
+    return list(groups.values())
+
+
+def allocate_vscode_port(port: int) -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError as exc:
+            raise BridgeError(HTTPStatus.SERVICE_UNAVAILABLE, f"VS Code Server port {port} is busy") from exc
+    return port
+
+
+def public_vscode_host(public_host: str | None = None) -> str:
+    configured = os.environ.get("VIDEO_LINK_VSCODE_PUBLIC_HOST")
+    if configured:
+        return configured
+    host = (public_host or "").strip()
+    if host and host not in {"127.0.0.1", "localhost", "::1"}:
+        return host
+    tailscale_host = local_tailscale_host()
+    return tailscale_host or host or "127.0.0.1"
+
+
+def local_tailscale_host() -> str | None:
+    try:
+        output = subprocess.check_output(
+            ["tailscale", "ip", "-4"],
+            text=True,
+            timeout=2,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return None
+    for line in output.splitlines():
+        value = line.strip()
+        if value:
+            return value
+    return None
+
+
+def allocate_local_port(port_range: tuple[int, int]) -> int:
+    start, end = port_range
+    for port in range(start, end + 1):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return port
+    raise BridgeError(HTTPStatus.SERVICE_UNAVAILABLE, f"no free VS Code Server port in {start}-{end}")
+
+
 def operation_env() -> dict[str, str]:
     env = os.environ.copy()
     for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
@@ -2128,6 +2865,17 @@ def parse_bool(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def iter_nested_strings(value: Any):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from iter_nested_strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from iter_nested_strings(item)
+
+
 def parse_bool_option(payload: dict[str, Any], snake_key: str, camel_key: str, default: bool) -> bool:
     if snake_key in payload:
         return parse_bool(normalize_optional_template(payload.get(snake_key)))
@@ -2153,15 +2901,16 @@ def normalize_focus_prompt(value: Any, max_chars: int = 4000) -> str:
 
 
 def focus_prompt_for_url(payload: dict[str, Any], url: str, index: int) -> str:
+    fallback = normalize_focus_prompt(payload.get("focus_prompt") if "focus_prompt" in payload else payload.get("focusPrompt", ""))
     prompts = payload.get("focus_prompts") if "focus_prompts" in payload else payload.get("focusPrompts")
     if isinstance(prompts, dict):
-        return normalize_focus_prompt(prompts.get(url, ""))
+        return normalize_focus_prompt(prompts.get(url, "")) or fallback
     if isinstance(prompts, list) and index - 1 < len(prompts):
         item = prompts[index - 1]
         if isinstance(item, dict):
-            return normalize_focus_prompt(item.get("focus_prompt") if "focus_prompt" in item else item.get("focusPrompt", ""))
-        return normalize_focus_prompt(item)
-    return normalize_focus_prompt(payload.get("focus_prompt") if "focus_prompt" in payload else payload.get("focusPrompt", ""))
+            return normalize_focus_prompt(item.get("focus_prompt") if "focus_prompt" in item else item.get("focusPrompt", "")) or fallback
+        return normalize_focus_prompt(item) or fallback
+    return fallback
 
 
 def normalize_optional_template(value: Any) -> Any:
@@ -2325,6 +3074,10 @@ def render_create_page(options: dict[str, Any]) -> str:
           <label for="cookies_from_browser">Cookie 来源</label>
           <select id="cookies_from_browser" name="cookies_from_browser"></select>
         </div>
+        <div>
+          <label for="download_device">下载设备</label>
+          <select id="download_device" name="download_device"></select>
+        </div>
         <label class="check"><input id="skip_images" name="skip_images" type="checkbox">跳过配图/提示词</label>
       </div>
       <details class="panel">
@@ -2363,8 +3116,9 @@ def render_create_page(options: dict[str, Any]) -> str:
     fillSelect("analysis_mode", choices.analysis_modes, defaults.analysis_mode);
     fillSelect("profile", choices.profiles, defaults.profile);
     fillSelect("cookies_from_browser", choices.cookie_browsers, defaults.cookies_from_browser);
+    fillSelect("download_device", choices.download_devices, defaults.download_device);
     document.getElementById("run_name").value = defaults.run_name || "operation-manual";
-    document.getElementById("max_comments").value = defaults.max_comments ?? 30;
+    document.getElementById("max_comments").value = defaults.max_comments ?? 3000;
     document.getElementById("subtitle_langs").value = defaults.subtitle_langs || "";
     setChecked("skip_images", defaults.skip_images);
     setChecked("keep_existing", defaults.keep_existing);
@@ -2384,6 +3138,7 @@ def render_create_page(options: dict[str, Any]) -> str:
         profile: document.getElementById("profile").value,
         run_name: document.getElementById("run_name").value.trim(),
         cookies_from_browser: document.getElementById("cookies_from_browser").value,
+        download_device: document.getElementById("download_device").value,
         skip_images: document.getElementById("skip_images").checked,
         keep_existing: document.getElementById("keep_existing").checked,
         include_subtitles: document.getElementById("include_subtitles").checked,
@@ -2705,7 +3460,8 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
                 return
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})", path)
             if match:
-                self.write_json(self.server_app.public_job(self.server_app.load_job(match.group(1))))
+                host = self.headers.get("Host", "").split(":", 1)[0] or None
+                self.write_json(self.server_app.public_job(self.server_app.load_job(match.group(1)), public_host=host))
                 return
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/logs/([a-z0-9-]+)", path)
             if match:
@@ -2747,9 +3503,26 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             if match:
                 self.write_json(self.server_app.open_run_dir(match.group(1)))
                 return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/vscode-session", path)
+            if match:
+                restart = parse_bool(payload.get("restart", False))
+                host = self.headers.get("Host", "").split(":", 1)[0] or None
+                self.write_json(self.server_app.start_vscode_session(match.group(1), public_host=host, restart=restart))
+                return
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/stages/([a-z0-9-]+)", path)
             if match:
                 self.write_json(self.server_app.run_stage(match.group(1), match.group(2)))
+                return
+            raise BridgeError(HTTPStatus.NOT_FOUND, "not found")
+        except BridgeError as exc:
+            self.write_json({"error": exc.message}, exc.status)
+
+    def do_DELETE(self) -> None:
+        try:
+            path = urlparse(self.path).path
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/vscode-session", path)
+            if match:
+                self.write_json(self.server_app.stop_vscode_session(match.group(1)))
                 return
             raise BridgeError(HTTPStatus.NOT_FOUND, "not found")
         except BridgeError as exc:

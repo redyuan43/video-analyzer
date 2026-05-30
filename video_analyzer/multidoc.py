@@ -183,8 +183,9 @@ def load_evidence(run_dir: Path, analysis: dict[str, Any]) -> dict[str, Any]:
     comments = read_text_if_exists(orin_dir / "comments.md")
     ocr_events = read_json_if_exists(orin_dir / "ocr_events.json") or analysis.get("ocr_events") or []
     frame_analyses = read_json_if_exists(orin_dir / "frame_analyses.json") or analysis.get("frame_analyses") or []
-    transcript = read_json_if_exists(orin_dir / "transcript.json") or analysis.get("transcript") or {}
-    chapters = parse_chapters(page_context, transcript)
+    transcript = normalize_transcript(read_json_if_exists(orin_dir / "transcript.json") or analysis.get("transcript") or {})
+    study_context = load_study_context(run_dir)
+    chapters = parse_study_chapters(study_context) or parse_chapters(page_context, transcript)
     chapter_transcript = build_chapter_transcript_digest(chapters, transcript)
     return {
         "page_context": page_context,
@@ -197,11 +198,16 @@ def load_evidence(run_dir: Path, analysis: dict[str, Any]) -> dict[str, Any]:
         "frame_analyses": frame_analyses,
         "chapters": chapters,
         "chapter_transcript": chapter_transcript,
+        "study_context": study_context,
+        "study_context_text": summarize_study_context(study_context),
         "metadata": analysis.get("metadata") or {},
     }
 
 
 def build_evidence_map_json(evidence: dict[str, Any]) -> dict[str, Any]:
+    study_context = evidence.get("study_context") or {}
+    gaps = study_context.get("evidence_gaps") or {}
+    guide = study_context.get("study_guide") or {}
     return {
         "chapter_count": len(evidence["chapters"]),
         "transcript_segments": len((evidence.get("transcript") or {}).get("segments") or []),
@@ -209,6 +215,10 @@ def build_evidence_map_json(evidence: dict[str, Any]) -> dict[str, Any]:
         "frame_analysis_count": len(evidence["frame_analyses"]),
         "has_page_context": bool(evidence["page_context"]),
         "has_manual": bool(evidence["manual"]),
+        "has_study_guide": bool(guide),
+        "study_chapter_count": len(guide.get("chapters") or []),
+        "evidence_gap_count": (gaps.get("summary") or {}).get("total", len(gaps.get("items") or [])),
+        "publish_decision": (study_context.get("publish_decision") or {}).get("status"),
     }
 
 
@@ -229,6 +239,9 @@ def build_evidence_map_prompt(evidence: dict[str, Any], language: str) -> str:
 
 OCR/视觉证据摘要：
 {trim(summarize_frame_evidence(evidence), 7000)}
+
+结构化学习证据模型：
+{trim(evidence.get('study_context_text') or '', 9000)}
 """.strip()
 
 
@@ -243,6 +256,9 @@ def build_chapter_analysis_prompt(evidence: dict[str, Any], round1: str, languag
 
 章节列表：
 {json.dumps(evidence['chapters'], ensure_ascii=False, indent=2)}
+
+结构化学习证据模型：
+{trim(evidence.get('study_context_text') or '', 9000)}
 
 第一轮证据索引：
 {trim(round1, 9000)}
@@ -274,6 +290,9 @@ def build_document_prompt(doc_type: str, evidence: dict[str, Any], round1: str, 
 第二轮逐章分析：
 {trim(round2, 9000)}
 
+结构化学习证据模型与证据缺口：
+{trim(evidence.get('study_context_text') or '', 9000)}
+
 按章节转写摘录：
 {trim(evidence['chapter_transcript'], 30000)}
 
@@ -303,6 +322,9 @@ def build_review_prompt(evidence: dict[str, Any], drafts: dict[str, str], langua
 
 原始证据摘要：
 {trim(summarize_frame_evidence(evidence), 6000)}
+
+结构化学习证据模型与发布门禁：
+{trim(evidence.get('study_context_text') or '', 9000)}
 """.strip()
 
 
@@ -317,6 +339,101 @@ def generate_round(client: Any, model: str, temperature: float, prompt: str, pat
 
 def render_final_document(draft: str, review: str) -> str:
     return f"{draft.rstrip()}\n\n---\n\n## 多轮复核摘要\n\n{review.strip()}\n"
+
+
+def load_study_context(run_dir: Path) -> dict[str, Any]:
+    guide = read_json_if_exists(run_dir / "study_guide.json") or {}
+    gaps = read_json_if_exists(run_dir / "evidence_gaps.json") or {}
+    decision = read_json_if_exists(run_dir / "publish_decision.json") or {}
+    chapter_dir = run_dir / "study_chapters"
+    chapter_packets = []
+    if chapter_dir.is_dir():
+        for path in sorted(chapter_dir.glob("chapter_*.json")):
+            payload = read_json_if_exists(path)
+            if payload:
+                chapter_packets.append(payload)
+    return {
+        "study_guide": guide,
+        "evidence_gaps": gaps,
+        "publish_decision": decision,
+        "chapter_packets": chapter_packets,
+    }
+
+
+def parse_study_chapters(study_context: dict[str, Any]) -> list[dict[str, Any]]:
+    guide = study_context.get("study_guide") or {}
+    chapters = guide.get("chapters") or study_context.get("chapter_packets") or []
+    parsed = []
+    for index, chapter in enumerate(chapters, start=1):
+        start = chapter.get("start") or chapter.get("start_time") or "00:00:00"
+        end = chapter.get("end") or chapter.get("end_time") or ""
+        title = chapter.get("title") or chapter.get("summary") or f"学习章节 {index:02d}"
+        parsed.append(
+            {
+                "start": format_timestamp(timestamp_to_seconds(start)),
+                "end": format_timestamp(timestamp_to_seconds(end)) if end else "",
+                "title": str(title).strip(),
+            }
+        )
+    return parsed
+
+
+def normalize_transcript(transcript: Any) -> dict[str, Any]:
+    if isinstance(transcript, list):
+        transcript = {"segments": transcript}
+    if not isinstance(transcript, dict):
+        return {}
+    normalized = dict(transcript)
+    segments = []
+    for segment in transcript.get("segments") or []:
+        if not isinstance(segment, dict):
+            continue
+        item = dict(segment)
+        item["start"] = first_present(segment, ("start", "Start", "start_time", "StartTime", "begin", "Begin"))
+        item["end"] = first_present(segment, ("end", "End", "end_time", "EndTime", "finish", "Finish"))
+        item["text"] = first_present(segment, ("text", "Text", "content", "Content", "transcript", "Transcript"))
+        segments.append(item)
+    normalized["segments"] = segments
+    return normalized
+
+
+def first_present(payload: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        value = payload.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def summarize_study_context(study_context: dict[str, Any]) -> str:
+    guide = study_context.get("study_guide") or {}
+    gaps = study_context.get("evidence_gaps") or {}
+    decision = study_context.get("publish_decision") or {}
+    chapter_packets = study_context.get("chapter_packets") or guide.get("chapters") or []
+    compact_chapters = []
+    for chapter in chapter_packets[:24]:
+        compact_chapters.append(
+            {
+                "chapter_id": chapter.get("chapter_id"),
+                "title": chapter.get("title"),
+                "time": f"{chapter.get('start', '')} - {chapter.get('end', '')}".strip(),
+                "summary": chapter.get("summary"),
+                "key_points": chapter.get("key_points") or [],
+                "evidence_ids": (chapter.get("evidence_ids") or [])[:12],
+            }
+        )
+    compact_gaps = {
+        "summary": gaps.get("summary") or {},
+        "items": (gaps.get("items") or [])[:40],
+    }
+    payload = {
+        "available": bool(guide),
+        "overview": guide.get("overview") or {},
+        "chapters": compact_chapters,
+        "evidence_gaps": compact_gaps,
+        "publish_decision": decision,
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 def parse_chapters(page_context: str, transcript: dict[str, Any]) -> list[dict[str, Any]]:

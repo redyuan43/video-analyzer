@@ -4,10 +4,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Video Analyzer</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}?v={{ static_version }}">
 </head>
 <body>
-    <main class="app-shell">
+    <main class="app-shell" data-initial-job="{{ request.args.get('job', '') }}">
         <header class="topbar">
             <div>
                 <h1>Video Analyzer</h1>
@@ -16,6 +16,7 @@
             <nav class="view-tabs" aria-label="视图切换">
                 <button id="consoleTab" class="view-tab active" type="button" data-view="console">控制台</button>
                 <button id="previewTab" class="view-tab" type="button" data-view="preview">预览</button>
+                <button id="vscodeTab" class="view-tab" type="button" data-view="vscode">学习/资源</button>
             </nav>
         </header>
 
@@ -33,6 +34,10 @@
                         </label>
                         <textarea id="videoUrls" name="video_urls" hidden></textarea>
                         <div id="urlList" class="url-list" aria-live="polite"></div>
+                        <label class="wide focus-prompt">
+                            <span>Focus Prompt / 关注重点</span>
+                            <textarea id="focusPrompt" name="focus_prompt" rows="4" placeholder="希望分析时特别关注的问题、模块、风险点或输出角度"></textarea>
+                        </label>
                         <label>
                             <span>分析模式</span>
                             <select id="analysisMode" name="analysis_mode"></select>
@@ -48,6 +53,10 @@
                         <label>
                             <span>Cookie 来源</span>
                             <select id="cookieBrowser" name="cookies_from_browser"></select>
+                        </label>
+                        <label>
+                            <span>下载设备</span>
+                            <select id="downloadDevice" name="download_device"></select>
                         </label>
                         <label class="check">
                             <input id="skipImages" name="skip_images" type="checkbox">
@@ -187,7 +196,55 @@
             </section>
             <section id="previewGrid" class="preview-grid"></section>
         </section>
+
+        <section id="vscodeView" class="vscode-view view-panel" hidden>
+            <section class="panel vscode-toolbar">
+                <div>
+                    <h2>学习与资源</h2>
+                    <p id="vscodeSummary">选择一个已生成资源包的任务</p>
+                </div>
+                <div class="vscode-actions">
+                    <button id="startVscodeButton" type="button" disabled>打开 WebIDE</button>
+                    <a id="openVscodeLink" class="button-link secondary" href="#" target="_blank" rel="noreferrer" hidden>新窗口打开</a>
+                    <button id="restartVscodeButton" class="secondary" type="button" disabled>重启</button>
+                    <button id="stopVscodeButton" class="secondary" type="button" disabled>停止</button>
+                </div>
+            </section>
+            <section class="vscode-docs">
+                <section id="studyPanel" class="study-panel">
+                    <div class="study-header">
+                        <div>
+                            <h3>学习视图</h3>
+                            <span id="studySummary">等待 study guide</span>
+                        </div>
+                        <span id="studyDecision" class="study-decision">-</span>
+                    </div>
+                    <div id="studyBody" class="study-body">暂无结构化学习数据</div>
+                </section>
+                <aside class="doc-list-panel">
+                    <div class="doc-list-header">
+                        <h3>文档预览</h3>
+                        <span id="docPreviewSummary">-</span>
+                    </div>
+                    <div id="docList" class="doc-list"></div>
+                </aside>
+                <section class="doc-preview-panel">
+                    <div class="doc-preview-header">
+                        <strong id="docPreviewTitle">选择文档</strong>
+                        <div class="doc-preview-actions">
+                            <a id="docOpenLink" class="secondary-link" href="#" target="_blank" rel="noreferrer" hidden>新窗口打开</a>
+                            <button id="docPreviewClose" class="icon-button light" type="button" title="关闭预览" aria-label="关闭预览">×</button>
+                        </div>
+                    </div>
+                    <div id="docPreviewBody" class="doc-preview-body">暂无可预览文档</div>
+                </section>
+            </section>
+            <section id="vscodeShell" class="vscode-shell" hidden>
+                <div id="vscodePlaceholder" class="vscode-placeholder">暂无 VS Code 资源包预览</div>
+                <iframe id="vscodeFrame" title="VS Code 资源包预览" hidden></iframe>
+            </section>
+        </section>
     </main>
-    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/main.js') }}?v={{ static_version }}"></script>
 </body>
 </html>

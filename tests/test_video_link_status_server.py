@@ -40,16 +40,80 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             self.assertIn("不能覆盖视频", text)
             self.assertEqual((focused.parent / "user_focus_prompt.md").read_text(encoding="utf-8"), "重点关注 CLI 参数\n")
 
+    def test_ytdlp_runtime_args_forward_extractor_args(self):
+        args = type(
+            "Args",
+            (),
+            {"ytdlp_js_runtimes": "node", "ytdlp_extractor_args": "youtube:player_client=mweb,web"},
+        )()
+        command = ["yt-dlp", "--skip-download"]
+
+        url_context_mod.add_ytdlp_runtime_args(command, args)
+
+        self.assertIn("--js-runtimes", command)
+        self.assertIn("node", command)
+        self.assertIn("--extractor-args", command)
+        self.assertIn("youtube:player_client=mweb,web", command)
+
+    def test_remote_download_command_uses_mi_safe_ytdlp_shape(self):
+        args = type(
+            "Args",
+            (),
+            {
+                "url": "https://example.com/video",
+                "include_subtitles": True,
+                "include_comments": True,
+                "subtitle_langs": "zh-CN,zh,en",
+                "ytdlp_js_runtimes": "auto",
+                "ytdlp_extractor_args": "",
+                "ytdlp_proxy": None,
+                "cookies": None,
+                "cookies_from_browser": "",
+            },
+        )()
+
+        command = url_context_mod.remote_download_command(args, "/home/ivan/Documents/video-analyzer-url-downloads/test")
+
+        self.assertTrue(command.startswith("bash -lc "))
+        self.assertIn("yt-dlp", command)
+        self.assertIn("--write-subs", command)
+        self.assertIn("--write-comments", command)
+        self.assertIn("--js-runtimes node", command)
+        self.assertIn("/home/ivan/Documents/video-analyzer-url-downloads/test/download.", command)
+
+    def test_existing_video_dir_for_url_uses_cached_youtube_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            video_dir = Path(tmp) / "B8OxtGSEfoo"
+            video_dir.mkdir()
+            (video_dir / "video.mp4").write_bytes(b"video")
+            (video_dir / "page_context.md").write_text("# context\n", encoding="utf-8")
+
+            resolved = url_context_mod.existing_video_dir_for_url(
+                Path(tmp),
+                "https://www.youtube.com/watch?v=B8OxtGSEfoo",
+            )
+
+        self.assertEqual(resolved, video_dir)
+
     def test_options_include_defaults_and_profiles(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
             options = server.options()
 
         self.assertEqual(options["defaults"]["analysis_mode"], "auto")
-        self.assertEqual(options["defaults"]["profile"], "deepseek_v4_pro")
-        self.assertEqual(options["defaults"]["cookies_from_browser"], "chrome")
+        self.assertEqual(options["defaults"]["profile"], "deepseek_v4_flash")
+        self.assertEqual(options["defaults"]["cookies_from_browser"], "none")
+        self.assertEqual(options["defaults"]["download_device"], "local")
+        self.assertTrue(options["defaults"]["keep_existing"])
+        self.assertTrue(options["defaults"]["include_subtitles"])
+        self.assertTrue(options["defaults"]["prefer_subtitle_transcript"])
+        self.assertTrue(options["defaults"]["include_comments"])
+        self.assertTrue(options["defaults"]["refresh_context"])
+        self.assertFalse(options["defaults"]["skip_images"])
+        self.assertEqual(options["defaults"]["max_comments"], 3000)
         self.assertIn("balanced", options["choices"]["analysis_modes"])
-        self.assertIn("deepseek_v4_pro", options["choices"]["profiles"])
+        self.assertIn("deepseek_v4_flash", options["choices"]["profiles"])
+        self.assertIn("mi", options["choices"]["download_devices"])
 
     def test_create_job_saves_common_and_collection_options(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -61,6 +125,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
                     "profile": "deepseek_v4_flash",
                     "runName": "../operation manual!",
                     "cookiesFromBrowser": "none",
+                    "downloadDevice": "mi",
                     "skipImages": True,
                     "keepExisting": False,
                     "includeSubtitles": False,
@@ -76,6 +141,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(job["options"]["analysis_mode"], "deep")
         self.assertEqual(job["options"]["run_name"], "operation-manual")
         self.assertEqual(job["options"]["cookies_from_browser"], "")
+        self.assertEqual(job["options"]["download_device"], "mi")
         self.assertTrue(job["options"]["skip_images"])
         self.assertFalse(job["options"]["keep_existing"])
         self.assertFalse(job["options"]["include_subtitles"])
@@ -95,6 +161,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
                     "analysis_mode": "fast",
                     "profile": "deepseek_v4_flash",
                     "cookies_from_browser": "none",
+                    "download_device": "mi",
                     "keep_existing": False,
                     "include_subtitles": False,
                     "prefer_subtitle_transcript": True,
@@ -122,6 +189,8 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertIn("只关注配置变更", command)
         self.assertNotIn("--keep-existing", command)
         self.assertNotIn("--cookies-from-browser", command)
+        self.assertIn("--download-device", command)
+        self.assertIn("mi", command)
 
     def test_create_jobs_batch_assigns_focus_prompt_per_url(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -140,7 +209,22 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
         self.assertEqual([job["options"]["focus_prompt"] for job in result["jobs"]], ["关注安装", "关注排错"])
 
-    def test_command_mapping_defaults_keep_downloads_and_browser_cookies(self):
+    def test_create_jobs_batch_uses_global_focus_prompt_as_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            result = server.create_jobs(
+                {
+                    "video_urls_text": "https://example.com/one\nhttps://example.com/two",
+                    "run_name": "batch",
+                    "focus_prompt": "关注部署风险",
+                    "focus_prompts": {"https://example.com/two": "关注排错"},
+                    "auto_start": False,
+                }
+            )
+
+        self.assertEqual([job["options"]["focus_prompt"] for job in result["jobs"]], ["关注部署风险", "关注排错"])
+
+    def test_command_mapping_defaults_keep_downloads_without_browser_cookies(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
             job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
@@ -151,10 +235,23 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
         self.assertIn("--download-only", command)
         self.assertIn("--keep-existing", command)
-        self.assertIn("--cookies-from-browser", command)
-        self.assertIn("chrome", command)
+        self.assertNotIn("--cookies-from-browser", command)
         self.assertIn("--include-subtitles", command)
         self.assertIn("--include-comments", command)
+
+    def test_command_mapping_keeps_explicit_browser_cookies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job(
+                {"video_url": "https://example.com/video", "analysis_mode": "fast", "cookies_from_browser": "chrome"}
+            )
+            loaded = server.load_job(job["job_id"])
+            loaded["resolved_mode"] = "fast"
+
+        command = server.prepare_command(loaded)
+
+        self.assertIn("--cookies-from-browser", command)
+        self.assertIn("chrome", command)
 
     def test_long_talk_prepare_uses_supported_pipeline_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -180,8 +277,15 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
         self.assertEqual(command[0], "tools/run_long_talk_fast_from_url.sh")
         self.assertIn("--profile", command)
-        self.assertEqual(command[command.index("--profile") + 1], "deepseek_v4_pro")
+        self.assertEqual(command[command.index("--profile") + 1], "deepseek_v4_flash")
         self.assertNotIn("--pipeline-mode", command)
+
+    def test_long_talk_wrapper_defaults_to_agx_dual_worker(self):
+        text = (REPO_ROOT / "tools" / "run_long_talk_fast_from_url.sh").read_text(encoding="utf-8")
+
+        self.assertIn('JETSON_FRAME_HOSTS="${JETSON_FRAME_HOSTS:-agx,agx}"', text)
+        self.assertIn("--jetson-frame-backend ray", text)
+        self.assertNotIn("nx1,nx2,nx3,nx4", text)
 
     def test_final_publish_stage_uses_finalize_only_script(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -200,7 +304,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertIn("--jobs", command)
         self.assertEqual(command[command.index("--jobs") + 1], "3")
         self.assertIn("--profile", command)
-        self.assertEqual(command[command.index("--profile") + 1], "deepseek_v4_pro")
+        self.assertEqual(command[command.index("--profile") + 1], "deepseek_v4_flash")
         self.assertNotIn("--skip-images", command)
 
     def test_final_publish_stage_respects_skip_images_option(self):
@@ -305,6 +409,34 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertIn("failed quality gate", result["artifacts"]["warnings"][0]["message"])
         self.assertIn("operation_manual.quality_failed.md", result["artifacts"]["warnings"][0]["message"])
 
+    def test_verify_core_rejects_frame_analysis_resource_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "run_name": "operation-manual"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "video" / "operation-manual"
+            run_dir.mkdir(parents=True)
+            (run_dir / "analysis.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": {},
+                        "frame_analyses": [
+                            {"response": "Error analyzing frame 12: model-resource-busy"},
+                            {"status": "skipped", "response": "VL analysis skipped."},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "manual_evidence.md").write_text("# Evidence\n", encoding="utf-8")
+            (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
+            loaded["run_dir"] = str(run_dir)
+
+            with self.assertRaises(server_mod.BridgeError) as caught:
+                server.stage_verify_core(loaded)
+
+        self.assertIn("core analysis errors", caught.exception.message)
+
     def test_analyze_core_accepts_quality_failed_manual_with_warning(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
@@ -346,8 +478,10 @@ class VideoLinkStatusServerTests(unittest.TestCase):
                 "prepare": {"status": "succeeded"},
                 "analyze-core": {"status": "succeeded"},
                 "verify-core": {"status": "succeeded"},
+                "study-guide": {"status": "skipped"},
                 "multidoc": {"status": "skipped"},
                 "deep-v2": {"status": "skipped"},
+                "evidence-review": {"status": "skipped"},
                 "image-prompts": {"status": "skipped"},
             }
             server.save_job(loaded)
@@ -359,6 +493,38 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertTrue(result["stages"]["final-publish"]["soft_failed"])
         self.assertEqual(result["warnings"][0]["stage"], "final-publish")
         self.assertIn("publisher unavailable", result["warnings"][0]["message"])
+
+    def test_study_and_evidence_review_are_separate_stages(self):
+        self.assertLess(server_mod.STAGE_ORDER.index("study-guide"), server_mod.STAGE_ORDER.index("multidoc"))
+        self.assertLess(server_mod.STAGE_ORDER.index("deep-v2"), server_mod.STAGE_ORDER.index("evidence-review"))
+        self.assertLess(server_mod.STAGE_ORDER.index("evidence-review"), server_mod.STAGE_ORDER.index("image-prompts"))
+
+    def test_study_guide_command_skips_model_review_until_deep_report_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            loaded["run_dir"] = str(run_dir)
+
+            command = server.study_guide_command(loaded)
+
+        self.assertIn("--skip-review", command)
+
+    def test_evidence_review_command_runs_model_review(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            loaded["run_dir"] = str(run_dir)
+
+            command = server.evidence_review_command(loaded)
+
+        self.assertNotIn("--skip-review", command)
+        self.assertEqual(command[1], "tools/run_study_guide.py")
 
     def test_list_jobs_returns_recent_public_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -472,6 +638,9 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(queued["queue"]["resource"], "core")
         self.assertEqual(queued["stages"]["analyze-core"]["queue_position"], 1)
         self.assertFalse(thread.is_alive())
+
+    def test_core_resource_is_exclusive_for_p40_subsystems(self):
+        self.assertEqual(server_mod.RESOURCE_LIMITS["core"], 1)
 
     def test_stage_waits_for_live_persisted_resource_user_after_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -750,6 +919,50 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(result["resolved_mode"], "long-talk-fast")
         self.assertEqual(result["stages"]["probe"]["status"], "succeeded")
 
+    def test_probe_auto_uses_focus_prompt_for_fast_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "focus_prompt": "快速给我一个摘要，先大概看看"})
+
+            with patch.object(server_mod, "probe_duration_seconds", return_value=600):
+                result = server.run_stage(job["job_id"], "probe")
+
+        self.assertEqual(result["resolved_mode"], "fast")
+        self.assertIn("quick", result["resolved_mode_reason"])
+
+    def test_probe_auto_uses_focus_prompt_for_deep_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "focus_prompt": "生成最终发布版，步骤和参数不要漏"})
+
+            with patch.object(server_mod, "probe_duration_seconds", return_value=600):
+                result = server.run_stage(job["job_id"], "probe")
+
+        self.assertEqual(result["resolved_mode"], "deep")
+        self.assertIn("deep", result["resolved_mode_reason"])
+
+    def test_probe_auto_uses_long_talk_for_long_subtitle_intent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "focus_prompt": "这是长视频播客，按字幕和章节梳理"})
+
+            with patch.object(server_mod, "probe_duration_seconds", return_value=3600):
+                result = server.run_stage(job["job_id"], "probe")
+
+        self.assertEqual(result["resolved_mode"], "long-talk-fast")
+        self.assertIn("long video", result["resolved_mode_reason"])
+
+    def test_probe_explicit_mode_ignores_focus_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "balanced", "focus_prompt": "快速摘要"})
+
+            with patch.object(server_mod, "probe_duration_seconds", return_value=3600):
+                result = server.run_stage(job["job_id"], "probe")
+
+        self.assertEqual(result["resolved_mode"], "balanced")
+        self.assertEqual(result["resolved_mode_reason"], "explicit mode selected")
+
     def test_analyze_core_stage_parses_run_dir_from_log(self):
         with tempfile.TemporaryDirectory() as tmp:
             jobs_dir = Path(tmp) / "jobs"
@@ -936,7 +1149,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertFalse(progress["live"])
         self.assertTrue(progress["stale"])
         self.assertIsNone(progress["current_step"])
-        self.assertEqual(progress["last_signal_label"], "OCR 执行")
+        self.assertEqual(progress["last_signal_label"], "OCR关键帧选择/执行")
         self.assertIn("等待 core #1/1", progress["summary"])
         self.assertGreater(progress["percent"], 40)
 
@@ -970,6 +1183,20 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(progress["current_step"], "asr")
         by_id = {step["id"]: step for step in progress["steps"]}
         self.assertIn("resource=asr", by_id["asr"]["message"])
+
+    def test_core_progress_recognizes_local_model_lock_wait_signals(self):
+        text = "\n".join(
+            [
+                "2026-05-17 01:12:36,681 - INFO - Extracting audio from video...",
+                "2026-05-17 01:12:49,609 - INFO - [local-model-lock] waiting stage=core owner=/tmp/run waited=0.000s",
+            ]
+        )
+
+        progress = server_mod.parse_core_progress(text, "running")
+
+        self.assertEqual(progress["current_step"], "local_model")
+        by_id = {step["id"]: step for step in progress["steps"]}
+        self.assertIn("local-model-lock", by_id["local_model"]["message"])
 
     def test_core_progress_prefers_progress_json_over_stale_asr_log(self):
         with tempfile.TemporaryDirectory() as tmp:

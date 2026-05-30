@@ -5,7 +5,16 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNTIME_DIR="$ROOT_DIR/tmp/video-link-status"
 PID_FILE="$RUNTIME_DIR/server.pid"
 LOG_FILE="$RUNTIME_DIR/server.log"
-HOST="${VIDEO_LINK_STATUS_HOST:-127.0.0.1}"
+default_host() {
+  if command -v tailscale >/dev/null 2>&1; then
+    tailscale ip -4 2>/dev/null | head -n 1
+    return 0
+  fi
+  printf '127.0.0.1\n'
+}
+
+HOST="${VIDEO_LINK_STATUS_HOST:-$(default_host)}"
+HOST="${HOST:-127.0.0.1}"
 PORT="${VIDEO_LINK_STATUS_PORT:-5000}"
 PYTHON_BIN="${VIDEO_LINK_STATUS_PYTHON:-$ROOT_DIR/.venv/bin/python}"
 if [[ ! -x "$PYTHON_BIN" ]]; then

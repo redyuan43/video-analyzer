@@ -52,7 +52,15 @@ class VideoAnalyzerUI:
     def setup_routes(self):
         @self.app.route('/')
         def index():
-            return render_template('index.html')
+            static_root = Path(self.app.static_folder or '')
+            try:
+                static_version = int(max(
+                    (static_root / 'js' / 'main.js').stat().st_mtime,
+                    (static_root / 'css' / 'styles.css').stat().st_mtime,
+                ))
+            except OSError:
+                static_version = 1
+            return render_template('index.html', static_version=static_version)
 
         @self.app.route('/video-link')
         def video_link_home():
@@ -92,7 +100,8 @@ class VideoAnalyzerUI:
         @self.app.route('/api/video-link/jobs/<job_id>')
         def video_link_get_job(job_id):
             try:
-                return jsonify(self.video_link.public_job(self.video_link.load_job(job_id)))
+                public_host = request.host.split(':', 1)[0]
+                return jsonify(self.video_link.public_job(self.video_link.load_job(job_id), public_host=public_host))
             except BridgeError as exc:
                 return jsonify({'error': exc.message}), int(exc.status)
 
@@ -107,6 +116,23 @@ class VideoAnalyzerUI:
         def video_link_open_run_dir(job_id):
             try:
                 return jsonify(self.video_link.open_run_dir(job_id))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>/vscode-session', methods=['POST'])
+        def video_link_vscode_session(job_id):
+            try:
+                payload = request.get_json(silent=True) or {}
+                public_host = request.host.split(':', 1)[0]
+                restart = str(payload.get('restart', 'false')).lower() in {'1', 'true', 'yes', 'on'}
+                return jsonify(self.video_link.start_vscode_session(job_id, public_host=public_host, restart=restart))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>/vscode-session', methods=['DELETE'])
+        def video_link_stop_vscode_session(job_id):
+            try:
+                return jsonify(self.video_link.stop_vscode_session(job_id))
             except BridgeError as exc:
                 return jsonify({'error': exc.message}), int(exc.status)
 
@@ -131,6 +157,21 @@ class VideoAnalyzerUI:
             try:
                 video_path, mimetype = self.video_link.preview_video_file(job_id)
                 return send_file(video_path, mimetype=mimetype, conditional=True)
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>/resource')
+        def video_link_resource_file(job_id):
+            try:
+                file_path, mimetype = self.video_link.resource_file(job_id, request.args.get('path', ''))
+                return send_file(file_path, mimetype=mimetype, conditional=True)
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>/study-guide')
+        def video_link_study_guide(job_id):
+            try:
+                return jsonify(self.video_link.study_guide(job_id))
             except BridgeError as exc:
                 return jsonify({'error': exc.message}), int(exc.status)
             
