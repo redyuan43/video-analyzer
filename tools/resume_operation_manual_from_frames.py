@@ -44,6 +44,7 @@ from video_analyzer.manual import (
     write_frame_evidence_index,
 )
 from video_analyzer.ocr import run_ocr
+from video_analyzer.local_model_runtime import local_model_runtime_session, local_model_stage
 from video_analyzer.prompt import PromptLoader
 
 LOGGER = logging.getLogger(__name__)
@@ -360,59 +361,62 @@ def main() -> int:
     )
     frames = frame_load.frames
 
-    LOGGER.info("Resuming from %s frames and transcript.md; starting at OCR", len(frames))
-    stage_started = time.perf_counter()
-    ocr_config = config.get("ocr", {})
-    ocr_events = run_ocr(
-        frames=frames,
-        provider=ocr_config.get("provider", "auto"),
-        base_url=ocr_config.get("base_url", "auto"),
-        model=ocr_config.get("model", "model"),
-        prompt_mode=ocr_config.get("prompt_mode", "prompt_scene_spotting"),
-        base_urls=ocr_config.get("base_urls"),
-        ocr_concurrency=ocr_config.get("concurrency", "auto"),
-        fallback_base_url=config.get("operation_manual", {}).get("llm_base_url"),
-        fallback_model=config.get("operation_manual", {}).get("vision_model"),
-        fallback_api_key="0",
-        request_timeout_seconds=ocr_config.get("timeout_seconds", 120),
-        cache_mode=ocr_config.get("cache", "on"),
-        cache_dir=ocr_config.get("cache_dir", ".cache/video-analyzer/ocr"),
-    )
-    timings["ocr_seconds"] = round(time.perf_counter() - stage_started, 3)
+    with local_model_runtime_session(config.config, LOGGER, str(args.run_dir)):
+        LOGGER.info("Resuming from %s frames and transcript.md; starting at OCR", len(frames))
+        stage_started = time.perf_counter()
+        ocr_config = config.get("ocr", {})
+        with local_model_stage("ocr", config.config, LOGGER, str(args.run_dir)):
+            ocr_events = run_ocr(
+                frames=frames,
+                provider=ocr_config.get("provider", "auto"),
+                base_url=ocr_config.get("base_url", "auto"),
+                model=ocr_config.get("model", "model"),
+                prompt_mode=ocr_config.get("prompt_mode", "prompt_scene_spotting"),
+                base_urls=ocr_config.get("base_urls"),
+                ocr_concurrency=ocr_config.get("concurrency", "auto"),
+                fallback_base_url=config.get("operation_manual", {}).get("llm_base_url"),
+                fallback_model=config.get("operation_manual", {}).get("vision_model"),
+                fallback_api_key="0",
+                request_timeout_seconds=ocr_config.get("timeout_seconds", 120),
+                cache_mode=ocr_config.get("cache", "on"),
+                cache_dir=ocr_config.get("cache_dir", ".cache/video-analyzer/ocr"),
+            )
+        timings["ocr_seconds"] = round(time.perf_counter() - stage_started, 3)
 
-    LOGGER.info("Selecting and analyzing VL frames")
-    stage_started = time.perf_counter()
-    options = FrameSelectionOptions(pipeline_mode=args.pipeline_mode)
-    selected_frame_numbers, frame_decisions, frame_selection_metadata = select_vl_frames(
-        frames=frames,
-        ocr_events=ocr_events,
-        transcript=transcript,
-        video_duration_seconds=video_duration,
-        options=options,
-    )
-    timings["frame_selection_seconds"] = round(time.perf_counter() - stage_started, 3)
-    vl_started = time.perf_counter()
-    analyzer = __import__("video_analyzer.analyzer", fromlist=["VideoAnalyzer"]).VideoAnalyzer(
-        client,
-        model,
-        prompt_loader,
-        config.get("clients", {}).get("temperature", 0.2),
-        config.get("prompt", ""),
-        frame_num_predict=config.get("response_length", {}).get("frame", 300),
-        frame_no_think=True,
-    )
-    frame_analyses = analyze_frames_for_vl(
-        analyzer=analyzer,
-        frames=frames,
-        ocr_events=ocr_events,
-        selected_frame_numbers=selected_frame_numbers,
-        decisions=frame_decisions,
-        concurrency=max(args.vl_concurrency, 1),
-        context_before=max(args.vl_context_before, 0),
-        context_after=max(args.vl_context_after, 0),
-        context_max_gap=AUTO,
-    )
-    timings["vl_seconds"] = round(time.perf_counter() - vl_started, 3)
+        LOGGER.info("Selecting and analyzing VL frames")
+        stage_started = time.perf_counter()
+        options = FrameSelectionOptions(pipeline_mode=args.pipeline_mode)
+        selected_frame_numbers, frame_decisions, frame_selection_metadata = select_vl_frames(
+            frames=frames,
+            ocr_events=ocr_events,
+            transcript=transcript,
+            video_duration_seconds=video_duration,
+            options=options,
+        )
+        timings["frame_selection_seconds"] = round(time.perf_counter() - stage_started, 3)
+        vl_started = time.perf_counter()
+        analyzer = __import__("video_analyzer.analyzer", fromlist=["VideoAnalyzer"]).VideoAnalyzer(
+            client,
+            model,
+            prompt_loader,
+            config.get("clients", {}).get("temperature", 0.2),
+            config.get("prompt", ""),
+            frame_num_predict=config.get("response_length", {}).get("frame", 300),
+            frame_no_think=True,
+        )
+        with local_model_stage("vl", config.config, LOGGER, str(args.run_dir)):
+            frame_analyses = analyze_frames_for_vl(
+                analyzer=analyzer,
+                frames=frames,
+                ocr_events=ocr_events,
+                selected_frame_numbers=selected_frame_numbers,
+                decisions=frame_decisions,
+                concurrency=max(args.vl_concurrency, 1),
+                context_before=max(args.vl_context_before, 0),
+                context_after=max(args.vl_context_after, 0),
+                context_max_gap=AUTO,
+            )
+        timings["vl_seconds"] = round(time.perf_counter() - vl_started, 3)
 
     LOGGER.info("Generating operation manual")
     stage_started = time.perf_counter()

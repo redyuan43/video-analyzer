@@ -41,6 +41,7 @@ class VideoProcessor:
         self.output_dir = output_dir
         self.model = model
         self.frames: List[Frame] = []
+        self.last_extraction_metadata: dict = {}
         
     def _calculate_frame_difference(self, frame1: np.ndarray, frame2: np.ndarray) -> float:
         """Calculate the difference between two frames using absolute difference."""
@@ -58,6 +59,38 @@ class VideoProcessor:
         score = np.mean(diff)
         
         return float(score)
+
+    def _calculate_textness_score(self, frame: np.ndarray) -> float:
+        """Estimate whether a frame contains screen text without running OCR."""
+        if cv2 is None or np is None or frame is None:
+            return 0.0
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        height, width = gray.shape[:2]
+        longest = max(height, width)
+        if longest > 640:
+            scale = 640.0 / longest
+            gray = cv2.resize(gray, (max(1, int(width * scale)), max(1, int(height * scale))))
+        edges = cv2.Canny(gray, 80, 180)
+        edge_density = min(float(np.count_nonzero(edges)) / float(edges.size) * 8.0, 1.0)
+        sharpness = min(float(cv2.Laplacian(gray, cv2.CV_64F).var()) / 1200.0, 1.0)
+        binary = cv2.adaptiveThreshold(
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            31,
+            9,
+        )
+        count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(binary, 8)
+        plausible = 0
+        area_total = float(binary.shape[0] * binary.shape[1])
+        for index in range(1, count):
+            _x, _y, w, h, area = stats[index]
+            aspect = w / max(h, 1)
+            if 4 <= w <= binary.shape[1] * 0.95 and 4 <= h <= binary.shape[0] * 0.35 and 0.12 <= aspect <= 35 and area / area_total <= 0.20:
+                plausible += 1
+        component_score = min(plausible / 45.0, 1.0)
+        return min((0.52 * component_score) + (0.30 * edge_density) + (0.18 * sharpness), 1.0)
 
     def _is_keyframe(self, current_frame: np.ndarray, prev_frame: np.ndarray, threshold: float = FRAME_DIFFERENCE_THRESHOLD) -> bool:
         """Determine if frame is significantly different from previous frame."""
@@ -309,6 +342,7 @@ class VideoProcessor:
         prev_sample = None
         last_selected_num = -min_gap_frames
         frame_num = 0
+        scan_frames_count = 0
 
         while frame_num < total_frames:
             ret, frame = cap.read()
@@ -317,17 +351,22 @@ class VideoProcessor:
 
             should_sample = frame_num == 0 or frame_num % sample_interval == 0
             score = self._calculate_frame_difference(frame, prev_sample)
+            textness = self._calculate_textness_score(frame) if should_sample or score >= change_threshold else 0.0
             changed = prev_sample is not None and score >= change_threshold
+            text_triggered = textness >= 0.28
+            if should_sample or changed:
+                scan_frames_count += 1
 
-            if (should_sample or changed) and frame_num - last_selected_num >= min_gap_frames:
+            if (should_sample or changed or text_triggered) and frame_num - last_selected_num >= min_gap_frames:
+                combined_score = score + (textness * 30.0)
                 if not candidates:
-                    candidates.append((frame_num, frame.copy(), score))
+                    candidates.append((frame_num, frame.copy(), combined_score))
                     last_selected_num = frame_num
                 else:
                     last_frame = candidates[-1][1]
                     similarity = self._calculate_frame_difference(frame, last_frame)
                     if similarity >= similarity_threshold:
-                        candidates.append((frame_num, frame.copy(), score))
+                        candidates.append((frame_num, frame.copy(), combined_score))
                         last_selected_num = frame_num
 
             if should_sample or changed:
@@ -339,6 +378,7 @@ class VideoProcessor:
             logger.warning("OpenCV decoded no screen keyframes from %s; falling back to ffmpeg extraction", self.video_path)
             return self._extract_ffmpeg_keyframes(frames_per_minute, duration, max_frames, similarity_threshold)
 
+        raw_candidate_count = len(candidates)
         if max_frames is not None:
             candidates = self._select_opencv_density_budget(candidates, fps, max_frames)
 
@@ -349,6 +389,13 @@ class VideoProcessor:
             self.frames.append(Frame(idx, frame_path, source_frame_num / fps, score))
 
         logger.info("Extracted %s screen keyframes", len(self.frames))
+        self.last_extraction_metadata = {
+            "decode_backend": "opencv",
+            "scan_frames_count": scan_frames_count,
+            "raw_decoded_frames": frame_num,
+            "raw_candidate_frames": raw_candidate_count,
+            "sample_interval_frames": sample_interval,
+        }
         return self.frames
 
     def _select_opencv_density_budget(

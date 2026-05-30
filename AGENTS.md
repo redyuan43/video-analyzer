@@ -13,6 +13,15 @@
 
 ## Operation Manual Runtime
 
+- On the `ai` host, local GPU model services are mutually exclusive by default.
+  Before using any local loopback model endpoint such as VibeVoice ASR,
+  DotsMOCR OCR, or MiniCPM VL, the analyzer must hold the global
+  `local-model-runtime` lock for the whole model-using stage. A second task
+  must wait on that lock and must not unload or replace the currently active
+  local model until the first task finishes its ASR/OCR/VL stage and releases
+  the lock. Stage switching uses `tools/prepare_ai_local_model_stage.sh` for
+  loopback endpoints only; remote Spark/Edge/AMD endpoints should not trigger
+  local service switching.
 - The default operation-manual ASR path should use remote VibeVoice on Spark/Edge services. Do not add local Whisper or CPU fallback just to hide remote service failures.
 - The project-wide LLM/VL endpoint is AMD Fast:
   - Base URL: `http://100.90.114.26:18081/v1`

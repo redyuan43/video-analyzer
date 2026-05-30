@@ -76,14 +76,14 @@ tools/run_operation_manual_from_url.sh "URL" \
   --ocr-concurrency auto \
   --ocr-cache on
 
-# Offload candidate frame extraction to Jetson NX workers.
+# Offload candidate frame extraction to the AGX Ray dual worker path.
 .venv/bin/python -m video_analyzer.cli VIDEO.mp4 \
   --task operation_manual \
   --pipeline-mode fast \
   --frame-extractor jetson \
-  --jetson-frame-hosts nx2,nx3 \
-  --jetson-frame-backend auto \
-  --jetson-sample-fps auto
+  --jetson-frame-hosts agx,agx \
+  --jetson-frame-backend ray \
+  --jetson-sample-fps 0.5
 
 # Only download video and page context.
 tools/run_operation_manual_from_url.sh "URL" --download-only
@@ -100,14 +100,14 @@ To switch or customize endpoints/models, use a runtime profile:
 
 ```json
 {
-  "active_runtime_profile": "ivan_minicpm_v100",
+  "active_runtime_profile": "deepseek_v4_flash",
   "runtime_profiles": {
-    "ivan_minicpm_v100": {
-      "llm_base_url": "http://100.90.114.26:18081/v1",
+    "deepseek_v4_flash": {
+      "llm_base_url": "https://api.deepseek.com",
       "vision_base_url": "http://100.96.79.21:18082/v1",
-      "text_base_url": "http://100.90.114.26:18081/v1",
+      "text_base_url": "https://api.deepseek.com",
       "vision_model": "minicpm-v-4.5-v100",
-      "text_model": "hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
+      "text_model": "deepseek-v4-flash",
       "vibevoice_url": "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
       "ocr_base_url": "http://spark-31d6.taild500c8.ts.net:8000/v1",
       "ocr_base_urls": [
@@ -116,15 +116,21 @@ To switch or customize endpoints/models, use a runtime profile:
       ],
       "ocr_concurrency": "auto",
       "ocr_cache": "on",
-      "max_comments": 30,
+      "download_device": "local",
+      "max_comments": 3000,
       "subtitle_langs": "zh-CN,zh-Hans,zh,en"
     }
   }
 }
 ```
 
-Both URL and multi-document runners accept `--profile ivan_minicpm_v100`. Command-line
+Both URL and multi-document runners accept `--profile deepseek_v4_flash`. Command-line
 arguments still override the profile for one-off runs.
+
+For URL downloads, `--download-device local` is the default. Use
+`--download-device mi` when the local host cannot download the video; the MI
+device runs `yt-dlp`, then the downloaded video, metadata, subtitles, and
+comments are synced back before the normal analysis stages continue.
 
 ### Remote Runtime Installation Notes
 
@@ -249,13 +255,23 @@ steps -> checks/caveats" document. Full screenshot dumps belong in
 The tool does not analyze every source frame. A 30 fps, 165 second video has
 roughly 4,956 frames, which is too expensive to send to a vision model.
 
-Instead, `operation_manual` uses screen-recording keyframe extraction followed
-by a dynamic VL-selection pass:
+Instead, `operation_manual` uses the staged OCR keyframe funnel documented in
+`docs/VIDEO_OCR_KEYFRAME_STRATEGY.md`:
 
-1. **Decode and sample**
+```text
+low-resolution scan frames
+-> textness/change OCR candidates
+-> high-resolution OCR keyframes
+-> deduplicated OCR text events
+-> small MiniCPM/VL explanation set
+```
+
+1. **Decode and scan**
    - OpenCV is tried first.
    - If OpenCV cannot open or decode useful frames, ffmpeg extracts preview
      frames. This handles AV1 and other codecs that OpenCV may not support.
+   - Jetson/Ray workers should be preferred for long videos so the scan can use
+     hardware decode and low-resolution previews.
 
 2. **Size the candidate frame pool**
    - `--candidate-frames auto` scales with video duration and pipeline mode.
@@ -271,7 +287,7 @@ by a dynamic VL-selection pass:
      coarse time buckets.
 
 4. **Spend remaining budget on information density**
-   - Candidate frames are scored by visual change.
+   - Candidate frames are scored by visual change and textness.
    - After coverage frames are reserved, the remaining candidate budget is
      assigned to high-change frames.
    - This means dense sections, such as UI transitions, code blocks, tables, or
@@ -281,7 +297,17 @@ by a dynamic VL-selection pass:
    - Very similar neighboring frames are skipped.
    - This avoids wasting model calls on unchanged screens.
 
-6. **Select VL frames**
+6. **Select OCR keyframes**
+   - `--ocr-keyframe-strategy auto|scan-text|legacy` controls OCR frame
+     selection.
+   - All normal URL operation-manual runs default to `scan-text`, regardless of
+     `fast`, `balanced`, `deep`, or `long-talk-fast`. `auto` is backward
+     compatible but should not be the default in production profiles.
+   - `--ocr-keyframe-budget auto|N` controls the actual number of frames sent to
+     DotsMOCR.
+   - OCR text is deduplicated into text events before VL selection.
+
+7. **Select VL frames**
    - `--pipeline-mode fast` skips VL but still keeps dynamic candidate frames
      and OCR evidence.
    - `--pipeline-mode balanced` sends a dynamic subset to VL, based on OCR text
@@ -295,19 +321,25 @@ by a dynamic VL-selection pass:
    - `--vl-context-max-gap auto` uses the median candidate-frame interval times
      3, clamped to 8-45 seconds, so context does not cross obvious time breaks.
 
-`analysis.json` records `metadata.frame_selection` with candidate/VL counts and
-per-frame selection reasons. Skipped VL frames are still present in
-`visual_events` with `status: "skipped"`, an OCR summary, and the selection
-score. Runtime breakdowns are written to `metadata.timings`; `metadata.vl_context`
-records the before/after window and resolved time-gap threshold. OCR endpoint
-selection, cache mode, cache hit counts, and effective worker count are written
-to `metadata.ocr`.
+`analysis.json` records `metadata.ocr_keyframes` with scan frame count, OCR
+candidate count, actual OCR frame count, OCR text event count, per-frame OCR
+selection reasons, and text-event dedupe results. It also records
+`metadata.frame_selection` with candidate/VL counts and per-frame VL selection
+reasons. Skipped VL frames are still present in `visual_events` with
+`status: "skipped"`, an OCR summary, and the selection score. Runtime breakdowns
+are written to `metadata.timings`; `metadata.vl_context` records the
+before/after window and resolved time-gap threshold. OCR endpoint selection,
+cache mode, cache hit counts, and effective worker count are written to
+`metadata.ocr`.
 
-Candidate frame extraction can run locally or on Jetson workers. With
-`--frame-extractor jetson`, the video is cached on each listed Jetson host,
-split into overlapping chunks, processed in parallel, then merged locally with
-the same global density/coverage budget. Worker health, per-host timings,
-sample FPS, and transport are written to `metadata.frame_extraction`.
+Candidate frame extraction can run locally or on Jetson workers. For long
+teaching/talk videos, the default Jetson path is the AGX Ray dual worker setup
+(`agx,agx`); NX1-NX4 remain manual override workers and are not part of the
+default path. With `--frame-extractor jetson`, the video is cached on each
+listed Jetson host, split into overlapping chunks, processed in parallel, then
+merged locally with the same global density/coverage budget. Worker health,
+per-host timings, sample FPS, and transport are written to
+`metadata.frame_extraction`.
 
 ## OCR vs Vision Model Efficiency
 
@@ -335,8 +367,8 @@ Recommended policy:
 - Use the AMD Fast OpenAI-compatible vision OCR fallback only when DotsMOCR is
   down.
 - Keep OCR for operation manuals because exact text is high-value evidence.
-- Reduce total cost by using the balanced dynamic VL selector instead of
-  uniformly increasing the candidate-frame cap.
+- Reduce total cost by selecting OCR keyframes and then using the balanced
+  dynamic VL selector instead of uniformly increasing frame caps.
 
 ## ASR Policy
 

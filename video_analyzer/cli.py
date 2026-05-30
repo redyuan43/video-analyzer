@@ -40,6 +40,13 @@ from .manual import (
     write_frame_evidence_index,
 )
 from .ocr import run_ocr
+from .ocr_keyframes import (
+    AUTO as OCR_AUTO,
+    build_ocr_text_events,
+    resolve_ocr_scan_sample_fps,
+    select_ocr_keyframes,
+)
+from .local_model_runtime import local_model_runtime_session, local_model_stage
 from .resource_locks import analyzer_resource_lock
 
 # Initialize logger at module level
@@ -232,6 +239,20 @@ def analyze_frames_for_vl(
             frame_analyses[index] = analysis
     return frame_analyses
 
+
+def scan_frames_count_from_metadata(metadata: dict) -> int | None:
+    if not metadata:
+        return None
+    per_host = metadata.get("per_host") or []
+    preview_total = sum(int(item.get("preview_frames") or 0) for item in per_host if isinstance(item, dict))
+    if preview_total:
+        return preview_total
+    for key in ("scan_frames_count", "preview_frames", "raw_candidate_frames"):
+        value = metadata.get(key)
+        if isinstance(value, int) and value > 0:
+            return value
+    return None
+
 def create_client(config: Config):
     """Create the appropriate client based on configuration."""
     client_type = config.get("clients", {}).get("default", "ollama")
@@ -337,6 +358,9 @@ def main():
     parser.add_argument("--ocr-concurrency", default=None, help="OCR concurrency per endpoint, or auto")
     parser.add_argument("--ocr-cache", choices=["on", "off", "refresh"], default=None, help="OCR cache mode")
     parser.add_argument("--ocr-cache-dir", default=None, help="OCR cache directory")
+    parser.add_argument("--ocr-keyframe-strategy", choices=["auto", "scan-text", "legacy"], default="scan-text", help="OCR frame selection strategy")
+    parser.add_argument("--ocr-keyframe-budget", type=parse_auto_int_arg, default=OCR_AUTO, help="auto or explicit OCR keyframe count")
+    parser.add_argument("--ocr-scan-sample-fps", type=parse_auto_float_arg, default=OCR_AUTO, help="auto or low-cost preview scan FPS for OCR keyframe discovery")
     parser.add_argument("--ocr-timeout-seconds", type=float, default=None, help="Per-frame OCR request timeout")
     parser.add_argument(
         "--ocr-prompt-mode",
@@ -408,6 +432,20 @@ def main():
     client = create_client(config)
     model = get_model(config)
     prompt_loader = PromptLoader(config.get("prompt_dir"), config.get("prompts", []))
+    local_runtime_stack = contextlib.ExitStack()
+    local_runtime_active = False
+
+    def enter_local_runtime() -> None:
+        nonlocal local_runtime_active
+        if not local_runtime_active:
+            local_runtime_stack.enter_context(local_model_runtime_session(config.config, logger, str(output_dir)))
+            local_runtime_active = True
+
+    def release_local_runtime() -> None:
+        nonlocal local_runtime_active
+        if local_runtime_active:
+            local_runtime_stack.close()
+            local_runtime_active = False
     
     try:
         transcript = None
@@ -424,6 +462,8 @@ def main():
         timings = {}
         frame_selection_metadata = {}
         frame_extraction_metadata = {}
+        ocr_keyframe_metadata = {}
+        ocr_text_events = []
         ocr_metadata = {}
         selected_frame_numbers = set()
         frame_decisions = []
@@ -432,6 +472,9 @@ def main():
         write_analysis_progress(output_dir, current_progress_step, message="analysis started")
         
         # Stage 1: Frame and Audio Processing
+        if args.start_stage <= 2:
+            enter_local_runtime()
+
         if args.start_stage <= 1:
             stage_started = time.perf_counter()
             if args.transcript_file:
@@ -480,33 +523,34 @@ def main():
                         else analyzer_resource_lock(config.config, "asr", str(output_dir), logger)
                     )
                     with asr_lock:
-                        if use_asr_strategy:
-                            asr_result = transcribe_with_strategy(
-                                strategy=asr_config.get("strategy", "balanced"),
-                                audio_path=audio_path,
-                                language=config.get("audio", {}).get("language", ""),
-                                whisper_model=config.get("audio", {}).get("whisper_model", "medium"),
-                                device=config.get("audio", {}).get("device", "cpu"),
-                                vibevoice_config=asr_config.get("vibevoice", {}),
-                            )
-                            transcript = asr_result.transcript
-                        elif provider == "faster_whisper":
-                            audio_processor = AudioProcessor(
-                                language=config.get("audio", {}).get("language", ""),
-                                model_size_or_path=config.get("audio", {}).get("whisper_model", "medium"),
-                                device=config.get("audio", {}).get("device", "cpu"),
-                            )
-                            transcript = audio_processor.transcribe(audio_path)
-                        else:
-                            asr_result = transcribe_with_provider_result(
-                                provider=provider,
-                                audio_path=audio_path,
-                                language=config.get("audio", {}).get("language", ""),
-                                whisper_model=config.get("audio", {}).get("whisper_model", "medium"),
-                                device=config.get("audio", {}).get("device", "cpu"),
-                                vibevoice_config=asr_config.get("vibevoice", {}),
-                            )
-                            transcript = asr_result.transcript
+                        with local_model_stage("asr", config.config, logger, str(output_dir)):
+                            if use_asr_strategy:
+                                asr_result = transcribe_with_strategy(
+                                    strategy=asr_config.get("strategy", "balanced"),
+                                    audio_path=audio_path,
+                                    language=config.get("audio", {}).get("language", ""),
+                                    whisper_model=config.get("audio", {}).get("whisper_model", "medium"),
+                                    device=config.get("audio", {}).get("device", "cpu"),
+                                    vibevoice_config=asr_config.get("vibevoice", {}),
+                                )
+                                transcript = asr_result.transcript
+                            elif provider == "faster_whisper":
+                                audio_processor = AudioProcessor(
+                                    language=config.get("audio", {}).get("language", ""),
+                                    model_size_or_path=config.get("audio", {}).get("whisper_model", "medium"),
+                                    device=config.get("audio", {}).get("device", "cpu"),
+                                )
+                                transcript = audio_processor.transcribe(audio_path)
+                            else:
+                                asr_result = transcribe_with_provider_result(
+                                    provider=provider,
+                                    audio_path=audio_path,
+                                    language=config.get("audio", {}).get("language", ""),
+                                    whisper_model=config.get("audio", {}).get("whisper_model", "medium"),
+                                    device=config.get("audio", {}).get("device", "cpu"),
+                                    vibevoice_config=asr_config.get("vibevoice", {}),
+                                )
+                                transcript = asr_result.transcript
                     if asr_result is None:
                         asr_result = ASRStrategyResult(
                             strategy=f"provider:{provider}",
@@ -545,6 +589,11 @@ def main():
             )
             if task == "operation_manual":
                 video_duration = processor._probe_duration(config.get("duration"))
+                ocr_scan_sample_fps = resolve_ocr_scan_sample_fps(
+                    args.ocr_scan_sample_fps,
+                    args.pipeline_mode,
+                    video_duration,
+                )
                 candidate_budget = resolve_candidate_frame_budget(
                     video_duration_seconds=video_duration,
                     pipeline_mode=args.pipeline_mode,
@@ -553,6 +602,9 @@ def main():
                 )
                 if args.frame_extractor in {"jetson", "auto"}:
                     hosts = [host.strip() for host in args.jetson_frame_hosts.split(",") if host.strip()]
+                    jetson_sample_fps = args.jetson_sample_fps
+                    if str(jetson_sample_fps).strip().lower() == OCR_AUTO and str(args.ocr_scan_sample_fps).strip().lower() != OCR_AUTO:
+                        jetson_sample_fps = ocr_scan_sample_fps
                     try:
                         extraction = extract_frames_with_jetson_workers(
                             video_path=video_path,
@@ -561,7 +613,7 @@ def main():
                             video_duration_seconds=video_duration,
                             pipeline_mode=args.pipeline_mode,
                             candidate_budget=candidate_budget,
-                            sample_fps=args.jetson_sample_fps,
+                            sample_fps=jetson_sample_fps,
                             backend=args.jetson_frame_backend,
                             overlap_seconds=args.jetson_chunk_overlap_seconds,
                             host_weights=parse_jetson_frame_weights(args.jetson_frame_weights),
@@ -574,7 +626,7 @@ def main():
                         logger.exception("Jetson frame extraction failed; falling back to local extraction")
                         extraction = extract_local_screen_keyframes(
                             processor=processor,
-                            frames_per_minute=config.get("frames", {}).get("per_minute", 60),
+                            frames_per_minute=max(1, int(round(ocr_scan_sample_fps * 60))),
                             duration=config.get("duration"),
                             max_frames=candidate_budget,
                         )
@@ -583,7 +635,7 @@ def main():
                 else:
                     extraction = extract_local_screen_keyframes(
                         processor=processor,
-                        frames_per_minute=config.get("frames", {}).get("per_minute", 60),
+                        frames_per_minute=max(1, int(round(ocr_scan_sample_fps * 60))),
                         duration=config.get("duration"),
                         max_frames=candidate_budget,
                     )
@@ -595,6 +647,7 @@ def main():
                     source=str(frame_extraction_metadata.get("backend", "unknown")),
                 )
                 frame_extraction_metadata["frame_manifest"] = str(frame_manifest_path)
+                frame_extraction_metadata["ocr_scan_sample_fps"] = ocr_scan_sample_fps
                 current_progress_step = "frames_done"
                 write_analysis_progress(
                     output_dir,
@@ -633,37 +686,56 @@ def main():
                 stage_started = time.perf_counter()
                 ocr_config = config.get("ocr", {})
                 ocr_base_urls = ocr_config.get("base_urls")
+                selected_ocr_frames, ocr_keyframe_decisions, ocr_keyframe_metadata = select_ocr_keyframes(
+                    frames=frames,
+                    transcript=transcript,
+                    video_duration_seconds=frame_selection_metadata.get("video_duration_seconds", config.get("duration") or 0.0),
+                    pipeline_mode=args.pipeline_mode,
+                    strategy=args.ocr_keyframe_strategy,
+                    budget=args.ocr_keyframe_budget,
+                    scan_frames_count=scan_frames_count_from_metadata(frame_extraction_metadata),
+                )
+                logger.info(
+                    "Selected %s OCR keyframes from %s candidate frames after scanning %s preview frames",
+                    len(selected_ocr_frames),
+                    len(frames),
+                    ocr_keyframe_metadata.get("scan_frames_count"),
+                )
                 with analyzer_resource_lock(config.config, "ocr", str(output_dir), logger):
-                    ocr_events = run_ocr(
-                        frames=frames,
-                        provider=ocr_config.get("provider", "auto"),
-                        base_url=ocr_config.get("base_url", "auto"),
-                        model=ocr_config.get("model", "model"),
-                        prompt_mode=ocr_config.get("prompt_mode", "prompt_scene_spotting"),
-                        base_urls=ocr_base_urls,
-                        ocr_concurrency=ocr_config.get("concurrency", "auto"),
-                        fallback_base_url=ocr_config.get(
-                            "fallback_base_url",
-                            config.get("operation_manual", {}).get("llm_base_url"),
-                        ),
-                        fallback_model=ocr_config.get(
-                            "fallback_model",
-                            config.get("operation_manual", {}).get("vision_model"),
-                        ),
-                        fallback_api_key=ocr_config.get(
-                            "fallback_api_key",
-                            config.get("clients", {}).get("openai_api", {}).get("api_key", "0"),
-                        ),
-                        request_timeout_seconds=ocr_config.get("timeout_seconds", 120),
-                        max_tokens=ocr_config.get("max_tokens", 1024),
-                        max_image_long_side=ocr_config.get("max_image_long_side", 1280),
-                        retry_endpoints=bool(ocr_config.get("retry_endpoints", True)),
-                        probe_timeout_seconds=ocr_config.get("probe_timeout_seconds", 5),
-                        warmup_timeout_seconds=ocr_config.get("warmup_timeout_seconds", 180),
-                        warmup_retry_interval_seconds=ocr_config.get("warmup_retry_interval_seconds", 5),
-                        cache_mode=ocr_config.get("cache", "on"),
-                        cache_dir=ocr_config.get("cache_dir", ".cache/video-analyzer/ocr"),
-                    )
+                    with local_model_stage("ocr", config.config, logger, str(output_dir)):
+                        ocr_events = run_ocr(
+                            frames=selected_ocr_frames,
+                            provider=ocr_config.get("provider", "auto"),
+                            base_url=ocr_config.get("base_url", "auto"),
+                            model=ocr_config.get("model", "model"),
+                            prompt_mode=ocr_config.get("prompt_mode", "prompt_scene_spotting"),
+                            base_urls=ocr_base_urls,
+                            ocr_concurrency=ocr_config.get("concurrency", "auto"),
+                            fallback_base_url=ocr_config.get(
+                                "fallback_base_url",
+                                config.get("operation_manual", {}).get("llm_base_url"),
+                            ),
+                            fallback_model=ocr_config.get(
+                                "fallback_model",
+                                config.get("operation_manual", {}).get("vision_model"),
+                            ),
+                            fallback_api_key=ocr_config.get(
+                                "fallback_api_key",
+                                config.get("clients", {}).get("openai_api", {}).get("api_key", "0"),
+                            ),
+                            request_timeout_seconds=ocr_config.get("timeout_seconds", 120),
+                            max_tokens=ocr_config.get("max_tokens", 1024),
+                            max_image_long_side=ocr_config.get("max_image_long_side", 1280),
+                            retry_endpoints=bool(ocr_config.get("retry_endpoints", True)),
+                            probe_timeout_seconds=ocr_config.get("probe_timeout_seconds", 5),
+                            warmup_timeout_seconds=ocr_config.get("warmup_timeout_seconds", 180),
+                            warmup_retry_interval_seconds=ocr_config.get("warmup_retry_interval_seconds", 5),
+                            cache_mode=ocr_config.get("cache", "on"),
+                            cache_dir=ocr_config.get("cache_dir", ".cache/video-analyzer/ocr"),
+                        )
+                ocr_text_events = build_ocr_text_events(ocr_events)
+                ocr_keyframe_metadata["ocr_text_events_count"] = len(ocr_text_events)
+                ocr_keyframe_metadata["text_events"] = ocr_text_events
                 ocr_requested_endpoints = ocr_base_urls or [ocr_config.get("base_url", "auto")]
                 ocr_provider_endpoints = sorted(
                     {
@@ -727,17 +799,18 @@ def main():
                 timings["frame_selection_seconds"] = round(time.perf_counter() - stage_started, 3)
                 vl_started = time.perf_counter()
                 with analyzer_resource_lock(config.config, "vl", str(output_dir), logger):
-                    frame_analyses = analyze_frames_for_vl(
-                        analyzer=analyzer,
-                        frames=frames,
-                        ocr_events=ocr_events,
-                        selected_frame_numbers=selected_frame_numbers,
-                        decisions=frame_decisions,
-                        concurrency=max(args.vl_concurrency, 1),
-                        context_before=max(args.vl_context_before, 0),
-                        context_after=max(args.vl_context_after, 0),
-                        context_max_gap=args.vl_context_max_gap,
-                    )
+                    with local_model_stage("vl", config.config, logger, str(output_dir)):
+                        frame_analyses = analyze_frames_for_vl(
+                            analyzer=analyzer,
+                            frames=frames,
+                            ocr_events=ocr_events,
+                            selected_frame_numbers=selected_frame_numbers,
+                            decisions=frame_decisions,
+                            concurrency=max(args.vl_concurrency, 1),
+                            context_before=max(args.vl_context_before, 0),
+                            context_after=max(args.vl_context_after, 0),
+                            context_max_gap=args.vl_context_max_gap,
+                        )
                 timings["vl_seconds"] = round(time.perf_counter() - vl_started, 3)
             else:
                 frame_analyses = []
@@ -747,6 +820,8 @@ def main():
                     analysis = analyzer.analyze_frame(frame, ocr_text=ocr_text)
                     frame_analyses.append(analysis)
                 timings["vl_seconds"] = round(time.perf_counter() - stage_started, 3)
+
+        release_local_runtime()
                 
         # Stage 3: Video Reconstruction
         if args.start_stage <= 3:
@@ -826,6 +901,7 @@ def main():
                 ),
                 "ocr_provider": config.get("ocr", {}).get("provider"),
                 "ocr": ocr_metadata,
+                "ocr_keyframes": ocr_keyframe_metadata,
                 "asr_provider": config.get("asr", {}).get("provider"),
                 "asr_strategy": config.get("asr", {}).get("strategy"),
                 "context_file": config.get("context_file"),
@@ -857,6 +933,7 @@ def main():
             } if transcript else None,
             "asr": asr_result.to_metadata() if asr_result else None,
             "ocr_events": [event.to_dict() for event in ocr_events],
+            "ocr_text_events": ocr_text_events,
             "visual_events": frame_analyses,
             "manual_steps": operation_manual,
             "uncertainties": [
@@ -912,6 +989,8 @@ def main():
         if not config.get("keep_frames"):
             cleanup_files(output_dir)
         raise
+    finally:
+        release_local_runtime()
 
 if __name__ == "__main__":
     main()

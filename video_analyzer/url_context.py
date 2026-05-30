@@ -16,8 +16,11 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 from video_analyzer.config import Config
 
@@ -27,6 +30,11 @@ FALLBACK_RUN_NAME = "operation-manual"
 FALLBACK_SUBTITLE_LANGS = "zh-CN,zh-Hans,zh,en"
 FALLBACK_VISION_MODEL = "qwen/qwen3-vl-30b"
 FALLBACK_TEXT_MODEL = "redhatai_qwen3.6-35b-a3b-nvfp4"
+LOCAL_DOWNLOAD_DEVICE = "local"
+DOWNLOAD_DEVICE_CHOICES = (LOCAL_DOWNLOAD_DEVICE, "mi")
+DOWNLOAD_DEVICE_REMOTE_ROOTS = {
+    "mi": "/home/ivan/Documents/video-analyzer-url-downloads",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,6 +62,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ocr-concurrency", help="OCR concurrency per endpoint, or auto")
     parser.add_argument("--ocr-cache", choices=["on", "off", "refresh"], help="OCR cache mode")
     parser.add_argument("--ocr-cache-dir", help="OCR cache directory")
+    parser.add_argument("--ocr-keyframe-strategy", choices=["auto", "scan-text", "legacy"])
+    parser.add_argument("--ocr-keyframe-budget", help="auto or explicit OCR keyframe count")
+    parser.add_argument("--ocr-scan-sample-fps", help="auto or low-cost preview scan FPS for OCR keyframe discovery")
     parser.add_argument("--llm-base-url")
     parser.add_argument("--vision-base-url")
     parser.add_argument("--text-base-url")
@@ -61,10 +72,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text-model")
     parser.add_argument("--cookies-from-browser", help="Forward to yt-dlp, e.g. chrome, chromium, firefox, brave")
     parser.add_argument("--cookies", help="Forward cookies.txt to yt-dlp")
+    parser.add_argument(
+        "--download-device",
+        choices=DOWNLOAD_DEVICE_CHOICES,
+        help="Device used for yt-dlp download/page context collection",
+    )
     parser.add_argument("--ytdlp-proxy", help="Proxy URL used only by yt-dlp download/metadata requests")
     parser.add_argument(
         "--ytdlp-js-runtimes",
         help="Forward to yt-dlp --js-runtimes. Use auto/node for YouTube JS challenges, or none to disable.",
+    )
+    parser.add_argument(
+        "--ytdlp-extractor-args",
+        help="Forward to yt-dlp --extractor-args, e.g. youtube:player_client=tv,web_safari.",
     )
     parser.add_argument("--refresh-context", action="store_true", help="Refresh page context, subtitles, and comments without redownloading an existing video")
     parser.add_argument(
@@ -130,6 +150,9 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
         "ocr_concurrency": profile.get("ocr_concurrency", "auto"),
         "ocr_cache": profile.get("ocr_cache", "on"),
         "ocr_cache_dir": profile.get("ocr_cache_dir", ".cache/video-analyzer/ocr"),
+        "ocr_keyframe_strategy": profile.get("ocr_keyframe_strategy", "scan-text"),
+        "ocr_keyframe_budget": profile.get("ocr_keyframe_budget", "auto"),
+        "ocr_scan_sample_fps": profile.get("ocr_scan_sample_fps", "auto"),
         "llm_base_url": profile.get("llm_base_url", default_llm_base_url),
         "vision_base_url": profile.get("vision_base_url"),
         "text_base_url": profile.get("text_base_url"),
@@ -137,10 +160,12 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
         "text_model": profile.get("text_model", FALLBACK_TEXT_MODEL),
         "include_subtitles": profile.get("include_subtitles", True),
         "include_comments": profile.get("include_comments", True),
-        "max_comments": profile.get("max_comments", 30),
+        "max_comments": profile.get("max_comments", 3000),
         "subtitle_langs": profile.get("subtitle_langs", FALLBACK_SUBTITLE_LANGS),
         "ytdlp_js_runtimes": profile.get("ytdlp_js_runtimes", "auto"),
-        "prefer_subtitle_transcript": profile.get("prefer_subtitle_transcript", False),
+        "ytdlp_extractor_args": profile.get("ytdlp_extractor_args"),
+        "download_device": profile.get("download_device", LOCAL_DOWNLOAD_DEVICE),
+        "prefer_subtitle_transcript": profile.get("prefer_subtitle_transcript", True),
         "frame_extractor": profile.get("frame_extractor", "local"),
         "jetson_frame_hosts": profile.get("jetson_frame_hosts", "nx2,nx3"),
         "jetson_frame_backend": profile.get("jetson_frame_backend", "auto"),
@@ -161,14 +186,22 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    ensure_tool("yt-dlp")
+    if args.download_device == LOCAL_DOWNLOAD_DEVICE:
+        ensure_tool("yt-dlp")
     ensure_tool("ffmpeg")
 
     output_root = Path(args.output_root)
-    info = fetch_metadata(args.url, args)
-    video_id = safe_slug(str(info.get("id") or info.get("display_id") or info.get("title") or "video"))
-    video_dir = output_root / video_id
-    video_dir.mkdir(parents=True, exist_ok=True)
+    video_dir = existing_video_dir_for_url(output_root, args.url) if args.keep_existing and not args.refresh_context else None
+    if video_dir:
+        info = load_downloaded_info(video_dir) or {}
+    elif args.download_device != LOCAL_DOWNLOAD_DEVICE:
+        video_dir = remote_download_video_dir(args, output_root)
+        info = load_downloaded_info(video_dir) or {}
+    else:
+        info = fetch_metadata(args.url, args)
+        video_id = safe_slug(str(info.get("id") or info.get("display_id") or info.get("title") or "video"))
+        video_dir = output_root / video_id
+        video_dir.mkdir(parents=True, exist_ok=True)
 
     video_path = video_dir / "video.mp4"
     info_path = video_dir / "info.json"
@@ -181,7 +214,15 @@ def main() -> int:
         print(f"[download] context: {page_context_path}")
         info = load_downloaded_info(video_dir) or info
     else:
-        if args.keep_existing and video_path.exists():
+        if args.download_device != LOCAL_DOWNLOAD_DEVICE and video_path.exists():
+            pass
+        elif args.download_device != LOCAL_DOWNLOAD_DEVICE:
+            video_dir = remote_download_video_dir(args, output_root)
+            video_path = video_dir / "video.mp4"
+            info_path = video_dir / "info.json"
+            description_path = video_dir / "description.md"
+            page_context_path = video_dir / "page_context.md"
+        elif args.keep_existing and video_path.exists():
             download_context_assets(args.url, video_dir, args)
         else:
             download_video(args.url, video_dir, args)
@@ -234,6 +275,87 @@ def main() -> int:
 def ensure_tool(name: str) -> None:
     if shutil.which(name) is None:
         raise SystemExit(f"Required command not found: {name}. Install it first, e.g. `pip install yt-dlp` for yt-dlp.")
+
+
+def remote_download_video_dir(args: argparse.Namespace, output_root: Path) -> Path:
+    device = args.download_device
+    if device == LOCAL_DOWNLOAD_DEVICE:
+        raise ValueError("remote_download_video_dir requires a non-local download device")
+    if device not in DOWNLOAD_DEVICE_REMOTE_ROOTS:
+        raise ValueError(f"Unsupported download device: {device}")
+    ensure_tool("rsync")
+    ensure_tool("ssh")
+    remote_root = DOWNLOAD_DEVICE_REMOTE_ROOTS[device]
+    with tempfile.TemporaryDirectory(prefix="video-analyzer-remote-download-") as tmp:
+        local_pull_dir = Path(tmp) / "pull"
+        local_pull_dir.mkdir(parents=True)
+        remote_run_name = f"download-{safe_slug(infer_video_id_from_url(args.url) or 'video')}-{int(time.time())}"
+        remote_run_dir = f"{remote_root.rstrip('/')}/{remote_run_name}"
+        remote_command = remote_download_command(args, remote_run_dir)
+        print(f"[download] remote device: {device}")
+        print(f"[download] remote run dir: {remote_run_dir}")
+        subprocess.run(["ssh", device, remote_command], check=True)
+        subprocess.run(
+            ["rsync", "-a", "--delete", f"{device}:{remote_run_dir}/", str(local_pull_dir) + "/"],
+            check=True,
+        )
+        info = load_downloaded_info(local_pull_dir) or {}
+        video_id = safe_slug(str(info.get("id") or info.get("display_id") or infer_video_id_from_url(args.url) or info.get("title") or "video"))
+        target_dir = output_root / video_id
+        if target_dir.exists():
+            shutil.rmtree(target_dir)
+        target_dir.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(local_pull_dir, target_dir)
+        materialize_download(target_dir, target_dir / "video.mp4")
+        print(f"[download] remote synced: {target_dir}")
+        return target_dir
+
+
+def remote_download_command(args: argparse.Namespace, remote_run_dir: str) -> str:
+    command = [
+        "set -euo pipefail",
+        "&&",
+        "rm -rf",
+        shell_quote(remote_run_dir),
+        "&&",
+        "mkdir -p",
+        shell_quote(remote_run_dir),
+        "&&",
+        "yt-dlp",
+        "--no-playlist",
+        "--write-info-json",
+        "--write-description",
+        "--merge-output-format",
+        "mp4",
+        "-f",
+        "bv*[vcodec^=avc1]+ba/b[vcodec^=avc1]/bv*+ba/b",
+        "-o",
+        shell_quote(f"{remote_run_dir}/download.%(ext)s"),
+    ]
+    if args.include_subtitles:
+        command.extend(["--write-subs", "--write-auto-subs", "--sub-langs", shell_quote(subtitle_langs_for_ytdlp(args.subtitle_langs))])
+    if args.include_comments:
+        command.append("--write-comments")
+    append_remote_ytdlp_runtime_args(command, args)
+    if getattr(args, "ytdlp_proxy", None):
+        command.extend(["--proxy", shell_quote(args.ytdlp_proxy)])
+    if getattr(args, "cookies", None):
+        raise ValueError("--cookies cannot be used with remote download devices yet")
+    if getattr(args, "cookies_from_browser", None):
+        command.extend(["--cookies-from-browser", shell_quote(args.cookies_from_browser)])
+    command.append(shell_quote(args.url))
+    return "bash -lc " + shell_quote(" ".join(command))
+
+
+def append_remote_ytdlp_runtime_args(command: list[str], args: argparse.Namespace) -> None:
+    value = str(getattr(args, "ytdlp_js_runtimes", None) or "auto").strip()
+    if value.lower() == "auto":
+        value = "node"
+    if value and value.lower() not in {"none", "no", "off", "false", "disabled"}:
+        command.extend(["--js-runtimes", shell_quote(value)])
+    extractor_args = str(getattr(args, "ytdlp_extractor_args", None) or "").strip()
+    if extractor_args and extractor_args.lower() not in {"none", "no", "off", "false", "disabled"}:
+        command.extend(["--extractor-args", shell_quote(extractor_args)])
 
 
 def fetch_metadata(url: str, args: argparse.Namespace) -> dict[str, Any]:
@@ -291,12 +413,42 @@ def download_context_assets(url: str, video_dir: Path, args: argparse.Namespace)
 
 
 def load_downloaded_info(video_dir: Path) -> dict[str, Any] | None:
+    info_path = video_dir / "info.json"
+    if info_path.is_file():
+        try:
+            return json.loads(info_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
     for path in sorted(video_dir.glob("download*.info.json")):
         try:
             return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             continue
     return None
+
+
+def existing_video_dir_for_url(output_root: Path, url: str) -> Path | None:
+    video_id = infer_video_id_from_url(url)
+    candidates = [output_root / safe_slug(video_id)] if video_id else []
+    for path in candidates:
+        if (path / "video.mp4").is_file() and (path / "page_context.md").is_file():
+            return path
+    return None
+
+
+def infer_video_id_from_url(url: str) -> str:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    if "youtube.com" in host:
+        query_id = parse_qs(parsed.query).get("v")
+        if query_id:
+            return query_id[0]
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) >= 2 and parts[0] in {"shorts", "embed", "live"}:
+            return parts[1]
+    if "youtu.be" in host:
+        return parsed.path.strip("/").split("/")[0]
+    return ""
 
 
 def add_cookie_args(command: list[str], args: argparse.Namespace) -> None:
@@ -314,13 +466,12 @@ def add_ytdlp_network_args(command: list[str], args: argparse.Namespace) -> None
 def add_ytdlp_runtime_args(command: list[str], args: argparse.Namespace) -> None:
     value = str(getattr(args, "ytdlp_js_runtimes", None) or "auto").strip()
     if value.lower() == "auto":
-        if not shutil.which("node"):
-            return
-        value = "node"
-    if not value or value.lower() in {"none", "no", "off", "false", "disabled"}:
-        return
-    if "--js-runtimes" not in command:
+        value = "node" if shutil.which("node") else ""
+    if value and value.lower() not in {"none", "no", "off", "false", "disabled"} and "--js-runtimes" not in command:
         command.extend(["--js-runtimes", value])
+    extractor_args = str(getattr(args, "ytdlp_extractor_args", None) or "").strip()
+    if extractor_args and extractor_args.lower() not in {"none", "no", "off", "false", "disabled"}:
+        command.extend(["--extractor-args", extractor_args])
 
 
 def materialize_download(video_dir: Path, video_path: Path) -> None:
@@ -818,6 +969,12 @@ def build_analyzer_command(args: argparse.Namespace, video_path: Path, context_p
             getattr(args, "ocr_cache", "on"),
             "--ocr-cache-dir",
             getattr(args, "ocr_cache_dir", ".cache/video-analyzer/ocr"),
+            "--ocr-keyframe-strategy",
+            getattr(args, "ocr_keyframe_strategy", "auto"),
+            "--ocr-keyframe-budget",
+            str(getattr(args, "ocr_keyframe_budget", "auto")),
+            "--ocr-scan-sample-fps",
+            str(getattr(args, "ocr_scan_sample_fps", "auto")),
         ]
     )
     if args.max_frames is not None:
