@@ -543,6 +543,38 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(result["summary"]["total"], 2)
         self.assertIn("core", result["resources"])
 
+    def test_public_job_derives_title_from_info_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            video_dir = Path(tmp) / "video"
+            video_dir.mkdir()
+            (video_dir / "info.json").write_text(json.dumps({"title": "真实视频标题"}, ensure_ascii=False), encoding="utf-8")
+            loaded = server.load_job(job["job_id"])
+            loaded["artifacts"] = {"video_path": {"value": str(video_dir / "video.mp4")}}
+            server.save_job(loaded)
+
+            public = server.public_job(server.load_job(job["job_id"]))
+
+        self.assertEqual(public["title"], "真实视频标题")
+        self.assertEqual(public["display_title"], "真实视频标题")
+
+    def test_delete_job_removes_status_record_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            loaded = server.load_job(job["job_id"])
+            loaded["run_dir"] = str(run_dir)
+            server.save_job(loaded)
+
+            result = server.delete_job(job["job_id"])
+
+            self.assertTrue(result["deleted"])
+            self.assertTrue(run_dir.exists())
+            self.assertFalse((Path(tmp) / "jobs" / job["job_id"]).exists())
+
     def test_create_jobs_batch_partially_accepts_valid_urls(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)

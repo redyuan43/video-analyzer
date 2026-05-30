@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Video Analyzer</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='vendor/katex/katex.min.css') }}?v={{ static_version }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}?v={{ static_version }}">
 </head>
 <body>
@@ -245,6 +246,10 @@
             </section>
         </section>
     </main>
+    <script src="{{ url_for('static', filename='vendor/markdown-it/markdown-it.min.js') }}?v={{ static_version }}"></script>
+    <script src="{{ url_for('static', filename='vendor/dompurify/purify.min.js') }}?v={{ static_version }}"></script>
+    <script src="{{ url_for('static', filename='vendor/katex/katex.min.js') }}?v={{ static_version }}"></script>
+    <script src="{{ url_for('static', filename='vendor/katex/contrib/auto-render.min.js') }}?v={{ static_version }}"></script>
     <script src="{{ url_for('static', filename='js/main.js') }}?v={{ static_version }}"></script>
 </body>
 </html>

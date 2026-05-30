@@ -54,10 +54,16 @@ class VideoAnalyzerUI:
         def index():
             static_root = Path(self.app.static_folder or '')
             try:
-                static_version = int(max(
-                    (static_root / 'js' / 'main.js').stat().st_mtime,
-                    (static_root / 'css' / 'styles.css').stat().st_mtime,
-                ))
+                assets = [
+                    static_root / 'js' / 'main.js',
+                    static_root / 'css' / 'styles.css',
+                    static_root / 'vendor' / 'markdown-it' / 'markdown-it.min.js',
+                    static_root / 'vendor' / 'dompurify' / 'purify.min.js',
+                    static_root / 'vendor' / 'katex' / 'katex.min.css',
+                    static_root / 'vendor' / 'katex' / 'katex.min.js',
+                    static_root / 'vendor' / 'katex' / 'contrib' / 'auto-render.min.js',
+                ]
+                static_version = int(max(path.stat().st_mtime for path in assets))
             except OSError:
                 static_version = 1
             return render_template('index.html', static_version=static_version)
@@ -102,6 +108,13 @@ class VideoAnalyzerUI:
             try:
                 public_host = request.host.split(':', 1)[0]
                 return jsonify(self.video_link.public_job(self.video_link.load_job(job_id), public_host=public_host))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>', methods=['DELETE'])
+        def video_link_delete_job(job_id):
+            try:
+                return jsonify(self.video_link.delete_job(job_id))
             except BridgeError as exc:
                 return jsonify({'error': exc.message}), int(exc.status)
 

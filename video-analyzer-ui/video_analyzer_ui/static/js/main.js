@@ -367,17 +367,26 @@ function preferredJob(jobs) {
     return sortJobsForAttention(jobs)[0] || null;
 }
 
+function jobDisplayTitle(job) {
+    return job.display_title || job.title || job.summary?.study?.title || job.video_url || job.job_id || '-';
+}
+
 function renderJobList(jobs) {
     const orderedJobs = sortJobsForAttention(jobs);
     nodes.jobList.innerHTML = orderedJobs.length ? orderedJobs.map(job => {
         const selected = job.job_id === selectedJobId ? ' selected' : '';
         const statusClass = job.status ? ` ${job.status}` : '';
-        const title = escapeHtml(job.video_url || job.job_id);
+        const title = escapeHtml(jobDisplayTitle(job));
+        const url = escapeHtml(job.video_url || '-');
         const stage = job.current_stage || job.error_summary?.stage || job.next_stage || '-';
-        return `<button class="job-item${selected}${statusClass}" type="button" data-job-id="${job.job_id}">
-            <strong>${title}</strong>
-            <span>${escapeHtml(job.status || '-')} · ${escapeHtml(stageNames[stage] || stage)}</span>
-        </button>`;
+        return `<div class="job-item${selected}${statusClass}" data-job-id="${escapeHtml(job.job_id)}">
+            <button class="job-select" type="button" data-job-id="${escapeHtml(job.job_id)}">
+                <strong title="${title}">${title}</strong>
+                <span class="job-url" title="${url}">${url}</span>
+                <span class="job-status-line">${escapeHtml(job.status || '-')} · ${escapeHtml(stageNames[stage] || stage)}</span>
+            </button>
+            <button class="icon-button light delete-job" type="button" data-job-id="${escapeHtml(job.job_id)}" title="删除任务" aria-label="删除任务">×</button>
+        </div>`;
     }).join('') : '<div class="empty">暂无任务</div>';
     bindJobButtons();
 }
@@ -466,9 +475,33 @@ function resourceItem(item, queued = false) {
 }
 
 function bindJobButtons() {
-    document.querySelectorAll('.job-item, .lane-item').forEach(button => {
+    document.querySelectorAll('.job-select, .lane-item').forEach(button => {
         button.addEventListener('click', () => {
             if (button.dataset.jobId) selectJob(button.dataset.jobId);
+        });
+    });
+    document.querySelectorAll('.delete-job').forEach(button => {
+        button.addEventListener('click', async event => {
+            event.stopPropagation();
+            const jobId = button.dataset.jobId;
+            const job = latestJobs.find(item => item.job_id === jobId);
+            const title = jobDisplayTitle(job || { job_id: jobId });
+            if (!jobId || !window.confirm(`删除最近任务？\n\n${title}\n\n只移除任务记录，不删除分析产物。`)) return;
+            button.disabled = true;
+            try {
+                await getJson(`/api/video-link/jobs/${jobId}`, { method: 'DELETE' });
+                if (selectedJobId === jobId) {
+                    selectedJobId = null;
+                    const url = new URL(window.location.href);
+                    url.searchParams.delete('job');
+                    window.history.replaceState({}, '', url);
+                    renderEmpty();
+                }
+                await refreshJobs();
+            } catch (error) {
+                nodes.formError.textContent = error.message;
+                button.disabled = false;
+            }
         });
     });
 }
@@ -524,9 +557,10 @@ function renderJob(job) {
     const runDir = job.summary?.run_dir || job.run_dir;
     const isSucceeded = job.status === 'succeeded';
     const missingRunDir = isSucceeded && !runDir;
-    nodes.selectedTitle.textContent = job.video_url || job.job_id;
+    nodes.selectedTitle.textContent = jobDisplayTitle(job);
     const subtitleReason = missingRunDir ? '资源目录不可用' : reason;
-    nodes.selectedSubtitle.textContent = subtitleReason ? `任务 ID: ${job.job_id} · ${subtitleReason}` : `任务 ID: ${job.job_id}`;
+    const subtitleBase = `任务 ID: ${job.job_id} · ${job.video_url || '-'}`;
+    nodes.selectedSubtitle.textContent = subtitleReason ? `${subtitleBase} · ${subtitleReason}` : subtitleBase;
     nodes.runButton.disabled = Boolean(subtitleReason);
     nodes.runButton.dataset.action = isSucceeded ? 'open-run-dir' : 'run';
     nodes.runButton.classList.toggle('success-action', isSucceeded);
@@ -900,6 +934,7 @@ async function loadDocPreview(job, path) {
         if (selectedDocPath !== path) return;
         nodes.docPreviewBody.className = 'doc-preview-body markdown';
         nodes.docPreviewBody.innerHTML = renderMarkdown(markdown, job.job_id, path);
+        renderMarkdownMath(nodes.docPreviewBody);
         loadedDocPreviewKey = previewKey;
     } catch (error) {
         nodes.docPreviewBody.className = 'doc-preview-body markdown';
@@ -909,6 +944,93 @@ async function loadDocPreview(job, path) {
 }
 
 function renderMarkdown(markdown, jobId = '', docPath = '') {
+    if (!window.markdownit || !window.DOMPurify) {
+        return renderLegacyMarkdown(markdown, jobId, docPath);
+    }
+    const renderer = createMarkdownRenderer(jobId, docPath);
+    return window.DOMPurify.sanitize(renderer.render(normalizeMarkdownForPreview(markdown)), {
+        ADD_TAGS: ['figure', 'figcaption'],
+        ADD_ATTR: ['target', 'rel', 'loading']
+    });
+}
+
+function normalizeMarkdownForPreview(markdown) {
+    const lines = String(markdown || '').split(/\r?\n/);
+    const normalized = [];
+    for (let index = 0; index < lines.length; index += 1) {
+        const line = lines[index];
+        if (isPotentialMarkdownTableRow(line) && !String(lines[index + 1] || '').trim() && isMarkdownTableSeparator(lines[index + 2] || '')) {
+            normalized.push(line, lines[index + 2]);
+            index += 2;
+            continue;
+        }
+        normalized.push(line);
+    }
+    return normalized.join('\n');
+}
+
+function isPotentialMarkdownTableRow(line) {
+    const value = String(line || '').trim();
+    return value.includes('|') && !isMarkdownTableSeparator(value);
+}
+
+function createMarkdownRenderer(jobId = '', docPath = '') {
+    const md = window.markdownit({
+        html: false,
+        linkify: true,
+        typographer: false,
+        breaks: false
+    });
+    const defaultImage = md.renderer.rules.image || ((tokens, idx, options, env, self) => self.renderToken(tokens, idx, options));
+    md.renderer.rules.image = (tokens, idx, options, env, self) => {
+        const token = tokens[idx];
+        const srcIndex = token.attrIndex('src');
+        if (srcIndex >= 0) {
+            const src = token.attrs[srcIndex][1];
+            const assetPath = markdownAssetPath(docPath, src);
+            token.attrs[srcIndex][1] = assetPath && jobId ? resourceUrl(jobId, assetPath) : assetPath;
+        }
+        token.attrSet('loading', 'lazy');
+        token.attrSet('class', 'markdown-image');
+        return defaultImage(tokens, idx, options, env, self);
+    };
+    const defaultFence = md.renderer.rules.fence || ((tokens, idx, options, env, self) => self.renderToken(tokens, idx, options));
+    md.renderer.rules.fence = (tokens, idx, options, env, self) => {
+        const token = tokens[idx];
+        const language = String(token.info || '').trim().split(/\s+/)[0].toLowerCase();
+        if (language === 'mermaid') {
+            const flowHtml = renderSimpleMermaidFlowchart(token.content);
+            if (flowHtml) return flowHtml;
+        }
+        return defaultFence(tokens, idx, options, env, self);
+    };
+    const defaultLinkOpen = md.renderer.rules.link_open || ((tokens, idx, options, env, self) => self.renderToken(tokens, idx, options));
+    md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
+        const token = tokens[idx];
+        const href = token.attrGet('href') || '';
+        if (/^https?:\/\//i.test(href)) {
+            token.attrSet('target', '_blank');
+            token.attrSet('rel', 'noreferrer');
+        }
+        return defaultLinkOpen(tokens, idx, options, env, self);
+    };
+    return md;
+}
+
+function renderMarkdownMath(container) {
+    if (!container || typeof window.renderMathInElement !== 'function') return;
+    window.renderMathInElement(container, {
+        delimiters: [
+            { left: '$$', right: '$$', display: true },
+            { left: '\\[', right: '\\]', display: true },
+            { left: '\\(', right: '\\)', display: false }
+        ],
+        throwOnError: false,
+        ignoredTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code']
+    });
+}
+
+function renderLegacyMarkdown(markdown, jobId = '', docPath = '') {
     const lines = String(markdown || '').split(/\r?\n/);
     const html = [];
     let paragraph = [];
@@ -928,7 +1050,8 @@ function renderMarkdown(markdown, jobId = '', docPath = '') {
             listOpen = false;
         }
     };
-    for (const line of lines) {
+    for (let index = 0; index < lines.length; index += 1) {
+        const line = lines[index];
         if (line.trim().startsWith('```')) {
             if (codeOpen) {
                 const codeText = codeLines.join('\n');
@@ -950,11 +1073,45 @@ function renderMarkdown(markdown, jobId = '', docPath = '') {
             codeLines.push(line);
             continue;
         }
+        const tableSeparatorIndex = markdownTableSeparatorIndex(lines, index);
+        if (tableSeparatorIndex !== -1) {
+            flushParagraph();
+            closeList();
+            const tableLines = [line, lines[tableSeparatorIndex]];
+            index = tableSeparatorIndex + 1;
+            while (index < lines.length && isMarkdownTableRow(lines[index])) {
+                tableLines.push(lines[index]);
+                index += 1;
+            }
+            index -= 1;
+            html.push(renderMarkdownTable(tableLines, jobId, docPath));
+            continue;
+        }
         const heading = line.match(/^(#{1,4})\s+(.+)$/);
         if (heading) {
             flushParagraph();
             closeList();
             html.push(`<h${heading[1].length}>${inlineMarkdown(heading[2], jobId, docPath)}</h${heading[1].length}>`);
+            continue;
+        }
+        if (isMarkdownHorizontalRule(line)) {
+            flushParagraph();
+            closeList();
+            html.push('<hr>');
+            continue;
+        }
+        const quote = line.match(/^\s*>\s?(.*)$/);
+        if (quote) {
+            flushParagraph();
+            closeList();
+            const quoteLines = [quote[1]];
+            while (index + 1 < lines.length) {
+                const nextQuote = lines[index + 1].match(/^\s*>\s?(.*)$/);
+                if (!nextQuote) break;
+                quoteLines.push(nextQuote[1]);
+                index += 1;
+            }
+            html.push(`<blockquote><p>${inlineMarkdown(quoteLines.join(' '), jobId, docPath)}</p></blockquote>`);
             continue;
         }
         const bullet = line.match(/^\s*[-*]\s+(.+)$/);
@@ -980,6 +1137,53 @@ function renderMarkdown(markdown, jobId = '', docPath = '') {
     return html.join('\n');
 }
 
+function isMarkdownHorizontalRule(line) {
+    return /^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/.test(String(line || ''));
+}
+
+function markdownTableSeparatorIndex(lines, index) {
+    if (!isMarkdownTableRow(lines[index])) return -1;
+    let cursor = index + 1;
+    while (cursor < lines.length && !String(lines[cursor] || '').trim()) {
+        cursor += 1;
+    }
+    return isMarkdownTableSeparator(lines[cursor] || '') ? cursor : -1;
+}
+
+function isMarkdownTableRow(line) {
+    const value = String(line || '').trim();
+    return value.includes('|') && !isMarkdownTableSeparator(value);
+}
+
+function isMarkdownTableSeparator(line) {
+    const value = String(line || '').trim();
+    if (!value.includes('|')) return false;
+    const cells = parseMarkdownTableRow(value);
+    return cells.length > 0 && cells.every(cell => /^:?-{3,}:?$/.test(cell.replace(/\s+/g, '')));
+}
+
+function parseMarkdownTableRow(line) {
+    let value = String(line || '').trim();
+    if (value.startsWith('|')) value = value.slice(1);
+    if (value.endsWith('|')) value = value.slice(0, -1);
+    return value.split('|').map(cell => cell.trim());
+}
+
+function renderMarkdownTable(tableLines, jobId = '', docPath = '') {
+    const header = parseMarkdownTableRow(tableLines[0]);
+    const align = parseMarkdownTableRow(tableLines[1]).map(cell => {
+        const value = cell.replace(/\s+/g, '');
+        if (value.startsWith(':') && value.endsWith(':')) return 'center';
+        if (value.endsWith(':')) return 'right';
+        return 'left';
+    });
+    const rows = tableLines.slice(2).map(parseMarkdownTableRow).filter(row => row.some(Boolean));
+    const cellStyle = index => ` style="text-align:${escapeHtml(align[index] || 'left')}"`;
+    const headHtml = header.map((cell, index) => `<th${cellStyle(index)}>${inlineMarkdown(cell, jobId, docPath)}</th>`).join('');
+    const bodyHtml = rows.map(row => `<tr>${header.map((_, index) => `<td${cellStyle(index)}>${inlineMarkdown(row[index] || '', jobId, docPath)}</td>`).join('')}</tr>`).join('');
+    return `<div class="markdown-table-wrap"><table><thead><tr>${headHtml}</tr></thead><tbody>${bodyHtml}</tbody></table></div>`;
+}
+
 function inlineMarkdown(text, jobId = '', docPath = '') {
     const value = String(text ?? '');
     let html = '';
@@ -998,7 +1202,8 @@ function inlineMarkdown(text, jobId = '', docPath = '') {
     html += escapeHtml(value.slice(lastIndex));
     return html
         .replace(/`([^`]+)`/g, '<code>$1</code>')
-        .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+        .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+        .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
 }
 
 function markdownAssetPath(docPath, rawPath) {

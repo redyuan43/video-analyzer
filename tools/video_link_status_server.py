@@ -495,6 +495,23 @@ class VideoLinkStatusServer:
             "resources": self.resource_summary(jobs),
         }
 
+    def delete_job(self, job_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        active = self.active_runners.get(job_id)
+        if active and active.is_alive():
+            raise BridgeError(HTTPStatus.CONFLICT, "job is still running")
+
+        stage = self.current_stage(job) or self.next_stage(job)
+        process = job.get("process") or ((job.get("stages") or {}).get(stage or "") or {}).get("process") or {}
+        pid = process.get("pid")
+        if pid and process_alive(pid):
+            raise BridgeError(HTTPStatus.CONFLICT, f"job process is still running: {pid}")
+
+        with self.vscode_lock:
+            self._stop_vscode_session_locked(job_id)
+        shutil.rmtree(self.job_dir(job_id))
+        return {"deleted": True, "job_id": job_id}
+
     def jobs_summary(self, jobs: list[dict[str, Any]]) -> dict[str, Any]:
         counts = {status: 0 for status in ("created", "running", "queued", "succeeded", "failed")}
         progress_values = []
@@ -1022,10 +1039,14 @@ class VideoLinkStatusServer:
         job["video_path"] = str(self.resolve_output_path(video_path))
         job["page_context_path"] = str(self.resolve_output_path(page_context))
         job["video_dir"] = str(Path(job["video_path"]).parent)
+        title = self.resolve_job_title(job)
+        if title:
+            job["title"] = title
         artifacts = {
             "video_path": job["video_path"],
             "page_context": job["page_context_path"],
             "video_dir": job["video_dir"],
+            "title": title,
             "command": command,
         }
         return {"artifacts": artifacts, "stdout_tail": result["stdout_tail"]}
@@ -1859,6 +1880,9 @@ class VideoLinkStatusServer:
         public = dict(job)
         public["stages"] = dict(job.get("stages") or {})
         public["summary"] = self.collect_summary(job)
+        title = self.resolve_job_title(public)
+        public["title"] = title
+        public["display_title"] = title or job.get("video_url") or job.get("job_id")
         public["stage_order"] = STAGE_ORDER
         public["progress"] = self.progress(job)
         public["current_stage"] = self.current_stage(job)
@@ -1879,6 +1903,61 @@ class VideoLinkStatusServer:
         current_info = public["stages"].get(current_stage or "", {})
         public["process"] = self.public_process_info(current_info.get("process"))
         return public
+
+    def resolve_job_title(self, job: dict[str, Any]) -> str:
+        for value in (
+            job.get("title"),
+            ((job.get("summary") or {}).get("study") or {}).get("title"),
+        ):
+            title = clean_display_title(value)
+            if title:
+                return title
+
+        info_title = self.video_info_title(job)
+        if info_title:
+            return info_title
+
+        context_title = self.page_context_title(job)
+        if context_title:
+            return context_title
+        return ""
+
+    def video_info_title(self, job: dict[str, Any]) -> str:
+        video_dir = job.get("video_dir")
+        if not video_dir and job.get("video_path"):
+            video_dir = str(Path(job["video_path"]).parent)
+        if not video_dir:
+            artifact_video = artifact_value(job, "video_path")
+            if artifact_video:
+                video_dir = str(Path(artifact_video).parent)
+        if not video_dir:
+            return ""
+        for path in (Path(video_dir) / "info.json", *sorted(Path(video_dir).glob("download*.info.json"))):
+            if not path.is_file():
+                continue
+            try:
+                title = clean_display_title((json.loads(path.read_text(encoding="utf-8")) or {}).get("title"))
+            except Exception:
+                title = ""
+            if title:
+                return title
+        return ""
+
+    def page_context_title(self, job: dict[str, Any]) -> str:
+        path_value = job.get("page_context_path") or artifact_value(job, "page_context")
+        if not path_value:
+            return ""
+        path = Path(path_value)
+        if not path.is_file():
+            return ""
+        try:
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                match = re.match(r"^#\s+(.+?)\s*$", line)
+                if match:
+                    return clean_display_title(match.group(1))
+        except Exception:
+            return ""
+        return ""
 
     def public_process_info(self, process_info: dict[str, Any] | None) -> dict[str, Any] | None:
         if not process_info:
@@ -2248,6 +2327,17 @@ class VideoLinkStatusServer:
 def sanitize_run_name(value: str) -> str:
     name = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip(".-")
     return name or "operation-manual"
+
+
+def clean_display_title(value: Any) -> str:
+    title = re.sub(r"\s+", " ", str(value or "")).strip()
+    title = re.sub(r"^Page Context Evidence:\s*", "", title, flags=re.IGNORECASE).strip()
+    return title[:180]
+
+
+def artifact_value(job: dict[str, Any], name: str) -> str:
+    value = ((job.get("artifacts") or {}).get(name) or {}).get("value")
+    return str(value or "")
 
 
 def extract_batch_urls(payload: dict[str, Any]) -> list[str]:
@@ -3520,6 +3610,10 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:
         try:
             path = urlparse(self.path).path
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})", path)
+            if match:
+                self.write_json(self.server_app.delete_job(match.group(1)))
+                return
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/vscode-session", path)
             if match:
                 self.write_json(self.server_app.stop_vscode_session(match.group(1)))
