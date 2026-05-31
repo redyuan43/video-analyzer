@@ -78,6 +78,39 @@ class StudyGuideTests(unittest.TestCase):
             guide = json.loads((run_dir / "study_guide.json").read_text(encoding="utf-8"))
             self.assertTrue(any(item["source_type"] == "asr" and "硬件选择" in item["text"] for item in guide["evidence"]))
 
+    def test_audio_only_run_does_not_require_visual_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "orin").mkdir()
+            (run_dir / "analysis.json").write_text(
+                json.dumps(
+                    {
+                        "transcript": {
+                            "text": "播客正文",
+                            "segments": [{"Start": 0.0, "End": 10.0, "Content": "播客正文"}],
+                        },
+                        "ocr_events": [],
+                        "frame_analyses": [],
+                        "metadata": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "manual_evidence.md").write_text("# Evidence\n", encoding="utf-8")
+            (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
+            (run_dir / "frames_manifest.json").write_text(
+                json.dumps({"version": 1, "source": "audio_only", "frames": []}),
+                encoding="utf-8",
+            )
+
+            result = build_study_artifacts(run_dir, skip_review=True)
+
+            categories = {item["category"] for item in result["evidence_gaps"]["items"]}
+            self.assertNotIn("frames_manifest_missing", categories)
+            self.assertNotIn("ocr_empty", categories)
+            self.assertNotIn("vl_empty", categories)
+            self.assertEqual(result["publish_decision"]["status"], "publishable")
+
 
 if __name__ == "__main__":
     unittest.main()

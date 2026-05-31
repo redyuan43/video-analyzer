@@ -22,21 +22,39 @@ def write_transcript_markdown(transcript: Optional[AudioTranscript], path: Path)
         "",
     ]
     segments = transcript.segments or []
+    wrote_segment = False
     if segments:
         for segment in segments:
-            text = str(segment.get("text") or segment.get("raw_output") or "").strip()
+            text = str(
+                first_present(
+                    segment,
+                    ("text", "Text", "content", "Content", "transcript", "Transcript", "raw_output", "raw_text"),
+                )
+                or ""
+            ).strip()
             if not text:
                 continue
-            start = segment.get("start_time", segment.get("start"))
-            end = segment.get("end_time", segment.get("end"))
+            speaker = str(first_present(segment, ("speaker", "Speaker")) or "").strip()
+            if speaker:
+                text = f"{speaker}: {text}"
+            start = first_present(segment, ("start_time", "start", "Start"))
+            end = first_present(segment, ("end_time", "end", "End"))
             if start is not None or end is not None:
                 lines.append(f"- [{format_timestamp(start)} - {format_timestamp(end)}] {text}")
             else:
                 lines.append(f"- {text}")
-    elif transcript.text:
+            wrote_segment = True
+    if not wrote_segment and transcript.text:
         lines.extend(["## Full Text", "", transcript.text])
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     return path
+
+
+def first_present(values: dict, keys: tuple[str, ...]) -> object:
+    for key in keys:
+        if key in values and values[key] not in (None, ""):
+            return values[key]
+    return None
 
 
 def format_timestamp(value: object) -> str:

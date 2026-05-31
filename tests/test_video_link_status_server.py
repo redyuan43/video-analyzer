@@ -1,11 +1,14 @@
 import importlib.util
 import json
 import os
+import subprocess
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+from video_analyzer import cli as cli_mod
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -44,7 +47,11 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         args = type(
             "Args",
             (),
-            {"ytdlp_js_runtimes": "node", "ytdlp_extractor_args": "youtube:player_client=mweb,web"},
+            {
+                "ytdlp_js_runtimes": "node",
+                "ytdlp_remote_components": "ejs:github",
+                "ytdlp_extractor_args": "youtube:player_client=mweb,web",
+            },
         )()
         command = ["yt-dlp", "--skip-download"]
 
@@ -52,6 +59,8 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
         self.assertIn("--js-runtimes", command)
         self.assertIn("node", command)
+        self.assertIn("--remote-components", command)
+        self.assertIn("ejs:github", command)
         self.assertIn("--extractor-args", command)
         self.assertIn("youtube:player_client=mweb,web", command)
 
@@ -65,6 +74,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
                 "include_comments": True,
                 "subtitle_langs": "zh-CN,zh,en",
                 "ytdlp_js_runtimes": "auto",
+                "ytdlp_remote_components": "ejs:github",
                 "ytdlp_extractor_args": "",
                 "ytdlp_proxy": None,
                 "cookies": None,
@@ -79,6 +89,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertIn("--write-subs", command)
         self.assertIn("--write-comments", command)
         self.assertIn("--js-runtimes node", command)
+        self.assertIn("--remote-components ejs:github", command)
         self.assertIn("/home/ivan/Documents/video-analyzer-url-downloads/test/download.", command)
 
     def test_existing_video_dir_for_url_uses_cached_youtube_id(self):
@@ -94,6 +105,51 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             )
 
         self.assertEqual(resolved, video_dir)
+
+    def test_existing_video_dir_for_url_accepts_cached_audio_media(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            video_dir = Path(tmp) / "B8OxtGSEfoo"
+            video_dir.mkdir()
+            (video_dir / "audio.m4a").write_bytes(b"audio")
+            (video_dir / "page_context.md").write_text("# context\n", encoding="utf-8")
+
+            resolved = url_context_mod.existing_video_dir_for_url(
+                Path(tmp),
+                "https://www.youtube.com/watch?v=B8OxtGSEfoo",
+            )
+
+        self.assertEqual(resolved, video_dir)
+
+    def test_materialize_download_accepts_audio_only_media(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            video_dir = Path(tmp)
+            (video_dir / "download.m4a").write_bytes(b"audio")
+
+            media_path = url_context_mod.materialize_download(video_dir, video_dir / "video.mp4")
+
+            self.assertEqual(media_path, video_dir / "audio.m4a")
+            self.assertEqual(media_path.read_bytes(), b"audio")
+            self.assertFalse((video_dir / "download.m4a").exists())
+
+    def test_media_has_video_stream_detects_audio_only_input(self):
+        completed = subprocess.CompletedProcess(
+            args=["ffprobe"],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+        with patch.object(cli_mod.subprocess, "run", return_value=completed):
+            self.assertFalse(cli_mod.media_has_video_stream(Path("/tmp/audio.m4a")))
+
+    def test_media_has_video_stream_detects_video_input(self):
+        completed = subprocess.CompletedProcess(
+            args=["ffprobe"],
+            returncode=0,
+            stdout="video\n",
+            stderr="",
+        )
+        with patch.object(cli_mod.subprocess, "run", return_value=completed):
+            self.assertTrue(cli_mod.media_has_video_stream(Path("/tmp/video.mp4")))
 
     def test_options_include_defaults_and_profiles(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -493,6 +549,31 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertTrue(result["stages"]["final-publish"]["soft_failed"])
         self.assertEqual(result["warnings"][0]["stage"], "final-publish")
         self.assertIn("publisher unavailable", result["warnings"][0]["message"])
+
+    def test_public_job_hides_resolved_and_audio_only_visual_warnings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/audio", "run_name": "operation-manual"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "audio" / "operation-manual"
+            run_dir.mkdir(parents=True)
+            (run_dir / "frames_manifest.json").write_text(
+                json.dumps({"version": 1, "source": "audio_only", "frames": []}),
+                encoding="utf-8",
+            )
+            loaded["run_dir"] = str(run_dir)
+            loaded["stages"] = {
+                "deep-v2": {"status": "skipped", "soft_failed": True},
+                "final-publish": {"status": "succeeded"},
+            }
+            loaded["warnings"] = [
+                {"stage": "deep-v2", "message": "no frames"},
+                {"stage": "final-publish", "message": "old failure"},
+            ]
+
+            public = server.public_job(loaded)
+
+        self.assertEqual(public["warnings"], [])
 
     def test_study_and_evidence_review_are_separate_stages(self):
         self.assertLess(server_mod.STAGE_ORDER.index("study-guide"), server_mod.STAGE_ORDER.index("multidoc"))
@@ -1096,6 +1177,27 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertTrue(result["preview"]["video_ready"])
         self.assertEqual(result["preview"]["video_url"], f"/api/video-link/jobs/{job['job_id']}/video")
         self.assertEqual(result["preview"]["duration_seconds"], 125)
+
+    def test_public_job_falls_back_to_downloaded_video_for_preview(self):
+        video_dir = REPO_ROOT / "downloads" / "url-videos" / "preview-fallback-test"
+        video_dir.mkdir(parents=True, exist_ok=True)
+        video = video_dir / "video.mp4"
+        video.write_bytes(b"fake video")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+                job = server.create_job({"video_url": "https://www.youtube.com/watch?v=preview-fallback-test"})
+
+                result = server.public_job(server.load_job(job["job_id"]))
+
+            self.assertTrue(result["preview"]["video_ready"])
+            self.assertEqual(result["preview"]["video_url"], f"/api/video-link/jobs/{job['job_id']}/video")
+        finally:
+            video.unlink(missing_ok=True)
+            try:
+                video_dir.rmdir()
+            except OSError:
+                pass
 
     def test_preview_video_file_rejects_missing_video(self):
         with tempfile.TemporaryDirectory() as tmp:

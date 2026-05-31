@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import shutil
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -55,6 +56,31 @@ TRANSCRIPT_LINE_RE = re.compile(
     r"^-\s+\[(?P<start>\d\d:\d\d:\d\d)\s+-\s+(?P<end>\d\d:\d\d:\d\d)\]\s+(?P<text>.*)$"
 )
 PROGRESS_FILENAME = "progress.json"
+
+
+def media_has_video_stream(media_path: Path) -> bool:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "csv=p=0",
+                str(media_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception as exc:
+        logger.warning("Could not probe video stream for %s; assuming video input: %s", media_path, exc)
+        return True
+    return bool(result.stdout.strip())
 
 def get_log_level(level_str: str) -> int:
     """Convert string log level to logging constant."""
@@ -427,6 +453,7 @@ def main():
 
     # Initialize components
     video_path = Path(args.video_path)
+    has_video_stream = media_has_video_stream(video_path)
     output_dir = Path(config.get("output_dir"))
     output_dir.mkdir(parents=True, exist_ok=True)
     client = create_client(config)
@@ -587,8 +614,32 @@ def main():
                 output_dir / "frames", 
                 model
             )
-            if task == "operation_manual":
-                video_duration = processor._probe_duration(config.get("duration"))
+            video_duration = processor._probe_duration(config.get("duration"))
+            if not has_video_stream:
+                logger.info("Input has no video stream; skipping frame extraction.")
+                frame_manifest_path = write_frame_manifest(frames, output_dir, source="audio_only")
+                frame_extraction_metadata = {
+                    "backend": "audio_only",
+                    "has_video_stream": False,
+                    "frame_manifest": str(frame_manifest_path),
+                    "video_duration_seconds": video_duration,
+                }
+                if task == "operation_manual":
+                    frame_selection_metadata = {
+                        "pipeline_mode": args.pipeline_mode,
+                        "video_duration_seconds": video_duration,
+                        "candidate_frames": args.candidate_frames,
+                        "candidate_frame_budget": 0,
+                        "explicit_max_frames": args.max_frames,
+                    }
+                current_progress_step = "frames_done"
+                write_analysis_progress(
+                    output_dir,
+                    current_progress_step,
+                    message="audio-only input; skipped frame extraction",
+                    artifacts={"frame_manifest": str(frame_manifest_path)},
+                )
+            elif task == "operation_manual":
                 ocr_scan_sample_fps = resolve_ocr_scan_sample_fps(
                     args.ocr_scan_sample_fps,
                     args.pipeline_mode,
@@ -701,38 +752,41 @@ def main():
                     len(frames),
                     ocr_keyframe_metadata.get("scan_frames_count"),
                 )
-                with analyzer_resource_lock(config.config, "ocr", str(output_dir), logger):
-                    with local_model_stage("ocr", config.config, logger, str(output_dir)):
-                        ocr_events = run_ocr(
-                            frames=selected_ocr_frames,
-                            provider=ocr_config.get("provider", "auto"),
-                            base_url=ocr_config.get("base_url", "auto"),
-                            model=ocr_config.get("model", "model"),
-                            prompt_mode=ocr_config.get("prompt_mode", "prompt_scene_spotting"),
-                            base_urls=ocr_base_urls,
-                            ocr_concurrency=ocr_config.get("concurrency", "auto"),
-                            fallback_base_url=ocr_config.get(
-                                "fallback_base_url",
-                                config.get("operation_manual", {}).get("llm_base_url"),
-                            ),
-                            fallback_model=ocr_config.get(
-                                "fallback_model",
-                                config.get("operation_manual", {}).get("vision_model"),
-                            ),
-                            fallback_api_key=ocr_config.get(
-                                "fallback_api_key",
-                                config.get("clients", {}).get("openai_api", {}).get("api_key", "0"),
-                            ),
-                            request_timeout_seconds=ocr_config.get("timeout_seconds", 120),
-                            max_tokens=ocr_config.get("max_tokens", 1024),
-                            max_image_long_side=ocr_config.get("max_image_long_side", 1280),
-                            retry_endpoints=bool(ocr_config.get("retry_endpoints", True)),
-                            probe_timeout_seconds=ocr_config.get("probe_timeout_seconds", 5),
-                            warmup_timeout_seconds=ocr_config.get("warmup_timeout_seconds", 180),
-                            warmup_retry_interval_seconds=ocr_config.get("warmup_retry_interval_seconds", 5),
-                            cache_mode=ocr_config.get("cache", "on"),
-                            cache_dir=ocr_config.get("cache_dir", ".cache/video-analyzer/ocr"),
-                        )
+                if selected_ocr_frames:
+                    with analyzer_resource_lock(config.config, "ocr", str(output_dir), logger):
+                        with local_model_stage("ocr", config.config, logger, str(output_dir)):
+                            ocr_events = run_ocr(
+                                frames=selected_ocr_frames,
+                                provider=ocr_config.get("provider", "auto"),
+                                base_url=ocr_config.get("base_url", "auto"),
+                                model=ocr_config.get("model", "model"),
+                                prompt_mode=ocr_config.get("prompt_mode", "prompt_scene_spotting"),
+                                base_urls=ocr_base_urls,
+                                ocr_concurrency=ocr_config.get("concurrency", "auto"),
+                                fallback_base_url=ocr_config.get(
+                                    "fallback_base_url",
+                                    config.get("operation_manual", {}).get("llm_base_url"),
+                                ),
+                                fallback_model=ocr_config.get(
+                                    "fallback_model",
+                                    config.get("operation_manual", {}).get("vision_model"),
+                                ),
+                                fallback_api_key=ocr_config.get(
+                                    "fallback_api_key",
+                                    config.get("clients", {}).get("openai_api", {}).get("api_key", "0"),
+                                ),
+                                request_timeout_seconds=ocr_config.get("timeout_seconds", 120),
+                                max_tokens=ocr_config.get("max_tokens", 1024),
+                                max_image_long_side=ocr_config.get("max_image_long_side", 1280),
+                                retry_endpoints=bool(ocr_config.get("retry_endpoints", True)),
+                                probe_timeout_seconds=ocr_config.get("probe_timeout_seconds", 5),
+                                warmup_timeout_seconds=ocr_config.get("warmup_timeout_seconds", 180),
+                                warmup_retry_interval_seconds=ocr_config.get("warmup_retry_interval_seconds", 5),
+                                cache_mode=ocr_config.get("cache", "on"),
+                                cache_dir=ocr_config.get("cache_dir", ".cache/video-analyzer/ocr"),
+                            )
+                else:
+                    logger.info("No OCR frames selected; skipping OCR provider calls.")
                 ocr_text_events = build_ocr_text_events(ocr_events)
                 ocr_keyframe_metadata["ocr_text_events_count"] = len(ocr_text_events)
                 ocr_keyframe_metadata["text_events"] = ocr_text_events
@@ -798,19 +852,23 @@ def main():
                 frame_selection_metadata.update(selection_metadata)
                 timings["frame_selection_seconds"] = round(time.perf_counter() - stage_started, 3)
                 vl_started = time.perf_counter()
-                with analyzer_resource_lock(config.config, "vl", str(output_dir), logger):
-                    with local_model_stage("vl", config.config, logger, str(output_dir)):
-                        frame_analyses = analyze_frames_for_vl(
-                            analyzer=analyzer,
-                            frames=frames,
-                            ocr_events=ocr_events,
-                            selected_frame_numbers=selected_frame_numbers,
-                            decisions=frame_decisions,
-                            concurrency=max(args.vl_concurrency, 1),
-                            context_before=max(args.vl_context_before, 0),
-                            context_after=max(args.vl_context_after, 0),
-                            context_max_gap=args.vl_context_max_gap,
-                        )
+                if frames:
+                    with analyzer_resource_lock(config.config, "vl", str(output_dir), logger):
+                        with local_model_stage("vl", config.config, logger, str(output_dir)):
+                            frame_analyses = analyze_frames_for_vl(
+                                analyzer=analyzer,
+                                frames=frames,
+                                ocr_events=ocr_events,
+                                selected_frame_numbers=selected_frame_numbers,
+                                decisions=frame_decisions,
+                                concurrency=max(args.vl_concurrency, 1),
+                                context_before=max(args.vl_context_before, 0),
+                                context_after=max(args.vl_context_after, 0),
+                                context_max_gap=args.vl_context_max_gap,
+                            )
+                else:
+                    logger.info("No video frames available; skipping VL provider calls.")
+                    frame_analyses = []
                 timings["vl_seconds"] = round(time.perf_counter() - vl_started, 3)
             else:
                 frame_analyses = []

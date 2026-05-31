@@ -133,12 +133,23 @@ fi
 export_one() {
   local rel="$1"
   local input="$RUN_DIR/$rel"
-  if [ ! -f "$input" ]; then
-    echo "[skip missing] $rel" >&2
-    return 0
-  fi
   local name
-  name="$(basename "$input" .md)"
+  name="$(basename "$rel" .md)"
+  if [ ! -f "$input" ]; then
+    case "$rel" in
+      docs_analysis_chapters/knowledge_notes_v2.md)
+        input="$RUN_DIR/docs_analysis/knowledge_notes.md"
+        ;;
+      docs_analysis_chapters/deep_report_v2.md)
+        input="$RUN_DIR/docs_analysis/deep_report.md"
+        ;;
+    esac
+    if [ ! -f "$input" ]; then
+      echo "[skip missing] $rel" >&2
+      return 0
+    fi
+    echo "[fallback] $rel <- ${input#$RUN_DIR/}" >&2
+  fi
   local prepared="$RUN_DIR/.$name.export.md"
   cleanup_prepared() {
     rm -f "$RUN_DIR/.$name.export.md" "$RUN_DIR/.$name.export."*.md "$RUN_DIR/..$name.export."*.md

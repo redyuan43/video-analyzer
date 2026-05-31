@@ -26,6 +26,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from video_analyzer.resource_locks import DEFAULT_LOCK_DIR
+from video_analyzer.url_context import FALLBACK_OUTPUT_ROOT, infer_video_id_from_url, safe_slug
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -1796,6 +1797,13 @@ class VideoLinkStatusServer:
         for value in values:
             if value:
                 return self.resolve_output_path(str(value))
+        video_id = infer_video_id_from_url(str(job.get("video_url") or ""))
+        if video_id:
+            video_dir = self.resolve_output_path(str(Path(FALLBACK_OUTPUT_ROOT) / safe_slug(video_id)))
+            for extension in sorted(VIDEO_PREVIEW_EXTENSIONS):
+                candidate = video_dir / f"video{extension}"
+                if candidate.is_file():
+                    return candidate
         return None
 
     def preview_duration_seconds(self, job: dict[str, Any]) -> int | None:
@@ -1894,7 +1902,7 @@ class VideoLinkStatusServer:
         public["stage_progress"] = self.stage_progress(public)
         public["preview"] = self.preview_metadata(public)
         public["vscode_preview"] = self.vscode_preview_metadata(public, public_host)
-        public["warnings"] = list(job.get("warnings") or [])
+        public["warnings"] = self.active_warnings(public)
         queued_stage = public["queue"].get("stage")
         if queued_stage and queued_stage in public["stages"]:
             public["stages"][queued_stage] = dict(public["stages"][queued_stage])
@@ -1903,6 +1911,33 @@ class VideoLinkStatusServer:
         current_info = public["stages"].get(current_stage or "", {})
         public["process"] = self.public_process_info(current_info.get("process"))
         return public
+
+    def active_warnings(self, job: dict[str, Any]) -> list[dict[str, Any]]:
+        warnings = []
+        stages = job.get("stages") or {}
+        audio_only = self.audio_only_job(job)
+        for warning in job.get("warnings") or []:
+            stage = normalize_stage_name(warning.get("stage") or "")
+            stage_info = stages.get(stage) or {}
+            if stage_info.get("status") == "succeeded":
+                continue
+            if audio_only and stage == "deep-v2":
+                continue
+            warnings.append(warning)
+        return warnings
+
+    def audio_only_job(self, job: dict[str, Any]) -> bool:
+        run_dir_value = job.get("run_dir")
+        if not run_dir_value:
+            return False
+        manifest_path = Path(run_dir_value) / "frames_manifest.json"
+        if not manifest_path.is_file():
+            return False
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        return isinstance(payload, dict) and payload.get("source") == "audio_only"
 
     def resolve_job_title(self, job: dict[str, Any]) -> str:
         for value in (

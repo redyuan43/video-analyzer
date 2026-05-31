@@ -1284,6 +1284,17 @@ figure.markdown-image figcaption {
     padding: 7px 10px;
 }
 
+.preview-source-link {
+    color: #155eef;
+    font-size: 12px;
+    text-decoration: none;
+    white-space: nowrap;
+}
+
+.preview-source-link:hover {
+    text-decoration: underline;
+}
+
 .preview-time,
 .scan-meter-head span {
     color: #667085;

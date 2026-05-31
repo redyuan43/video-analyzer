@@ -1432,9 +1432,12 @@ function renderPreviewCard(job) {
     const percent = scanPercent(job);
     const durationSeconds = Number(preview.duration_seconds || 0);
     const video = ready
-        ? `<video class="preview-video" preload="metadata" playsinline src="${escapeHtml(preview.video_url)}"></video>`
+        ? `<video class="preview-video" preload="none" playsinline data-src="${escapeHtml(preview.video_url)}"></video>`
         : `<div class="preview-placeholder">${failed ? '加载停止' : '等待视频'}</div>`;
     const buttonLabel = ready ? '播放' : (failed ? '失败' : '等待');
+    const sourceLink = job.video_url
+        ? `<a class="preview-source-link" href="${escapeHtml(job.video_url)}" target="_blank" rel="noreferrer">原站</a>`
+        : '';
     return `<article class="preview-card ${escapeHtml(job.status || 'created')} ${scanning ? 'scanning' : ''} ${failed ? 'preview-failed' : ''}"
         data-job-id="${escapeHtml(job.job_id)}"
         data-status="${escapeHtml(job.status || 'created')}"
@@ -1450,10 +1453,11 @@ function renderPreviewCard(job) {
             </div>
         </div>
         <div class="preview-body">
-            <strong title="${escapeHtml(job.video_url || job.job_id)}">${escapeHtml(job.video_url || job.job_id)}</strong>
+            <strong title="${escapeHtml(jobDisplayTitle(job))}">${escapeHtml(jobDisplayTitle(job))}</strong>
             <div class="video-controls">
                 <button class="preview-play" type="button" data-job-id="${escapeHtml(job.job_id)}" ${ready ? '' : 'disabled'}>${buttonLabel}</button>
                 <span class="preview-time" data-job-id="${escapeHtml(job.job_id)}">0:00 / ${escapeHtml(formatClock(durationSeconds))}</span>
+                ${sourceLink}
             </div>
             <input class="video-seek" data-job-id="${escapeHtml(job.job_id)}" type="range" min="0" max="1000" value="0" ${ready ? '' : 'disabled'} aria-label="视频进度">
             <div class="scan-meter">
@@ -1503,11 +1507,20 @@ function setPreviewButton(video, label) {
 async function togglePreviewPlayback(jobId) {
     const video = previewVideo(jobId);
     if (!video) return;
+    ensurePreviewVideoSource(video);
     if (video.paused) {
         await video.play().catch(() => markPreviewVideoError(video));
     } else {
         video.pause();
     }
+}
+
+function ensurePreviewVideoSource(video) {
+    if (!video || video.src) return;
+    const source = video.dataset.src || '';
+    if (!source) return;
+    video.src = source;
+    video.load();
 }
 
 async function openPreviewRunDir(jobId) {
