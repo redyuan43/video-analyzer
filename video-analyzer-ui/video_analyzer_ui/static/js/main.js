@@ -1634,10 +1634,38 @@ async function copySelectedLog() {
     if (!stage) return;
     try {
         const log = await getJson(`/api/video-link/jobs/${selectedJobId}/logs/${stage}?full=1`);
-        await navigator.clipboard.writeText(log.text || (log.lines || []).join('\n'));
+        await copyText(log.text || (log.lines || []).join('\n'));
         nodes.copyMessage.textContent = '已复制';
     } catch (error) {
         nodes.copyMessage.textContent = `复制失败：${error.message}`;
+    }
+}
+
+async function copyText(text) {
+    const value = String(text || '');
+    if (navigator.clipboard?.writeText && window.isSecureContext) {
+        try {
+            await navigator.clipboard.writeText(value);
+            return;
+        } catch (_error) {
+            // Fall through to the textarea path for HTTP/Tailscale dashboards.
+        }
+    }
+    const textarea = document.createElement('textarea');
+    textarea.value = value;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.top = '-1000px';
+    textarea.style.left = '-1000px';
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    try {
+        if (!document.execCommand('copy')) {
+            throw new Error('浏览器拒绝复制');
+        }
+    } finally {
+        textarea.remove();
     }
 }
 

@@ -3522,12 +3522,36 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
       }}
       try {{
         const log = await fetch(`/api/video-link/jobs/${{currentJobId}}/logs/${{stage}}?full=1`).then(r => r.json());
-        await navigator.clipboard.writeText(log.text || (log.lines || []).join("\\n"));
+        await copyText(log.text || (log.lines || []).join("\\n"));
         message.textContent = "已复制";
       }} catch (error) {{
         message.textContent = `复制失败：${{error.message}}`;
       }}
     }});
+    async function copyText(value) {{
+      const textValue = String(value || "");
+      if (navigator.clipboard?.writeText && window.isSecureContext) {{
+        try {{
+          await navigator.clipboard.writeText(textValue);
+          return;
+        }} catch (_error) {{
+        }}
+      }}
+      const textarea = document.createElement("textarea");
+      textarea.value = textValue;
+      textarea.setAttribute("readonly", "");
+      textarea.style.position = "fixed";
+      textarea.style.top = "-1000px";
+      textarea.style.left = "-1000px";
+      document.body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+      try {{
+        if (!document.execCommand("copy")) throw new Error("浏览器拒绝复制");
+      }} finally {{
+        textarea.remove();
+      }}
+    }}
     document.getElementById("runButton").addEventListener("click", async () => {{
       const button = document.getElementById("runButton");
       const message = document.getElementById("runMessage");

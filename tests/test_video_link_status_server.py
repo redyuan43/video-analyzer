@@ -1502,6 +1502,8 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertIn('id="copyLogButton"', html)
         self.assertIn('id="corePanel"', html)
         self.assertIn("?full=1", html)
+        self.assertIn("copyText", html)
+        self.assertIn('document.execCommand("copy")', html)
         self.assertIn("查看日志", html)
 
 

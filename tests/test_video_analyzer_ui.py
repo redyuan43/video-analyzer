@@ -48,6 +48,8 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn('id="resourceLanes"', html)
         self.assertIn('id="jobList"', html)
         self.assertIn('id="copyLogButton"', html)
+        self.assertIn("copyText", (UI_ROOT / "video_analyzer_ui" / "static" / "js" / "main.js").read_text(encoding="utf-8"))
+        self.assertIn("document.execCommand('copy')", (UI_ROOT / "video_analyzer_ui" / "static" / "js" / "main.js").read_text(encoding="utf-8"))
         self.assertIn('id="stageDurationSummary"', html)
         self.assertIn('id="previewView"', html)
         self.assertIn('id="previewGrid"', html)
