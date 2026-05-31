@@ -8,17 +8,45 @@ usage() {
   echo "Usage: $0 asr|ocr|vl" >&2
 }
 
+stop_pids() {
+  local pids="$1"
+  [[ -z "${pids}" ]] && return 0
+  xargs -r kill <<<"${pids}" || true
+  for _ in $(seq 1 30); do
+    local remaining=()
+    while read -r pid; do
+      [[ -z "${pid}" ]] && continue
+      kill -0 "${pid}" 2>/dev/null && remaining+=("${pid}")
+    done <<<"${pids}"
+    if (( ${#remaining[@]} == 0 )); then
+      return 0
+    fi
+    sleep 1
+  done
+  xargs -r kill -9 <<<"${pids}" || true
+}
+
+stop_matching() {
+  local pattern="$1"
+  local pids
+  pids="$(pgrep -f "${pattern}" || true)"
+  stop_pids "${pids}"
+}
+
 stop_ocr() {
   systemctl --user stop dots-mocr-p40.service >/dev/null 2>&1 || true
   ps -eo pid=,comm=,args= \
     | awk '/python/ && /\/home\/ai\/ocr-deploy\/scripts\/dots_mocr_p40_proxy.py|\/home\/ai\/ocr-deploy\/dots\.mocr\/weights\/DotsMOCR/ {print $1}' \
-    | xargs -r kill || true
+    | {
+        pids="$(cat)"
+        stop_pids "${pids}"
+      }
 }
 
 stop_vibevoice() {
   systemctl --user stop vibevoice-p40-asr.service >/dev/null 2>&1 || true
-  pkill -f "[v]ibevoice_vllm_p40_http_server.py" || true
-  pkill -f "[v]llm.entrypoints.openai.api_server --host 127.0.0.1 --port 1800[0-4]" || true
+  stop_matching "[v]ibevoice_vllm_p40_http_server.py"
+  stop_matching "[v]llm.entrypoints.openai.api_server --host 127.0.0.1 --port 1800[0-4]"
 }
 
 stop_minicpm() {
@@ -27,7 +55,11 @@ stop_minicpm() {
 
 start_vibevoice() {
   local workers="${VIBEVOICE_WORKER_COUNT:-5}"
-  "/home/ai/github/VibeVoice-bench/start_vibevoice_p40_workers.sh" "${workers}"
+  stop_vibevoice
+  if ! "/home/ai/github/VibeVoice-bench/start_vibevoice_p40_workers.sh" "${workers}"; then
+    stop_vibevoice
+    return 1
+  fi
 }
 
 start_ocr() {

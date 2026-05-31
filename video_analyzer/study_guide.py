@@ -165,6 +165,14 @@ def load_frame_manifest(run_dir: Path) -> dict[int, dict[str, Any]]:
     return result
 
 
+def is_audio_only_run(run_dir: Path) -> bool:
+    manifest_path = run_dir / "frames_manifest.json"
+    if not manifest_path.is_file():
+        return False
+    payload = read_json(manifest_path)
+    return isinstance(payload, dict) and payload.get("source") == "audio_only"
+
+
 def build_chapters(run_dir: Path, transcript: dict[str, Any]) -> list[dict[str, Any]]:
     page_context = read_text_if_exists(run_dir / "orin" / "page_context.md") or read_text_if_exists(run_dir.parent / "page_context.md")
     chapters = parse_chapters(page_context, transcript)
@@ -342,8 +350,9 @@ def detect_evidence_gaps(
     chapter_packets: list[dict[str, Any]],
 ) -> dict[str, Any]:
     items: list[dict[str, Any]] = []
+    audio_only = is_audio_only_run(run_dir)
 
-    if not frames:
+    if not frames and not audio_only:
         add_gap(items, "frames_manifest_missing", "error", "frames_manifest.json 不存在或为空", None)
     for frame in frames.values():
         if not frame.get("exists"):
@@ -355,7 +364,7 @@ def detect_evidence_gaps(
         add_gap(items, "asr_empty", "error", "ASR transcript 为空或缺少 segments", None)
 
     ocr_events = load_ocr_events(run_dir, analysis)
-    if not ocr_events:
+    if not ocr_events and not audio_only:
         add_gap(items, "ocr_empty", "warning", "OCR events 为空", None)
     for index, event in enumerate(ocr_events):
         text = clean_text(event.get("text"))
@@ -367,7 +376,7 @@ def detect_evidence_gaps(
             add_gap(items, "ocr_text_empty", "info", "OCR 文本为空", frame, evidence_id=f"ocr_{index:04d}")
 
     frame_analyses = load_frame_analyses(run_dir, analysis)
-    if not frame_analyses:
+    if not frame_analyses and not audio_only:
         add_gap(items, "vl_empty", "warning", "VL frame analyses 为空", None)
     for index, event in enumerate(frame_analyses):
         text = clean_text(event.get("response") or event.get("text"))

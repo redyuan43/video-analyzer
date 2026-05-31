@@ -35,6 +35,9 @@ DOWNLOAD_DEVICE_CHOICES = (LOCAL_DOWNLOAD_DEVICE, "mi")
 DOWNLOAD_DEVICE_REMOTE_ROOTS = {
     "mi": "/home/ivan/Documents/video-analyzer-url-downloads",
 }
+VIDEO_MEDIA_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".flv", ".avi", ".m4v"}
+AUDIO_MEDIA_EXTENSIONS = {".m4a", ".mp3", ".wav", ".aac", ".opus", ".ogg", ".flac"}
+MEDIA_EXTENSIONS = VIDEO_MEDIA_EXTENSIONS | AUDIO_MEDIA_EXTENSIONS
 
 
 def parse_args() -> argparse.Namespace:
@@ -85,6 +88,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ytdlp-extractor-args",
         help="Forward to yt-dlp --extractor-args, e.g. youtube:player_client=tv,web_safari.",
+    )
+    parser.add_argument(
+        "--ytdlp-remote-components",
+        help="Forward to yt-dlp --remote-components for JS challenge solvers, e.g. ejs:github; use none to disable.",
     )
     parser.add_argument("--refresh-context", action="store_true", help="Refresh page context, subtitles, and comments without redownloading an existing video")
     parser.add_argument(
@@ -164,6 +171,7 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
         "subtitle_langs": profile.get("subtitle_langs", FALLBACK_SUBTITLE_LANGS),
         "ytdlp_js_runtimes": profile.get("ytdlp_js_runtimes", "auto"),
         "ytdlp_extractor_args": profile.get("ytdlp_extractor_args"),
+        "ytdlp_remote_components": profile.get("ytdlp_remote_components", "ejs:github"),
         "download_device": profile.get("download_device", LOCAL_DOWNLOAD_DEVICE),
         "prefer_subtitle_transcript": profile.get("prefer_subtitle_transcript", True),
         "frame_extractor": profile.get("frame_extractor", "local"),
@@ -203,7 +211,7 @@ def main() -> int:
         video_dir = output_root / video_id
         video_dir.mkdir(parents=True, exist_ok=True)
 
-    video_path = video_dir / "video.mp4"
+    video_path = materialized_media_path(video_dir) or video_dir / "video.mp4"
     info_path = video_dir / "info.json"
     description_path = video_dir / "description.md"
     page_context_path = video_dir / "page_context.md"
@@ -218,7 +226,7 @@ def main() -> int:
             pass
         elif args.download_device != LOCAL_DOWNLOAD_DEVICE:
             video_dir = remote_download_video_dir(args, output_root)
-            video_path = video_dir / "video.mp4"
+            video_path = materialized_media_path(video_dir) or video_dir / "video.mp4"
             info_path = video_dir / "info.json"
             description_path = video_dir / "description.md"
             page_context_path = video_dir / "page_context.md"
@@ -226,7 +234,7 @@ def main() -> int:
             download_context_assets(args.url, video_dir, args)
         else:
             download_video(args.url, video_dir, args)
-            materialize_download(video_dir, video_path)
+            video_path = materialize_download(video_dir, video_dir / "video.mp4")
         info = load_downloaded_info(video_dir) or info
         info_path.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
         description_text = build_context_markdown(info, args.url)
@@ -353,6 +361,9 @@ def append_remote_ytdlp_runtime_args(command: list[str], args: argparse.Namespac
         value = "node"
     if value and value.lower() not in {"none", "no", "off", "false", "disabled"}:
         command.extend(["--js-runtimes", shell_quote(value)])
+        remote_components = str(getattr(args, "ytdlp_remote_components", None) or "").strip()
+        if remote_components and remote_components.lower() not in {"none", "no", "off", "false", "disabled"}:
+            command.extend(["--remote-components", shell_quote(remote_components)])
     extractor_args = str(getattr(args, "ytdlp_extractor_args", None) or "").strip()
     if extractor_args and extractor_args.lower() not in {"none", "no", "off", "false", "disabled"}:
         command.extend(["--extractor-args", shell_quote(extractor_args)])
@@ -431,7 +442,7 @@ def existing_video_dir_for_url(output_root: Path, url: str) -> Path | None:
     video_id = infer_video_id_from_url(url)
     candidates = [output_root / safe_slug(video_id)] if video_id else []
     for path in candidates:
-        if (path / "video.mp4").is_file() and (path / "page_context.md").is_file():
+        if materialized_media_path(path) and (path / "page_context.md").is_file():
             return path
     return None
 
@@ -469,24 +480,42 @@ def add_ytdlp_runtime_args(command: list[str], args: argparse.Namespace) -> None
         value = "node" if shutil.which("node") else ""
     if value and value.lower() not in {"none", "no", "off", "false", "disabled"} and "--js-runtimes" not in command:
         command.extend(["--js-runtimes", value])
+        remote_components = str(getattr(args, "ytdlp_remote_components", None) or "").strip()
+        if remote_components and remote_components.lower() not in {"none", "no", "off", "false", "disabled"}:
+            command.extend(["--remote-components", remote_components])
     extractor_args = str(getattr(args, "ytdlp_extractor_args", None) or "").strip()
     if extractor_args and extractor_args.lower() not in {"none", "no", "off", "false", "disabled"}:
         command.extend(["--extractor-args", extractor_args])
 
 
-def materialize_download(video_dir: Path, video_path: Path) -> None:
+def materialized_media_path(video_dir: Path) -> Path | None:
+    preferred = [video_dir / "video.mp4"]
+    preferred.extend(sorted(video_dir.glob("video.*")))
+    preferred.extend(sorted(video_dir.glob("audio.*")))
+    for path in preferred:
+        if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS:
+            return path
+    return None
+
+
+def materialize_download(video_dir: Path, video_path: Path) -> Path:
     candidates = sorted(video_dir.glob("download.*"))
     media_candidates = [
         path
         for path in candidates
-        if path.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".flv"} and path.name != video_path.name
+        if path.suffix.lower() in MEDIA_EXTENSIONS and path.name != video_path.name
     ]
     if not media_candidates:
-        raise RuntimeError(f"yt-dlp did not produce a video file in {video_dir}")
+        raise RuntimeError(f"yt-dlp did not produce a media file in {video_dir}")
     source = media_candidates[0]
-    if video_path.exists():
+    suffix = source.suffix.lower()
+    target_path = video_path if suffix in VIDEO_MEDIA_EXTENSIONS else video_dir / f"audio{suffix}"
+    if video_path.exists() and video_path != target_path:
         video_path.unlink()
-    source.rename(video_path)
+    if target_path.exists():
+        target_path.unlink()
+    source.rename(target_path)
+    return target_path
 
 
 def build_context_markdown(info: dict[str, Any], url: str) -> str:
