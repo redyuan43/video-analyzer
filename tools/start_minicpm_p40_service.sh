@@ -49,6 +49,18 @@ stop_pattern() {
   pids="$(ps -eo pid=,args= | awk -v pattern="${pattern}" 'index($0, pattern) && $1 != PROCINFO["pid"] {print $1}')"
   if [[ -n "${pids}" ]]; then
     xargs -r kill <<<"${pids}" || true
+    for _ in $(seq 1 "${MINICPM_STOP_TIMEOUT:-30}"); do
+      local remaining=()
+      while read -r pid; do
+        [[ -z "${pid}" ]] && continue
+        kill -0 "${pid}" 2>/dev/null && remaining+=("${pid}")
+      done <<<"${pids}"
+      if (( ${#remaining[@]} == 0 )); then
+        return 0
+      fi
+      sleep 1
+    done
+    xargs -r kill -9 <<<"${pids}" || true
   fi
 }
 
