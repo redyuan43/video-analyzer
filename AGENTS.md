@@ -7,96 +7,69 @@
 - Do not commit or push unless the user explicitly asks for it.
 - Keep local runtime overrides in `config/config.json`; do not commit machine-specific endpoint or model configuration.
 - Prefer `rg` for code and documentation search.
-- Operation-manual run scripts must bypass local proxy variables for LAN/Tailscale endpoints. Source `tools/operation_manual_no_proxy_env.sh` instead of letting `HTTP_PROXY`/`ALL_PROXY` route Spark, Edge, AMD Fast, or Jetson traffic through local proxies such as `127.0.0.1:10808`.
-- Keep DotsMOCR OCR endpoint configuration on stable MagicDNS names. The OCR client has a runtime fallback that uses `tailscale status --json` to resolve the current Tailscale IP if MagicDNS lookup fails.
+- Operation-manual run scripts must bypass local proxy variables for LAN/Tailscale endpoints. Source `tools/operation_manual_no_proxy_env.sh` instead of letting `HTTP_PROXY`/`ALL_PROXY` route local loopback services, AMD Fast, Jetson, or other LAN/Tailscale traffic through local proxies such as `127.0.0.1:10808`.
+- Keep runtime endpoints aligned with the current `ai` host by default. Do not switch ASR/OCR/VL work to Spark or Edge unless the user explicitly asks for a cross-machine comparison or fallback.
 - If the user's request is clearly part of an ongoing implementation or says to continue, keep executing the next required step instead of stopping at a status update. Report concise progress, then continue until the task is genuinely blocked or complete.
 
 ## Operation Manual Runtime
 
-- On the `ai` host, local GPU model services are mutually exclusive by default.
+- On the `ai` host, operation-manual model work is local-first by default.
   Before using any local loopback model endpoint such as VibeVoice ASR,
   DotsMOCR OCR, or MiniCPM VL, the analyzer must hold the global
   `local-model-runtime` lock for the whole model-using stage. A second task
   must wait on that lock and must not unload or replace the currently active
   local model until the first task finishes its ASR/OCR/VL stage and releases
   the lock. Stage switching uses `tools/prepare_ai_local_model_stage.sh` for
-  loopback endpoints only; remote Spark/Edge/AMD endpoints should not trigger
+  loopback endpoints only; remote endpoints should not trigger
   local service switching.
-- The default operation-manual ASR path should use remote VibeVoice on Spark/Edge services. Do not add local Whisper or CPU fallback just to hide remote service failures.
-- The project-wide LLM/VL endpoint is AMD Fast:
+- The default operation-manual ASR path should use local VibeVoice on the current `ai` machine:
+  `http://127.0.0.1:18012/api/asr/transcribe`. Do not add local Whisper or CPU fallback just to hide VibeVoice failures.
+- The current `ai` machine has five Tesla P40 cards plus one Tesla V100. VibeVoice uses the P40/Pascal runtime and must exclude the V100 until the user explicitly asks to validate a V100 path.
+- When starting VibeVoice workers, choose only P40 GPU indices from current `nvidia-smi` output. As of 2026-06-01, the expected P40 indices are `0,1,2,4,5`; GPU `3` is `Tesla V100-SXM2-16GB` and should not be included in VibeVoice worker mapping.
+- If VibeVoice startup fails with an apparent CUDA OOM on a 15-16 GiB device, first suspect that the V100 was selected accidentally. Check `nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total --format=csv,noheader` and fix the GPU mapping before changing model length, memory utilization, or ASR provider.
+- The project-wide text/VL endpoint is configured by the active runtime profile. Current local overrides may intentionally use loopback services such as MiniCPM or DotsMOCR; keep those on the current machine unless the user asks otherwise. Historical AMD Fast settings are reference-only, not a reason to move work off `ai`.
+- Historical AMD Fast reference:
   - Base URL: `http://100.90.114.26:18081/v1`
   - Model: `hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive`
-  Use this same OpenAI-compatible model for frame vision analysis and final text/manual generation. Do not route this project through the generic SayAnything Gateway unless the user explicitly asks for a cross-service comparison.
-- For long or strict ASR runs, use the VibeVoice HTTP endpoint on either:
-  - `http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe`
-  - `http://edge.taild500c8.ts.net:8012/api/asr/transcribe`
-- Both `8012` endpoints are lazy proxies. They should keep the VibeVoice backend unloaded until a request arrives.
-- The persistent VibeVoice Ray pool is:
-  - Spark Ray head: `vibevoice-ray-head.service` on `spark-31d6`, `10.31.36.1:6379`
-  - Edge Ray worker: `vibevoice-ray-worker.service` on `edge`, `10.31.36.2`
-  - Ray resources: `vibevoice_spark:1`, `vibevoice_edge:1`, `GPU:2`
-- Both VibeVoice backend services should use Ray mode:
-  - `VIBEVOICE_WORKER_BACKEND=ray`
-  - `VIBEVOICE_RAY_ADDRESS=10.31.36.1:6379`
-  - `VIBEVOICE_RAY_REQUIRED_ACTORS=spark,edge`
-  - `VIBEVOICE_CHUNK_PARALLEL_WORKERS=2`
-  - `VIBEVOICE_RAY_FALLBACK=raise`
-- Both machines use shared logical model paths:
-  - `/tmp/vibevoice-model`
-  - `/tmp/qwen-tokenizer`
-  These are symlinks to each machine's own Hugging Face cache. Do not pass `/home/admin/...` paths to Spark or `/home/dgx/...` paths to Edge.
-- Ray worker import requires `PYTHONPATH` to include the local `VibeVoice-bench` checkout on each machine.
+  Use this OpenAI-compatible model only when the selected runtime profile points to AMD Fast or the user explicitly requests it. Do not route this project through the generic SayAnything Gateway unless the user explicitly asks for a cross-service comparison.
+- Spark/Edge VibeVoice and Ray notes are historical fallback context only. Do not probe, SSH into, or route operation-manual ASR to Spark/Edge during normal work on this repo.
 
 ## Verification Commands
 
-Use these checks before claiming the dual-worker path is healthy:
+Use these checks before claiming the local VibeVoice path is healthy:
 
 ```bash
-ssh dgx@spark-31d6.taild500c8.ts.net \
-  "/home/dgx/github/VibeVoice-bench/.venv/bin/ray status"
+nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total --format=csv,noheader
+curl --noproxy "*" -fsS http://127.0.0.1:18012/api/health | python3 -m json.tool
 ```
 
-Expected resources include both `vibevoice_spark` and `vibevoice_edge`.
-
-```bash
-ssh admin@edge.taild500c8.ts.net \
-  "curl -fsS http://127.0.0.1:8012/api/health | python3 -m json.tool"
-ssh dgx@spark-31d6.taild500c8.ts.net \
-  "curl -fsS http://127.0.0.1:8012/api/health | python3 -m json.tool"
-```
-
-Expected health contains `"ray": {"enabled": true, ...}`. `connected` may remain false while idle; it becomes connected when a transcription request creates Ray actors.
+Expected GPU selection includes only P40 cards for VibeVoice workers. The V100 must remain excluded unless explicitly requested.
 
 For a real smoke test, send a short audio file and force chunking:
 
 ```bash
-curl -fsS -X POST http://127.0.0.1:8012/api/asr/transcribe \
+curl --noproxy "*" -fsS -X POST http://127.0.0.1:18012/api/asr/transcribe \
   -F audio=@/tmp/vibevoice-smoke-4min.wav \
   -F use_native_chunking=true \
   -F single_pass_max_duration_sec=1 \
   -F chunk_duration_sec=120 \
-  -F chunk_overlap_sec=10 \
-  -F chunk_parallel_workers=2
+  -F chunk_overlap_sec=10
 ```
 
-A passing dual-worker response includes:
+A passing local response includes:
 
 ```json
 {
   "success": true,
-  "mode": "ray_chunk_reconcile",
-  "chunk_parallel_workers": 2,
-  "ray_enabled": true,
-  "ray_fallback_active": false,
-  "ray_actor_names": ["spark", "edge"]
+  "provider": "vibevoice_remote"
 }
 ```
 
 ## Operational Notes
 
-- Keep only one long VibeVoice ASR job active at a time. A single dual-worker request consumes both GPUs.
-- After a smoke test, stop only `vibevoice-asr-backend.service` if you want to unload model actors. Keep Ray head/worker and lazy proxies active.
-- If `8012` health times out during a request, check GPU processes before declaring failure; model/actor initialization can occupy the backend until the request completes.
+- Keep only one long VibeVoice ASR job active at a time. A local multi-worker request consumes the selected P40 cards.
+- After a smoke test, unload only the local VibeVoice backend if needed; keep unrelated local services untouched.
+- If `18012` health times out during a request, check GPU processes before declaring failure; model initialization can occupy the backend until the request completes.
 
 ## Video Link Status Server
 
@@ -106,7 +79,7 @@ A passing dual-worker response includes:
 - Keep runtime progress and service failures visible on the home page, including failed stage, queue/resource state, error message, log path, selected log tail, full-log copy, core-analysis substeps, and artifact counts.
 - The background runner skips stages already marked `succeeded` or `skipped`, then resumes from the first incomplete stage. If a resource is busy, the stage should become `queued` instead of failing with a lock conflict.
 - The home page should expose only common and collection options: URL, analysis mode, profile, run name, browser cookie source, skip images, keep existing, subtitles, subtitle transcript preference, comments, max comments, subtitle languages, and refresh context.
-- Model endpoint/model overrides should stay in runtime profiles, not page fields. The default page profile should prefer `deepseek_v4_flash` when available.
+- Model endpoint/model overrides should stay in runtime profiles, not page fields. The default page profile should prefer `deepseek_v4_pro` when available.
 - Start or restart the server with:
   `tools/run_video_link_status_server.sh restart`
   The launcher defaults to this repo's `.venv/bin/python`; use `VIDEO_LINK_STATUS_PYTHON=...` only for an intentional override. It must use `setsid ... < /dev/null` so the server survives Codex command-session cleanup.
@@ -123,9 +96,9 @@ A passing dual-worker response includes:
   `python -m video_analyzer.cli VIDEO.mp4 --output NEW_RUN_DIR --context-file PAGE_CONTEXT.md --asr-provider none --transcript-file /abs/path/transcript.md ...`
   Prefer a new resume output directory when in doubt, so existing ASR/transcript artifacts are not destroyed.
 - If the requested text LLM changes while ASR is already running, let VibeVoice finish and write `transcript.md`, then stop before OCR/VL/manual generation and restart from that transcript with the new runtime profile/model. Do not rerun download or ASR just to change the final LLM.
-- When the user asks for DeepSeek V4 output, use the `deepseek_v4_flash` runtime profile for text/manual/multidoc stages. Treat DeepSeek V4 as a text/review path; keep visual frame analysis on the configured vision model such as MiniCPM unless the user explicitly asks to change the visual model.
+- When the user asks for DeepSeek V4 Pro output, use the `deepseek_v4_pro` runtime profile for text/manual/multidoc stages. Treat DeepSeek V4 Pro as a text/review path; keep visual frame analysis on the configured vision model such as MiniCPM unless the user explicitly asks to change the visual model.
 - For publisher resume after operation-manual artifacts already exist, use:
-  `~/.codex/skills/video-link/scripts/run_video_link_analysis_publisher.sh URL --profile deepseek_v4_flash --run-dir "$RUN_DIR" --skip-operation`
+  `~/.codex/skills/video-link/scripts/run_video_link_analysis_publisher.sh URL --profile deepseek_v4_pro --run-dir "$RUN_DIR" --skip-operation`
 - Current final publish is mobile-first PDF-only by default. Do not require `.long.png` unless the user explicitly asks for long-image delivery.
 - The default PDF backend is `tools/md_to_mobile_pdf.py` through `tools/export_video_docs.sh`. It renders prepared Markdown to narrow mobile-readable PDF with WeasyPrint. Simple acyclic `flowchart TB/TD` and `graph TB/TD/LR/RL` Mermaid blocks should render as native mobile HTML flowcharts, including branch/merge flows and `<br/>` label breaks; more complex Mermaid blocks rely on `@mermaid-js/mermaid-cli` plus Chrome/Chromium PNG rendering. If a PDF shows raw Mermaid source, first check whether the diagram is outside the built-in simple-flow renderer and whether the Mermaid CLI/Puppeteer/Chrome path is failing.
 - Optional long-image delivery uses `tools/export_video_docs.sh --long-png` or `tools/run_video_doc_final_publish.sh --long-png`. It converts each verified PDF page to PNG, trims page whitespace, and stitches pages into `<name>.long.png`.
