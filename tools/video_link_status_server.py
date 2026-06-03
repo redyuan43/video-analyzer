@@ -63,7 +63,7 @@ CORE_DIAGNOSTIC_NOT_READY_PATTERNS = (
 CORE_DIAGNOSTIC_STALE_SECONDS = 600
 CORE_DIAGNOSTIC_QUEUE_WARN_SECONDS = 300
 CORE_DIAGNOSTIC_EXPECTED_MINICPM_CONCURRENCY = 6
-CORE_DIAGNOSTIC_GPU_TTL_SECONDS = 5
+CORE_DIAGNOSTIC_GPU_TTL_SECONDS = 120
 CORE_DIAGNOSTIC_GPU_TIMEOUT_SECONDS = 0.8
 AUTO_MODE_LONG_SECONDS = 2700
 AUTO_MODE_FAST_KEYWORDS = (
@@ -510,7 +510,7 @@ class VideoLinkStatusServer:
         jobs = []
         for path in self.jobs_dir.glob("*/job.json"):
             try:
-                jobs.append(self.public_job(self.load_job(path.parent.name)))
+                jobs.append(self.public_job_summary(self.load_job(path.parent.name)))
             except Exception:
                 continue
         jobs.sort(key=lambda item: item.get("created_at") or "", reverse=True)
@@ -1998,6 +1998,35 @@ class VideoLinkStatusServer:
             public["stages"][queued_stage]["queue_position"] = public["queue"].get("position")
         current_stage = public.get("current_stage")
         current_info = public["stages"].get(current_stage or "", {})
+        public["process"] = self.public_process_info(current_info.get("process"))
+        return public
+
+    def public_job_summary(self, job: dict[str, Any]) -> dict[str, Any]:
+        public = {
+            "job_id": job["job_id"],
+            "video_url": job.get("video_url"),
+            "status": job.get("status"),
+            "created_at": job.get("created_at"),
+            "updated_at": job.get("updated_at"),
+            "options": job.get("options") or {},
+            "runner": job.get("runner") or {},
+            "stages": dict(job.get("stages") or {}),
+            "resolved_mode": job.get("resolved_mode") or ((job.get("artifacts") or {}).get("resolved_mode") or {}).get("value"),
+            "resolved_mode_reason": job.get("resolved_mode_reason")
+            or ((job.get("artifacts") or {}).get("resolved_mode_reason") or {}).get("value"),
+            "run_dir": job.get("run_dir"),
+            "video_path": job.get("video_path"),
+        }
+        title = self.resolve_job_title(public)
+        public["title"] = title
+        public["display_title"] = title or job.get("video_url") or job.get("job_id")
+        public["stage_order"] = STAGE_ORDER
+        public["progress"] = self.progress(job)
+        public["current_stage"] = self.current_stage(job)
+        public["next_stage"] = self.next_stage(job)
+        public["error_summary"] = self.error_summary(job)
+        public["dashboard_url"] = self.dashboard_url(job["job_id"])
+        current_info = public["stages"].get(public.get("current_stage") or "", {})
         public["process"] = self.public_process_info(current_info.get("process"))
         return public
 

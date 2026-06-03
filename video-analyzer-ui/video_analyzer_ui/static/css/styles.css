@@ -13,20 +13,28 @@
 
 body {
     margin: 0;
+    height: 100vh;
+    height: 100dvh;
+    overflow: hidden;
     background: #f5f7fa;
 }
 
 .app-shell {
-    width: min(1500px, calc(100vw - 32px));
-    margin: 0 auto;
-    padding: 20px 0 32px;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+    gap: 16px;
+    width: 100%;
+    height: 100vh;
+    height: 100dvh;
+    padding: 20px clamp(16px, 2vw, 32px) 0;
+    overflow: hidden;
 }
 
 .topbar {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: 16px;
+    margin-bottom: 0;
 }
 
 .topbar h1 {
@@ -67,19 +75,48 @@ body {
 
 .view-panel.active {
     display: grid;
+    min-height: 0;
 }
 
 .workspace {
     display: grid;
     grid-template-columns: minmax(300px, 360px) minmax(0, 1fr);
     gap: 16px;
-    align-items: start;
+    align-items: stretch;
+    overflow: hidden;
+    min-height: 0;
 }
 
 .sidebar,
 .main-panel {
     display: grid;
     gap: 14px;
+    align-content: start;
+    min-height: 0;
+    overflow: auto;
+}
+
+.sidebar,
+.main-panel {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+
+.sidebar > .panel:last-child {
+    flex: 1 1 180px;
+}
+
+.main-panel > .panel:last-child {
+    display: grid;
+    flex: 1 1 300px;
+    grid-template-rows: auto minmax(240px, 1fr) auto;
+    min-height: 0;
+}
+
+.main-panel > .panel:last-child pre {
+    height: 100%;
+    max-height: none;
 }
 
 .panel {
@@ -931,6 +968,8 @@ th {
 
 .preview-view {
     gap: 14px;
+    grid-template-rows: auto minmax(0, 1fr);
+    overflow: hidden;
 }
 
 .preview-toolbar,
@@ -950,6 +989,8 @@ th {
 
 .vscode-view {
     gap: 14px;
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    overflow: hidden;
 }
 
 .vscode-actions {
@@ -990,7 +1031,8 @@ th {
     display: grid;
     grid-template-columns: minmax(420px, 1fr) minmax(240px, 320px);
     gap: 14px;
-    min-height: 720px;
+    min-height: 0;
+    overflow: hidden;
 }
 
 .vscode-docs.preview-open {
@@ -1061,7 +1103,7 @@ th {
 }
 
 .study-body {
-    max-height: 680px;
+    height: 100%;
     overflow: auto;
     padding: 12px;
 }
@@ -1117,7 +1159,7 @@ th {
 }
 
 .doc-list {
-    max-height: 680px;
+    height: 100%;
     overflow: auto;
     padding: 8px;
 }
@@ -1169,7 +1211,7 @@ th {
 }
 
 .doc-preview-body {
-    height: 680px;
+    height: 100%;
     overflow: auto;
     padding: 22px;
     color: #101828;
@@ -1585,6 +1627,12 @@ pre {
 }
 
 @media (max-width: 980px) {
+    body {
+        height: auto;
+        min-height: 100vh;
+        overflow: auto;
+    }
+
     .workspace,
     .stats-panel,
     .info-grid,
@@ -1603,12 +1651,30 @@ pre {
     }
 
     .app-shell {
-        width: min(100vw - 20px, 720px);
+        height: auto;
+        min-height: 100vh;
+        overflow: visible;
+        padding: 12px 10px 24px;
+    }
+
+    .workspace,
+    .sidebar,
+    .main-panel,
+    .preview-view,
+    .vscode-view,
+    .vscode-docs {
+        overflow: visible;
     }
 }
 
 @media (min-width: 981px) and (max-width: 1240px) {
     .preview-grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
+@media (min-width: 1920px) {
+    .preview-grid {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
     }
 }

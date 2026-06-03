@@ -782,6 +782,17 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(result["summary"]["total"], 2)
         self.assertIn("core", result["resources"])
 
+    def test_list_jobs_uses_lightweight_summaries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            server.create_job({"video_url": "https://example.com/one"})
+
+            with patch.object(server, "core_diagnostics", side_effect=AssertionError("too expensive")):
+                result = server.list_jobs()
+
+        self.assertEqual(result["total"], 1)
+        self.assertNotIn("core_diagnostics", result["jobs"][0])
+
     def test_public_job_derives_title_from_info_json(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)

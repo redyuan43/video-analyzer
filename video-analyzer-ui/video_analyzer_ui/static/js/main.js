@@ -396,14 +396,39 @@ function renderJobList(jobs) {
     bindJobButtons();
 }
 
+function mergeSelectedJobSnapshot(snapshot) {
+    if (!snapshot || currentJob?.job_id !== snapshot.job_id) return snapshot;
+    const merged = { ...currentJob, ...snapshot };
+    [
+        'summary',
+        'core_diagnostics',
+        'preview',
+        'vscode_preview',
+        'warnings',
+        'queue',
+        'core_progress',
+        'stage_progress'
+    ].forEach(key => {
+        if (snapshot[key] === undefined && currentJob[key] !== undefined) {
+            merged[key] = currentJob[key];
+        }
+    });
+    return merged;
+}
+
+function renderSelectedJobSnapshot(jobs) {
+    const snapshot = selectedJobId ? jobs.find(job => job.job_id === selectedJobId) : null;
+    if (!snapshot) return;
+    renderJob(mergeSelectedJobSnapshot(snapshot));
+}
+
 async function refreshJobs() {
     const data = await getJson('/api/video-link/jobs?limit=50');
     renderGlobal(data);
     const jobs = data.jobs || [];
     latestJobs = jobs;
     renderJobList(jobs);
-    const selectedFromList = selectedJobId ? jobs.find(job => job.job_id === selectedJobId) : null;
-    if (selectedFromList) renderJob(selectedFromList);
+    renderSelectedJobSnapshot(jobs);
     renderPreviewGrid(jobs);
     const first = preferredJob(jobs);
     if (!selectedJobId && first) selectJob(first.job_id, true);
@@ -429,8 +454,7 @@ async function refreshJobsNoSelect() {
     const jobs = data.jobs || [];
     latestJobs = jobs;
     renderJobList(jobs);
-    const selectedFromList = selectedJobId ? jobs.find(job => job.job_id === selectedJobId) : null;
-    if (selectedFromList) renderJob(selectedFromList);
+    renderSelectedJobSnapshot(jobs);
     renderPreviewGrid(jobs);
 }
 
