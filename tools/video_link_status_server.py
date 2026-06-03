@@ -671,6 +671,48 @@ class VideoLinkStatusServer:
         thread.start()
         return self.public_job(self.load_job(job_id))
 
+    def stop_job(self, job_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        stage = normalize_stage_name((job.get("runner") or {}).get("current_stage") or self.current_stage(job) or self.next_stage(job) or "")
+        stage_info = dict((job.get("stages") or {}).get(stage) or {})
+        process_info = dict(stage_info.get("process") or job.get("process") or {})
+        pid = process_info.get("pid")
+        stopped_pids: list[int] = []
+        if pid and process_alive(pid):
+            stopped_pids = terminate_process_tree(pid)
+        now = iso_now()
+        if stage:
+            stage_info.update(
+                {
+                    "status": "failed",
+                    "finished_at": now,
+                    "exit_code": -15 if stopped_pids else None,
+                    "error": "stopped by user",
+                }
+            )
+            if process_info:
+                process_info["alive"] = False
+                process_info["stopped_at"] = now
+                process_info["stopped_pids"] = stopped_pids
+                stage_info["process"] = process_info
+            job.setdefault("stages", {})[stage] = stage_info
+        job["status"] = "failed"
+        job["updated_at"] = now
+        runner = dict(job.get("runner") or {})
+        runner.update(
+            {
+                "status": "failed",
+                "current_stage": stage or runner.get("current_stage"),
+                "error": "stopped by user",
+                "finished_at": now,
+                "updated_at": now,
+                "server_pid": os.getpid(),
+            }
+        )
+        job["runner"] = runner
+        self.save_job(job)
+        return {"stopped": True, "job_id": job_id, "stage": stage, "pid": pid, "stopped_pids": stopped_pids}
+
     def recover_interrupted_jobs(self, auto_start: bool = False) -> None:
         recovered_jobs: list[dict[str, Any]] = []
         for path in sorted(self.jobs_dir.glob("*/job.json")):
@@ -887,6 +929,10 @@ class VideoLinkStatusServer:
     def wait_for_resource_slot(self, resource: str, job_id: str) -> None:
         limit = max(1, int(RESOURCE_LIMITS.get(resource, 1)))
         while True:
+            job = self.load_job(job_id)
+            runner = job.get("runner") or {}
+            if job.get("status") == "failed" or runner.get("status") == "failed":
+                raise BridgeError(HTTPStatus.CONFLICT, runner.get("error") or "job stopped")
             blockers = self.live_resource_users(resource, exclude_job_id=job_id)
             if len(blockers) < limit:
                 return
@@ -2509,6 +2555,65 @@ def process_alive(pid: Any) -> bool:
     return True
 
 
+def child_process_map() -> dict[int, list[int]]:
+    try:
+        result = subprocess.run(["ps", "-eo", "pid=,ppid="], capture_output=True, text=True, check=True)
+    except Exception:
+        return {}
+    children: dict[int, list[int]] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        children.setdefault(ppid, []).append(pid)
+    return children
+
+
+def process_tree_pids(root_pid: Any) -> list[int]:
+    try:
+        root = int(root_pid)
+    except (TypeError, ValueError):
+        return []
+    children = child_process_map()
+    ordered: list[int] = []
+    stack = [root]
+    seen = set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        ordered.append(pid)
+        stack.extend(children.get(pid, []))
+    return ordered
+
+
+def terminate_process_tree(root_pid: Any, grace_seconds: float = 3.0) -> list[int]:
+    pids = [pid for pid in process_tree_pids(root_pid) if pid != os.getpid()]
+    if not pids:
+        return []
+    for pid in reversed(pids):
+        if process_alive(pid):
+            try:
+                os.kill(pid, 15)
+            except OSError:
+                pass
+    deadline = time.time() + grace_seconds
+    while time.time() < deadline and any(process_alive(pid) for pid in pids):
+        time.sleep(0.1)
+    for pid in reversed(pids):
+        if process_alive(pid):
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+    return pids
+
+
 def parse_core_progress(text: str, stage_status: str) -> dict[str, Any]:
     return parse_progress_steps(text, stage_status, CORE_PROGRESS_STEPS, CORE_PROGRESS_WEIGHTS)
 
@@ -3911,6 +4016,11 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
 	    button.secondary {{ background: #eef2f7; color: #202124; }}
 	    button.success-action {{ display: inline-flex; align-items: center; justify-content: center; gap: 6px; background: #16a34a; color: #fff; }}
 	    button.success-action::before {{ content: "\\2713"; display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 999px; background: rgba(255,255,255,.22); font-size: 12px; font-weight: 700; line-height: 1; }}
+	    button.play-action, button.stop-action {{ display: inline-flex; align-items: center; justify-content: center; gap: 6px; }}
+	    button.play-action {{ background: #16a34a; color: #fff; }}
+	    button.play-action::before {{ content: ""; width: 0; height: 0; border-top: 6px solid transparent; border-bottom: 6px solid transparent; border-left: 10px solid currentColor; }}
+	    button.stop-action {{ background: #dc2626; color: #fff; }}
+	    button.stop-action::before {{ content: ""; width: 11px; height: 11px; border-radius: 2px; background: currentColor; }}
 	    button:disabled {{ opacity: .55; cursor: default; }}
     .logLink {{ border: 0; background: transparent; color: #0969da; padding: 0; cursor: pointer; font: inherit; }}
     pre {{ margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.5; max-height: 420px; overflow: auto; }}
@@ -3930,7 +4040,7 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
       </div>
       <div class="bar"><div id="progressBar"></div></div>
       <div class="actions">
-        <button id="runButton" type="button">继续运行</button>
+        <button id="runButton" class="play-action" type="button">继续运行</button>
         <span class="hint" id="runMessage"></span>
       </div>
     </section>
@@ -3979,6 +4089,7 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
   <script>
 	    const apiUrl = {json.dumps(api_url)};
 	    const runActionUrl = `${{apiUrl}}/run`;
+	    const stopActionUrl = `${{apiUrl}}/stop`;
 	    const openRunDirActionUrl = `${{apiUrl}}/open-run-dir`;
 	    let logUrl = {json.dumps(log_url)};
 	    let selectedLogStage = null;
@@ -4029,10 +4140,15 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
 	      const runButton = document.getElementById("runButton");
 	      const runDir = job.summary?.run_dir || job.run_dir;
 	      const isSucceeded = job.status === "succeeded";
-	      runButton.disabled = isSucceeded ? !runDir : (job.status === "running" || job.runner?.status === "running");
-	      runButton.classList.toggle("success-action", isSucceeded);
-	      runButton.textContent = isSucceeded ? "成功" : (job.status === "failed" ? "重试失败阶段" : "继续运行");
-	      runButton.title = isSucceeded && runDir ? `打开资源目录：${{runDir}}` : "";
+	      const process = job.process || job.stages?.[job.current_stage || job.next_stage || ""]?.process;
+	      const isActive = Boolean(process?.alive || job.status === "running" || job.status === "queued" || job.runner?.status === "running" || job.runner?.status === "queued");
+	      runButton.disabled = isSucceeded ? !runDir : false;
+	      runButton.dataset.action = isActive ? "stop" : (isSucceeded ? "open-run-dir" : "run");
+	      runButton.classList.toggle("success-action", isSucceeded && !isActive);
+	      runButton.classList.toggle("play-action", !isSucceeded && !isActive);
+	      runButton.classList.toggle("stop-action", isActive);
+	      runButton.textContent = isActive ? "停止" : (isSucceeded ? "成功" : (job.status === "failed" ? "重试失败阶段" : "继续运行"));
+	      runButton.title = isActive ? "停止当前运行任务" : (isSucceeded && runDir ? `打开资源目录：${{runDir}}` : "继续运行任务");
       text("current", stageNames[job.current_stage] || job.current_stage);
       text("next", stageNames[job.next_stage] || job.next_stage);
       text("progressText", `${{progress.completed || 0}}/${{progress.total || 0}} · ${{progress.percent || 0}}%`);
@@ -4137,14 +4253,14 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
 	      button.disabled = true;
 	      message.textContent = "已发送";
 	      try {{
-	        const action = currentJob?.status === "succeeded" ? "open-run-dir" : "run";
-	        const actionUrl = action === "open-run-dir" ? openRunDirActionUrl : runActionUrl;
+	        const action = button.dataset.action || (currentJob?.status === "succeeded" ? "open-run-dir" : "run");
+	        const actionUrl = action === "open-run-dir" ? openRunDirActionUrl : (action === "stop" ? stopActionUrl : runActionUrl);
 	        await fetch(actionUrl, {{ method: "POST", headers: {{ "Content-Type": "application/json" }}, body: "{{}}" }}).then(async r => {{
 	          if (!r.ok) throw new Error((await r.json()).error || `HTTP ${{r.status}}`);
 	          return r.json();
 	        }});
-	        message.textContent = action === "open-run-dir" ? "已打开资源目录" : "运行中";
-	        if (action === "run") {{
+	        message.textContent = action === "open-run-dir" ? "已打开资源目录" : (action === "stop" ? "已停止" : "运行中");
+	        if (action === "run" || action === "stop") {{
 	          await refresh();
 	        }} else {{
 	          button.disabled = false;
@@ -4226,6 +4342,10 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/run", path)
             if match:
                 self.write_json(self.server_app.start_run(match.group(1)), HTTPStatus.ACCEPTED)
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/stop", path)
+            if match:
+                self.write_json(self.server_app.stop_job(match.group(1)), HTTPStatus.ACCEPTED)
                 return
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/open-run-dir", path)
             if match:

@@ -10,6 +10,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .artifacts import write_json, write_orin_artifacts, write_transcript_markdown
+from .candidate_frame_strategies import parse_candidate_frame_strategy
 from .config import Config, build_openai_extra_body, get_client, get_model, resolve_api_key, resolve_temperature
 from .frame import VideoProcessor
 from .frame_selection import (
@@ -481,6 +482,12 @@ def main():
     parser.add_argument("--context-file", type=str, help="Extra page/video context file")
     parser.add_argument("--pipeline-mode", choices=["fast", "balanced", "deep"], default="balanced", help="Operation manual pipeline depth")
     parser.add_argument("--candidate-frames", type=parse_auto_int_arg, default=AUTO, help="auto or explicit candidate frame pool size")
+    parser.add_argument(
+        "--candidate-frame-strategy",
+        type=parse_candidate_frame_strategy,
+        default="auto",
+        help="Internal candidate frame strategy: auto, legacy, generic, lecture, or operation",
+    )
     parser.add_argument("--frame-extractor", choices=["local", "jetson", "auto"], default="local", help="Candidate frame extraction backend")
     parser.add_argument("--jetson-frame-hosts", default="nx2,nx3", help="Comma-separated Jetson SSH hosts for frame extraction")
     parser.add_argument("--jetson-frame-backend", choices=["auto", "ssh", "ray"], default="auto", help="Jetson frame worker transport")
@@ -781,6 +788,8 @@ def main():
                             video_duration_seconds=video_duration,
                             pipeline_mode=args.pipeline_mode,
                             candidate_budget=candidate_budget,
+                            candidate_strategy=args.candidate_frame_strategy,
+                            transcript=transcript,
                             sample_fps=jetson_sample_fps,
                             backend=args.jetson_frame_backend,
                             overlap_seconds=args.jetson_chunk_overlap_seconds,

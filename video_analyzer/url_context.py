@@ -50,6 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-frames", type=int, help="Explicit upper limit for the operation-manual candidate frame pool")
     parser.add_argument("--pipeline-mode", choices=["fast", "balanced", "deep"])
     parser.add_argument("--candidate-frames", help="auto or explicit candidate frame pool size")
+    parser.add_argument("--candidate-frame-strategy", choices=["auto", "legacy", "generic", "lecture", "operation"])
     parser.add_argument("--min-vl-frames", help="auto or minimum frames sent to VL")
     parser.add_argument("--max-vl-frames", help="auto or maximum frames sent to VL")
     parser.add_argument("--vl-frame-policy", choices=["auto", "all", "none"])
@@ -144,6 +145,7 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
         "run_name": profile.get("run_name", FALLBACK_RUN_NAME),
         "pipeline_mode": profile.get("pipeline_mode", "balanced"),
         "candidate_frames": profile.get("candidate_frames", "auto"),
+        "candidate_frame_strategy": profile.get("candidate_frame_strategy", "auto"),
         "min_vl_frames": profile.get("min_vl_frames", "auto"),
         "max_vl_frames": profile.get("max_vl_frames", "auto"),
         "vl_frame_policy": profile.get("vl_frame_policy", "auto"),
@@ -960,6 +962,8 @@ def build_analyzer_command(args: argparse.Namespace, video_path: Path, context_p
         args.pipeline_mode,
         "--candidate-frames",
         str(args.candidate_frames),
+        "--candidate-frame-strategy",
+        str(getattr(args, "candidate_frame_strategy", "auto")),
         "--min-vl-frames",
         str(args.min_vl_frames),
         "--max-vl-frames",

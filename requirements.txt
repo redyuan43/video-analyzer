@@ -1,6 +1,9 @@
 opencv-python>=4.8.0
 numpy>=1.24.0
 torch>=2.0.0
+open-clip-torch>=3.3.0
+transnetv2-pytorch>=1.0.5
+scikit-learn>=1.7.2
 openai-whisper>=20231117
 requests>=2.31.0
 Pillow>=10.0.0

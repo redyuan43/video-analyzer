@@ -299,6 +299,41 @@ button.success-action::before {
     line-height: 1;
 }
 
+button.play-action,
+button.stop-action {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+}
+
+button.play-action {
+    background: #16a34a;
+    color: #fff;
+}
+
+button.play-action::before {
+    content: "";
+    width: 0;
+    height: 0;
+    border-top: 6px solid transparent;
+    border-bottom: 6px solid transparent;
+    border-left: 10px solid currentColor;
+}
+
+button.stop-action {
+    background: #dc2626;
+    color: #fff;
+}
+
+button.stop-action::before {
+    content: "";
+    width: 11px;
+    height: 11px;
+    border-radius: 2px;
+    background: currentColor;
+}
+
 button:disabled {
     opacity: .55;
     cursor: default;

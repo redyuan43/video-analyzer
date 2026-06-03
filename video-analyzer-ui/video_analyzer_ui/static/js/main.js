@@ -514,9 +514,10 @@ function bindJobButtons() {
 function renderEmpty() {
     currentJob = null;
     nodes.runButton.disabled = true;
-    nodes.runButton.classList.remove('success-action');
+    nodes.runButton.classList.remove('success-action', 'play-action', 'stop-action');
     nodes.runButton.dataset.action = 'run';
     nodes.runButton.title = '';
+    nodes.runButton.textContent = '继续运行';
     nodes.selectedTitle.textContent = '未选择任务';
     nodes.selectedSubtitle.textContent = '创建或选择一个任务后查看进度。';
     nodes.stageDurationSummary.textContent = '原视频长度：- · 阶段总耗时：-';
@@ -525,9 +526,10 @@ function renderEmpty() {
 function renderServiceOffline(error) {
     currentJob = null;
     nodes.runButton.disabled = true;
-    nodes.runButton.classList.remove('success-action');
+    nodes.runButton.classList.remove('success-action', 'play-action', 'stop-action');
     nodes.runButton.dataset.action = 'run';
     nodes.runButton.title = '';
+    nodes.runButton.textContent = '继续运行';
     nodes.selectedTitle.textContent = '服务未连接';
     nodes.selectedSubtitle.textContent = error.message;
     setText(nodes.statusValue, 'offline');
@@ -546,10 +548,13 @@ function activeProcess(job) {
 
 function runDisabledReason(job) {
     const process = activeProcess(job);
-    if (process?.alive) return `已有外部进程 PID ${process.pid} 仍在运行`;
-    if (job.runner?.status === 'running') return '阶段仍在运行，等待完成';
-    if (job.runner?.status === 'queued') return `等待资源: ${job.queue?.resource || job.runner?.queued_for || '-'}`;
+    if (process?.alive || job.runner?.status === 'running' || job.runner?.status === 'queued' || job.status === 'running' || job.status === 'queued') return '';
     return '';
+}
+
+function jobIsActive(job) {
+    const process = activeProcess(job);
+    return Boolean(process?.alive || job.runner?.status === 'running' || job.runner?.status === 'queued' || job.status === 'running' || job.status === 'queued');
 }
 
 function renderJob(job) {
@@ -561,16 +566,19 @@ function renderJob(job) {
     const process = activeProcess(job);
     const runDir = job.summary?.run_dir || job.run_dir;
     const isSucceeded = job.status === 'succeeded';
+    const isActive = jobIsActive(job);
     const missingRunDir = isSucceeded && !runDir;
     nodes.selectedTitle.textContent = jobDisplayTitle(job);
     const subtitleReason = missingRunDir ? '资源目录不可用' : reason;
     const subtitleBase = `任务 ID: ${job.job_id} · ${job.video_url || '-'}`;
     nodes.selectedSubtitle.textContent = subtitleReason ? `${subtitleBase} · ${subtitleReason}` : subtitleBase;
-    nodes.runButton.disabled = Boolean(subtitleReason);
-    nodes.runButton.dataset.action = isSucceeded ? 'open-run-dir' : 'run';
-    nodes.runButton.classList.toggle('success-action', isSucceeded);
-    nodes.runButton.textContent = isSucceeded ? '成功' : (job.status === 'failed' ? '重试失败阶段' : '继续运行');
-    nodes.runButton.title = isSucceeded && runDir ? `打开资源目录：${runDir}` : '';
+    nodes.runButton.disabled = Boolean(missingRunDir);
+    nodes.runButton.dataset.action = isActive ? 'stop' : (isSucceeded ? 'open-run-dir' : 'run');
+    nodes.runButton.classList.toggle('success-action', isSucceeded && !isActive);
+    nodes.runButton.classList.toggle('play-action', !isSucceeded && !isActive);
+    nodes.runButton.classList.toggle('stop-action', isActive);
+    nodes.runButton.textContent = isActive ? '停止' : (isSucceeded ? '成功' : (job.status === 'failed' ? '重试失败阶段' : '继续运行'));
+    nodes.runButton.title = isActive ? '停止当前运行任务' : (isSucceeded && runDir ? `打开资源目录：${runDir}` : '继续运行任务');
     setText(nodes.statusValue, job.status);
     setText(nodes.currentStageValue, stageNames[job.current_stage] || job.current_stage);
     setText(nodes.nextStageValue, stageNames[job.next_stage] || job.next_stage);
@@ -1792,13 +1800,13 @@ async function runSelectedJob() {
     if (!selectedJobId) return;
     nodes.runButton.disabled = true;
     try {
-        const action = currentJob?.status === 'succeeded' ? 'open-run-dir' : 'run';
+        const action = nodes.runButton.dataset.action || (currentJob?.status === 'succeeded' ? 'open-run-dir' : 'run');
         await getJson(`/api/video-link/jobs/${selectedJobId}/${action}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: '{}'
         });
-        if (action === 'run') {
+        if (action === 'run' || action === 'stop') {
             await refreshSelectedJob();
         } else {
             nodes.runButton.disabled = false;

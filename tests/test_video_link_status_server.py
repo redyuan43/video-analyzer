@@ -1071,6 +1071,51 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertTrue(recovered["stages"]["final-publish"]["process"]["alive"])
         self.assertTrue(recovered["stages"]["final-publish"]["process"]["orphaned"])
 
+    def test_stop_job_terminates_running_process_tree_and_marks_failed(self):
+        process = subprocess.Popen(["bash", "-c", "sleep 60 & wait"])
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+                job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
+                loaded = server.load_job(job["job_id"])
+                loaded["status"] = "running"
+                loaded["runner"] = {"status": "running", "current_stage": "analyze-core"}
+                loaded["stages"]["analyze-core"] = {"status": "running", "process": {"pid": process.pid}}
+                server.save_job(loaded)
+
+                result = server.stop_job(job["job_id"])
+                stopped = server.load_job(job["job_id"])
+
+            process.wait(timeout=5)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+
+        self.assertTrue(result["stopped"])
+        self.assertIn(process.pid, result["stopped_pids"])
+        self.assertEqual(stopped["status"], "failed")
+        self.assertEqual(stopped["runner"]["error"], "stopped by user")
+        self.assertEqual(stopped["stages"]["analyze-core"]["status"], "failed")
+
+    def test_stop_job_marks_queued_job_failed_without_process(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
+            loaded = server.load_job(job["job_id"])
+            loaded["status"] = "queued"
+            loaded["runner"] = {"status": "queued", "current_stage": "analyze-core", "queued_for": "core"}
+            loaded["stages"]["analyze-core"] = {"status": "queued", "queued_for": "core"}
+            server.save_job(loaded)
+
+            result = server.stop_job(job["job_id"])
+            stopped = server.load_job(job["job_id"])
+
+        self.assertTrue(result["stopped"])
+        self.assertEqual(result["stopped_pids"], [])
+        self.assertEqual(stopped["status"], "failed")
+        self.assertEqual(stopped["stages"]["analyze-core"]["error"], "stopped by user")
+
     def test_load_job_marks_final_publish_succeeded_when_exports_are_complete(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
