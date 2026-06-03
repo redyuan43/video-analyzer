@@ -670,6 +670,211 @@ th {
     height: 8px;
 }
 
+.core-diagnostics-panel[data-status="ok"] {
+    border-color: #bbf7d0;
+}
+
+.core-diagnostics-panel[data-status="watch"] {
+    border-color: #fde68a;
+}
+
+.core-diagnostics-panel[data-status="warning"] {
+    border-color: #fed7aa;
+}
+
+.core-diagnostics-panel[data-status="error"] {
+    border-color: #fecdd3;
+}
+
+.diagnostic-status {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 48px;
+    padding: 4px 9px;
+    border-radius: 999px;
+    background: #eef2f7;
+    color: #344054;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.diagnostic-status.ok {
+    background: #dcfce7;
+    color: #166534;
+}
+
+.diagnostic-status.watch {
+    background: #fef3c7;
+    color: #92400e;
+}
+
+.diagnostic-status.warning {
+    background: #ffedd5;
+    color: #9a3412;
+}
+
+.diagnostic-status.error {
+    background: #ffe4e6;
+    color: #9f1239;
+}
+
+.diagnostic-metrics {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    gap: 10px;
+    margin-top: 14px;
+}
+
+.diagnostic-metric {
+    padding: 10px;
+    border: 1px solid #e4e7ec;
+    border-radius: 8px;
+    background: #f8fafc;
+}
+
+.diagnostic-metric span {
+    display: block;
+    color: #667085;
+    font-size: 12px;
+}
+
+.diagnostic-metric strong {
+    display: block;
+    margin-top: 4px;
+    color: #1f2933;
+    font-size: 14px;
+}
+
+.diagnostic-gpu-summary,
+.diagnostic-gpu-table {
+    padding: 10px;
+    border: 1px solid #e4e7ec;
+    border-radius: 8px;
+    background: #f8fafc;
+}
+
+.diagnostic-gpu-summary span,
+.diagnostic-gpu-title {
+    display: block;
+    color: #667085;
+    font-size: 12px;
+}
+
+.diagnostic-gpu-summary strong {
+    display: block;
+    margin-top: 4px;
+    color: #1f2933;
+    font-size: 14px;
+}
+
+.diagnostic-gpu-table {
+    grid-column: 1 / -1;
+}
+
+.diagnostic-gpu-title {
+    margin-bottom: 8px;
+    font-weight: 700;
+}
+
+.diagnostic-gpu-row {
+    display: grid;
+    grid-template-columns: minmax(150px, 1fr) minmax(130px, auto);
+    gap: 4px 10px;
+    padding: 7px 0;
+    border-top: 1px solid #e4e7ec;
+}
+
+.diagnostic-gpu-row span {
+    color: #344054;
+    font-size: 13px;
+}
+
+.diagnostic-gpu-row strong {
+    color: #1f2933;
+    font-size: 13px;
+    text-align: right;
+}
+
+.diagnostic-gpu-row em {
+    grid-column: 1 / -1;
+    overflow: hidden;
+    color: #667085;
+    font-size: 12px;
+    font-style: normal;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.diagnostic-issues {
+    display: grid;
+    gap: 10px;
+    margin-top: 12px;
+}
+
+.diagnostic-issue,
+.diagnostic-empty {
+    padding: 10px;
+    border: 1px solid #e4e7ec;
+    border-radius: 8px;
+    background: #fff;
+}
+
+.diagnostic-issue.warning {
+    background: #fff7ed;
+    border-color: #fed7aa;
+}
+
+.diagnostic-issue.watch {
+    background: #fffbeb;
+    border-color: #fde68a;
+}
+
+.diagnostic-issue.error {
+    background: #fff1f2;
+    border-color: #fecdd3;
+}
+
+.diagnostic-issue-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+}
+
+.diagnostic-issue-head span {
+    color: #667085;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.diagnostic-issue-head strong {
+    color: #1f2933;
+}
+
+.diagnostic-issue p {
+    margin: 4px 0;
+    color: #475467;
+    font-size: 13px;
+}
+
+.diagnostic-issue code {
+    display: block;
+    margin-top: 8px;
+    padding: 8px;
+    overflow: auto;
+    border-radius: 6px;
+    background: rgba(15, 23, 42, .06);
+    color: #344054;
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+.diagnostic-empty {
+    color: #475467;
+    font-size: 13px;
+}
+
 @keyframes status-spin {
     to { transform: rotate(360deg); }
 }

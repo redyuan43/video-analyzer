@@ -24,7 +24,7 @@ from .frame_selection import (
     resolve_vl_context_gap_seconds,
     select_vl_frames,
 )
-from .frame_manifest import write_frame_manifest
+from .frame_manifest import MANIFEST_NAME, read_frames_from_manifest, write_frame_manifest
 from .jetson_frames import extract_frames_with_jetson_workers, extract_local_screen_keyframes
 from .prompt import PromptLoader
 from .analyzer import VideoAnalyzer
@@ -221,11 +221,18 @@ def analyze_frames_for_vl(
     context_before: int,
     context_after: int,
     context_max_gap: float | str,
+    checkpoint_path: Path | None = None,
 ):
     ocr_by_frame = {event.frame_number: event for event in ocr_events}
     context_ocr_texts = {event.frame_number: event.text for event in ocr_events if event.text}
     decisions_by_frame = {decision.frame_number: decision for decision in decisions}
-    frame_analyses = [None] * len(frames)
+    checkpoint_by_frame = load_frame_analysis_checkpoint(checkpoint_path)
+    frame_analyses = [checkpoint_by_frame.get(frame.number) for frame in frames]
+
+    def save_checkpoint() -> None:
+        if checkpoint_path is None:
+            return
+        write_frame_analysis_checkpoint(checkpoint_path, [item for item in frame_analyses if item is not None])
 
     def analyze_one(index_frame):
         index, frame = index_frame
@@ -247,15 +254,20 @@ def analyze_frames_for_vl(
     selected = [(index, frame) for index, frame in enumerate(frames) if frame.number in selected_frame_numbers]
     skipped = [(index, frame) for index, frame in enumerate(frames) if frame.number not in selected_frame_numbers]
     for index, frame in skipped:
-        frame_analyses[index] = make_skipped_visual_event(frame, decisions_by_frame[frame.number])
+        if frame_analyses[index] is None:
+            frame_analyses[index] = make_skipped_visual_event(frame, decisions_by_frame[frame.number])
+
+    selected = [(index, frame) for index, frame in selected if frame_analyses[index] is None]
 
     if not selected:
+        save_checkpoint()
         return frame_analyses
 
     if concurrency <= 1:
         for index_frame in selected:
             index, analysis = analyze_one(index_frame)
             frame_analyses[index] = analysis
+            save_checkpoint()
         return frame_analyses
 
     with ThreadPoolExecutor(max_workers=max(concurrency, 1)) as executor:
@@ -263,7 +275,35 @@ def analyze_frames_for_vl(
         for future in as_completed(futures):
             index, analysis = future.result()
             frame_analyses[index] = analysis
+            save_checkpoint()
     return frame_analyses
+
+
+def load_frame_analysis_checkpoint(path: Path | None) -> dict[int, dict]:
+    if path is None or not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, list):
+        return {}
+    loaded = {}
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        frame_number = item.get("frame_number", item.get("number"))
+        if frame_number is None:
+            continue
+        loaded[int(frame_number)] = item
+    return loaded
+
+
+def write_frame_analysis_checkpoint(path: Path, analyses: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(analyses, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def scan_frames_count_from_metadata(metadata: dict) -> int | None:
@@ -278,6 +318,31 @@ def scan_frames_count_from_metadata(metadata: dict) -> int | None:
         if isinstance(value, int) and value > 0:
             return value
     return None
+
+
+def frame_manifest_matches_request(metadata: dict, frame_extractor: str) -> bool:
+    manifest_source = str(metadata.get("manifest_source") or "").strip().lower()
+    requested = str(frame_extractor or "local").strip().lower()
+    if requested == "jetson":
+        return manifest_source == "jetson"
+    if requested == "local":
+        return manifest_source in {"local", "local_keyframes", "audio_only"}
+    return bool(manifest_source)
+
+
+def reusable_frames_from_manifest(output_dir: Path, frame_extractor: str):
+    frames, metadata = read_frames_from_manifest(output_dir / MANIFEST_NAME, output_dir)
+    if not frames:
+        return [], metadata
+    if not frame_manifest_matches_request(metadata, frame_extractor):
+        metadata["reuse_rejected_reason"] = (
+            f"manifest source {metadata.get('manifest_source')!r} does not match requested extractor {frame_extractor!r}"
+        )
+        return [], metadata
+    metadata = dict(metadata)
+    metadata["backend"] = f"reused_{metadata.get('manifest_source') or 'frames_manifest'}"
+    metadata["resumed_existing"] = True
+    return frames, metadata
 
 def create_client(config: Config):
     """Create the appropriate client based on configuration."""
@@ -363,6 +428,7 @@ def main():
     parser.add_argument("--keep-frames", action="store_true", help="Keep extracted frames after analysis")
     parser.add_argument("--whisper-model", type=str, help="Whisper model size (tiny, base, small, medium, large), or path to local Whisper model snapshot")
     parser.add_argument("--start-stage", type=int, default=1, help="Stage to start processing from (1-3)")
+    parser.add_argument("--resume-existing", action="store_true", help="Reuse completed core artifacts in the output directory")
     parser.add_argument("--max-frames", type=int, help="Explicit upper limit for the operation-manual candidate frame pool")
     parser.add_argument("--log-level", type=str, default="INFO", 
                         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
@@ -446,6 +512,14 @@ def main():
     )
     # Ensure our module logger has the correct level
     logger.setLevel(log_level)
+
+    output_arg = Path(args.output or "output")
+    if args.resume_existing and not args.transcript_file:
+        existing_transcript = output_arg / "transcript.md"
+        if existing_transcript.is_file() and existing_transcript.stat().st_size > 0:
+            args.transcript_file = str(existing_transcript)
+            args.asr_provider = "none"
+            logger.info("Resume mode found existing transcript: %s", existing_transcript)
 
     # Load and update configuration
     config = Config(args.config)
@@ -615,7 +689,50 @@ def main():
                 model
             )
             video_duration = processor._probe_duration(config.get("duration"))
-            if not has_video_stream:
+            reused_frames = []
+            reuse_metadata = {}
+            if args.resume_existing and task == "operation_manual":
+                reused_frames, reuse_metadata = reusable_frames_from_manifest(output_dir, args.frame_extractor)
+                if reused_frames:
+                    logger.info(
+                        "Resume mode reusing %s candidate frames from %s",
+                        len(reused_frames),
+                        reuse_metadata.get("path"),
+                    )
+                elif reuse_metadata.get("reuse_rejected_reason"):
+                    logger.info("Resume mode will re-extract frames: %s", reuse_metadata["reuse_rejected_reason"])
+            if reused_frames:
+                frames = reused_frames
+                frame_extraction_metadata = reuse_metadata
+                frame_manifest_path = output_dir / MANIFEST_NAME
+                ocr_scan_sample_fps = resolve_ocr_scan_sample_fps(
+                    args.ocr_scan_sample_fps,
+                    args.pipeline_mode,
+                    video_duration,
+                )
+                candidate_budget = resolve_candidate_frame_budget(
+                    video_duration_seconds=video_duration,
+                    pipeline_mode=args.pipeline_mode,
+                    candidate_frames=args.candidate_frames,
+                    explicit_max_frames=args.max_frames,
+                )
+                frame_extraction_metadata["frame_manifest"] = str(frame_manifest_path)
+                frame_extraction_metadata["ocr_scan_sample_fps"] = ocr_scan_sample_fps
+                current_progress_step = "frames_done"
+                write_analysis_progress(
+                    output_dir,
+                    current_progress_step,
+                    message="candidate frames reused",
+                    artifacts={"frame_manifest": str(frame_manifest_path)},
+                )
+                frame_selection_metadata = {
+                    "pipeline_mode": args.pipeline_mode,
+                    "video_duration_seconds": video_duration,
+                    "candidate_frames": args.candidate_frames,
+                    "candidate_frame_budget": candidate_budget,
+                    "explicit_max_frames": args.max_frames,
+                }
+            elif not has_video_stream:
                 logger.info("Input has no video stream; skipping frame extraction.")
                 frame_manifest_path = write_frame_manifest(frames, output_dir, source="audio_only")
                 frame_extraction_metadata = {
@@ -865,6 +982,7 @@ def main():
                                 context_before=max(args.vl_context_before, 0),
                                 context_after=max(args.vl_context_after, 0),
                                 context_max_gap=args.vl_context_max_gap,
+                                checkpoint_path=output_dir / "orin" / "frame_analyses.partial.json",
                             )
                 else:
                     logger.info("No video frames available; skipping VL provider calls.")

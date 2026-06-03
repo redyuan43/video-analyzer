@@ -110,6 +110,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--jetson-require-hwdec", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--download-only", action="store_true", help="Only download video and page context")
     parser.add_argument("--keep-existing", action="store_true", help="Reuse existing video/context if present")
+    parser.add_argument("--resume-existing-core", action="store_true", help="Reuse existing core-analysis artifacts in run_dir")
     parser.add_argument("--no-keep-frames", action="store_true", help="Do not keep extracted frames after analysis")
     parser.add_argument(
         "--include-subtitles",
@@ -199,7 +200,11 @@ def main() -> int:
     ensure_tool("ffmpeg")
 
     output_root = Path(args.output_root)
-    video_dir = existing_video_dir_for_url(output_root, args.url) if args.keep_existing and not args.refresh_context else None
+    video_dir = (
+        existing_video_dir_for_url(output_root, args.url)
+        if args.keep_existing and (not args.refresh_context or args.resume_existing_core)
+        else None
+    )
     if video_dir:
         info = load_downloaded_info(video_dir) or {}
     elif args.download_device != LOCAL_DOWNLOAD_DEVICE:
@@ -215,7 +220,9 @@ def main() -> int:
     info_path = video_dir / "info.json"
     description_path = video_dir / "description.md"
     page_context_path = video_dir / "page_context.md"
-    if args.keep_existing and video_path.exists() and page_context_path.exists() and not args.refresh_context:
+    if args.keep_existing and video_path.exists() and page_context_path.exists() and (
+        not args.refresh_context or args.resume_existing_core
+    ):
         print(f"[download] reusing {video_path}")
         print(f"[download] video: {video_path}")
         print(f"[download] description: {description_path}")
@@ -262,8 +269,14 @@ def main() -> int:
         return 0
 
     run_dir = safe_child_dir(video_dir, args.run_name)
-    if run_dir.exists():
+    if run_dir.exists() and not args.resume_existing_core:
         shutil.rmtree(run_dir)
+    if args.resume_existing_core and not args.transcript_file:
+        existing_transcript = run_dir / "transcript.md"
+        if existing_transcript.is_file() and existing_transcript.stat().st_size > 0:
+            args.transcript_file = str(existing_transcript.resolve())
+            args.asr_provider = "none"
+            print(f"[resume] transcript: {existing_transcript}")
 
     context_for_analysis = materialize_analysis_context(page_context_path, run_dir, read_focus_prompt(args))
     command = build_analyzer_command(args, video_path, context_for_analysis, run_dir)
@@ -988,6 +1001,8 @@ def build_analyzer_command(args: argparse.Namespace, video_path: Path, context_p
         command.extend(["--jetson-frame-weights", args.jetson_frame_weights])
     if getattr(args, "jetson_require_hwdec", False):
         command.append("--jetson-require-hwdec")
+    if getattr(args, "resume_existing_core", False):
+        command.append("--resume-existing")
     for endpoint in normalize_cli_list(args.ocr_base_url):
         command.extend(["--ocr-base-url", endpoint])
     command.extend(

@@ -37,11 +37,34 @@ ALLOWED_COOKIE_BROWSERS = ("", "chrome", "none", "edge", "firefox", "chromium", 
 ALLOWED_DOWNLOAD_DEVICES = ("local", "mi")
 DEFAULT_COOKIE_BROWSER = ""
 DEFAULT_PROFILE = "deepseek_v4_pro"
+DEFAULT_FRAME_EXTRACTOR = "jetson"
+DEFAULT_JETSON_FRAME_HOSTS = "agx,agx"
+DEFAULT_JETSON_FRAME_BACKEND = "ray"
+DEFAULT_JETSON_SAMPLE_FPS = "0.5"
 CORE_ANALYSIS_ERROR_PATTERNS = (
     "Error analyzing frame",
     "model-resource-busy",
     "ActorDiedError",
 )
+CORE_DIAGNOSTIC_ERROR_PATTERNS = (
+    "Traceback",
+    "CUDA out of memory",
+    "out of memory",
+    "ActorDiedError",
+    "model-resource-busy",
+    "Error analyzing frame",
+)
+CORE_DIAGNOSTIC_NOT_READY_PATTERNS = (
+    "endpoint not ready",
+    "DotsMOCR endpoint not ready",
+    "no MiniCPM worker is ready",
+    "Connection refused",
+)
+CORE_DIAGNOSTIC_STALE_SECONDS = 600
+CORE_DIAGNOSTIC_QUEUE_WARN_SECONDS = 300
+CORE_DIAGNOSTIC_EXPECTED_MINICPM_CONCURRENCY = 6
+CORE_DIAGNOSTIC_GPU_TTL_SECONDS = 5
+CORE_DIAGNOSTIC_GPU_TIMEOUT_SECONDS = 0.8
 AUTO_MODE_LONG_SECONDS = 2700
 AUTO_MODE_FAST_KEYWORDS = (
     "快速",
@@ -323,6 +346,8 @@ class VideoLinkStatusServer:
         self.vscode_lock = threading.Lock()
         self.auto_retry_stop = threading.Event()
         self.auto_retry_thread: threading.Thread | None = None
+        self.gpu_snapshot_cache: dict[str, Any] | None = None
+        self.gpu_snapshot_cache_time = 0.0
         self.resource_locks = {name: threading.BoundedSemaphore(limit) for name, limit in RESOURCE_LIMITS.items()}
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         if auto_resume:
@@ -1175,6 +1200,8 @@ class VideoLinkStatusServer:
                 "--pipeline-mode",
                 pipeline_mode_for(resolved_mode),
             ]
+            self.append_default_frame_extractor_options(command)
+        command.append("--resume-existing-core")
         self.append_url_options(command, opts)
         return command
 
@@ -1214,6 +1241,21 @@ class VideoLinkStatusServer:
             command.extend(["--subtitle-langs", opts["subtitle_langs"]])
         if opts.get("focus_prompt"):
             command.extend(["--focus-prompt", opts["focus_prompt"]])
+
+    def append_default_frame_extractor_options(self, command: list[str]) -> None:
+        command.extend(
+            [
+                "--frame-extractor",
+                os.environ.get("VIDEO_LINK_FRAME_EXTRACTOR", DEFAULT_FRAME_EXTRACTOR),
+                "--jetson-frame-hosts",
+                os.environ.get("VIDEO_LINK_JETSON_FRAME_HOSTS", os.environ.get("JETSON_FRAME_HOSTS", DEFAULT_JETSON_FRAME_HOSTS)),
+                "--jetson-frame-backend",
+                os.environ.get("VIDEO_LINK_JETSON_FRAME_BACKEND", DEFAULT_JETSON_FRAME_BACKEND),
+                "--jetson-sample-fps",
+                os.environ.get("VIDEO_LINK_JETSON_SAMPLE_FPS", DEFAULT_JETSON_SAMPLE_FPS),
+                "--jetson-require-hwdec",
+            ]
+        )
 
     def multidoc_command(self, job: dict[str, Any]) -> list[str]:
         return ["tools/run_multidoc_analysis.sh", str(self.require_run_dir(job)), "--profile", job["options"]["profile"]]
@@ -1900,6 +1942,7 @@ class VideoLinkStatusServer:
         public["queue"] = self.queue_info(public)
         public["core_progress"] = self.core_progress(public)
         public["stage_progress"] = self.stage_progress(public)
+        public["core_diagnostics"] = self.core_diagnostics(public)
         public["preview"] = self.preview_metadata(public)
         public["vscode_preview"] = self.vscode_preview_metadata(public, public_host)
         public["warnings"] = self.active_warnings(public)
@@ -2155,6 +2198,57 @@ class VideoLinkStatusServer:
             "message": message,
             "log_path": failed_info.get("log_path"),
         }
+
+    def core_diagnostics(self, job: dict[str, Any]) -> dict[str, Any] | None:
+        stage_info = (job.get("stages") or {}).get("analyze-core") or {}
+        log_path = Path(stage_info.get("log_path") or self.stage_log_path(job["job_id"], "analyze-core"))
+        run_dir = self.discover_run_dir(job)
+        progress = job.get("core_progress") or self.core_progress(job)
+        log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+        analysis = read_analysis_payload(run_dir)
+        timings = ((analysis.get("metadata") or {}).get("timings") or {}) if analysis else {}
+        counts = core_diagnostic_counts(analysis)
+        issues: list[dict[str, Any]] = []
+        sources = {
+            "run_dir": str(run_dir) if run_dir else None,
+            "log_path": str(log_path) if log_path.exists() else str(log_path),
+            "progress_json": str(run_dir / ANALYSIS_PROGRESS_FILENAME) if run_dir and (run_dir / ANALYSIS_PROGRESS_FILENAME).is_file() else None,
+            "analysis_json": str(run_dir / "analysis.json") if run_dir and (run_dir / "analysis.json").is_file() else None,
+        }
+
+        if not stage_info and not run_dir and not log_text:
+            return None
+
+        add_core_process_issues(job, stage_info, issues)
+        add_core_log_issues(log_text, issues)
+        add_core_artifact_issues(self, job, run_dir, stage_info, issues)
+        add_core_stale_issue(progress, issues)
+        add_core_queue_issue(job, issues)
+        add_core_concurrency_issue(job, log_text, issues)
+        gpu = self.gpu_snapshot() if core_gpu_snapshot_needed(job, stage_info) else None
+        if gpu:
+            add_core_gpu_issues(gpu, core_command_text(job, log_text), issues)
+        add_core_efficiency_issues(timings, issues)
+
+        efficiency = core_efficiency_summary(timings, counts)
+        status = diagnostic_status(issues)
+        return {
+            "status": status,
+            "summary": core_diagnostic_summary(status, issues, efficiency, progress),
+            "efficiency": efficiency,
+            "gpu": gpu,
+            "issues": issues,
+            "sources": sources,
+        }
+
+    def gpu_snapshot(self) -> dict[str, Any]:
+        now = time.time()
+        if self.gpu_snapshot_cache and now - self.gpu_snapshot_cache_time < CORE_DIAGNOSTIC_GPU_TTL_SECONDS:
+            return self.gpu_snapshot_cache
+        snapshot = collect_gpu_snapshot()
+        self.gpu_snapshot_cache = snapshot
+        self.gpu_snapshot_cache_time = now
+        return snapshot
 
     def progress(self, job: dict[str, Any]) -> dict[str, Any]:
         statuses = [job.get("stages", {}).get(stage, {}).get("status") for stage in STAGE_ORDER]
@@ -2643,6 +2737,491 @@ def progress_percent_from_steps(
     if stage_status == "running":
         return min(99, max(1 if completed else 0, percent))
     return max(0, min(100, percent))
+
+
+def read_analysis_payload(run_dir: Path | None) -> dict[str, Any] | None:
+    if not run_dir:
+        return None
+    analysis_path = run_dir / "analysis.json"
+    if not analysis_path.is_file():
+        return None
+    try:
+        payload = json.loads(analysis_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def core_diagnostic_counts(analysis: dict[str, Any] | None) -> dict[str, Any]:
+    if not analysis:
+        return {}
+    metadata = analysis.get("metadata") or {}
+    ocr_keyframes = metadata.get("ocr_keyframes") or {}
+    frame_selection = metadata.get("frame_selection") or {}
+    return {
+        "frames_extracted": metadata.get("frames_extracted"),
+        "scan_frames": ocr_keyframes.get("scan_frames_count"),
+        "ocr_candidate_frames": ocr_keyframes.get("ocr_candidate_frames_count"),
+        "ocr_keyframes": ocr_keyframes.get("ocr_frames_count"),
+        "ocr_text_events": ocr_keyframes.get("ocr_text_events_count"),
+        "vl_frames": frame_selection.get("vl_frames_count") or metadata.get("vl_frames_processed"),
+        "video_duration_seconds": frame_selection.get("video_duration_seconds") or ocr_keyframes.get("video_duration_seconds"),
+    }
+
+
+def issue(severity: str, code: str, title: str, detail: str, recommendation: str, evidence: str | None = None) -> dict[str, Any]:
+    return {
+        "severity": severity,
+        "code": code,
+        "title": title,
+        "detail": detail,
+        "recommendation": recommendation,
+        "evidence": evidence,
+    }
+
+
+def add_core_process_issues(job: dict[str, Any], stage_info: dict[str, Any], issues: list[dict[str, Any]]) -> None:
+    status = stage_info.get("status")
+    if status == "failed":
+        issues.append(
+            issue(
+                "error",
+                "core-stage-failed",
+                "核心分析阶段失败",
+                str(stage_info.get("error") or "analyze-core returned a non-zero result"),
+                "查看 analyze-core 日志末尾，优先处理第一个模型/资源错误。",
+            )
+        )
+    if status == "running":
+        process_info = stage_info.get("process") or {}
+        pid = process_info.get("pid")
+        if pid and not process_alive(pid):
+            issues.append(
+                issue(
+                    "error",
+                    "dead-core-process",
+                    "核心分析进程已退出",
+                    f"job 仍标记 running，但 PID {pid} 已不存在。",
+                    "将该任务标记为失败或重试当前阶段，避免状态页继续误报运行中。",
+                )
+            )
+        runner = job.get("runner") or {}
+        if runner.get("status") == "running" and not pid:
+            issues.append(
+                issue(
+                    "watch",
+                    "missing-process-record",
+                    "缺少运行进程记录",
+                    "任务处于 running，但 analyze-core 没有记录 PID。",
+                    "确认 status server 是否在启动子进程前异常重启；必要时根据产物恢复阶段状态。",
+                )
+            )
+
+
+def add_core_log_issues(log_text: str, issues: list[dict[str, Any]]) -> None:
+    for pattern in CORE_DIAGNOSTIC_ERROR_PATTERNS:
+        line = first_line_containing(log_text, pattern)
+        if line:
+            issues.append(
+                issue(
+                    "error",
+                    "core-log-error",
+                    "日志出现模型或运行时错误",
+                    f"匹配到 `{pattern}`。",
+                    "先处理该错误对应的模型服务或资源冲突，再重试核心分析。",
+                    line,
+                )
+            )
+            break
+    for pattern in CORE_DIAGNOSTIC_NOT_READY_PATTERNS:
+        line = first_line_containing(log_text, pattern)
+        if line:
+            issues.append(
+                issue(
+                    "warning",
+                    "endpoint-not-ready",
+                    "本地模型 endpoint 未就绪",
+                    f"匹配到 `{pattern}`。",
+                    "检查 stage handoff、端口监听和当前常驻模型，确认 ASR/OCR/VL 服务已切到正确阶段。",
+                    line,
+                )
+            )
+            break
+
+
+def add_core_artifact_issues(
+    server: VideoLinkStatusServer,
+    job: dict[str, Any],
+    run_dir: Path | None,
+    stage_info: dict[str, Any],
+    issues: list[dict[str, Any]],
+) -> None:
+    if not run_dir:
+        return
+    missing = server.missing_core_artifacts(run_dir)
+    if missing and stage_info.get("status") in {"succeeded", "failed"}:
+        issues.append(
+            issue(
+                "error",
+                "missing-core-artifacts",
+                "核心产物不完整",
+                ", ".join(missing),
+                "优先从 transcript 或已存在帧目录恢复，避免不必要地重跑 ASR。",
+            )
+        )
+    core_errors = server.core_analysis_errors(run_dir)
+    if core_errors:
+        issues.append(
+            issue(
+                "warning",
+                "core-result-errors",
+                "核心分析产物包含错误文本",
+                f"发现 {len(core_errors)} 条 VL/resource failure。",
+                "打开 frame_analyses/visual_events 核对失败帧；如果比例高，重跑 VL 阶段。",
+                core_errors[0],
+            )
+        )
+
+
+def add_core_stale_issue(progress: dict[str, Any] | None, issues: list[dict[str, Any]]) -> None:
+    if not progress or not progress.get("live"):
+        return
+    steps = progress.get("steps") or []
+    current_step = progress.get("current_step")
+    current = next((step for step in steps if step.get("id") == current_step), None)
+    started_at = parse_iso_timestamp(current.get("started_at")) if current else None
+    if not started_at:
+        return
+    elapsed = time.time() - started_at
+    if elapsed >= CORE_DIAGNOSTIC_STALE_SECONDS:
+        issues.append(
+            issue(
+                "watch",
+                "stale-core-step",
+                "当前核心子项长时间没有新信号",
+                f"{current.get('label') or current_step} 已持续 {int(elapsed)} 秒。",
+                "查看当前日志尾部和 GPU/endpoint 状态，确认是正常长请求还是服务卡住。",
+                current.get("message"),
+            )
+        )
+
+
+def add_core_queue_issue(job: dict[str, Any], issues: list[dict[str, Any]]) -> None:
+    queue = job.get("queue") or {}
+    if queue.get("resource") != "core":
+        return
+    stage_info = (job.get("stages") or {}).get("analyze-core") or {}
+    queued_at = parse_iso_timestamp(stage_info.get("queued_at") or ((job.get("runner") or {}).get("updated_at")))
+    if not queued_at:
+        return
+    waited = time.time() - queued_at
+    if waited >= CORE_DIAGNOSTIC_QUEUE_WARN_SECONDS:
+        issues.append(
+            issue(
+                "watch",
+                "core-queue-wait",
+                "核心分析等待资源较久",
+                f"core 队列等待约 {int(waited)} 秒，位置 #{queue.get('position') or '-'} / {queue.get('size') or '-'}。",
+                "这是预期的全局互斥行为；若没有真实运行任务，检查残留 PID 或 lock 文件。",
+            )
+        )
+
+
+def add_core_concurrency_issue(job: dict[str, Any], log_text: str, issues: list[dict[str, Any]]) -> None:
+    command = core_command_text(job, log_text)
+    if not command or "minicpm-v-4.5-v100" not in command:
+        return
+    match = re.search(r"--vl-concurrency(?:=|\s+)(\d+)", command)
+    if not match:
+        return
+    concurrency = int(match.group(1))
+    if concurrency < CORE_DIAGNOSTIC_EXPECTED_MINICPM_CONCURRENCY:
+        issues.append(
+            issue(
+                "warning",
+                "low-minicpm-vl-concurrency",
+                "MiniCPM VL 并发低于 worker 数",
+                f"命令使用 --vl-concurrency {concurrency}，当前期望至少 {CORE_DIAGNOSTIC_EXPECTED_MINICPM_CONCURRENCY}。",
+                "后续任务使用更新后的 MiniCPM profile；当前任务如需立刻提速，需要从可恢复点重启。",
+                match.group(0),
+            )
+        )
+
+
+def core_gpu_snapshot_needed(job: dict[str, Any], stage_info: dict[str, Any]) -> bool:
+    runner = job.get("runner") or {}
+    status = stage_info.get("status")
+    return bool(
+        status in {"running", "queued"}
+        or (runner.get("status") in {"running", "queued"} and runner.get("current_stage") == "analyze-core")
+    )
+
+
+def add_core_gpu_issues(gpu: dict[str, Any], command: str, issues: list[dict[str, Any]]) -> None:
+    if gpu.get("status") != "ok":
+        issues.append(
+            issue(
+                "watch",
+                "gpu-snapshot-unavailable",
+                "GPU 快照不可用",
+                str(gpu.get("error") or "nvidia-smi did not return data"),
+                "核心分析不受影响；如需 GPU 视图，检查 nvidia-smi 是否可用。",
+            )
+        )
+        return
+    if "minicpm-v-4.5-v100" not in command:
+        return
+    workers = [
+        proc
+        for device in gpu.get("devices", [])
+        for proc in device.get("processes", [])
+        if "llama-server" in str(proc.get("process_name") or "")
+    ]
+    if len(workers) < CORE_DIAGNOSTIC_EXPECTED_MINICPM_CONCURRENCY:
+        issues.append(
+            issue(
+                "warning",
+                "minicpm-gpu-worker-count-low",
+                "MiniCPM GPU worker 数低于预期",
+                f"当前 nvidia-smi 看到 {len(workers)} 个 llama-server，期望 {CORE_DIAGNOSTIC_EXPECTED_MINICPM_CONCURRENCY} 个。",
+                "检查 MiniCPM 代理健康和 worker 日志，确认 6 个 backend 都已加载到 GPU。",
+            )
+        )
+
+
+def add_core_efficiency_issues(timings: dict[str, Any], issues: list[dict[str, Any]]) -> None:
+    numeric = numeric_timings(timings)
+    total = numeric.get("total_seconds")
+    if not total:
+        return
+    bottleneck = bottleneck_timing(numeric)
+    if bottleneck and bottleneck[1] / total >= 0.6:
+        label = timing_label(bottleneck[0])
+        issues.append(
+            issue(
+                "watch",
+                "dominant-core-bottleneck",
+                f"{label} 是主要耗时瓶颈",
+                f"{label} 用时 {round(bottleneck[1], 1)} 秒，占核心分析约 {round((bottleneck[1] / total) * 100)}%。",
+                "结合并发、选帧数量和对应 endpoint 日志判断是否需要调参。",
+            )
+        )
+
+
+def core_efficiency_summary(timings: dict[str, Any], counts: dict[str, Any]) -> dict[str, Any]:
+    numeric = numeric_timings(timings)
+    total = numeric.get("total_seconds")
+    video_duration = counts.get("video_duration_seconds")
+    ratio = None
+    if total and video_duration:
+        try:
+            ratio = round(total / float(video_duration), 3)
+        except (TypeError, ValueError, ZeroDivisionError):
+            ratio = None
+    bottleneck = bottleneck_timing(numeric)
+    return {
+        "total_seconds": total,
+        "video_duration_seconds": video_duration,
+        "runtime_ratio": ratio,
+        "bottleneck": {"key": bottleneck[0], "label": timing_label(bottleneck[0]), "seconds": bottleneck[1]} if bottleneck else None,
+        "timings": numeric,
+        "counts": counts,
+    }
+
+
+def numeric_timings(timings: dict[str, Any]) -> dict[str, float]:
+    numeric: dict[str, float] = {}
+    for key, value in timings.items():
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        numeric[key] = round(number, 3)
+    return numeric
+
+
+def bottleneck_timing(timings: dict[str, float]) -> tuple[str, float] | None:
+    candidates = {
+        key: value
+        for key, value in timings.items()
+        if key != "total_seconds" and key.endswith("_seconds") and value is not None
+    }
+    if not candidates:
+        return None
+    return max(candidates.items(), key=lambda item: item[1])
+
+
+def timing_label(key: str | None) -> str:
+    labels = {
+        "asr_seconds": "ASR 转写",
+        "candidate_frame_extraction_seconds": "候选帧抽取",
+        "ocr_seconds": "OCR",
+        "frame_selection_seconds": "VL 选帧",
+        "vl_seconds": "VL 分析",
+        "manual_generation_seconds": "手册生成",
+    }
+    return labels.get(key or "", key or "-")
+
+
+def diagnostic_status(issues: list[dict[str, Any]]) -> str:
+    severities = {item.get("severity") for item in issues}
+    if "error" in severities:
+        return "error"
+    if "warning" in severities:
+        return "warning"
+    if "watch" in severities:
+        return "watch"
+    return "ok"
+
+
+def core_diagnostic_summary(
+    status: str,
+    issues: list[dict[str, Any]],
+    efficiency: dict[str, Any],
+    progress: dict[str, Any] | None,
+) -> str:
+    if issues:
+        first = issues[0]
+        return f"{first.get('title')}: {first.get('detail')}"
+    bottleneck = efficiency.get("bottleneck")
+    if bottleneck:
+        ratio = efficiency.get("runtime_ratio")
+        ratio_text = f"，耗时比 {ratio}x" if ratio is not None else ""
+        return f"核心分析正常；主要耗时在{bottleneck.get('label')}{ratio_text}。"
+    if progress and progress.get("summary"):
+        return str(progress["summary"])
+    return "暂无异常信号。"
+
+
+def first_line_containing(text: str, pattern: str) -> str | None:
+    for line in text.splitlines():
+        if pattern in line:
+            return line.strip()[:240]
+    return None
+
+
+def core_command_text(job: dict[str, Any], log_text: str) -> str:
+    candidates = []
+    command = ((job.get("stages") or {}).get("analyze-core") or {}).get("artifacts", {}).get("command")
+    if isinstance(command, list):
+        candidates.append(" ".join(str(part) for part in command))
+    elif isinstance(command, str):
+        candidates.append(command)
+    artifact_command = ((job.get("artifacts") or {}).get("command") or {}).get("value")
+    if isinstance(artifact_command, list):
+        candidates.append(" ".join(str(part) for part in artifact_command))
+    elif isinstance(artifact_command, str):
+        candidates.append(artifact_command)
+    for line in log_text.splitlines():
+        if "--vl-concurrency" in line or "minicpm-v-4.5-v100" in line:
+            candidates.append(line)
+    return "\n".join(candidates)
+
+
+def collect_gpu_snapshot() -> dict[str, Any]:
+    started = time.time()
+    try:
+        gpu_output = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,name,uuid,memory.total,memory.used,utilization.gpu,power.draw,power.limit",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            stderr=subprocess.STDOUT,
+            timeout=CORE_DIAGNOSTIC_GPU_TIMEOUT_SECONDS,
+        )
+        proc_output = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=pid,process_name,gpu_uuid,used_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            stderr=subprocess.STDOUT,
+            timeout=CORE_DIAGNOSTIC_GPU_TIMEOUT_SECONDS,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        return {
+            "status": "unavailable",
+            "error": str(exc),
+            "sampled_at": iso_now(),
+            "duration_seconds": round(time.time() - started, 3),
+            "devices": [],
+        }
+    devices = parse_gpu_rows(gpu_output)
+    processes_by_uuid = parse_gpu_process_rows(proc_output)
+    for device in devices:
+        processes = processes_by_uuid.get(device.get("uuid"), [])
+        device["processes"] = processes
+        device["process_count"] = len(processes)
+    return {
+        "status": "ok",
+        "sampled_at": iso_now(),
+        "duration_seconds": round(time.time() - started, 3),
+        "devices": devices,
+        "process_count": sum(len(device.get("processes", [])) for device in devices),
+    }
+
+
+def parse_gpu_rows(text: str) -> list[dict[str, Any]]:
+    devices = []
+    for row in csv_rows(text, 8):
+        index, name, uuid_value, memory_total, memory_used, utilization, power_draw, power_limit = row
+        devices.append(
+            {
+                "index": parse_int(index),
+                "name": name,
+                "uuid": uuid_value,
+                "memory_total_mib": parse_int(memory_total),
+                "memory_used_mib": parse_int(memory_used),
+                "utilization_gpu_percent": parse_int(utilization),
+                "power_draw_w": parse_float(power_draw),
+                "power_limit_w": parse_float(power_limit),
+                "processes": [],
+                "process_count": 0,
+            }
+        )
+    return devices
+
+
+def parse_gpu_process_rows(text: str) -> dict[str, list[dict[str, Any]]]:
+    processes: dict[str, list[dict[str, Any]]] = {}
+    for row in csv_rows(text, 4):
+        pid, process_name, gpu_uuid, used_memory = row
+        if not gpu_uuid:
+            continue
+        item = {
+            "pid": parse_int(pid),
+            "process_name": process_name,
+            "used_memory_mib": parse_int(used_memory),
+        }
+        processes.setdefault(gpu_uuid, []).append(item)
+    return processes
+
+
+def csv_rows(text: str, width: int) -> list[list[str]]:
+    rows = []
+    for line in text.splitlines():
+        values = [part.strip() for part in line.split(",")]
+        if len(values) < width:
+            continue
+        rows.append(values[:width])
+    return rows
+
+
+def parse_int(value: Any) -> int | None:
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_float(value: Any) -> float | None:
+    try:
+        return round(float(str(value).strip()), 1)
+    except (TypeError, ValueError):
+        return None
 
 
 def parse_log_timestamp(line: str) -> float | None:

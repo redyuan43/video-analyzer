@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -9,6 +10,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from video_analyzer import cli as cli_mod
+from video_analyzer.frame import Frame
+from video_analyzer.frame_manifest import write_frame_manifest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -247,6 +250,121 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertNotIn("--cookies-from-browser", command)
         self.assertIn("--download-device", command)
         self.assertIn("mi", command)
+        self.assertIn("--frame-extractor", command)
+        self.assertEqual(command[command.index("--frame-extractor") + 1], "jetson")
+        self.assertIn("--jetson-frame-hosts", command)
+        self.assertEqual(command[command.index("--jetson-frame-hosts") + 1], "agx,agx")
+        self.assertIn("--jetson-frame-backend", command)
+        self.assertEqual(command[command.index("--jetson-frame-backend") + 1], "ray")
+        self.assertIn("--jetson-sample-fps", command)
+        self.assertEqual(command[command.index("--jetson-sample-fps") + 1], "0.5")
+        self.assertIn("--jetson-require-hwdec", command)
+        self.assertIn("--resume-existing-core", command)
+
+    def test_deep_operation_uses_agx_frame_extractor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "deep"})
+            loaded = server.load_job(job["job_id"])
+            loaded["resolved_mode"] = "deep"
+
+        command = server.operation_command(loaded)
+
+        self.assertEqual(command[0], "tools/run_operation_manual_from_url.sh")
+        self.assertEqual(command[command.index("--pipeline-mode") + 1], "deep")
+        self.assertEqual(command[command.index("--frame-extractor") + 1], "jetson")
+        self.assertEqual(command[command.index("--jetson-frame-hosts") + 1], "agx,agx")
+        self.assertEqual(command[command.index("--jetson-frame-backend") + 1], "ray")
+        self.assertIn("--jetson-require-hwdec", command)
+        self.assertIn("--resume-existing-core", command)
+
+    def test_url_context_resume_command_passes_core_resume_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            context = run_dir / "input_page_context.md"
+            video = Path(tmp) / "video.mp4"
+            run_dir.mkdir()
+            context.write_text("# Context\n", encoding="utf-8")
+            video.write_bytes(b"video")
+            args = type(
+                "Args",
+                (),
+                {
+                    "python": sys.executable,
+                    "llm_base_url": "http://127.0.0.1:8000/v1",
+                    "vision_base_url": "http://127.0.0.1:18082/v1",
+                    "text_base_url": "http://127.0.0.1:8000/v1",
+                    "vision_model": "minicpm-v-4.5-v100",
+                    "text_model": "deepseek-v4-pro",
+                    "manual_language": "zh-CN",
+                    "log_level": "INFO",
+                    "pipeline_mode": "deep",
+                    "candidate_frames": "auto",
+                    "min_vl_frames": "auto",
+                    "max_vl_frames": "auto",
+                    "vl_frame_policy": "auto",
+                    "vl_concurrency": 6,
+                    "vl_context_before": 0,
+                    "vl_context_after": 0,
+                    "vl_context_max_gap": "auto",
+                    "transcript_file": str(run_dir / "transcript.md"),
+                    "asr_provider": "none",
+                    "vibevoice_url": [],
+                    "frame_extractor": "jetson",
+                    "jetson_frame_hosts": "agx,agx",
+                    "jetson_frame_backend": "ray",
+                    "jetson_sample_fps": "0.5",
+                    "jetson_chunk_overlap_seconds": 2.0,
+                    "jetson_frame_weights": "",
+                    "jetson_require_hwdec": True,
+                    "resume_existing_core": True,
+                    "ocr_base_url": ["http://127.0.0.1:18088/v1"],
+                    "ocr_concurrency": "5",
+                    "ocr_cache": "on",
+                    "ocr_cache_dir": ".cache/video-analyzer/ocr",
+                    "ocr_keyframe_strategy": "scan-text",
+                    "ocr_keyframe_budget": "auto",
+                    "ocr_scan_sample_fps": "auto",
+                    "no_keep_frames": False,
+                    "max_frames": None,
+                    "duration": None,
+                },
+            )()
+
+            command = url_context_mod.build_analyzer_command(args, video, context, run_dir)
+
+        self.assertIn("--resume-existing", command)
+        self.assertIn("--transcript-file", command)
+        self.assertIn("--asr-provider", command)
+        self.assertEqual(command[command.index("--asr-provider") + 1], "none")
+
+    def test_reusable_frames_rejects_local_manifest_for_jetson_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            frames_dir = output_dir / "frames"
+            frames_dir.mkdir()
+            frame_path = frames_dir / "frame_0.jpg"
+            frame_path.write_bytes(b"jpg")
+            write_frame_manifest([Frame(0, frame_path, 1.0, 0.5)], output_dir, source="local")
+
+            frames, metadata = cli_mod.reusable_frames_from_manifest(output_dir, "jetson")
+
+        self.assertEqual(frames, [])
+        self.assertIn("reuse_rejected_reason", metadata)
+
+    def test_reusable_frames_accepts_jetson_manifest_for_jetson_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            frames_dir = output_dir / "frames"
+            frames_dir.mkdir()
+            frame_path = frames_dir / "frame_0.jpg"
+            frame_path.write_bytes(b"jpg")
+            write_frame_manifest([Frame(0, frame_path, 1.0, 0.5)], output_dir, source="jetson")
+
+            frames, metadata = cli_mod.reusable_frames_from_manifest(output_dir, "jetson")
+
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(metadata["backend"], "reused_jetson")
 
     def test_create_jobs_batch_assigns_focus_prompt_per_url(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1162,6 +1280,126 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(result["progress"]["failed"], 1)
         self.assertEqual(result["error_summary"]["stage"], "analyze-core")
         self.assertIn("ASR endpoint timed out", result["error_summary"]["message"])
+        self.assertEqual(result["core_diagnostics"]["status"], "error")
+        self.assertEqual(result["core_diagnostics"]["issues"][0]["code"], "core-stage-failed")
+
+    def test_core_diagnostics_reports_efficiency_bottleneck_from_analysis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
+            (run_dir / "manual_evidence.md").write_text("# Evidence\n", encoding="utf-8")
+            (run_dir / "analysis.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": {
+                            "frames_extracted": 24,
+                            "timings": {
+                                "asr_seconds": 40,
+                                "ocr_seconds": 20,
+                                "vl_seconds": 75,
+                                "manual_generation_seconds": 10,
+                                "total_seconds": 120,
+                            },
+                            "ocr_keyframes": {
+                                "scan_frames_count": 100,
+                                "ocr_candidate_frames_count": 24,
+                                "ocr_frames_count": 18,
+                                "ocr_text_events_count": 12,
+                            },
+                            "frame_selection": {
+                                "video_duration_seconds": 240,
+                                "vl_frames_count": 24,
+                            },
+                        },
+                        "frame_analyses": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            loaded["run_dir"] = str(run_dir)
+            loaded["stages"]["analyze-core"] = {"status": "succeeded"}
+
+            diagnostics = server.public_job(loaded)["core_diagnostics"]
+
+        self.assertEqual(diagnostics["status"], "watch")
+        self.assertEqual(diagnostics["efficiency"]["runtime_ratio"], 0.5)
+        self.assertEqual(diagnostics["efficiency"]["bottleneck"]["key"], "vl_seconds")
+        self.assertEqual(diagnostics["efficiency"]["counts"]["vl_frames"], 24)
+        self.assertIn("dominant-core-bottleneck", [item["code"] for item in diagnostics["issues"]])
+
+    def test_core_diagnostics_warns_when_minicpm_vl_concurrency_is_low(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            loaded["stages"]["analyze-core"] = {
+                "status": "running",
+                "artifacts": {
+                    "command": [
+                        "python",
+                        "-m",
+                        "video_analyzer.cli",
+                        "--vision-model",
+                        "minicpm-v-4.5-v100",
+                        "--vl-concurrency",
+                        "3",
+                    ]
+                },
+            }
+
+            with patch.object(server, "gpu_snapshot", return_value={"status": "ok", "devices": []}):
+                diagnostics = server.public_job(loaded)["core_diagnostics"]
+
+        self.assertEqual(diagnostics["status"], "warning")
+        self.assertIn("low-minicpm-vl-concurrency", [item["code"] for item in diagnostics["issues"]])
+        self.assertEqual(diagnostics["gpu"]["status"], "ok")
+
+    def test_core_diagnostics_warns_when_minicpm_gpu_workers_are_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            loaded["stages"]["analyze-core"] = {
+                "status": "running",
+                "artifacts": {
+                    "command": [
+                        "python",
+                        "-m",
+                        "video_analyzer.cli",
+                        "--vision-model",
+                        "minicpm-v-4.5-v100",
+                        "--vl-concurrency",
+                        "6",
+                    ]
+                },
+            }
+            gpu = {
+                "status": "ok",
+                "devices": [
+                    {
+                        "index": 0,
+                        "name": "Tesla P40",
+                        "memory_total_mib": 24576,
+                        "memory_used_mib": 7400,
+                        "utilization_gpu_percent": 50,
+                        "power_draw_w": 68.5,
+                        "power_limit_w": 250.0,
+                        "processes": [
+                            {"pid": 123, "process_name": "llama-server", "used_memory_mib": 7300},
+                        ],
+                    }
+                ],
+            }
+
+            with patch.object(server, "gpu_snapshot", return_value=gpu):
+                diagnostics = server.public_job(loaded)["core_diagnostics"]
+
+        self.assertEqual(diagnostics["gpu"], gpu)
+        self.assertIn("minicpm-gpu-worker-count-low", [item["code"] for item in diagnostics["issues"]])
 
     def test_public_job_includes_video_preview_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:

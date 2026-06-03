@@ -70,6 +70,11 @@ const nodes = {
     corePanel: document.getElementById('corePanel'),
     corePanelTitle: document.getElementById('corePanelTitle'),
     coreRows: document.getElementById('coreRows'),
+    coreDiagnosticsPanel: document.getElementById('coreDiagnosticsPanel'),
+    coreDiagnosticsSummary: document.getElementById('coreDiagnosticsSummary'),
+    coreDiagnosticsStatus: document.getElementById('coreDiagnosticsStatus'),
+    coreDiagnosticsMetrics: document.getElementById('coreDiagnosticsMetrics'),
+    coreDiagnosticsIssues: document.getElementById('coreDiagnosticsIssues'),
     artifactSummary: document.getElementById('artifactSummary'),
     logHint: document.getElementById('logHint'),
     logText: document.getElementById('logText'),
@@ -597,6 +602,7 @@ function renderJob(job) {
     }
     renderStages(job);
     renderStageProgress(stageProgress);
+    renderCoreDiagnostics(job.core_diagnostics);
     renderArtifacts(job.summary || {});
     renderVscodePanel(job);
     loadSelectedLog(job);
@@ -650,6 +656,86 @@ function renderStageProgress(progress) {
         <td>${escapeHtml(duration(step.duration_seconds))}</td>
         <td>${escapeHtml(step.message || '-')}</td>
     </tr>`).join('');
+}
+
+function renderCoreDiagnostics(diagnostics) {
+    if (!nodes.coreDiagnosticsPanel) return;
+    const hasDiagnostics = diagnostics && (diagnostics.summary || diagnostics.efficiency || (diagnostics.issues || []).length);
+    nodes.coreDiagnosticsPanel.hidden = !hasDiagnostics;
+    if (!hasDiagnostics) return;
+
+    const status = diagnostics.status || 'ok';
+    nodes.coreDiagnosticsPanel.dataset.status = status;
+    nodes.coreDiagnosticsSummary.textContent = diagnostics.summary || '暂无异常信号';
+    nodes.coreDiagnosticsStatus.textContent = diagnosticStatusLabel(status);
+    nodes.coreDiagnosticsStatus.className = `diagnostic-status ${status}`;
+
+    const efficiency = diagnostics.efficiency || {};
+    const bottleneck = efficiency.bottleneck;
+    const metrics = [
+        ['总耗时', duration(efficiency.total_seconds)],
+        ['视频时长', duration(efficiency.video_duration_seconds)],
+        ['耗时比', efficiency.runtime_ratio == null ? '-' : `${efficiency.runtime_ratio}x`],
+        ['瓶颈', bottleneck ? `${bottleneck.label || bottleneck.key}: ${duration(bottleneck.seconds)}` : '-']
+    ];
+    nodes.coreDiagnosticsMetrics.innerHTML = metrics.map(([label, value]) => `
+        <div class="diagnostic-metric">
+            <span>${escapeHtml(label)}</span>
+            <strong>${escapeHtml(value)}</strong>
+        </div>
+    `).join('') + renderGpuDiagnostics(diagnostics.gpu);
+
+    const issues = diagnostics.issues || [];
+    nodes.coreDiagnosticsIssues.innerHTML = issues.length ? issues.map(item => `
+        <div class="diagnostic-issue ${escapeHtml(item.severity || 'watch')}">
+            <div class="diagnostic-issue-head">
+                <span>${escapeHtml(diagnosticStatusLabel(item.severity || 'watch'))}</span>
+                <strong>${escapeHtml(item.title || item.code || '诊断项')}</strong>
+            </div>
+            <p>${escapeHtml(item.detail || '-')}</p>
+            <p class="muted">${escapeHtml(item.recommendation || '')}</p>
+            ${item.evidence ? `<code>${escapeHtml(item.evidence)}</code>` : ''}
+        </div>
+    `).join('') : '<div class="diagnostic-empty">没有发现效率或失败异常。</div>';
+}
+
+function renderGpuDiagnostics(gpu) {
+    if (!gpu) return '';
+    if (gpu.status !== 'ok') {
+        return `<div class="diagnostic-gpu-summary"><span>GPU</span><strong>不可用</strong></div>`;
+    }
+    const devices = gpu.devices || [];
+    if (!devices.length) {
+        return `<div class="diagnostic-gpu-summary"><span>GPU</span><strong>未发现设备</strong></div>`;
+    }
+    return `<div class="diagnostic-gpu-table">
+        <div class="diagnostic-gpu-title">GPU 实时快照 · ${escapeHtml(gpu.sampled_at || '-')}</div>
+        ${devices.map(device => {
+            const used = device.memory_used_mib ?? 0;
+            const total = device.memory_total_mib ?? 0;
+            const util = device.utilization_gpu_percent ?? 0;
+            const powerDraw = device.power_draw_w == null ? '-' : `${device.power_draw_w}W`;
+            const powerLimit = device.power_limit_w == null ? '-' : `${device.power_limit_w}W`;
+            const processText = (device.processes || []).slice(0, 2).map(proc => {
+                const name = String(proc.process_name || '').split('/').pop();
+                return `${proc.pid || '-'} ${name || '-'} ${proc.used_memory_mib || 0}MiB`;
+            }).join(' · ') || '无计算进程';
+            return `<div class="diagnostic-gpu-row">
+                <span>GPU ${escapeHtml(device.index ?? '-')} · ${escapeHtml(device.name || '-')}</span>
+                <strong>${escapeHtml(used)}/${escapeHtml(total)} MiB · ${escapeHtml(util)}% · ${escapeHtml(powerDraw)}/${escapeHtml(powerLimit)}</strong>
+                <em>${escapeHtml(processText)}</em>
+            </div>`;
+        }).join('')}
+    </div>`;
+}
+
+function diagnosticStatusLabel(status) {
+    return {
+        ok: '正常',
+        watch: '观察',
+        warning: '警告',
+        error: '错误'
+    }[status] || status || '-';
 }
 
 function renderArtifacts(summary) {
