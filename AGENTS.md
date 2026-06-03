@@ -81,6 +81,7 @@ A passing local response includes:
 - Keep runtime progress and service failures visible on the home page, including failed stage, queue/resource state, error message, log path, selected log tail, full-log copy, core-analysis substeps, and artifact counts.
 - The background runner skips stages already marked `succeeded` or `skipped`, then resumes from the first incomplete stage. If a resource is busy, the stage should become `queued` instead of failing with a lock conflict.
 - The home page should expose only common and collection options: URL, analysis mode, profile, run name, browser cookie source, skip images, keep existing, subtitles, subtitle transcript preference, comments, max comments, subtitle languages, and refresh context.
+- If a job has `keep_existing=true` and `refresh_context=true`, the core stage may intentionally rerun the URL context/download path instead of only reusing the successful prepare artifacts. With `download_device=mi` and subtitles enabled, a repeated remote `yt-dlp` attempt can fail on YouTube subtitle fetch with `HTTP Error 429: Too Many Requests`; treat that as a network/rate-limit retry condition, not an ASR/OCR/VL/LLM failure.
 - Model endpoint/model overrides should stay in runtime profiles, not page fields. The default page profile should prefer `deepseek_v4_pro` when available.
 - Start or restart the server with:
   `tools/run_video_link_status_server.sh restart`
