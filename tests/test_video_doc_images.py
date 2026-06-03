@@ -225,6 +225,39 @@ class VideoDocImageTests(unittest.TestCase):
             self.assertNotIn("```mermaid", rendered)
             self.assertFalse((work_dir / "mermaid_001.png").exists())
 
+    def test_mobile_pdf_export_allows_standalone_flowchart_nodes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work_dir = Path(tmp)
+
+            rendered = render_mermaid_blocks(
+                "```mermaid\n"
+                "flowchart TD\n"
+                "A[绪论: 市场在重估什么?] --> B{第一章: 市场担忧};\n"
+                "B --> B1[外部: 港股大科技估值环境不友好];\n"
+                "F[结论: 买的是防守和提效, 不是短期爆发];\n"
+                "```\n",
+                work_dir,
+            )
+
+            self.assertIn('class="mobile-flowchart"', rendered)
+            self.assertIn("结论: 买的是防守和提效, 不是短期爆发", rendered)
+            self.assertNotIn("```mermaid", rendered)
+            self.assertFalse((work_dir / "mermaid_001.png").exists())
+
+    def test_mobile_pdf_export_normalizes_inline_table_after_intro(self):
+        body = render_markdown(
+            "对比竞品数据（2026年3月QuestMobile）： "
+            "| 产品 | 月活（MAU） | 日活（DAU） | "
+            "| :--- | :--- | :--- | "
+            "| 豆包（字节） | 3.45亿 | 1.4亿 | "
+            "| 元宝（腾讯） | 5735万 | 1800万 |\n"
+        )
+
+        self.assertIn("<table>", body)
+        self.assertIn("豆包（字节）", body)
+        self.assertIn("元宝（腾讯）", body)
+        self.assertIn("2026年3月QuestMobile", body)
+
     def test_mobile_pdf_export_rewrites_non_linear_mermaid_to_png_images(self):
         with tempfile.TemporaryDirectory() as tmp:
             work_dir = Path(tmp)

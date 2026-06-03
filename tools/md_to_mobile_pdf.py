@@ -246,7 +246,7 @@ def parse_args() -> argparse.Namespace:
 
 def render_markdown(text: str) -> str:
     return markdown.markdown(
-        text,
+        normalize_markdown_tables(text),
         extensions=[
             "markdown.extensions.extra",
             "markdown.extensions.sane_lists",
@@ -261,6 +261,41 @@ def render_markdown(text: str) -> str:
         },
         output_format="html5",
     )
+
+
+def normalize_markdown_tables(text: str) -> str:
+    normalized: list[str] = []
+    for line in str(text or "").splitlines():
+        split_lines = split_inline_markdown_table_line(line)
+        normalized.extend(split_lines)
+    return "\n".join(normalized)
+
+
+def split_inline_markdown_table_line(line: str) -> list[str]:
+    match = re.match(r"^(.+?[：:])\s+(\|.+)$", line)
+    if not match:
+        return [line]
+    rows = [row.strip() for row in re.split(r"(?<=\|)\s+(?=\|)", match.group(2).strip()) if row.strip()]
+    if len(rows) < 2 or not is_markdown_table_separator(rows[1]):
+        return [line]
+    return [match.group(1).strip(), "", *rows]
+
+
+def parse_markdown_table_row(line: str) -> list[str]:
+    value = line.strip()
+    if value.startswith("|"):
+        value = value[1:]
+    if value.endswith("|"):
+        value = value[:-1]
+    return [cell.strip() for cell in value.split("|")]
+
+
+def is_markdown_table_separator(line: str) -> bool:
+    value = line.strip()
+    if "|" not in value:
+        return False
+    cells = parse_markdown_table_row(value)
+    return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell.replace(" ", "")) for cell in cells)
 
 
 def wrap_final_images(body: str) -> str:
@@ -281,7 +316,7 @@ def normalize_mermaid(diagram: str) -> str:
 
 def parse_mermaid_node(node: str) -> tuple[str, str | None, str]:
     node = node.strip().rstrip(";")
-    match = re.match(r"^([A-Za-z][A-Za-z0-9_]*)(?:([\[\{])(.*)([\]\}]))?$", node)
+    match = re.match(r"^([A-Za-z][A-Za-z0-9_]*)(?:([\[\{\(])(.*)([\]\}\)]))?$", node)
     if not match:
         return node, None, "box"
     node_id = match.group(1)
@@ -308,39 +343,58 @@ def render_simple_mermaid_flowchart(diagram: str) -> str | None:
     if not lines:
         return None
     first_line = lines[0].strip()
-    if not re.match(r"^(flowchart\s+(TB|TD)|graph\s+(TB|TD|LR|RL))\b", first_line, re.I):
+    if not re.match(r"^(flowchart\s+(TB|TD|LR|RL)|graph\s+(TB|TD|LR|RL))\b", first_line, re.I):
         return None
 
     labels: dict[str, str] = {}
     shapes: dict[str, str] = {}
     edges: list[tuple[str, str]] = []
     node_order: list[str] = []
+    standalone_nodes: list[str] = []
+    unsupported_prefixes = re.compile(r"^(subgraph|end\b|direction\b|style\b|classDef\b|class\b)", re.I)
+
+    def remember_node(node_id: str, label: str | None, shape: str) -> bool:
+        if not node_id or re.search(r"[{}()[\]]", node_id):
+            return False
+        if node_id not in node_order:
+            node_order.append(node_id)
+        if label is not None:
+            labels[node_id] = label
+        shapes.setdefault(node_id, shape)
+        return True
+
     for line in lines[1:]:
+        if unsupported_prefixes.match(line) or re.fullmatch(r"[};\s]+", line):
+            continue
         edge_match = re.match(r"^(.+?)\s*-->(?:\|.*?\|)?\s*(.+?)\s*;?$", line)
         if not edge_match:
-            return None
+            node_id, label, shape = parse_mermaid_node(line)
+            if not remember_node(node_id, label, shape):
+                return None
+            if node_id not in standalone_nodes:
+                standalone_nodes.append(node_id)
+            continue
         left_id, left_label, left_shape = parse_mermaid_node(edge_match.group(1))
         right_id, right_label, right_shape = parse_mermaid_node(edge_match.group(2))
-        for node_id, label, shape in (
-            (left_id, left_label, left_shape),
-            (right_id, right_label, right_shape),
-        ):
-            if node_id not in node_order:
-                node_order.append(node_id)
-            if label is not None:
-                labels[node_id] = label
-            shapes.setdefault(node_id, shape)
+        if not remember_node(left_id, left_label, left_shape):
+            continue
+        if not remember_node(right_id, right_label, right_shape):
+            continue
         edges.append((left_id, right_id))
 
     outgoing: dict[str, list[str]] = {}
     incoming: dict[str, int] = {}
-    nodes = set(labels) | {node_id for edge in edges for node_id in edge}
+    connected_nodes = {node_id for edge in edges for node_id in edge}
+    nodes = set(connected_nodes)
+    standalone_only = [node_id for node_id in standalone_nodes if node_id not in connected_nodes]
+    if not edges and not standalone_only:
+        return None
     for left_id, right_id in edges:
         outgoing.setdefault(left_id, []).append(right_id)
         incoming[right_id] = incoming.get(right_id, 0) + 1
         incoming.setdefault(left_id, incoming.get(left_id, 0))
     starts = [node_id for node_id in nodes if incoming.get(node_id, 0) == 0]
-    if not starts:
+    if edges and not starts:
         return None
 
     order_index = {node_id: index for index, node_id in enumerate(node_order)}
@@ -355,7 +409,7 @@ def render_simple_mermaid_flowchart(diagram: str) -> str | None:
             if remaining_incoming[next_id] == 0:
                 queue.append(next_id)
                 queue.sort(key=lambda item: order_index.get(item, 10**9))
-    if len(topological) != len(nodes):
+    if edges and len(topological) != len(nodes):
         return None
 
     levels: dict[str, int] = {node_id: 0 for node_id in starts}
@@ -363,16 +417,16 @@ def render_simple_mermaid_flowchart(diagram: str) -> str | None:
         base_level = levels.get(node_id, 0)
         for next_id in outgoing.get(node_id, []):
             levels[next_id] = max(levels.get(next_id, 0), base_level + 1)
-    max_level = max(levels.values(), default=0)
-    grouped: list[list[str]] = [[] for _ in range(max_level + 1)]
+    max_level = max(levels.values()) if edges else -1
+    grouped: list[list[str]] = [[] for _ in range(max_level + 1)] if max_level >= 0 else []
     for node_id in topological:
         grouped[levels.get(node_id, 0)].append(node_id)
 
     flow_parts = ['<div class="mobile-flowchart" aria-label="流程图">']
     rendered_index = 1
-    for level, row in enumerate(grouped):
-        if not row:
-            return None
+
+    def append_row(row: list[str]) -> None:
+        nonlocal rendered_index
         flow_parts.append('<div class="flow-row">')
         for node_id in row:
             label = mermaid_label_to_html(labels.get(node_id, node_id))
@@ -382,8 +436,17 @@ def render_simple_mermaid_flowchart(diagram: str) -> str | None:
             )
             rendered_index += 1
         flow_parts.append("</div>")
+
+    for level, row in enumerate(grouped):
+        if not row:
+            return None
+        append_row(row)
         if level < max_level:
             flow_parts.append('<div class="flow-arrow">↓</div>')
+    if standalone_only:
+        if grouped:
+            flow_parts.append('<div class="flow-arrow">↓</div>')
+        append_row(standalone_only)
     flow_parts.append("</div>")
     return "\n".join(flow_parts)
 

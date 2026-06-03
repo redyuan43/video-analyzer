@@ -959,6 +959,11 @@ function normalizeMarkdownForPreview(markdown) {
     const normalized = [];
     for (let index = 0; index < lines.length; index += 1) {
         const line = lines[index];
+        const inlineTableLines = splitInlineMarkdownTableLine(line);
+        if (inlineTableLines.length > 1) {
+            normalized.push(...inlineTableLines);
+            continue;
+        }
         if (isPotentialMarkdownTableRow(line) && !String(lines[index + 1] || '').trim() && isMarkdownTableSeparator(lines[index + 2] || '')) {
             normalized.push(line, lines[index + 2]);
             index += 2;
@@ -967,6 +972,19 @@ function normalizeMarkdownForPreview(markdown) {
         normalized.push(line);
     }
     return normalized.join('\n');
+}
+
+function splitInlineMarkdownTableLine(line) {
+    const value = String(line || '');
+    const match = value.match(/^(.+?[：:])\s+(\|.+)$/);
+    if (!match) return [line];
+    const rows = match[2]
+        .trim()
+        .split(/(?<=\|)\s+(?=\|)/)
+        .map(row => row.trim())
+        .filter(Boolean);
+    if (rows.length < 2 || !isMarkdownTableSeparator(rows[1])) return [line];
+    return [match[1].trim(), '', ...rows];
 }
 
 function isPotentialMarkdownTableRow(line) {
@@ -1260,18 +1278,25 @@ function renderSimpleMermaidFlowchart(diagram) {
     const shapes = new Map();
     const edges = [];
     const nodeOrder = [];
+    const standaloneNodes = [];
     const rememberNode = node => {
-        if (!node.id) return;
-        if (node.id.includes('{') || node.id.includes('}') || node.id.includes('(') || node.id.includes(')')) return;
+        if (!node.id) return false;
+        if (/[{}()[\]]/.test(node.id)) return false;
         if (!nodeOrder.includes(node.id)) nodeOrder.push(node.id);
         if (node.label) labels.set(node.id, node.label);
         if (!shapes.has(node.id)) shapes.set(node.id, node.shape);
+        return true;
     };
     for (const line of lines.slice(1)) {
         if (/^(subgraph|end\b|direction\b|style\b|classDef\b|class\b)/i.test(line)) continue;
         if (/^[};\s]+$/.test(line)) continue;
         const edgeMatch = line.match(/^(.+?)\s*-->\s*(?:\|.*?\|\s*)?(.+?)\s*;?$/);
-        if (!edgeMatch) return '';
+        if (!edgeMatch) {
+            const node = parseMermaidNode(line);
+            if (!rememberNode(node)) return '';
+            if (!standaloneNodes.includes(node.id)) standaloneNodes.push(node.id);
+            continue;
+        }
         const left = parseMermaidNode(edgeMatch[1]);
         const right = parseMermaidNode(edgeMatch[2]);
         if (/[{}()[\]]/.test(left.id) || /[{}()[\]]/.test(right.id)) continue;
@@ -1279,7 +1304,6 @@ function renderSimpleMermaidFlowchart(diagram) {
         rememberNode(right);
         edges.push([left.id, right.id]);
     }
-    if (!edges.length) return '';
 
     const nodes = new Set();
     const outgoing = new Map();
@@ -1292,11 +1316,13 @@ function renderSimpleMermaidFlowchart(diagram) {
         incoming.set(right, (incoming.get(right) || 0) + 1);
         if (!incoming.has(left)) incoming.set(left, incoming.get(left) || 0);
     });
+    const standaloneOnly = standaloneNodes.filter(node => !nodes.has(node));
+    if (!edges.length && !standaloneOnly.length) return '';
     const orderIndex = new Map(nodeOrder.map((node, index) => [node, index]));
     const starts = [...nodes]
         .filter(node => (incoming.get(node) || 0) === 0)
         .sort((left, right) => (orderIndex.get(left) ?? 1e9) - (orderIndex.get(right) ?? 1e9));
-    if (!starts.length) return '';
+    if (edges.length && !starts.length) return '';
 
     const remainingIncoming = new Map(incoming);
     const queue = [...starts];
@@ -1312,7 +1338,7 @@ function renderSimpleMermaidFlowchart(diagram) {
             }
         });
     }
-    if (topological.length !== nodes.size) return '';
+    if (edges.length && topological.length !== nodes.size) return '';
 
     const levels = new Map(starts.map(node => [node, 0]));
     topological.forEach(node => {
@@ -1321,14 +1347,13 @@ function renderSimpleMermaidFlowchart(diagram) {
             levels.set(next, Math.max(levels.get(next) || 0, baseLevel + 1));
         });
     });
-    const maxLevel = Math.max(...[...levels.values()]);
-    const grouped = Array.from({ length: maxLevel + 1 }, () => []);
+    const maxLevel = edges.length ? Math.max(...[...levels.values()]) : -1;
+    const grouped = maxLevel >= 0 ? Array.from({ length: maxLevel + 1 }, () => []) : [];
     topological.forEach(node => grouped[levels.get(node) || 0].push(node));
 
     let index = 1;
     const parts = ['<div class="mobile-flowchart" aria-label="流程图">'];
-    grouped.forEach((row, level) => {
-        if (!row.length) return;
+    const appendRow = row => {
         parts.push('<div class="flow-row">');
         row.forEach(node => {
             const shape = shapes.get(node) === 'decision' ? ' decision' : '';
@@ -1337,8 +1362,16 @@ function renderSimpleMermaidFlowchart(diagram) {
             index += 1;
         });
         parts.push('</div>');
+    };
+    grouped.forEach((row, level) => {
+        if (!row.length) return;
+        appendRow(row);
         if (level < maxLevel) parts.push('<div class="flow-arrow">↓</div>');
     });
+    if (standaloneOnly.length) {
+        if (grouped.length) parts.push('<div class="flow-arrow">↓</div>');
+        appendRow(standaloneOnly);
+    }
     parts.push('</div>');
     return parts.join('\n');
 }
