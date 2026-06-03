@@ -239,6 +239,8 @@ def attach_clip_embeddings(candidates):
 def attach_transnet_shot_boundaries(video, candidates):
     if not candidates or not has_module("transnetv2_pytorch") or not has_module("torch"):
         return {"status": "fail", "reason": "transnetv2_pytorch_or_torch_missing"}
+    if os.environ.get("VIDEO_ANALYZER_ENABLE_TRANSNET", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return {"status": "unavailable", "reason": "VIDEO_ANALYZER_ENABLE_TRANSNET not enabled"}
     try:
         import torch
         if not torch.cuda.is_available():
@@ -490,6 +492,111 @@ def extract_highres_candidate(video, timestamp, output_path):
         return "ffmpeg"
 
 
+def extract_probe_candidate(video, timestamp, output_path):
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        f"{timestamp:.3f}",
+        "-i",
+        str(video),
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale=320:180,format=gray",
+        "-q:v",
+        "8",
+        str(output_path),
+    ]
+    subprocess.run(command, check=True, capture_output=True)
+    return output_path
+
+
+def static_probe_timestamps(segment_start, segment_duration, probe_count):
+    if segment_duration <= 0 or probe_count <= 0:
+        return []
+    count = max(2, probe_count)
+    usable_duration = max(segment_duration - 1.0, 0.0)
+    return [
+        segment_start + (usable_duration * index / max(count - 1, 1))
+        for index in range(count)
+    ]
+
+
+def build_static_coverage_candidates(probe_paths, segment_start, segment_duration, max_frames):
+    if not probe_paths:
+        return []
+    target = min(max_frames or len(probe_paths), len(probe_paths))
+    denominator = max(target - 1, 1)
+    selected_indexes = [round(index * (len(probe_paths) - 1) / denominator) for index in range(target)]
+    candidates = []
+    previous = None
+    for index in selected_indexes:
+        path, timestamp = probe_paths[index]
+        score, current = diff_score(path, previous)
+        textness = textness_score(path)
+        candidates.append({
+            "path": str(path),
+            "timestamp": min(float(timestamp), segment_start + segment_duration),
+            "score": score + (textness * 30.0),
+            "visual_score": 0.0 if previous is None else score,
+            "textness_score": textness,
+            "gffv": gffv_feature(path),
+            "sspa_projection": sspa_projection(path),
+            "static_shortcut": True,
+        })
+        previous = current
+    return candidates
+
+
+def probe_static_segment(video, output_dir, segment_start, segment_duration, max_frames, change_threshold):
+    if segment_duration < float(os.environ.get("VIDEO_ANALYZER_STATIC_MIN_DURATION_SEC", "600")):
+        return None
+    probe_count = max(2, int(os.environ.get("VIDEO_ANALYZER_STATIC_PROBE_FRAMES", "12")))
+    static_max_frames = max(2, int(os.environ.get("VIDEO_ANALYZER_STATIC_MAX_CANDIDATES", "12")))
+    threshold = float(os.environ.get("VIDEO_ANALYZER_STATIC_DIFF_THRESHOLD", str(min(change_threshold, 2.0))))
+    probe_dir = output_dir / "static_probe"
+    probe_dir.mkdir(parents=True, exist_ok=True)
+    probe_paths = []
+    previous = None
+    visual_scores = []
+    textness_values = []
+    for index, timestamp in enumerate(static_probe_timestamps(segment_start, segment_duration, probe_count)):
+        path = probe_dir / f"probe_{index:06d}.jpg"
+        try:
+            extract_probe_candidate(video, timestamp, path)
+        except Exception as exc:
+            return {"status": "unavailable", "reason": str(exc)}
+        score, previous = diff_score(path, previous)
+        visual_scores.append(0.0 if index == 0 else score)
+        textness_values.append(textness_score(path))
+        probe_paths.append((path, timestamp))
+
+    tail_scores = visual_scores[1:]
+    max_diff = max(tail_scores) if tail_scores else 0.0
+    mean_diff = float(np.mean(tail_scores)) if tail_scores else 0.0
+    is_static = max_diff <= threshold and mean_diff <= threshold * 0.6
+    candidates = []
+    if is_static:
+        candidates = build_static_coverage_candidates(
+            probe_paths,
+            segment_start,
+            segment_duration,
+            min(max_frames or static_max_frames, static_max_frames),
+        )
+    return {
+        "status": "static" if is_static else "dynamic",
+        "probe_frames": len(probe_paths),
+        "max_diff": round(float(max_diff), 4),
+        "mean_diff": round(float(mean_diff), 4),
+        "threshold": threshold,
+        "textness_mean": round(float(np.mean(textness_values)), 4) if textness_values else 0.0,
+        "candidates": candidates,
+    }
+
+
 def materialize_highres_candidates(video, output_dir, candidates):
     highres_dir = output_dir / "candidates"
     highres_dir.mkdir(parents=True, exist_ok=True)
@@ -700,6 +807,57 @@ def main():
     preview_dir = output_dir / "preview"
     preview_dir.mkdir(parents=True, exist_ok=True)
     video = Path(args.video)
+    static_probe_started = time.perf_counter()
+    static_probe = probe_static_segment(
+        video,
+        output_dir,
+        args.start,
+        args.duration,
+        args.max_frames,
+        args.change_threshold,
+    )
+    static_probe_seconds = round(time.perf_counter() - static_probe_started, 3)
+    if static_probe and static_probe.get("status") == "static":
+        candidates = static_probe.get("candidates") or []
+        paper_backends = {
+            "transnetv2": {"status": "unavailable", "reason": "static_shortcut"},
+            "open_clip": {"status": "unavailable", "reason": "static_shortcut"},
+            "sspa": {"status": "ok", "projection": "lower_middle_text_band"},
+            "mskvs": {"status": "ok", "feature": "gffv_global_orientation_histogram"},
+        }
+        still_backends = []
+        materialize_seconds = 0.0
+        if not args.metadata_only:
+            materialize_started = time.perf_counter()
+            candidates, still_backends = materialize_highres_candidates(video, output_dir, candidates)
+            materialize_seconds = round(time.perf_counter() - materialize_started, 3)
+        manifest = {
+            "success": True,
+            "decode_backend": status["decode_backend"],
+            "preview_fallback": None,
+            "candidate_still_backends": still_backends,
+            "metadata_only": args.metadata_only,
+            "paper_backends": paper_backends,
+            "segment_start": args.start,
+            "segment_duration": args.duration,
+            "sample_fps": args.sample_fps,
+            "preview_frames": 0,
+            "candidate_frames": len(candidates),
+            "static_shortcut": static_probe,
+            "observation_metrics": candidate_observation_metrics(candidates, args.start, args.duration),
+            "candidates": candidates,
+            "timings": {
+                "static_probe_seconds": static_probe_seconds,
+                "preview_seconds": 0.0,
+                "selection_seconds": 0.0,
+                "materialize_seconds": materialize_seconds,
+                "total_seconds": round(time.perf_counter() - started, 3),
+            },
+        }
+        (output_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(json.dumps(manifest, ensure_ascii=False))
+        return 0
+
     preview_started = time.perf_counter()
     backend, preview_fallback = extract_preview_frames(
         video,
@@ -750,6 +908,7 @@ def main():
         "observation_metrics": candidate_observation_metrics(candidates, args.start, args.duration),
         "candidates": candidates,
         "timings": {
+            "static_probe_seconds": static_probe_seconds,
             "preview_seconds": preview_seconds,
             "selection_seconds": selection_seconds,
             "materialize_seconds": materialize_seconds,

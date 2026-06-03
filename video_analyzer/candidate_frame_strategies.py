@@ -617,7 +617,10 @@ def _sklearn_mean_shift_modes(
         bandwidth = max(_median_pairwise_distance(vectors), 0.08)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
-        labels = MeanShift(bandwidth=bandwidth, bin_seeding=True).fit_predict(matrix)
+        try:
+            labels = MeanShift(bandwidth=bandwidth, bin_seeding=True).fit_predict(matrix)
+        except ValueError:
+            return []
     clusters: dict[int, list[tuple[int, Any, float, float]]] = {}
     for item, label in zip(candidates, labels):
         clusters.setdefault(int(label), []).append(item)

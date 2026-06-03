@@ -1,6 +1,8 @@
 from unittest import TestCase
+from unittest.mock import patch
 
 from video_analyzer.candidate_frame_strategies import (
+    _sklearn_mean_shift_modes,
     classify_video_profile,
     select_candidate_frames_with_strategy,
 )
@@ -81,6 +83,52 @@ class CandidateFrameStrategyTests(TestCase):
             result.metadata["strategy_observations"]["paper_algorithm_trace"]["mskvs"]["feature"],
             "gffv_global_orientation",
         )
+
+    def test_operation_strategy_falls_back_when_sklearn_mean_shift_errors(self):
+        rows = [
+            candidate(0, 0.0, 8.0, 0.35, [1, 0, 0, 0, 0, 0, 0, 0]),
+            candidate(1, 8.0, 9.0, 0.36, [1, 0, 0, 0, 0, 0, 0, 0]),
+            candidate(2, 16.0, 14.0, 0.40, [0, 1, 0, 0, 0, 0, 0, 0]),
+            candidate(3, 24.0, 12.0, 0.38, [0, 1, 0, 0, 0, 0, 0, 0]),
+        ]
+
+        with patch(
+            "video_analyzer.candidate_frame_strategies._sklearn_mean_shift_modes",
+            return_value=[],
+        ):
+            result = select_candidate_frames_with_strategy(
+                rows,
+                candidate_budget=2,
+                video_duration_seconds=30.0,
+                pipeline_mode="deep",
+                strategy="operation",
+            )
+
+        self.assertEqual(len(result.selected), 2)
+        self.assertEqual(result.metadata["paper_algorithm"], "mskvs_gffv_adaptive_mean_shift_with_sspa")
+
+    def test_sklearn_mean_shift_value_error_is_treated_as_unavailable(self):
+        rows = [
+            candidate(0, 0.0, 8.0, 0.35),
+            candidate(1, 8.0, 9.0, 0.36),
+        ]
+
+        class FailingMeanShift:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def fit_predict(self, matrix):
+                raise ValueError("No point was within bandwidth")
+
+        with patch("sklearn.cluster.MeanShift", FailingMeanShift):
+            selected = _sklearn_mean_shift_modes(
+                rows,
+                vectors=[[0.0, 1.0], [1.0, 0.0]],
+                budget=1,
+                duration=8.0,
+            )
+
+        self.assertEqual(selected, [])
 
     def test_lmske_uses_clip_embeddings_and_transnet_boundaries_when_present(self):
         rows = [

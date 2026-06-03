@@ -1,3 +1,4 @@
+import os
 import tempfile
 from pathlib import Path
 from unittest import TestCase
@@ -30,6 +31,28 @@ class JetsonFrameSelectionTests(TestCase):
         self.assertEqual(len(filled), 5)
         self.assertEqual(filled[0]["timestamp"], 0.0)
         self.assertEqual(filled[-1]["timestamp"], 90.0)
+
+    def test_static_shortcut_limits_candidates_before_full_preview_scan(self):
+        namespace = {}
+        exec(REMOTE_WORKER_SCRIPT, namespace)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = []
+            for index in range(12):
+                image_path = Path(temp_dir) / f"probe_{index:06d}.jpg"
+                Image.new("L", (320, 180), color=128).save(image_path)
+                paths.append((image_path, index * 60.0))
+
+            candidates = namespace["build_static_coverage_candidates"](
+                paths,
+                segment_start=0.0,
+                segment_duration=720.0,
+                max_frames=4,
+            )
+
+        self.assertEqual(len(candidates), 4)
+        self.assertTrue(all(item["static_shortcut"] for item in candidates))
+        self.assertEqual(candidates[0]["timestamp"], 0.0)
+        self.assertEqual(candidates[-1]["timestamp"], 660.0)
 
     def make_worker(self, name: str) -> JetsonFrameWorker:
         return JetsonFrameWorker(
@@ -99,7 +122,7 @@ class JetsonFrameSelectionTests(TestCase):
         self.assertEqual(len(gffv), 8)
         self.assertIsInstance(projection, float)
         self.assertIn(clip_status["status"], {"ok", "fail"})
-        self.assertIn(transnet_status["status"], {"ok", "fail"})
+        self.assertIn(transnet_status["status"], {"ok", "fail", "unavailable"})
 
     def test_remote_worker_fails_cpu_only_heavy_paper_backends(self):
         namespace = {}
@@ -121,7 +144,9 @@ class JetsonFrameSelectionTests(TestCase):
         old_torch = sys.modules.get("torch")
         old_open_clip = sys.modules.get("open_clip")
         old_transnet = sys.modules.get("transnetv2_pytorch")
+        old_enable_transnet = os.environ.get("VIDEO_ANALYZER_ENABLE_TRANSNET")
         try:
+            os.environ["VIDEO_ANALYZER_ENABLE_TRANSNET"] = "1"
             sys.modules["torch"] = TorchStub
             sys.modules["open_clip"] = open_clip_stub
             sys.modules["transnetv2_pytorch"] = transnet_stub
@@ -129,6 +154,10 @@ class JetsonFrameSelectionTests(TestCase):
             clip_status = namespace["attach_clip_embeddings"]([{"path": "missing.jpg"}])
             transnet_status = namespace["attach_transnet_shot_boundaries"](Path("missing.mp4"), [{"timestamp": 0.0}])
         finally:
+            if old_enable_transnet is None:
+                os.environ.pop("VIDEO_ANALYZER_ENABLE_TRANSNET", None)
+            else:
+                os.environ["VIDEO_ANALYZER_ENABLE_TRANSNET"] = old_enable_transnet
             for name, old in [("torch", old_torch), ("open_clip", old_open_clip), ("transnetv2_pytorch", old_transnet)]:
                 if old is None:
                     sys.modules.pop(name, None)
