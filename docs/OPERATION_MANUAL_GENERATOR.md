@@ -100,14 +100,14 @@ To switch or customize endpoints/models, use a runtime profile:
 
 ```json
 {
-  "active_runtime_profile": "deepseek_v4_flash",
+  "active_runtime_profile": "deepseek_v4_pro",
   "runtime_profiles": {
-    "deepseek_v4_flash": {
+    "deepseek_v4_pro": {
       "llm_base_url": "https://api.deepseek.com",
       "vision_base_url": "http://100.96.79.21:18082/v1",
       "text_base_url": "https://api.deepseek.com",
       "vision_model": "minicpm-v-4.5-v100",
-      "text_model": "deepseek-v4-flash",
+      "text_model": "deepseek-v4-pro",
       "vibevoice_url": "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
       "ocr_base_url": "http://spark-31d6.taild500c8.ts.net:8000/v1",
       "ocr_base_urls": [
@@ -124,7 +124,7 @@ To switch or customize endpoints/models, use a runtime profile:
 }
 ```
 
-Both URL and multi-document runners accept `--profile deepseek_v4_flash`. Command-line
+Both URL and multi-document runners accept `--profile deepseek_v4_pro`. Command-line
 arguments still override the profile for one-off runs.
 
 For URL downloads, `--download-device local` is the default. Use

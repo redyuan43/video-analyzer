@@ -157,7 +157,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             options = server.options()
 
         self.assertEqual(options["defaults"]["analysis_mode"], "auto")
-        self.assertEqual(options["defaults"]["profile"], "deepseek_v4_flash")
+        self.assertEqual(options["defaults"]["profile"], "deepseek_v4_pro")
         self.assertEqual(options["defaults"]["cookies_from_browser"], "none")
         self.assertEqual(options["defaults"]["download_device"], "local")
         self.assertTrue(options["defaults"]["keep_existing"])
@@ -168,7 +168,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertFalse(options["defaults"]["skip_images"])
         self.assertEqual(options["defaults"]["max_comments"], 3000)
         self.assertIn("balanced", options["choices"]["analysis_modes"])
-        self.assertIn("deepseek_v4_flash", options["choices"]["profiles"])
+        self.assertIn("deepseek_v4_pro", options["choices"]["profiles"])
         self.assertIn("mi", options["choices"]["download_devices"])
 
     def test_create_job_saves_common_and_collection_options(self):
@@ -178,7 +178,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
                 {
                     "videoUrl": "https://example.com/video",
                     "analysisMode": "deep",
-                    "profile": "deepseek_v4_flash",
+                    "profile": "deepseek_v4_pro",
                     "runName": "../operation manual!",
                     "cookiesFromBrowser": "none",
                     "downloadDevice": "mi",
@@ -215,7 +215,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
                 {
                     "video_url": "https://example.com/video",
                     "analysis_mode": "fast",
-                    "profile": "deepseek_v4_flash",
+                    "profile": "deepseek_v4_pro",
                     "cookies_from_browser": "none",
                     "download_device": "mi",
                     "keep_existing": False,
@@ -333,7 +333,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
         self.assertEqual(command[0], "tools/run_long_talk_fast_from_url.sh")
         self.assertIn("--profile", command)
-        self.assertEqual(command[command.index("--profile") + 1], "deepseek_v4_flash")
+        self.assertEqual(command[command.index("--profile") + 1], "deepseek_v4_pro")
         self.assertNotIn("--pipeline-mode", command)
 
     def test_long_talk_wrapper_defaults_to_agx_dual_worker(self):
@@ -360,7 +360,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertIn("--jobs", command)
         self.assertEqual(command[command.index("--jobs") + 1], "3")
         self.assertIn("--profile", command)
-        self.assertEqual(command[command.index("--profile") + 1], "deepseek_v4_flash")
+        self.assertEqual(command[command.index("--profile") + 1], "deepseek_v4_pro")
         self.assertNotIn("--skip-images", command)
 
     def test_final_publish_stage_respects_skip_images_option(self):

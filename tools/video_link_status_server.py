@@ -36,7 +36,7 @@ ALLOWED_ANALYSIS_MODES = ("auto", "fast", "balanced", "deep", "long-talk-fast")
 ALLOWED_COOKIE_BROWSERS = ("", "chrome", "none", "edge", "firefox", "chromium", "brave")
 ALLOWED_DOWNLOAD_DEVICES = ("local", "mi")
 DEFAULT_COOKIE_BROWSER = ""
-DEFAULT_PROFILE = "deepseek_v4_flash"
+DEFAULT_PROFILE = "deepseek_v4_pro"
 CORE_ANALYSIS_ERROR_PATTERNS = (
     "Error analyzing frame",
     "model-resource-busy",

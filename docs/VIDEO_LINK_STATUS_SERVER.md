@@ -26,7 +26,7 @@ tmp/video-link-status/
 
 - `video_url`：必填视频链接。
 - `analysis_mode`：`auto` / `fast` / `balanced` / `deep` / `long-talk-fast`。
-- `profile`：从 `config/config.json` 和 `video_analyzer/config/default_config.json` 的 `runtime_profiles` 读取；默认优先 `deepseek_v4_flash`。
+- `profile`：从 `config/config.json` 和 `video_analyzer/config/default_config.json` 的 `runtime_profiles` 读取；默认优先 `deepseek_v4_pro`。
 - `run_name`：输出目录名，默认 `operation-manual`。
 - `cookies_from_browser`：`chrome` / `none` / `edge` / `firefox` / `chromium` / `brave`。
 - `download_device`：下载执行设备，默认 `local`；当本机下载失败或网络受限时可选 `mi`，由 MI 设备下载后同步回本机。
@@ -67,7 +67,7 @@ curl -fsS http://127.0.0.1:5000/api/video-link/options | python3 -m json.tool
 ```bash
 curl -fsS -X POST http://127.0.0.1:5000/api/video-link/jobs \
   -H 'Content-Type: application/json' \
-  -d '{"video_url":"https://example.com/video","analysis_mode":"auto","profile":"deepseek_v4_flash","auto_start":true}'
+  -d '{"video_url":"https://example.com/video","analysis_mode":"auto","profile":"deepseek_v4_pro","auto_start":true}'
 ```
 
 列出最近任务：

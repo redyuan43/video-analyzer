@@ -47,7 +47,7 @@
             ]
         }
     },
-    "active_runtime_profile": "deepseek_v4_flash",
+    "active_runtime_profile": "deepseek_v4_pro",
     "runtime_profiles": {
         "ivan_minicpm_v100": {
             "llm_base_url": "{amd_fast_base_url}",
