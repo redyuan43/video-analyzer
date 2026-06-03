@@ -95,6 +95,46 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertIn("--remote-components ejs:github", command)
         self.assertIn("/home/ivan/Documents/video-analyzer-url-downloads/test/download.", command)
 
+    def test_bilibili_ytdlp_commands_include_site_headers(self):
+        command = ["yt-dlp", "--skip-download"]
+
+        url_context_mod.add_ytdlp_site_args(command, "https://www.bilibili.com/video/BV1YtVz6eEAz/")
+
+        self.assertIn("--add-header", command)
+        self.assertIn("Referer: https://www.bilibili.com/", command)
+        self.assertTrue(any(header.startswith("User-Agent: Mozilla/5.0") for header in command))
+
+        remote_args = type(
+            "Args",
+            (),
+            {
+                "url": "https://www.bilibili.com/video/BV1YtVz6eEAz/",
+                "include_subtitles": False,
+                "include_comments": False,
+                "subtitle_langs": "zh-CN,zh,en",
+                "ytdlp_js_runtimes": "none",
+                "ytdlp_remote_components": "",
+                "ytdlp_extractor_args": "",
+                "ytdlp_proxy": None,
+                "cookies": None,
+                "cookies_from_browser": "",
+            },
+        )()
+        remote_command = url_context_mod.remote_download_command(
+            remote_args,
+            "/home/ivan/Documents/video-analyzer-url-downloads/test",
+        )
+
+        self.assertIn("--add-header", remote_command)
+        self.assertIn("Referer: https://www.bilibili.com/", remote_command)
+        self.assertIn("User-Agent: Mozilla/5.0", remote_command)
+
+    def test_infer_video_id_from_bilibili_url(self):
+        self.assertEqual(
+            url_context_mod.infer_video_id_from_url("https://www.bilibili.com/video/BV1YtVz6eEAz/?spm_id_from=333"),
+            "BV1YtVz6eEAz",
+        )
+
     def test_existing_video_dir_for_url_uses_cached_youtube_id(self):
         with tempfile.TemporaryDirectory() as tmp:
             video_dir = Path(tmp) / "B8OxtGSEfoo"

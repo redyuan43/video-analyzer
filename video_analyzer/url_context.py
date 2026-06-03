@@ -360,6 +360,7 @@ def remote_download_command(args: argparse.Namespace, remote_run_dir: str) -> st
     if args.include_comments:
         command.append("--write-comments")
     append_remote_ytdlp_runtime_args(command, args)
+    append_remote_ytdlp_site_args(command, args.url)
     if getattr(args, "ytdlp_proxy", None):
         command.extend(["--proxy", shell_quote(args.ytdlp_proxy)])
     if getattr(args, "cookies", None):
@@ -384,11 +385,18 @@ def append_remote_ytdlp_runtime_args(command: list[str], args: argparse.Namespac
         command.extend(["--extractor-args", shell_quote(extractor_args)])
 
 
+def append_remote_ytdlp_site_args(command: list[str], url: str) -> None:
+    for header in ytdlp_site_headers(url):
+        command.extend(["--add-header", shell_quote(header)])
+
+
 def fetch_metadata(url: str, args: argparse.Namespace) -> dict[str, Any]:
-    command = ["yt-dlp", "--dump-single-json", "--no-warnings", "--skip-download", url]
+    command = ["yt-dlp", "--dump-single-json", "--no-warnings", "--skip-download"]
     add_ytdlp_runtime_args(command, args)
+    add_ytdlp_site_args(command, url)
     add_ytdlp_network_args(command, args)
     add_cookie_args(command, args)
+    command.append(url)
     raw = subprocess.check_output(command, text=True)
     return json.loads(raw)
 
@@ -405,15 +413,16 @@ def download_video(url: str, video_dir: Path, args: argparse.Namespace) -> None:
         "bv*[vcodec^=avc1]+ba/b[vcodec^=avc1]/bv*+ba/b",
         "-o",
         str(video_dir / "download.%(ext)s"),
-        url,
     ]
     if args.include_subtitles:
         command.extend(["--write-subs", "--write-auto-subs", "--sub-langs", subtitle_langs_for_ytdlp(args.subtitle_langs)])
     if args.include_comments:
         command.append("--write-comments")
     add_ytdlp_runtime_args(command, args)
+    add_ytdlp_site_args(command, url)
     add_ytdlp_network_args(command, args)
     add_cookie_args(command, args)
+    command.append(url)
     subprocess.run(command, check=True)
 
 
@@ -426,15 +435,16 @@ def download_context_assets(url: str, video_dir: Path, args: argparse.Namespace)
         "--write-description",
         "-o",
         str(video_dir / "download.%(ext)s"),
-        url,
     ]
     if args.include_subtitles:
         command.extend(["--write-subs", "--write-auto-subs", "--sub-langs", subtitle_langs_for_ytdlp(args.subtitle_langs)])
     if args.include_comments:
         command.append("--write-comments")
     add_ytdlp_runtime_args(command, args)
+    add_ytdlp_site_args(command, url)
     add_ytdlp_network_args(command, args)
     add_cookie_args(command, args)
+    command.append(url)
     subprocess.run(command, check=True)
 
 
@@ -465,7 +475,7 @@ def existing_video_dir_for_url(output_root: Path, url: str) -> Path | None:
 def infer_video_id_from_url(url: str) -> str:
     parsed = urlparse(url)
     host = parsed.netloc.lower()
-    if "youtube.com" in host:
+    if is_youtube_url(url):
         query_id = parse_qs(parsed.query).get("v")
         if query_id:
             return query_id[0]
@@ -474,7 +484,31 @@ def infer_video_id_from_url(url: str) -> str:
             return parts[1]
     if "youtu.be" in host:
         return parsed.path.strip("/").split("/")[0]
+    if is_bilibili_url(url):
+        parts = [part for part in parsed.path.split("/") if part]
+        for part in parts:
+            if part.startswith("BV") or part.startswith("av"):
+                return part
     return ""
+
+
+def is_youtube_url(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    return "youtube.com" in host or "youtu.be" in host
+
+
+def is_bilibili_url(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    return "bilibili.com" in host or "b23.tv" in host
+
+
+def ytdlp_site_headers(url: str) -> list[str]:
+    if not is_bilibili_url(url):
+        return []
+    return [
+        "Referer: https://www.bilibili.com/",
+        "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    ]
 
 
 def add_cookie_args(command: list[str], args: argparse.Namespace) -> None:
@@ -487,6 +521,11 @@ def add_cookie_args(command: list[str], args: argparse.Namespace) -> None:
 def add_ytdlp_network_args(command: list[str], args: argparse.Namespace) -> None:
     if getattr(args, "ytdlp_proxy", None):
         command.extend(["--proxy", args.ytdlp_proxy])
+
+
+def add_ytdlp_site_args(command: list[str], url: str) -> None:
+    for header in ytdlp_site_headers(url):
+        command.extend(["--add-header", header])
 
 
 def add_ytdlp_runtime_args(command: list[str], args: argparse.Namespace) -> None:
