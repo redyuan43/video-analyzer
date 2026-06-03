@@ -78,6 +78,59 @@ class StudyGuideTests(unittest.TestCase):
             guide = json.loads((run_dir / "study_guide.json").read_text(encoding="utf-8"))
             self.assertTrue(any(item["source_type"] == "asr" and "硬件选择" in item["text"] for item in guide["evidence"]))
 
+    def test_learning_copy_uses_chapter_content_instead_of_repeated_manual(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "orin").mkdir()
+            (run_dir / "frames").mkdir()
+            (run_dir / "orin" / "page_context.md").write_text(
+                "- 00:00:00 - 00:02:00: 背景说明\n"
+                "- 00:02:00 - 00:05:00: 参数配置\n",
+                encoding="utf-8",
+            )
+            (run_dir / "analysis.json").write_text(
+                json.dumps(
+                    {
+                        "transcript": {
+                            "segments": [
+                                {
+                                    "Start": 10.0,
+                                    "End": 30.0,
+                                    "Content": "先解释系统为什么需要这个流程，并明确最终要验证的目标。",
+                                },
+                                {
+                                    "Start": 140.0,
+                                    "End": 180.0,
+                                    "Content": "进入参数配置页面，依次填写服务地址、模型名称和并发数量。",
+                                },
+                            ]
+                        },
+                        "ocr_events": [],
+                        "frame_analyses": [],
+                        "metadata": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "manual_evidence.md").write_text("# Evidence\n", encoding="utf-8")
+            (run_dir / "operation_manual.md").write_text(
+                "这是一段全局手册内容，如果每个章节都展示它，学习视图就会重复。",
+                encoding="utf-8",
+            )
+            (run_dir / "frames_manifest.json").write_text(
+                json.dumps({"version": 1, "source": "audio_only", "frames": []}),
+                encoding="utf-8",
+            )
+
+            build_study_artifacts(run_dir, skip_review=True)
+
+            guide = json.loads((run_dir / "study_guide.json").read_text(encoding="utf-8"))
+            first, second = guide["chapters"][:2]
+            self.assertIn("为什么需要这个流程", first["summary"])
+            self.assertIn("参数配置页面", second["summary"])
+            self.assertNotEqual(first["summary"], second["summary"])
+            self.assertFalse(any(point.endswith("...") for chapter in guide["chapters"] for point in chapter["key_points"]))
+
     def test_audio_only_run_does_not_require_visual_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)

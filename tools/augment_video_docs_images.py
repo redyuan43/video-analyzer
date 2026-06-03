@@ -20,7 +20,10 @@ DOCS = [
     ),
     ("docs_analysis_chapters/knowledge_notes_v2.md", "02-infographic-knowledge-notes.png", "逐章知识笔记视觉摘要", r"^## 01\. .+$", ()),
     ("docs_analysis_chapters/deep_report_v2.md", "03-infographic-deep-report.png", "逐章深度报告视觉摘要", r"^## 逐章分析\s*$", ()),
-    ("manual_evidence.md", "04-infographic-manual-evidence.png", "证据索引视觉摘要", r"^## 0\.00s / Frame 0\s*$", ()),
+]
+
+CLEANUP_IMAGE_REFS = [
+    ("manual_evidence.md", ("04-infographic-manual-evidence.png",)),
 ]
 
 
@@ -53,6 +56,14 @@ def main() -> int:
         path.write_text(normalize_spacing(text), encoding="utf-8")
         changed.append(rel)
         print(f"[augmented] {rel}")
+    for rel, deprecated_image_names in CLEANUP_IMAGE_REFS:
+        path = run_dir / rel
+        if not path.exists():
+            continue
+        text = remove_deprecated_image_refs(path.read_text(encoding="utf-8"), deprecated_image_names)
+        path.write_text(normalize_spacing(text), encoding="utf-8")
+        changed.append(rel)
+        print(f"[cleaned] {rel}")
 
     print(json.dumps({"run_dir": str(run_dir), "documents": changed}, ensure_ascii=False, indent=2))
     return 0

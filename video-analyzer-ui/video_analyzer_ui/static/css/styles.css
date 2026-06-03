@@ -1048,6 +1048,13 @@ th {
     background: #fff;
 }
 
+.study-panel,
+.doc-list-panel,
+.doc-preview-panel {
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+}
+
 .study-header,
 .doc-list-header,
 .doc-preview-header {
@@ -1108,53 +1115,217 @@ th {
     padding: 12px;
 }
 
-.study-overview {
-    margin: 0 0 12px;
-    color: #344054;
-    font-size: 13px;
-    line-height: 1.55;
+.study-learning-shell {
+    display: grid;
+    gap: 12px;
+    min-height: 100%;
 }
 
-.study-chapter {
-    margin: 0 0 10px;
-    padding: 10px;
+.study-content-summary,
+.study-workflow-section,
+.study-detail {
     border: 1px solid #e4e7ec;
     border-radius: 8px;
     background: #fcfcfd;
 }
 
-.study-chapter h4 {
-    margin: 0 0 6px;
-    font-size: 13px;
+.study-content-summary {
+    display: grid;
+    gap: 8px;
+    padding: 10px;
 }
 
-.study-chapter p {
-    margin: 0 0 8px;
-    color: #475467;
+.study-content-summary > span,
+.study-section-title,
+.study-detail-head span,
+.study-detail h5 {
+    color: #667085;
     font-size: 12px;
+    font-weight: 700;
+}
+
+.study-content-summary p {
+    margin: 0;
+    color: #475467;
     line-height: 1.55;
 }
 
-.study-evidence-list {
+.study-progress-meta {
     display: grid;
     gap: 6px;
-    margin-top: 8px;
-}
-
-.study-evidence {
-    display: grid;
-    gap: 4px;
-    padding: 7px;
-    border-radius: 6px;
-    background: #f2f4f7;
     color: #344054;
-    font-size: 11px;
+    font-size: 12px;
 }
 
-.study-jump {
-    width: max-content;
-    min-height: 28px;
-    padding: 4px 8px;
+.study-progress-bar {
+    height: 7px;
+}
+
+.study-workflow-section {
+    display: grid;
+    gap: 10px;
+    padding: 10px;
+}
+
+.study-workflow {
+    display: flex;
+    gap: 28px;
+    overflow-x: auto;
+    padding: 2px 2px 10px;
+}
+
+.study-node {
+    position: relative;
+    display: grid;
+    flex: 0 0 168px;
+    gap: 5px;
+    min-height: 92px;
+    padding: 10px;
+    border: 1px solid #d7dde5;
+    border-radius: 8px;
+    background: #fff;
+    color: #101828;
+    text-align: left;
+}
+
+.study-node:not(:last-child)::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: calc(100% + 7px);
+    width: 14px;
+    height: 2px;
+    background: #98a2b3;
+}
+
+.study-node:not(:last-child)::before {
+    content: "";
+    position: absolute;
+    top: calc(50% - 4px);
+    left: calc(100% + 19px);
+    border-top: 5px solid transparent;
+    border-bottom: 5px solid transparent;
+    border-left: 7px solid #98a2b3;
+}
+
+.study-node span {
+    color: #2563eb;
+    font-size: 12px;
+    font-weight: 800;
+}
+
+.study-node strong {
+    overflow: hidden;
+    font-size: 13px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.study-node em {
+    color: #667085;
+    font-size: 12px;
+    font-style: normal;
+}
+
+.study-node.active {
+    border-color: #101828;
+    background: #eef2f7;
+    box-shadow: inset 0 0 0 1px #101828;
+}
+
+.study-detail {
+    display: grid;
+    grid-template-columns: minmax(180px, 34%) minmax(0, 1fr);
+    gap: 12px;
+    min-height: 280px;
+    padding: 10px;
+}
+
+.study-frame {
+    min-height: 220px;
+    overflow: hidden;
+    border: 1px solid #d7dde5;
+    border-radius: 8px;
+    background: #f2f4f7;
+}
+
+.study-frame img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    background: #101828;
+    cursor: zoom-in;
+}
+
+.study-frame-empty {
+    display: grid;
+    height: 100%;
+    min-height: 220px;
+    place-items: center;
+    color: #667085;
+    font-size: 13px;
+}
+
+.study-detail-content {
+    display: grid;
+    gap: 12px;
+    min-width: 0;
+}
+
+.study-detail-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.study-detail h4,
+.study-detail h5,
+.study-detail p {
+    margin: 0;
+}
+
+.study-detail h4 {
+    margin-top: 3px;
+    color: #101828;
+    font-size: 16px;
+}
+
+.study-detail-head p,
+.study-detail section p,
+.study-empty-note {
+    color: #475467;
+    font-size: 13px;
+    line-height: 1.55;
+}
+
+.study-play {
+    flex: 0 0 auto;
+}
+
+.study-key-points {
+    display: grid;
+    gap: 7px;
+    margin: 8px 0 0;
+    padding-left: 20px;
+    color: #344054;
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.study-step-actions {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-top: auto;
+    padding-top: 10px;
+    border-top: 1px solid #e4e7ec;
+}
+
+.study-step-actions span {
+    color: #667085;
     font-size: 12px;
 }
 
@@ -1330,6 +1501,7 @@ th {
     border-radius: 8px;
     background: #f8fafc;
     object-fit: contain;
+    cursor: zoom-in;
 }
 
 .doc-preview-body.markdown td img.markdown-image {
@@ -1351,6 +1523,105 @@ figure.markdown-image img {
     border-radius: 8px;
     background: #f8fafc;
     object-fit: contain;
+    cursor: zoom-in;
+}
+
+body.image-viewer-open {
+    overflow: hidden;
+}
+
+.image-viewer[hidden] {
+    display: none;
+}
+
+.image-viewer {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+}
+
+.image-viewer-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(11, 18, 32, 0.84);
+}
+
+.image-viewer-panel {
+    position: relative;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+    width: min(96vw, 1480px);
+    height: min(94vh, 980px);
+    margin: 3vh auto;
+    overflow: hidden;
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    border-radius: 8px;
+    background: #0b1220;
+    box-shadow: 0 28px 80px rgba(0, 0, 0, 0.35);
+}
+
+.image-viewer-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    min-height: 52px;
+    padding: 8px 12px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+    color: #f8fafc;
+}
+
+.image-viewer-title {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 14px;
+}
+
+.image-viewer-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+}
+
+.image-viewer-actions button,
+.image-viewer-actions span {
+    min-width: 40px;
+    height: 34px;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.08);
+    color: #f8fafc;
+    font-size: 13px;
+}
+
+.image-viewer-actions button {
+    cursor: pointer;
+}
+
+.image-viewer-actions span {
+    display: inline-grid;
+    place-items: center;
+    padding: 0 8px;
+}
+
+.image-viewer-stage {
+    display: grid;
+    place-items: center;
+    min-height: 0;
+    overflow: auto;
+    padding: 18px;
+}
+
+.image-viewer-stage img {
+    max-width: 100%;
+    max-height: 100%;
+    transform-origin: center center;
+    transition: transform 120ms ease;
+    object-fit: contain;
+    cursor: zoom-in;
 }
 
 figure.markdown-image figcaption {
@@ -1630,7 +1901,33 @@ pre {
     body {
         height: auto;
         min-height: 100vh;
-        overflow: auto;
+        overflow-x: hidden;
+        overflow-y: auto;
+    }
+
+    .topbar {
+        display: grid;
+        gap: 10px;
+    }
+
+    .view-tabs {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        width: 100%;
+    }
+
+    .view-tab {
+        min-width: 0;
+    }
+
+    .preview-toolbar,
+    .vscode-toolbar {
+        align-items: stretch;
+        flex-direction: column;
+    }
+
+    .vscode-actions {
+        justify-content: flex-start;
     }
 
     .workspace,
@@ -1664,6 +1961,47 @@ pre {
     .vscode-view,
     .vscode-docs {
         overflow: visible;
+    }
+
+    .study-workflow {
+        display: grid;
+        gap: 18px;
+        overflow-x: visible;
+    }
+
+    .study-node {
+        width: 100%;
+        min-height: 78px;
+    }
+
+    .study-node:not(:last-child)::after {
+        top: calc(100% + 4px);
+        left: 50%;
+        width: 2px;
+        height: 10px;
+    }
+
+    .study-node:not(:last-child)::before {
+        top: calc(100% + 12px);
+        left: calc(50% - 5px);
+        border-top: 7px solid #98a2b3;
+        border-right: 5px solid transparent;
+        border-left: 5px solid transparent;
+        border-bottom: 0;
+    }
+
+    .study-detail {
+        grid-template-columns: 1fr;
+    }
+
+    .study-frame {
+        min-height: 180px;
+    }
+
+    .study-detail-head,
+    .study-step-actions {
+        align-items: stretch;
+        flex-direction: column;
     }
 }
 

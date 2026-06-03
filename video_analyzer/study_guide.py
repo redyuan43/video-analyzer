@@ -16,6 +16,7 @@ from video_analyzer.multidoc import parse_chapters, timestamp_to_seconds
 
 
 CORE_SOURCE_TYPES = {"asr", "subtitle", "ocr", "vl", "manual"}
+LEARNING_SOURCE_TYPES = {"asr", "subtitle", "ocr", "vl"}
 DEFAULT_TEXT_MODEL = "redhatai_qwen3.6-35b-a3b-nvfp4"
 
 
@@ -317,11 +318,12 @@ def build_chapter_packets(
         end = chapter["end_sec"] if chapter["end_sec"] > start else float("inf")
         chapter_evidence = [item for item in evidence if start <= item["timestamp_sec"] < end or item["source_type"] == "manual"]
         core_evidence = [item for item in chapter_evidence if item["source_type"] in CORE_SOURCE_TYPES and item.get("text")]
+        learning_evidence = chapter_learning_evidence(core_evidence)
         representative = choose_representative_frame(start, end, frames)
         packet = {
             **chapter,
-            "summary": summarize_chapter(core_evidence),
-            "key_points": key_points_from_evidence(core_evidence),
+            "summary": summarize_chapter(learning_evidence),
+            "key_points": key_points_from_evidence(learning_evidence),
             "representative_frame": representative,
             "evidence_ids": [item["id"] for item in chapter_evidence[:30]],
             "evidence": chapter_evidence[:30],
@@ -696,23 +698,73 @@ def summarize_video(chapter_packets: list[dict[str, Any]]) -> str:
     return f"全片分为 {len(chapter_packets)} 个学习章节，核心路径包括：{titles}。"
 
 
+def chapter_learning_evidence(evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    timed = [item for item in evidence if item.get("source_type") in LEARNING_SOURCE_TYPES and clean_text(item.get("text"))]
+    if timed:
+        return sorted(timed, key=learning_evidence_sort_key)
+    return [item for item in evidence if clean_text(item.get("text"))]
+
+
+def learning_evidence_sort_key(item: dict[str, Any]) -> tuple[int, float, str]:
+    priority = {"asr": 0, "subtitle": 0, "ocr": 1, "vl": 2}
+    return (priority.get(str(item.get("source_type")), 9), float_or_zero(item.get("timestamp_sec")), str(item.get("id") or ""))
+
+
 def summarize_chapter(evidence: list[dict[str, Any]]) -> str:
-    for item in evidence:
-        text = clean_text(item.get("text"))
-        if text:
-            return trim(text, 120)
+    units = learning_units_from_evidence(evidence, max_units=3, max_chars=420)
+    if units:
+        return "；".join(units)
     return "本章暂无可用核心证据。"
 
 
 def key_points_from_evidence(evidence: list[dict[str, Any]]) -> list[str]:
-    points = []
+    return learning_units_from_evidence(evidence, max_units=5, max_chars=760)
+
+
+def learning_units_from_evidence(evidence: list[dict[str, Any]], max_units: int, max_chars: int) -> list[str]:
+    units: list[str] = []
+    seen: set[str] = set()
+    used_chars = 0
     for item in evidence:
-        text = trim(clean_text(item.get("text")), 90)
-        if text and text not in points:
-            points.append(f"{item['timestamp_label']} · {text}")
-        if len(points) >= 4:
-            break
-    return points
+        for unit in split_learning_units(clean_text(item.get("text"))):
+            normalized = re.sub(r"\W+", "", unit).lower()
+            if not normalized or normalized in seen:
+                continue
+            remaining = max_chars - used_chars
+            if remaining <= 0:
+                return units
+            clipped = sentence_safe_trim(unit, min(220, remaining))
+            if not clipped:
+                continue
+            units.append(clipped)
+            seen.add(normalized)
+            used_chars += len(clipped)
+            if len(units) >= max_units:
+                return units
+    return units
+
+
+def split_learning_units(text: str) -> list[str]:
+    text = clean_text(text)
+    if not text:
+        return []
+    parts = [part.strip(" ，,；;。.!！?？") for part in re.split(r"(?<=[。！？!?；;])\s*|\n+", text) if part.strip()]
+    if len(parts) <= 1 and len(text) > 180:
+        parts = [part.strip(" ，,；;。.!！?？") for part in re.split(r"[，,]\s*", text) if part.strip()]
+    return [part for part in parts if len(part) >= 4]
+
+
+def sentence_safe_trim(text: str, max_chars: int) -> str:
+    text = clean_text(text).strip(" ，,；;。.!！?？")
+    if len(text) <= max_chars:
+        return text
+    boundary = max(text.rfind(mark, 0, max_chars) for mark in ("。", "！", "？", "；", ";", ".", "!", "?"))
+    if boundary >= max(24, max_chars // 2):
+        return text[: boundary + 1].strip(" ，,；;。.!！?？")
+    comma = max(text.rfind(mark, 0, max_chars) for mark in ("，", ",", "、"))
+    if comma >= max(24, max_chars // 2):
+        return text[:comma].strip(" ，,；;。.!！?？")
+    return text[:max_chars].rstrip()
 
 
 def deterministic_risk(gaps: dict[str, Any]) -> str:

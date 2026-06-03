@@ -65,6 +65,17 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn("vendor/katex/katex.min.css", html)
         self.assertIn("vendor/katex/katex.min.js", html)
         self.assertIn("vendor/katex/contrib/auto-render.min.js", html)
+        main_js = (UI_ROOT / "video_analyzer_ui" / "static" / "js" / "main.js").read_text(encoding="utf-8")
+        styles_css = (UI_ROOT / "video_analyzer_ui" / "static" / "css" / "styles.css").read_text(encoding="utf-8")
+        self.assertIn("study-workflow", main_js)
+        self.assertIn("study-detail-shell", main_js)
+        self.assertIn("representative_frame", main_js)
+        self.assertIn("wireStudyGuideInteractions", main_js)
+        self.assertIn("bindImageViewer", main_js)
+        self.assertIn("data-image-viewer-src", main_js)
+        self.assertIn("study-node", styles_css)
+        self.assertIn("study-frame", styles_css)
+        self.assertIn(".image-viewer-stage", styles_css)
         self.assertLess(html.index('id="jobList"'), html.index('id="globalSummary"'))
 
     def test_video_link_api_create_list_get_and_log(self):

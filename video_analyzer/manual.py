@@ -280,6 +280,8 @@ def write_frame_evidence_index(
     lines = [
         "# 帧证据索引",
         "",
+        *render_text_evidence_map(frames, frame_analyses, ocr_by_frame),
+        "",
         "这个文件用于复核与调试。面向用户的手册应优先阅读 `operation_manual.md`。",
         "",
     ]
@@ -308,6 +310,52 @@ def write_frame_evidence_index(
     evidence_path = output_dir / "manual_evidence.md"
     evidence_path.write_text("\n".join(line for line in lines if line is not None), encoding="utf-8")
     return evidence_path
+
+
+def render_text_evidence_map(frames: List[Frame], frame_analyses: List[Dict[str, Any]], ocr_by_frame: Dict[int, OCREvent]) -> List[str]:
+    total = len(frames)
+    ocr_ok = 0
+    ocr_with_text = 0
+    vl_with_text = 0
+    rows = []
+    for frame, analysis in zip(frames, frame_analyses):
+        ocr = ocr_by_frame.get(frame.number)
+        ocr_status = ocr.status if ocr else "not_run"
+        ocr_text = clean_evidence_cell(ocr.text if ocr else "")
+        vl_text = clean_evidence_cell(analysis.get("response", ""))
+        if ocr_status in {"ok", "succeeded", "success"}:
+            ocr_ok += 1
+        if ocr_text != "_无_":
+            ocr_with_text += 1
+        if vl_text != "_无_":
+            vl_with_text += 1
+        rows.append(
+            "| "
+            + " | ".join([f"{frame.timestamp:.2f}s", f"Frame {frame.number}", f"`{ocr_status}`", ocr_text, vl_text])
+            + " |"
+        )
+    return [
+        "## 文字证据地图",
+        "",
+        f"- 覆盖帧数：{total}",
+        f"- OCR 成功：{ocr_ok}/{total}",
+        f"- OCR 有文本：{ocr_with_text}/{total}",
+        f"- 视觉分析有内容：{vl_with_text}/{total}",
+        "",
+        "| 时间 | 帧 | OCR 状态 | OCR 摘要 | 视觉摘要 |",
+        "| --- | --- | --- | --- | --- |",
+        *(rows or ["| - | - | - | _无_ | _无_ |"]),
+    ]
+
+
+def clean_evidence_cell(value: str) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return "_无_"
+    text = text.replace("|", "\\|")
+    if len(text) <= 90:
+        return text
+    return text[:87].rstrip() + "..."
 
 
 def embed_step_images(manual_text: str, frames: List[Frame], frame_assets: Dict[int, str]) -> str:

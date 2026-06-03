@@ -28,6 +28,12 @@ let renderedDocListKey = '';
 let loadedDocPreviewKey = '';
 let loadedStudyKey = '';
 const videoLoadErrors = {};
+const imageViewer = {
+    node: null,
+    image: null,
+    scaleLabel: null,
+    scale: 1
+};
 
 const nodes = {
     consoleTab: document.getElementById('consoleTab'),
@@ -845,8 +851,9 @@ function renderStudyPanel(job) {
     if (!nodes.studyBody) return;
     const study = job?.summary?.study || {};
     const decision = study.publish_decision || {};
+    const durationLabel = durationMinutes(job?.preview?.duration_seconds || job?.duration_seconds);
     nodes.studySummary.textContent = study.available
-        ? `${study.chapter_count || 0} 章 · ${study.evidence_count || 0} 条证据`
+        ? `${study.chapter_count || 0} 章${durationLabel === '-' ? '' : ` · 约 ${durationLabel}`}`
         : '等待 study guide';
     const status = decision.status || '-';
     nodes.studyDecision.textContent = status;
@@ -866,9 +873,7 @@ async function loadStudyGuide(jobId) {
         const guide = await getJson(`/api/video-link/jobs/${jobId}/study-guide`);
         if (currentJob?.job_id !== jobId) return;
         nodes.studyBody.innerHTML = renderStudyGuide(guide, jobId);
-        nodes.studyBody.querySelectorAll('.study-jump').forEach(button => {
-            button.addEventListener('click', () => jumpToVideoTime(button.dataset.jobId, Number(button.dataset.seconds || 0)));
-        });
+        wireStudyGuideInteractions(guide, jobId);
         loadedStudyKey = jobId;
     } catch (error) {
         nodes.studyBody.innerHTML = `<div class="doc-empty">学习视图加载失败：${escapeHtml(error.message)}</div>`;
@@ -879,28 +884,150 @@ async function loadStudyGuide(jobId) {
 function renderStudyGuide(guide, jobId) {
     const chapters = guide.chapters || [];
     const overview = guide.overview || {};
-    const decision = guide.publish_decision || {};
-    const gaps = guide.evidence_gaps?.summary || {};
-    const html = [
-        `<p class="study-overview">${escapeHtml(overview.summary || '暂无学习总览')}</p>`,
-        `<p class="study-overview">发布门禁：${escapeHtml(decision.status || '-')} · 证据缺口：${escapeHtml(gaps.total ?? 0)} 条</p>`
-    ];
-    chapters.slice(0, 30).forEach(chapter => {
-        const evidence = (chapter.evidence || []).filter(item => item.text).slice(0, 3);
-        html.push(`<article class="study-chapter">
-            <h4>${escapeHtml(String(chapter.index || '').padStart(2, '0'))}. ${escapeHtml(chapter.title || '未命名章节')}</h4>
-            <p>${escapeHtml(chapter.start || '')} - ${escapeHtml(chapter.end || '')}</p>
-            <p>${escapeHtml(chapter.summary || '')}</p>
-            <button class="study-jump" type="button" data-job-id="${escapeHtml(jobId)}" data-seconds="${escapeHtml(chapter.start_sec || 0)}">跳到视频</button>
-            <div class="study-evidence-list">
-                ${evidence.map(item => `<div class="study-evidence">
-                    <strong>${escapeHtml(item.timestamp_label || '')} · ${escapeHtml(item.source_type || '')}</strong>
-                    <span>${escapeHtml(item.text || '')}</span>
-                </div>`).join('')}
+    if (!chapters.length) {
+        return `<section class="study-learning-shell">
+            <div class="study-content-summary">
+                <span>内容总结</span>
+                <p>${escapeHtml(overview.summary || '暂无学习总览')}</p>
             </div>
-        </article>`);
-    });
+            <div class="doc-empty">暂无可展示的学习步骤</div>
+        </section>`;
+    }
+    const firstChapter = chapters[0];
+    const html = [
+        `<section class="study-learning-shell">
+            <div class="study-content-summary">
+                <span>内容总结</span>
+                <p>${escapeHtml(overview.summary || '暂无学习总览')}</p>
+                <div class="study-progress-meta">
+                    <strong data-study-progress-text>当前步骤：1 / ${escapeHtml(chapters.length)}</strong>
+                    <div class="bar study-progress-bar"><div data-study-progress-bar style="width:${escapeHtml(progressPercent(1, chapters.length))}%"></div></div>
+                </div>
+            </div>
+            <div class="study-workflow-section">
+                <div class="study-section-title">工作流</div>
+                <div class="study-workflow" role="list" aria-label="视频内容学习工作流">
+                    ${chapters.map((chapter, index) => renderStudyNode(chapter, index === 0, index)).join('')}
+                </div>
+            </div>
+            <div class="study-detail-shell">
+                ${renderStudyDetail(firstChapter, jobId, 0, chapters.length)}
+            </div>
+        </section>`
+    ];
     return html.join('');
+}
+
+function renderStudyNode(chapter, selected, index) {
+    return `<button class="study-node${selected ? ' active' : ''}" type="button" role="listitem" data-study-index="${escapeHtml(index)}" aria-pressed="${selected ? 'true' : 'false'}">
+        <span>${escapeHtml(String(chapter.index || index + 1).padStart(2, '0'))}</span>
+        <strong>${escapeHtml(chapter.title || '未命名章节')}</strong>
+        <em>${escapeHtml(studyTimeRange(chapter))}</em>
+    </button>`;
+}
+
+function renderStudyDetail(chapter, jobId, index, total) {
+    const title = `${String(chapter.index || index + 1).padStart(2, '0')}. ${chapter.title || '未命名章节'}`;
+    const points = Array.isArray(chapter.key_points) ? chapter.key_points.filter(Boolean).slice(0, 5) : [];
+    return `<article class="study-detail" data-study-detail-index="${escapeHtml(index)}">
+        <div class="study-frame">
+            ${renderStudyFrame(chapter, jobId)}
+        </div>
+        <div class="study-detail-content">
+            <div class="study-detail-head">
+                <div>
+                    <span>当前学习步骤</span>
+                    <h4>${escapeHtml(title)}</h4>
+                    <p>${escapeHtml(studyTimeRange(chapter))}</p>
+                </div>
+                <button class="study-play" type="button" data-job-id="${escapeHtml(jobId)}" data-seconds="${escapeHtml(chapter.start_sec || 0)}">从这里播放</button>
+            </div>
+            <section>
+                <h5>这一段在讲什么</h5>
+                <p>${escapeHtml(chapter.summary || '暂无章节总结')}</p>
+            </section>
+            <section>
+                <h5>需要理解的要点</h5>
+                ${points.length
+                    ? `<ol class="study-key-points">${points.map(point => `<li>${escapeHtml(point)}</li>`).join('')}</ol>`
+                    : '<div class="study-empty-note">暂无单独提取的理解要点</div>'}
+            </section>
+            <div class="study-step-actions">
+                <button class="secondary study-step-prev" type="button" data-study-target="${escapeHtml(index - 1)}" ${index <= 0 ? 'disabled' : ''}>← 上一步</button>
+                <span>${escapeHtml(index + 1)} / ${escapeHtml(total)}</span>
+                <button class="secondary study-step-next" type="button" data-study-target="${escapeHtml(index + 1)}" ${index >= total - 1 ? 'disabled' : ''}>下一步 →</button>
+            </div>
+        </div>
+    </article>`;
+}
+
+function renderStudyFrame(chapter, jobId) {
+    const frame = chapter.representative_frame || {};
+    const path = frame.path || frame.frame_path || '';
+    if (!path || !jobId) {
+        return '<div class="study-frame-empty">暂无章节截图</div>';
+    }
+    const src = resourceUrl(jobId, path);
+    const alt = chapter.title || '章节代表截图';
+    return `<img src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" loading="lazy" data-image-viewer-src="${escapeHtml(src)}" data-image-viewer-alt="${escapeHtml(alt)}">`;
+}
+
+function wireStudyGuideInteractions(guide, jobId) {
+    const chapters = guide.chapters || [];
+    if (!chapters.length || !nodes.studyBody) return;
+    const workflow = nodes.studyBody.querySelector('.study-workflow');
+    const detailShell = nodes.studyBody.querySelector('.study-detail-shell');
+    const progressText = nodes.studyBody.querySelector('[data-study-progress-text]');
+    const progressBar = nodes.studyBody.querySelector('[data-study-progress-bar]');
+    const selectChapter = index => {
+        if (!Number.isInteger(index) || index < 0 || index >= chapters.length || !detailShell) return;
+        detailShell.innerHTML = renderStudyDetail(chapters[index], jobId, index, chapters.length);
+        nodes.studyBody.querySelectorAll('.study-node').forEach(node => {
+            const active = Number(node.dataset.studyIndex || -1) === index;
+            node.classList.toggle('active', active);
+            node.setAttribute('aria-pressed', active ? 'true' : 'false');
+            if (active) node.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+        });
+        if (progressText) progressText.textContent = `当前步骤：${index + 1} / ${chapters.length}`;
+        if (progressBar) progressBar.style.width = `${progressPercent(index + 1, chapters.length)}%`;
+        wireStudyDetailActions(selectChapter);
+    };
+    workflow?.querySelectorAll('.study-node').forEach(button => {
+        button.addEventListener('click', () => selectChapter(Number(button.dataset.studyIndex || 0)));
+    });
+    wireStudyDetailActions(selectChapter);
+}
+
+function wireStudyDetailActions(selectChapter) {
+    nodes.studyBody.querySelectorAll('.study-step-prev, .study-step-next').forEach(button => {
+        button.addEventListener('click', () => selectChapter(Number(button.dataset.studyTarget)));
+    });
+    nodes.studyBody.querySelectorAll('.study-play').forEach(button => {
+        button.addEventListener('click', () => jumpToVideoTime(button.dataset.jobId, Number(button.dataset.seconds || 0)));
+    });
+}
+
+function studyTimeRange(chapter) {
+    const start = chapter.start || formatTimestampFromSeconds(chapter.start_sec);
+    const end = chapter.end || formatTimestampFromSeconds(chapter.end_sec);
+    return [start, end].filter(Boolean).join(' - ') || '-';
+}
+
+function progressPercent(current, total) {
+    const value = Number(total) > 0 ? (Number(current) / Number(total)) * 100 : 0;
+    return Math.max(0, Math.min(100, value)).toFixed(1);
+}
+
+function formatTimestampFromSeconds(value) {
+    const seconds = Number(value);
+    if (!Number.isFinite(seconds) || seconds < 0) return '';
+    const whole = Math.floor(seconds);
+    const hours = Math.floor(whole / 3600);
+    const minutes = Math.floor((whole % 3600) / 60);
+    const rest = whole % 60;
+    return hours > 0
+        ? `${hours}:${String(minutes).padStart(2, '0')}:${String(rest).padStart(2, '0')}`
+        : `${minutes}:${String(rest).padStart(2, '0')}`;
 }
 
 async function jumpToVideoTime(jobId, seconds) {
@@ -1124,7 +1251,10 @@ function createMarkdownRenderer(jobId = '', docPath = '') {
         if (srcIndex >= 0) {
             const src = token.attrs[srcIndex][1];
             const assetPath = markdownAssetPath(docPath, src);
-            token.attrs[srcIndex][1] = assetPath && jobId ? resourceUrl(jobId, assetPath) : assetPath;
+            const resolvedSrc = assetPath && jobId ? resourceUrl(jobId, assetPath) : assetPath;
+            token.attrs[srcIndex][1] = resolvedSrc;
+            token.attrSet('data-image-viewer-src', resolvedSrc);
+            token.attrSet('data-image-viewer-alt', token.content || '');
         }
         token.attrSet('loading', 'lazy');
         token.attrSet('class', 'markdown-image');
@@ -1331,7 +1461,7 @@ function inlineMarkdown(text, jobId = '', docPath = '') {
         const imagePath = markdownAssetPath(docPath, match[2] || '');
         const src = imagePath && jobId ? resourceUrl(jobId, imagePath) : imagePath;
         html += src
-            ? `<figure class="markdown-image"><img src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" loading="lazy"><figcaption>${escapeHtml(alt)}</figcaption></figure>`
+            ? `<figure class="markdown-image"><img src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" loading="lazy" data-image-viewer-src="${escapeHtml(src)}" data-image-viewer-alt="${escapeHtml(alt)}"><figcaption>${escapeHtml(alt)}</figcaption></figure>`
             : escapeHtml(match[0]);
         lastIndex = (match.index || 0) + match[0].length;
     }
@@ -1820,6 +1950,99 @@ async function copyText(text) {
     }
 }
 
+function ensureImageViewer() {
+    if (imageViewer.node) return imageViewer.node;
+    const viewer = document.createElement('div');
+    viewer.className = 'image-viewer';
+    viewer.hidden = true;
+    viewer.innerHTML = `
+        <div class="image-viewer-backdrop" data-image-viewer-close></div>
+        <div class="image-viewer-panel" role="dialog" aria-modal="true" aria-label="图片预览">
+            <div class="image-viewer-toolbar">
+                <strong class="image-viewer-title">图片预览</strong>
+                <div class="image-viewer-actions">
+                    <button type="button" data-image-viewer-zoom="out" aria-label="缩小">−</button>
+                    <span data-image-viewer-scale>100%</span>
+                    <button type="button" data-image-viewer-zoom="in" aria-label="放大">+</button>
+                    <button type="button" data-image-viewer-reset>1:1</button>
+                    <button type="button" data-image-viewer-close aria-label="关闭">×</button>
+                </div>
+            </div>
+            <div class="image-viewer-stage">
+                <img alt="">
+            </div>
+        </div>`;
+    document.body.appendChild(viewer);
+    imageViewer.node = viewer;
+    imageViewer.image = viewer.querySelector('img');
+    imageViewer.scaleLabel = viewer.querySelector('[data-image-viewer-scale]');
+    viewer.addEventListener('click', event => {
+        if (event.target.closest('[data-image-viewer-close]')) {
+            closeImageViewer();
+            return;
+        }
+        const zoomButton = event.target.closest('[data-image-viewer-zoom]');
+        if (zoomButton) {
+            zoomImageViewer(zoomButton.dataset.imageViewerZoom === 'in' ? 0.2 : -0.2);
+            return;
+        }
+        if (event.target.closest('[data-image-viewer-reset]')) {
+            setImageViewerScale(1);
+        }
+    });
+    viewer.querySelector('.image-viewer-stage')?.addEventListener('wheel', event => {
+        event.preventDefault();
+        zoomImageViewer(event.deltaY < 0 ? 0.1 : -0.1);
+    }, { passive: false });
+    return viewer;
+}
+
+function openImageViewer(src, alt = '') {
+    if (!src) return;
+    const viewer = ensureImageViewer();
+    imageViewer.image.src = src;
+    imageViewer.image.alt = alt || '图片预览';
+    viewer.hidden = false;
+    document.body.classList.add('image-viewer-open');
+    setImageViewerScale(1);
+}
+
+function closeImageViewer() {
+    if (!imageViewer.node) return;
+    imageViewer.node.hidden = true;
+    document.body.classList.remove('image-viewer-open');
+}
+
+function setImageViewerScale(scale) {
+    imageViewer.scale = Math.max(0.25, Math.min(5, scale));
+    if (imageViewer.image) {
+        imageViewer.image.style.transform = `scale(${imageViewer.scale})`;
+    }
+    if (imageViewer.scaleLabel) {
+        imageViewer.scaleLabel.textContent = `${Math.round(imageViewer.scale * 100)}%`;
+    }
+}
+
+function zoomImageViewer(delta) {
+    setImageViewerScale(imageViewer.scale + delta);
+}
+
+function bindImageViewer() {
+    document.addEventListener('dblclick', event => {
+        const image = event.target.closest('img[data-image-viewer-src]');
+        if (!image) return;
+        event.preventDefault();
+        openImageViewer(image.dataset.imageViewerSrc || image.currentSrc || image.src, image.dataset.imageViewerAlt || image.alt || '');
+    });
+    document.addEventListener('keydown', event => {
+        if (!imageViewer.node || imageViewer.node.hidden) return;
+        if (event.key === 'Escape') closeImageViewer();
+        if (event.key === '+' || event.key === '=') zoomImageViewer(0.2);
+        if (event.key === '-' || event.key === '_') zoomImageViewer(-0.2);
+        if (event.key === '0') setImageViewerScale(1);
+    });
+}
+
 async function runSelectedJob() {
     if (!selectedJobId) return;
     nodes.runButton.disabled = true;
@@ -1862,6 +2085,7 @@ async function boot() {
     nodes.docPreviewClose.addEventListener('click', closeDocPreview);
     nodes.runButton.addEventListener('click', runSelectedJob);
     nodes.copyLogButton.addEventListener('click', copySelectedLog);
+    bindImageViewer();
     await loadOptions();
     setView(currentView, false);
     await refreshJobs();

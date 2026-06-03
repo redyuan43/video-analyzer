@@ -208,7 +208,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertTrue(options["defaults"]["prefer_subtitle_transcript"])
         self.assertTrue(options["defaults"]["include_comments"])
         self.assertTrue(options["defaults"]["refresh_context"])
-        self.assertFalse(options["defaults"]["skip_images"])
+        self.assertTrue(options["defaults"]["skip_images"])
         self.assertEqual(options["defaults"]["max_comments"], 3000)
         self.assertIn("balanced", options["choices"]["analysis_modes"])
         self.assertIn("deepseek_v4_pro", options["choices"]["profiles"])
@@ -519,7 +519,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(command[command.index("--jobs") + 1], "3")
         self.assertIn("--profile", command)
         self.assertEqual(command[command.index("--profile") + 1], "deepseek_v4_pro")
-        self.assertNotIn("--skip-images", command)
+        self.assertIn("--skip-images", command)
 
     def test_final_publish_stage_respects_skip_images_option(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -533,6 +533,19 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             command = server.final_publish_command(loaded)
 
         self.assertIn("--skip-images", command)
+
+    def test_final_publish_stage_can_enable_images_explicitly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "skip_images": False})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            loaded["run_dir"] = str(run_dir)
+
+            command = server.final_publish_command(loaded)
+
+        self.assertNotIn("--skip-images", command)
 
     def test_image_prompts_stage_uses_repo_script(self):
         with tempfile.TemporaryDirectory() as tmp:

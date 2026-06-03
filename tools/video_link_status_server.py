@@ -364,7 +364,7 @@ class VideoLinkStatusServer:
                 "run_name": DEFAULT_RUN_NAME,
                 "cookies_from_browser": "none",
                 "download_device": "local",
-                "skip_images": False,
+                "skip_images": True,
                 "keep_existing": True,
                 "include_subtitles": True,
                 "prefer_subtitle_transcript": True,
@@ -407,7 +407,7 @@ class VideoLinkStatusServer:
         profiles = runtime_profile_names()
         if profiles and profile not in profiles:
             raise BridgeError(HTTPStatus.BAD_REQUEST, f"profile must be one of {profiles}")
-        skip_images = parse_bool(normalize_optional_template(payload.get("skip_images") if "skip_images" in payload else payload.get("skipImages", False)))
+        skip_images = parse_bool_option(payload, "skip_images", "skipImages", defaults["skip_images"])
         auto_start = parse_bool(normalize_optional_template(payload.get("auto_start") if "auto_start" in payload else payload.get("autoStart", False)))
         keep_existing = parse_bool_option(payload, "keep_existing", "keepExisting", defaults["keep_existing"])
         include_subtitles = parse_bool_option(payload, "include_subtitles", "includeSubtitles", defaults["include_subtitles"])
