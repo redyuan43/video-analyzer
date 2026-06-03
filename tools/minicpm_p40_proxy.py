@@ -38,6 +38,17 @@ class WorkerSpec:
     log_path: Path
 
 
+@dataclass
+class WorkerRuntimeStats:
+    inflight: int = 0
+    assigned: int = 0
+    completed: int = 0
+    failed: int = 0
+    last_assigned_at: float | None = None
+    last_completed_at: float | None = None
+    last_latency_sec: float | None = None
+
+
 class LlamaWorkerPool:
     def __init__(
         self,
@@ -70,7 +81,9 @@ class LlamaWorkerPool:
         self._processes: dict[int, subprocess.Popen] = {}
         self._log_files = {}
         self._last_error: dict[int, str] = {}
-        self._next_worker = 0
+        self._stats: dict[int, WorkerRuntimeStats] = {
+            worker.port: WorkerRuntimeStats() for worker in workers
+        }
         self._lock = threading.RLock()
 
     def shutdown(self) -> None:
@@ -86,9 +99,31 @@ class LlamaWorkerPool:
                     for worker in self.workers
                 )
                 raise RuntimeError(f"no MiniCPM worker is ready ({errors})")
-            worker = ready_workers[self._next_worker % len(ready_workers)]
-            self._next_worker += 1
+
+            worker = min(
+                ready_workers,
+                key=lambda item: (
+                    self._stats[item.port].inflight,
+                    self._stats[item.port].assigned,
+                    self.workers.index(item),
+                ),
+            )
+            stats = self._stats[worker.port]
+            stats.inflight += 1
+            stats.assigned += 1
+            stats.last_assigned_at = time.time()
             return worker
+
+    def release_worker(self, worker: WorkerSpec, *, failed: bool, latency_sec: float) -> None:
+        with self._lock:
+            stats = self._stats[worker.port]
+            stats.inflight = max(0, stats.inflight - 1)
+            if failed:
+                stats.failed += 1
+            else:
+                stats.completed += 1
+            stats.last_completed_at = time.time()
+            stats.last_latency_sec = latency_sec
 
     def ensure_ready(self) -> None:
         pending_workers: list[WorkerSpec] = []
@@ -136,6 +171,7 @@ class LlamaWorkerPool:
                         "http_ready": self._is_http_ready(worker),
                         "log": str(worker.log_path),
                         "last_error": self._last_error.get(worker.port),
+                        "stats": self._worker_stats_payload(worker),
                     }
                 )
         return {
@@ -219,6 +255,18 @@ class LlamaWorkerPool:
         except OSError:
             return False
 
+    def _worker_stats_payload(self, worker: WorkerSpec) -> dict:
+        stats = self._stats[worker.port]
+        return {
+            "inflight": stats.inflight,
+            "assigned": stats.assigned,
+            "completed": stats.completed,
+            "failed": stats.failed,
+            "last_assigned_at": stats.last_assigned_at,
+            "last_completed_at": stats.last_completed_at,
+            "last_latency_sec": stats.last_latency_sec,
+        }
+
 
 def make_handler(pool: LlamaWorkerPool):
     class ProxyHandler(BaseHTTPRequestHandler):
@@ -248,12 +296,23 @@ def make_handler(pool: LlamaWorkerPool):
             if not self.path.startswith("/v1/"):
                 self.send_error(404)
                 return
+            worker = None
+            started_at = time.monotonic()
+            failed = False
             try:
                 worker = pool.choose_worker()
                 self._proxy_to_worker(worker)
             except Exception as exc:
+                failed = True
                 logging.exception("MiniCPM proxy request failed")
                 self._send_json({"error": str(exc)}, status=503)
+            finally:
+                if worker is not None:
+                    pool.release_worker(
+                        worker,
+                        failed=failed,
+                        latency_sec=time.monotonic() - started_at,
+                    )
 
         def _proxy_to_worker(self, worker: WorkerSpec) -> None:
             length = int(self.headers.get("Content-Length", "0") or "0")
