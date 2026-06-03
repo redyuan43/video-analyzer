@@ -148,6 +148,7 @@ class LlamaWorkerPool:
         worker.log_path.parent.mkdir(parents=True, exist_ok=True)
         log_file = worker.log_path.open("ab")
         env = os.environ.copy()
+        env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
         env["CUDA_VISIBLE_DEVICES"] = str(worker.gpu)
         env["NO_PROXY"] = env.get("NO_PROXY", "127.0.0.1,localhost")
         env["no_proxy"] = env.get("no_proxy", "127.0.0.1,localhost")

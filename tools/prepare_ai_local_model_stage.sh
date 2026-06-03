@@ -69,7 +69,7 @@ start_ocr() {
 }
 
 start_minicpm() {
-  "${ROOT_DIR}/tools/start_minicpm_p40_service.sh" start "${MINICPM_WORKER_COUNT:-5}"
+  "${ROOT_DIR}/tools/start_minicpm_p40_service.sh" start "${MINICPM_WORKER_COUNT:-6}"
 }
 
 case "${STAGE}" in

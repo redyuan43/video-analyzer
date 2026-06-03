@@ -27,6 +27,8 @@
 - The current `ai` machine has five Tesla P40 cards plus one Tesla V100. VibeVoice uses the P40/Pascal runtime and must exclude the V100 until the user explicitly asks to validate a V100 path.
 - When starting VibeVoice workers, choose only P40 GPU indices from current `nvidia-smi` output. As of 2026-06-01, the expected P40 indices are `0,1,2,4,5`; GPU `3` is `Tesla V100-SXM2-16GB` and should not be included in VibeVoice worker mapping.
 - If VibeVoice startup fails with an apparent CUDA OOM on a 15-16 GiB device, first suspect that the V100 was selected accidentally. Check `nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total --format=csv,noheader` and fix the GPU mapping before changing model length, memory utilization, or ASR provider.
+- MiniCPM VL may use the V100 together with the five P40 cards. Its normal local worker set is six GPUs, `0,1,2,3,4,5`, with `CUDA_DEVICE_ORDER=PCI_BUS_ID` so script GPU IDs match `nvidia-smi`.
+- DotsMOCR OCR must remain P40-only for now: use `0,1,2,4,5`. A 2026-06-01 V100 smoke failed in the current vLLM/Pascal runtime with `CUDA error: no kernel image is available for execution on the device`, so do not include GPU `3` in OCR until the OCR runtime is rebuilt or otherwise validated for sm_70.
 - The project-wide text/VL endpoint is configured by the active runtime profile. Current local overrides may intentionally use loopback services such as MiniCPM or DotsMOCR; keep those on the current machine unless the user asks otherwise. Historical AMD Fast settings are reference-only, not a reason to move work off `ai`.
 - Historical AMD Fast reference:
   - Base URL: `http://100.90.114.26:18081/v1`

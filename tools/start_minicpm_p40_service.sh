@@ -8,7 +8,8 @@ PID_FILE="${MINICPM_PID_FILE:-${RUNTIME_DIR}/proxy.pid}"
 PROXY_HOST="${MINICPM_PROXY_HOST:-0.0.0.0}"
 PROXY_PORT="${MINICPM_PROXY_PORT:-18082}"
 BASE_BACKEND_PORT="${MINICPM_BASE_BACKEND_PORT:-18182}"
-WORKER_COUNT="${MINICPM_WORKER_COUNT:-5}"
+WORKER_COUNT="${MINICPM_WORKER_COUNT:-6}"
+GPU_IDS="${MINICPM_GPU_IDS:-0,1,2,3,4,5}"
 PYTHON_BIN="${MINICPM_PYTHON:-${ROOT_DIR}/.venv/bin/python}"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
@@ -17,6 +18,7 @@ fi
 
 usage() {
   echo "Usage: $0 start|stop|restart|status [worker-count]" >&2
+  echo "Set MINICPM_GPU_IDS to choose physical GPUs; default: ${GPU_IDS}" >&2
 }
 
 is_running() {
@@ -37,8 +39,19 @@ join_by_comma() {
 worker_spec() {
   local count="$1"
   local specs=()
-  for ((gpu = 0; gpu < count; gpu++)); do
-    specs+=("${gpu}:$((BASE_BACKEND_PORT + gpu))")
+  local gpu_ids=()
+  IFS=, read -r -a gpu_ids <<<"${GPU_IDS}"
+  if (( count > ${#gpu_ids[@]} )); then
+    echo "worker-count ${count} exceeds MINICPM_GPU_IDS entries (${GPU_IDS})" >&2
+    exit 2
+  fi
+  for ((index = 0; index < count; index++)); do
+    local gpu="${gpu_ids[index]}"
+    if ! [[ "${gpu}" =~ ^[0-9]+$ ]]; then
+      echo "invalid GPU id in MINICPM_GPU_IDS: ${gpu}" >&2
+      exit 2
+    fi
+    specs+=("${gpu}:$((BASE_BACKEND_PORT + index))")
   done
   join_by_comma "${specs[@]}"
 }
@@ -69,7 +82,7 @@ stop_conflicting_gpu_services() {
   systemctl --user stop vibevoice-p40-asr.service >/dev/null 2>&1 || true
   pkill -f "[d]ots_mocr_p40_proxy.py" || true
   pkill -f "[v]ibevoice_vllm_p40_http_server.py" || true
-  pkill -f "[v]llm.entrypoints.openai.api_server --host 127.0.0.1 --port 1800[0-4]" || true
+  pkill -f "[v]llm.entrypoints.openai.api_server --host 127.0.0.1 --port 1800[0-9]" || true
 }
 
 stop_minicpm() {
@@ -84,8 +97,8 @@ stop_minicpm() {
 
 start_minicpm() {
   local count="${1:-${WORKER_COUNT}}"
-  if ! [[ "${count}" =~ ^[1-5]$ ]]; then
-    echo "worker-count must be an integer from 1 to 5" >&2
+  if ! [[ "${count}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "worker-count must be a positive integer" >&2
     exit 2
   fi
   clear_stale_pid
@@ -101,11 +114,14 @@ start_minicpm() {
   cd "${ROOT_DIR}"
   local workers
   workers="$(worker_spec "${count}")"
-  echo "Starting MiniCPM P40 proxy with ${count} worker(s): ${workers}"
+  echo "Starting MiniCPM proxy with ${count} worker(s)."
+  echo "Configured GPUs: ${GPU_IDS}"
+  echo "Worker mapping: ${workers}"
   echo "Proxy URL: http://127.0.0.1:${PROXY_PORT}/v1"
 
   NO_PROXY="${NO_PROXY:-127.0.0.1,localhost}" \
   no_proxy="${no_proxy:-127.0.0.1,localhost}" \
+  CUDA_DEVICE_ORDER="${CUDA_DEVICE_ORDER:-PCI_BUS_ID}" \
   setsid "${PYTHON_BIN}" tools/minicpm_p40_proxy.py \
     --host "${PROXY_HOST}" \
     --port "${PROXY_PORT}" \
