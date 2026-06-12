@@ -217,6 +217,18 @@
                     <p id="vscodeSummary">选择一个已生成资源包的任务</p>
                 </div>
                 <div class="vscode-actions">
+                    <label class="view-switch">
+                        <input id="toggleDocListPanel" type="checkbox" checked>
+                        <span>文档预览</span>
+                    </label>
+                    <label class="view-switch">
+                        <input id="toggleStudyPanel" type="checkbox" checked>
+                        <span>学习视图</span>
+                    </label>
+                    <label class="view-switch">
+                        <input id="toggleDocContentPanel" type="checkbox" checked>
+                        <span>内容预览</span>
+                    </label>
                     <button id="startVscodeButton" type="button" disabled>打开 WebIDE</button>
                     <a id="openVscodeLink" class="button-link secondary" href="#" target="_blank" rel="noreferrer" hidden>新窗口打开</a>
                     <button id="restartVscodeButton" class="secondary" type="button" disabled>重启</button>
@@ -224,6 +236,14 @@
                 </div>
             </section>
             <section class="vscode-docs">
+                <aside class="doc-list-panel">
+                    <div class="doc-list-header">
+                        <h3>文档预览</h3>
+                        <span id="docPreviewSummary">-</span>
+                    </div>
+                    <div id="docList" class="doc-list"></div>
+                </aside>
+                <div class="pane-resizer doc-list-resizer" data-resize-pane="doc-list" role="separator" aria-orientation="vertical" aria-label="调整文档预览宽度" tabindex="0"></div>
                 <section id="studyPanel" class="study-panel">
                     <div class="study-header">
                         <div>
@@ -234,14 +254,8 @@
                     </div>
                     <div id="studyBody" class="study-body">暂无结构化学习数据</div>
                 </section>
-                <aside class="doc-list-panel">
-                    <div class="doc-list-header">
-                        <h3>文档预览</h3>
-                        <span id="docPreviewSummary">-</span>
-                    </div>
-                    <div id="docList" class="doc-list"></div>
-                </aside>
-                <section class="doc-preview-panel">
+                <div class="pane-resizer" data-resize-pane="study" role="separator" aria-orientation="vertical" aria-label="调整学习视图宽度" tabindex="0"></div>
+                <section class="doc-preview-panel" hidden>
                     <div class="doc-preview-header">
                         <strong id="docPreviewTitle">选择文档</strong>
                         <div class="doc-preview-actions">

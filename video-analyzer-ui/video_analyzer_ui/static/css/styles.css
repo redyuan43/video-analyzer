@@ -1000,6 +1000,65 @@ th {
     justify-content: flex-end;
 }
 
+.view-switch {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 36px;
+    padding: 0 10px;
+    border: 1px solid #d0d5dd;
+    border-radius: 999px;
+    background: #fff;
+    color: #344054;
+    font-size: 13px;
+    font-weight: 700;
+    cursor: pointer;
+    user-select: none;
+}
+
+.view-switch input {
+    position: relative;
+    width: 34px;
+    height: 20px;
+    margin: 0;
+    appearance: none;
+    box-sizing: border-box;
+    border: 0;
+    border-radius: 999px;
+    background: #e4e7ec;
+    box-shadow: inset 0 0 0 1px #cbd5e1;
+    cursor: pointer;
+    transition: background 0.16s ease, box-shadow 0.16s ease;
+}
+
+.view-switch input::before {
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    display: block;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 1px 2px rgb(16 24 40 / 0.18);
+    content: "";
+    transition: transform 0.16s ease;
+}
+
+.view-switch input:checked {
+    background: #101828;
+    box-shadow: inset 0 0 0 1px #101828;
+}
+
+.view-switch input:checked::before {
+    transform: translateX(14px);
+}
+
+.view-switch input:focus-visible {
+    outline: 2px solid #2563eb;
+    outline-offset: 2px;
+}
+
 .vscode-shell {
     position: relative;
     min-height: calc(100vh - 190px);
@@ -1029,14 +1088,71 @@ th {
 
 .vscode-docs {
     display: grid;
-    grid-template-columns: minmax(420px, 1fr) minmax(240px, 320px);
-    gap: 14px;
+    grid-template-columns: minmax(240px, var(--doc-list-pane-width, 300px)) 14px minmax(300px, var(--study-pane-width, 1fr));
+    gap: 0;
     min-height: 0;
     overflow: hidden;
 }
 
 .vscode-docs.preview-open {
-    grid-template-columns: minmax(300px, 420px) minmax(220px, 300px) minmax(0, 1fr);
+    grid-template-columns:
+        minmax(220px, var(--doc-list-pane-width, 300px))
+        14px
+        minmax(280px, var(--study-pane-width, 420px))
+        14px
+        minmax(320px, 1fr);
+}
+
+.vscode-docs.empty-layout {
+    display: grid;
+    place-items: center;
+    min-height: 320px;
+}
+
+.pane-resizer {
+    display: grid;
+    place-items: center;
+    cursor: col-resize;
+    touch-action: none;
+    user-select: none;
+}
+
+.pane-resizer::before {
+    display: block;
+    width: 2px;
+    height: min(100%, 72px);
+    min-height: 42px;
+    border-radius: 999px;
+    background: #cfd6df;
+    content: "";
+}
+
+.pane-resizer:hover::before,
+.pane-resizer:focus-visible::before,
+.vscode-docs.resizing .pane-resizer::before {
+    background: #667085;
+}
+
+.pane-resizer:focus-visible {
+    outline: 2px solid #2563eb;
+    outline-offset: -2px;
+}
+
+.doc-list-resizer,
+.vscode-docs.preview-open .pane-resizer {
+    display: none;
+}
+
+.vscode-docs .pane-resizer.active {
+    display: grid;
+}
+
+.vscode-docs.resizing {
+    cursor: col-resize;
+}
+
+.vscode-docs.resizing * {
+    user-select: none;
 }
 
 .study-panel,
@@ -1941,6 +2057,11 @@ pre {
     .vscode-docs,
     .vscode-docs.preview-open {
         grid-template-columns: 1fr;
+    }
+
+    .pane-resizer,
+    .vscode-docs .pane-resizer.active {
+        display: none;
     }
 
     .resource-lane header span {

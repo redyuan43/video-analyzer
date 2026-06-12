@@ -34,6 +34,17 @@ const imageViewer = {
     scaleLabel: null,
     scale: 1
 };
+const paneResizeState = {
+    active: null,
+    pointerId: null
+};
+const paneLayoutStorageKey = 'videoAnalyzerPaneLayout';
+const panelVisibilityStorageKey = 'videoAnalyzerLearningPanels';
+const learningPanelVisibility = {
+    docList: true,
+    study: true,
+    docContent: true
+};
 
 const nodes = {
     consoleTab: document.getElementById('consoleTab'),
@@ -94,10 +105,18 @@ const nodes = {
     openVscodeLink: document.getElementById('openVscodeLink'),
     restartVscodeButton: document.getElementById('restartVscodeButton'),
     stopVscodeButton: document.getElementById('stopVscodeButton'),
+    vscodeDocs: document.querySelector('.vscode-docs'),
+    toggleDocListPanel: document.getElementById('toggleDocListPanel'),
+    toggleStudyPanel: document.getElementById('toggleStudyPanel'),
+    toggleDocContentPanel: document.getElementById('toggleDocContentPanel'),
     vscodePlaceholder: document.getElementById('vscodePlaceholder'),
     vscodeFrame: document.getElementById('vscodeFrame'),
     docPreviewSummary: document.getElementById('docPreviewSummary'),
+    docListPanel: document.querySelector('.doc-list-panel'),
     docList: document.getElementById('docList'),
+    docListResizer: document.querySelector('.doc-list-resizer'),
+    studyPanel: document.getElementById('studyPanel'),
+    studyResizer: document.querySelector('[data-resize-pane="study"]'),
     docPreviewPanel: document.querySelector('.doc-preview-panel'),
     docPreviewTitle: document.getElementById('docPreviewTitle'),
     docOpenLink: document.getElementById('docOpenLink'),
@@ -1084,6 +1103,83 @@ function previewableDocs(job) {
     });
 }
 
+function loadLearningPanelVisibility() {
+    try {
+        const stored = JSON.parse(localStorage.getItem(panelVisibilityStorageKey) || '{}') || {};
+        ['docList', 'study', 'docContent'].forEach(key => {
+            if (typeof stored[key] === 'boolean') learningPanelVisibility[key] = stored[key];
+        });
+    } catch (_error) {
+        // Keep the default all-on layout when localStorage is unavailable or stale.
+    }
+}
+
+function saveLearningPanelVisibility() {
+    localStorage.setItem(panelVisibilityStorageKey, JSON.stringify(learningPanelVisibility));
+}
+
+function syncLearningPanelToggles() {
+    if (nodes.toggleDocListPanel) nodes.toggleDocListPanel.checked = learningPanelVisibility.docList;
+    if (nodes.toggleStudyPanel) nodes.toggleStudyPanel.checked = learningPanelVisibility.study;
+    if (nodes.toggleDocContentPanel) nodes.toggleDocContentPanel.checked = learningPanelVisibility.docContent;
+}
+
+function hasDocContent() {
+    return Boolean(selectedDocPath && learningPanelVisibility.docContent);
+}
+
+function updateLearningDocsLayout() {
+    if (!nodes.vscodeDocs) return;
+    const docListVisible = learningPanelVisibility.docList;
+    const studyVisible = learningPanelVisibility.study;
+    const contentVisible = hasDocContent();
+    const visiblePanelCount = [docListVisible, studyVisible, contentVisible].filter(Boolean).length;
+    const columns = [];
+
+    nodes.docListPanel.hidden = !docListVisible;
+    nodes.studyPanel.hidden = !studyVisible;
+    nodes.docPreviewPanel.hidden = !contentVisible;
+    nodes.vscodeDocs.classList.toggle('preview-open', contentVisible);
+    nodes.vscodeDocs.classList.toggle('empty-layout', visiblePanelCount === 0);
+
+    if (docListVisible) columns.push('minmax(220px, var(--doc-list-pane-width, 300px))');
+    const docListNeedsHandle = docListVisible && (studyVisible || contentVisible);
+    nodes.docListResizer?.classList.toggle('active', docListNeedsHandle);
+    if (nodes.docListResizer) nodes.docListResizer.hidden = !docListNeedsHandle;
+    if (docListNeedsHandle) columns.push('14px');
+
+    if (studyVisible) columns.push('minmax(280px, var(--study-pane-width, 1fr))');
+    const studyNeedsHandle = studyVisible && contentVisible;
+    nodes.studyResizer?.classList.toggle('active', studyNeedsHandle);
+    if (nodes.studyResizer) nodes.studyResizer.hidden = !studyNeedsHandle;
+    if (studyNeedsHandle) columns.push('14px');
+
+    if (contentVisible) columns.push('minmax(320px, 1fr)');
+    nodes.vscodeDocs.style.gridTemplateColumns = columns.join(' ') || '1fr';
+}
+
+function setLearningPanelVisibility(panel, visible, persist = true) {
+    learningPanelVisibility[panel] = Boolean(visible);
+    syncLearningPanelToggles();
+    updateLearningDocsLayout();
+    if (persist) saveLearningPanelVisibility();
+}
+
+function bindLearningPanelToggles() {
+    loadLearningPanelVisibility();
+    syncLearningPanelToggles();
+    nodes.toggleDocListPanel?.addEventListener('change', event => {
+        setLearningPanelVisibility('docList', event.target.checked);
+    });
+    nodes.toggleStudyPanel?.addEventListener('change', event => {
+        setLearningPanelVisibility('study', event.target.checked);
+    });
+    nodes.toggleDocContentPanel?.addEventListener('change', event => {
+        setLearningPanelVisibility('docContent', event.target.checked);
+    });
+    updateLearningDocsLayout();
+}
+
 function renderDocPreviewPanel(job) {
     if (!nodes.docList) return;
     const docs = previewableDocs(job);
@@ -1135,18 +1231,20 @@ function showDocPreview(title, contentHtml) {
 }
 
 function showDocPreviewPanel() {
-    if (nodes.docPreviewPanel) nodes.docPreviewPanel.hidden = false;
-    nodes.vscodeView?.querySelector('.vscode-docs')?.classList.add('preview-open');
+    if (!learningPanelVisibility.docContent) {
+        setLearningPanelVisibility('docContent', true);
+        return;
+    }
+    updateLearningDocsLayout();
 }
 
 function hideDocPreview() {
-    if (nodes.docPreviewPanel) nodes.docPreviewPanel.hidden = true;
-    nodes.vscodeView?.querySelector('.vscode-docs')?.classList.remove('preview-open');
     nodes.docPreviewTitle.textContent = '选择文档';
     nodes.docOpenLink.hidden = true;
     nodes.docOpenLink.removeAttribute('href');
     nodes.docPreviewBody.className = 'doc-preview-body';
     nodes.docPreviewBody.innerHTML = '';
+    updateLearningDocsLayout();
 }
 
 function closeDocPreview() {
@@ -2043,6 +2141,132 @@ function bindImageViewer() {
     });
 }
 
+function clamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+}
+
+function loadPaneLayout() {
+    if (!nodes.vscodeDocs) return;
+    let layout = {};
+    try {
+        layout = JSON.parse(localStorage.getItem(paneLayoutStorageKey) || '{}') || {};
+    } catch (_error) {
+        layout = {};
+    }
+    applyPaneWidth('study', Number(layout.study));
+    applyPaneWidth('doc-list', Number(layout.docList));
+}
+
+function savePaneLayout() {
+    if (!nodes.vscodeDocs) return;
+    const style = nodes.vscodeDocs.style;
+    const layout = {
+        study: parsePanePixels(style.getPropertyValue('--study-pane-width')),
+        docList: parsePanePixels(style.getPropertyValue('--doc-list-pane-width'))
+    };
+    localStorage.setItem(paneLayoutStorageKey, JSON.stringify(layout));
+}
+
+function parsePanePixels(value) {
+    const number = Number.parseFloat(String(value || '').replace('px', ''));
+    return Number.isFinite(number) ? Math.round(number) : null;
+}
+
+function applyPaneWidth(pane, width) {
+    if (!nodes.vscodeDocs || !Number.isFinite(width)) return;
+    const property = pane === 'doc-list' ? '--doc-list-pane-width' : '--study-pane-width';
+    nodes.vscodeDocs.style.setProperty(property, `${Math.round(width)}px`);
+}
+
+function paneWidth(pane) {
+    if (!nodes.vscodeDocs) return 0;
+    const property = pane === 'doc-list' ? '--doc-list-pane-width' : '--study-pane-width';
+    const explicit = parsePanePixels(nodes.vscodeDocs.style.getPropertyValue(property));
+    if (explicit) return explicit;
+    const selector = pane === 'doc-list' ? '.doc-list-panel' : '.study-panel';
+    return nodes.vscodeDocs.querySelector(selector)?.getBoundingClientRect().width || 0;
+}
+
+function resizeStudyPane(clientX) {
+    const docs = nodes.vscodeDocs;
+    if (!docs || !learningPanelVisibility.study) return;
+    const rect = docs.getBoundingClientRect();
+    const docListOffset = learningPanelVisibility.docList ? (paneWidth('doc-list') || 300) + 14 : 0;
+    const contentReserve = hasDocContent() ? 14 + 320 : 0;
+    const leftEdge = rect.left + docListOffset;
+    const max = Math.max(280, rect.right - leftEdge - contentReserve);
+    applyPaneWidth('study', clamp(clientX - leftEdge, 280, max));
+}
+
+function resizeDocListPane(clientX) {
+    const docs = nodes.vscodeDocs;
+    if (!docs || !learningPanelVisibility.docList) return;
+    const rect = docs.getBoundingClientRect();
+    const studyReserve = learningPanelVisibility.study ? 14 + 280 : 0;
+    const contentReserve = hasDocContent() ? 14 + 320 : 0;
+    const max = Math.max(220, rect.width - studyReserve - contentReserve);
+    applyPaneWidth('doc-list', clamp(clientX - rect.left, 220, max));
+}
+
+function resizePaneFromPointer(pane, clientX) {
+    if (pane === 'doc-list') {
+        resizeDocListPane(clientX);
+    } else {
+        resizeStudyPane(clientX);
+    }
+}
+
+function adjustPaneWidth(pane, delta) {
+    if (!nodes.vscodeDocs) return;
+    const rect = nodes.vscodeDocs.getBoundingClientRect();
+    if (pane === 'doc-list') {
+        const studyReserve = learningPanelVisibility.study ? 14 + 280 : 0;
+        const contentReserve = hasDocContent() ? 14 + 320 : 0;
+        const max = Math.max(220, rect.width - studyReserve - contentReserve);
+        applyPaneWidth('doc-list', clamp(paneWidth('doc-list') + delta, 220, max));
+        return;
+    }
+    const docListReserve = learningPanelVisibility.docList ? (paneWidth('doc-list') || 300) + 14 : 0;
+    const contentReserve = hasDocContent() ? 14 + 320 : 0;
+    const max = Math.max(280, rect.width - docListReserve - contentReserve);
+    applyPaneWidth('study', clamp(paneWidth('study') + delta, 280, max));
+}
+
+function bindPaneResizers() {
+    if (!nodes.vscodeDocs) return;
+    loadPaneLayout();
+    nodes.vscodeDocs.querySelectorAll('.pane-resizer').forEach(handle => {
+        handle.addEventListener('pointerdown', event => {
+            paneResizeState.active = handle.dataset.resizePane || 'study';
+            paneResizeState.pointerId = event.pointerId;
+            handle.setPointerCapture?.(event.pointerId);
+            nodes.vscodeDocs.classList.add('resizing');
+            resizePaneFromPointer(paneResizeState.active, event.clientX);
+            event.preventDefault();
+        });
+        handle.addEventListener('keydown', event => {
+            if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+            const pane = handle.dataset.resizePane || 'study';
+            const delta = event.key === 'ArrowRight' ? 24 : -24;
+            adjustPaneWidth(pane, delta);
+            savePaneLayout();
+            event.preventDefault();
+        });
+    });
+    document.addEventListener('pointermove', event => {
+        if (!paneResizeState.active) return;
+        resizePaneFromPointer(paneResizeState.active, event.clientX);
+    });
+    document.addEventListener('pointerup', event => {
+        if (!paneResizeState.active) return;
+        if (paneResizeState.pointerId !== null && event.pointerId !== paneResizeState.pointerId) return;
+        nodes.vscodeDocs.classList.remove('resizing');
+        paneResizeState.active = null;
+        paneResizeState.pointerId = null;
+        savePaneLayout();
+    });
+}
+
 async function runSelectedJob() {
     if (!selectedJobId) return;
     nodes.runButton.disabled = true;
@@ -2086,6 +2310,8 @@ async function boot() {
     nodes.runButton.addEventListener('click', runSelectedJob);
     nodes.copyLogButton.addEventListener('click', copySelectedLog);
     bindImageViewer();
+    bindLearningPanelToggles();
+    bindPaneResizers();
     await loadOptions();
     setView(currentView, false);
     await refreshJobs();
