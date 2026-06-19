@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import ipaddress
+import os
 import shlex
 import subprocess
 import tempfile
@@ -1687,7 +1688,9 @@ def _ssh_host_args(host: str) -> list[str]:
         "ServerAliveCountMax=3",
     ]
     if host == "agx":
-        return [*base, "-o", "HostKeyAlias=agx-lan", "agx@192.168.2.110"]
+        if _agx_lan_host():
+            return [*base, "-o", "HostKeyAlias=agx-lan", f"agx@{_agx_lan_host()}"]
+        return [*base, "agx"]
     if host == "nx3":
         return [*base, "-o", "ProxyCommand=none", "nx@nx3.taild500c8.ts.net"]
     return [*base, host]
@@ -1695,20 +1698,26 @@ def _ssh_host_args(host: str) -> list[str]:
 
 def _rsync_host(host: str) -> str:
     if host == "agx":
-        return "agx@192.168.2.110"
+        if _agx_lan_host():
+            return f"agx@{_agx_lan_host()}"
+        return "agx"
     if host == "nx3":
         return "nx@nx3.taild500c8.ts.net"
     return host
 
 
 def _rsync_ssh_args(host: str) -> list[str]:
-    if host == "agx":
+    if host == "agx" and _agx_lan_host():
         return [
             "-e",
             "ssh -o BatchMode=yes -o ConnectTimeout=10 -o ConnectionAttempts=1 "
             "-o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o HostKeyAlias=agx-lan",
         ]
     return []
+
+
+def _agx_lan_host() -> str:
+    return os.environ.get("JETSON_AGX_LAN_HOST", "").strip()
 
 
 def _safe_host_name(host: str) -> str:

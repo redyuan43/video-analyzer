@@ -8,11 +8,41 @@ from video_analyzer.jetson_frames import (
     JetsonFrameWorker,
     REMOTE_WORKER_SCRIPT,
     _candidate_observation_metrics_from_items,
+    _rsync_host,
+    _rsync_ssh_args,
     _select_jetson_candidate_metadata,
+    _ssh_host_args,
 )
 
 
 class JetsonFrameSelectionTests(TestCase):
+    def test_agx_default_uses_control_host_instead_of_stale_lan_ip(self):
+        old_value = os.environ.pop("JETSON_AGX_LAN_HOST", None)
+        try:
+            self.assertEqual(_ssh_host_args("agx")[-1], "agx")
+            self.assertEqual(_rsync_host("agx"), "agx")
+            self.assertEqual(_rsync_ssh_args("agx"), [])
+        finally:
+            if old_value is not None:
+                os.environ["JETSON_AGX_LAN_HOST"] = old_value
+
+    def test_agx_lan_host_override_is_explicit(self):
+        old_value = os.environ.get("JETSON_AGX_LAN_HOST")
+        try:
+            os.environ["JETSON_AGX_LAN_HOST"] = "agx-lan"
+
+            ssh_args = _ssh_host_args("agx")
+
+            self.assertEqual(ssh_args[-1], "agx@agx-lan")
+            self.assertIn("HostKeyAlias=agx-lan", ssh_args)
+            self.assertEqual(_rsync_host("agx"), "agx@agx-lan")
+            self.assertTrue(_rsync_ssh_args("agx"))
+        finally:
+            if old_value is None:
+                os.environ.pop("JETSON_AGX_LAN_HOST", None)
+            else:
+                os.environ["JETSON_AGX_LAN_HOST"] = old_value
+
     def test_static_video_candidates_are_filled_with_uniform_coverage(self):
         namespace = {}
         exec(REMOTE_WORKER_SCRIPT, namespace)

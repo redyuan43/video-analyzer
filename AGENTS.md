@@ -134,13 +134,14 @@ A passing local response includes:
 
 ## Jetson LAN Sync
 
-- Use Tailscale/MagicDNS as the control plane to reach devices and repair SSH state, but use `192.168.31.x` LAN addresses as the data plane for large video transfers between Jetson workers.
-- Current LAN identities:
+- Use Tailscale/MagicDNS as the control plane to reach devices and repair SSH state. Use dynamically discovered private LAN addresses as the data plane for large video transfers between Jetson workers; do not hard-code transient DHCP IPs in default startup paths.
+- Historical LAN identities for diagnostics only:
   - `nx1`: `nx@192.168.31.40`, Tailscale `100.119.5.57`
   - `nx2`: `nx@192.168.31.68`, Tailscale `100.123.222.45`
   - `nx3`: `nx@192.168.31.35`, Tailscale `100.127.71.86`
   - `nx4`: `nx@192.168.31.10`, Tailscale `100.82.227.71`
   - `agx`: `agx@192.168.31.201`, Tailscale `100.103.199.121`
+- For AGX Ray startup, default to the `agx` control host and let `tools/start_jetson_frame_ray.sh` resolve the current private LAN IP from AGX before starting Ray. Set `JETSON_AGX_LAN_HOST=agx-lan` only when a stable LAN DNS/DHCP hostname exists; set `JETSON_RAY_HEAD_IP` only as an explicit temporary override.
 - All `nx*` device passwords are `nx`; AGX password is `agx`. Prefer using those only to bootstrap public-key auth, then keep automated runs passwordless.
 - Before large syncs, validate LAN mesh with direct device-to-device SSH, for example:
   `ssh nx1 "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new nx@192.168.31.10 hostname"`
