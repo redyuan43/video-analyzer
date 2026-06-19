@@ -64,6 +64,7 @@ class LlamaWorkerPool:
         startup_timeout: int,
         stop_timeout: int,
         backend_timeout: int,
+        idle_unload_seconds: int,
         extra_args: list[str],
     ) -> None:
         self.server_bin = server_bin
@@ -77,6 +78,7 @@ class LlamaWorkerPool:
         self.startup_timeout = startup_timeout
         self.stop_timeout = stop_timeout
         self.backend_timeout = backend_timeout
+        self.idle_unload_seconds = idle_unload_seconds
         self.extra_args = extra_args
         self._processes: dict[int, subprocess.Popen] = {}
         self._log_files = {}
@@ -84,6 +86,7 @@ class LlamaWorkerPool:
         self._stats: dict[int, WorkerRuntimeStats] = {
             worker.port: WorkerRuntimeStats() for worker in workers
         }
+        self._last_activity_at = time.time()
         self._lock = threading.RLock()
 
     def shutdown(self) -> None:
@@ -112,18 +115,21 @@ class LlamaWorkerPool:
             stats.inflight += 1
             stats.assigned += 1
             stats.last_assigned_at = time.time()
+            self._last_activity_at = stats.last_assigned_at
             return worker
 
     def release_worker(self, worker: WorkerSpec, *, failed: bool, latency_sec: float) -> None:
         with self._lock:
+            now = time.time()
             stats = self._stats[worker.port]
             stats.inflight = max(0, stats.inflight - 1)
             if failed:
                 stats.failed += 1
             else:
                 stats.completed += 1
-            stats.last_completed_at = time.time()
+            stats.last_completed_at = now
             stats.last_latency_sec = latency_sec
+            self._last_activity_at = now
 
     def ensure_ready(self) -> None:
         pending_workers: list[WorkerSpec] = []
@@ -138,8 +144,31 @@ class LlamaWorkerPool:
 
     def stop_all(self) -> None:
         with self._lock:
-            processes = list(self._processes.items())
-            self._processes.clear()
+            processes, log_file_items = self._process_snapshot_locked()
+            self._stop_drained_processes(processes, [handle for _, handle in log_file_items])
+            self._clear_stopped_processes_locked(processes, log_file_items)
+
+    def _process_snapshot_locked(self) -> tuple[list[tuple[int, subprocess.Popen]], list[tuple[int, object]]]:
+        return list(self._processes.items()), list(self._log_files.items())
+
+    def _clear_stopped_processes_locked(
+        self,
+        processes: list[tuple[int, subprocess.Popen]],
+        log_file_items: list[tuple[int, object]],
+    ) -> None:
+        for port, proc in processes:
+            if self._processes.get(port) is proc:
+                self._processes.pop(port, None)
+        for port, handle in log_file_items:
+            if self._log_files.get(port) is handle:
+                self._log_files.pop(port, None)
+        self._last_activity_at = time.time()
+
+    def _stop_drained_processes(
+        self,
+        processes: list[tuple[int, subprocess.Popen]],
+        log_files: list[object],
+    ) -> None:
         for _, proc in processes:
             if proc.poll() is None:
                 proc.terminate()
@@ -151,12 +180,27 @@ class LlamaWorkerPool:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=5)
-        for handle in list(self._log_files.values()):
+        for handle in log_files:
             try:
                 handle.close()
             except OSError:
                 pass
-        self._log_files.clear()
+
+    def unload_if_idle(self) -> bool:
+        if self.idle_unload_seconds <= 0:
+            return False
+        with self._lock:
+            if not self._processes:
+                return False
+            total_inflight = sum(stats.inflight for stats in self._stats.values())
+            idle_for = time.time() - self._last_activity_at
+            if total_inflight > 0 or idle_for < self.idle_unload_seconds:
+                return False
+            processes, log_file_items = self._process_snapshot_locked()
+            logging.info("MiniCPM workers idle for %.1fs; unloading workers", idle_for)
+            self._stop_drained_processes(processes, [handle for _, handle in log_file_items])
+            self._clear_stopped_processes_locked(processes, log_file_items)
+        return True
 
     def health(self) -> dict:
         with self._lock:
@@ -177,6 +221,8 @@ class LlamaWorkerPool:
         return {
             "ready": all(item["http_ready"] for item in workers),
             "model": self.model_alias,
+            "idle_unload_seconds": self.idle_unload_seconds,
+            "last_activity_at": self._last_activity_at,
             "workers": workers,
         }
 
@@ -386,6 +432,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--startup-timeout", type=int, default=int(os.getenv("MINICPM_STARTUP_TIMEOUT", "300")))
     parser.add_argument("--stop-timeout", type=int, default=int(os.getenv("MINICPM_STOP_TIMEOUT", "30")))
     parser.add_argument("--backend-timeout", type=int, default=int(os.getenv("MINICPM_BACKEND_TIMEOUT", "600")))
+    parser.add_argument("--idle-unload-seconds", type=int, default=int(os.getenv("MINICPM_IDLE_UNLOAD_SECONDS", "600")))
+    parser.add_argument("--idle-check-interval", type=int, default=int(os.getenv("MINICPM_IDLE_CHECK_INTERVAL", "30")))
     parser.add_argument("--llama-extra-arg", action="append", default=[])
     return parser.parse_args()
 
@@ -420,11 +468,24 @@ def main() -> int:
         startup_timeout=args.startup_timeout,
         stop_timeout=args.stop_timeout,
         backend_timeout=args.backend_timeout,
+        idle_unload_seconds=args.idle_unload_seconds,
         extra_args=args.llama_extra_arg,
     )
+    stop_reaper = threading.Event()
+
+    def idle_reaper() -> None:
+        interval = max(1, args.idle_check_interval)
+        while not stop_reaper.wait(interval):
+            try:
+                pool.unload_if_idle()
+            except Exception:
+                logging.exception("MiniCPM idle unload check failed")
+
+    threading.Thread(target=idle_reaper, daemon=True).start()
 
     def shutdown(signum: int, _frame: object) -> None:
         logging.info("received signal %s; stopping MiniCPM workers", signum)
+        stop_reaper.set()
         pool.shutdown()
         raise SystemExit(0)
 
@@ -436,6 +497,7 @@ def main() -> int:
     try:
         server.serve_forever()
     finally:
+        stop_reaper.set()
         pool.shutdown()
     return 0
 

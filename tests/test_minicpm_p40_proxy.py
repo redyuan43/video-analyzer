@@ -1,6 +1,7 @@
 import importlib.util
 import sys
 import tempfile
+import time
 from pathlib import Path
 from unittest import TestCase
 
@@ -35,6 +36,7 @@ class MiniCpmWorkerPoolTests(TestCase):
             startup_timeout=1,
             stop_timeout=1,
             backend_timeout=1,
+            idle_unload_seconds=600,
             extra_args=[],
         )
         pool.ensure_ready = lambda: None
@@ -70,3 +72,77 @@ class MiniCpmWorkerPoolTests(TestCase):
         self.assertEqual(worker_payload["stats"]["inflight"], 0)
         self.assertEqual(worker_payload["stats"]["failed"], 1)
         self.assertEqual(worker_payload["stats"]["last_latency_sec"], 1.25)
+
+    def test_idle_unload_stops_workers_after_timeout(self):
+        pool, _workers = self.make_pool()
+        stopped = []
+        old_process = object()
+        pool._processes[18182] = old_process
+        pool._last_activity_at = time.time() - 601
+        pool._stop_drained_processes = lambda processes, _logs: stopped.extend(processes)
+
+        self.assertTrue(pool.unload_if_idle())
+        self.assertEqual(stopped, [(18182, old_process)])
+
+    def test_idle_unload_keeps_old_process_visible_while_stopping(self):
+        pool, _workers = self.make_pool()
+        old_process = object()
+        pool._processes[18182] = old_process
+        pool._last_activity_at = time.time() - 601
+        observed_processes = []
+
+        def stop_drained(_processes, _logs):
+            observed_processes.append(dict(pool._processes))
+
+        pool._stop_drained_processes = stop_drained
+
+        self.assertTrue(pool.unload_if_idle())
+        self.assertEqual(observed_processes, [{18182: old_process}])
+        self.assertEqual(pool._processes, {})
+
+    def test_idle_unload_keeps_active_workers(self):
+        pool, workers = self.make_pool()
+        pool._processes[18182] = object()
+        pool._last_activity_at = time.time() - 601
+        pool._stats[workers[0].port].inflight = 1
+
+        self.assertFalse(pool.unload_if_idle())
+
+    def test_idle_unload_only_stops_drained_workers(self):
+        pool, _workers = self.make_pool()
+        old_process = object()
+        old_log = object()
+        new_process = object()
+        new_log = object()
+        stopped = []
+        pool._processes[18182] = old_process
+        pool._log_files[18182] = old_log
+        pool._last_activity_at = time.time() - 601
+
+        def stop_drained(processes, logs):
+            pool._processes[18182] = new_process
+            pool._log_files[18182] = new_log
+            stopped.append((processes, logs))
+
+        pool._stop_drained_processes = stop_drained
+
+        self.assertTrue(pool.unload_if_idle())
+        self.assertEqual(stopped, [([(18182, old_process)], [old_log])])
+        self.assertEqual(pool._processes, {18182: new_process})
+        self.assertEqual(pool._log_files, {18182: new_log})
+
+    def test_stop_all_keeps_old_process_visible_while_stopping(self):
+        pool, _workers = self.make_pool()
+        old_process = object()
+        pool._processes[18182] = old_process
+        observed_processes = []
+
+        def stop_drained(_processes, _logs):
+            observed_processes.append(dict(pool._processes))
+
+        pool._stop_drained_processes = stop_drained
+
+        pool.stop_all()
+
+        self.assertEqual(observed_processes, [{18182: old_process}])
+        self.assertEqual(pool._processes, {})
