@@ -20,7 +20,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlunparse
 
 from video_analyzer.config import Config
 
@@ -505,10 +505,19 @@ def is_bilibili_url(url: str) -> bool:
 def ytdlp_site_headers(url: str) -> list[str]:
     if not is_bilibili_url(url):
         return []
+    referer = bilibili_referer(url)
     return [
-        "Referer: https://www.bilibili.com/",
-        "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        f"Referer: {referer}",
+        "Origin: https://www.bilibili.com",
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     ]
+
+
+def bilibili_referer(url: str) -> str:
+    parsed = urlparse(url)
+    if "bilibili.com" not in parsed.netloc.lower() or not parsed.path:
+        return "https://www.bilibili.com/"
+    return urlunparse((parsed.scheme or "https", parsed.netloc, parsed.path, "", "", ""))
 
 
 def add_cookie_args(command: list[str], args: argparse.Namespace) -> None:

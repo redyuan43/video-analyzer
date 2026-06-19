@@ -101,7 +101,8 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         url_context_mod.add_ytdlp_site_args(command, "https://www.bilibili.com/video/BV1YtVz6eEAz/")
 
         self.assertIn("--add-header", command)
-        self.assertIn("Referer: https://www.bilibili.com/", command)
+        self.assertIn("Referer: https://www.bilibili.com/video/BV1YtVz6eEAz/", command)
+        self.assertIn("Origin: https://www.bilibili.com", command)
         self.assertTrue(any(header.startswith("User-Agent: Mozilla/5.0") for header in command))
 
         remote_args = type(
@@ -126,7 +127,8 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         )
 
         self.assertIn("--add-header", remote_command)
-        self.assertIn("Referer: https://www.bilibili.com/", remote_command)
+        self.assertIn("Referer: https://www.bilibili.com/video/BV1YtVz6eEAz/", remote_command)
+        self.assertIn("Origin: https://www.bilibili.com", remote_command)
         self.assertIn("User-Agent: Mozilla/5.0", remote_command)
 
     def test_infer_video_id_from_bilibili_url(self):

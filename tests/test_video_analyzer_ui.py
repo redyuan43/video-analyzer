@@ -60,6 +60,8 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn('id="vscodeFrame"', html)
         self.assertIn('id="docList"', html)
         self.assertIn('id="docPreviewBody"', html)
+        self.assertIn('data-resize-pane="study"', html)
+        self.assertIn('data-resize-pane="doc-list"', html)
         self.assertIn("vendor/markdown-it/markdown-it.min.js", html)
         self.assertIn("vendor/dompurify/purify.min.js", html)
         self.assertIn("vendor/katex/katex.min.css", html)
@@ -72,10 +74,13 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn("representative_frame", main_js)
         self.assertIn("wireStudyGuideInteractions", main_js)
         self.assertIn("bindImageViewer", main_js)
+        self.assertIn("bindPaneResizers", main_js)
+        self.assertIn("videoAnalyzerPaneLayout", main_js)
         self.assertIn("data-image-viewer-src", main_js)
         self.assertIn("study-node", styles_css)
         self.assertIn("study-frame", styles_css)
         self.assertIn(".image-viewer-stage", styles_css)
+        self.assertIn(".pane-resizer", styles_css)
         self.assertLess(html.index('id="jobList"'), html.index('id="globalSummary"'))
 
     def test_video_link_api_create_list_get_and_log(self):
