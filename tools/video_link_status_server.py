@@ -25,6 +25,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient
+from video_analyzer.config import Config, build_openai_extra_body, resolve_api_key, resolve_temperature
+from video_analyzer.doc_chat import ask_video_docs_result
+from video_analyzer.qa_index import ANSWER_INDEX_NAME, CHUNKS_NAME, QA_DIR_NAME
+from video_analyzer.skill_candidate import (
+    build_tool_skill_candidate,
+    candidate_summary,
+    enable_tool_skill_candidate,
+)
 from video_analyzer.resource_locks import DEFAULT_LOCK_DIR
 from video_analyzer.url_context import FALLBACK_OUTPUT_ROOT, infer_video_id_from_url, safe_slug
 
@@ -32,7 +41,7 @@ from video_analyzer.url_context import FALLBACK_OUTPUT_ROOT, infer_video_id_from
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_JOBS_DIR = REPO_ROOT / "tmp" / "video-link-status" / "jobs"
 BAOYU_PROMPT_SCRIPT = REPO_ROOT / "tools" / "prepare_baoyu_image_prompts.py"
-ALLOWED_ANALYSIS_MODES = ("auto", "fast", "balanced", "deep", "long-talk-fast")
+ALLOWED_ANALYSIS_MODES = ("auto", "fast", "balanced", "deep", "operation-fast", "long-talk-fast")
 ALLOWED_COOKIE_BROWSERS = ("", "chrome", "none", "edge", "firefox", "chromium", "brave")
 ALLOWED_DOWNLOAD_DEVICES = ("local", "mi")
 DEFAULT_COOKIE_BROWSER = ""
@@ -132,6 +141,26 @@ AUTO_MODE_LONG_TALK_KEYWORDS = (
     "subtitle",
     "chapter",
 )
+AUTO_MODE_OPERATION_KEYWORDS = (
+    "操作",
+    "教程",
+    "演示",
+    "屏幕",
+    "界面",
+    "配置",
+    "步骤",
+    "命令",
+    "安装",
+    "部署",
+    "debug",
+    "setup",
+    "install",
+    "configure",
+    "tutorial",
+    "screen",
+    "ui",
+    "cli",
+)
 DEFAULT_RUN_NAME = "operation-manual"
 DEFAULT_SUBTITLE_LANGS = "zh-CN,zh-Hans,zh,en"
 MODULE_ORDER = [
@@ -143,6 +172,8 @@ MODULE_ORDER = [
     "multidoc",
     "deep-v2",
     "evidence-review",
+    "web-evidence",
+    "qa-index",
     "image-prompts",
     "final-publish",
 ]
@@ -155,6 +186,8 @@ MODULE_LABELS = {
     "multidoc": "多文档分析",
     "deep-v2": "章节深度报告",
     "evidence-review": "证据复核/发布门禁",
+    "web-evidence": "联网补证据",
+    "qa-index": "问答证据索引",
     "image-prompts": "生成配图提示词",
     "final-publish": "最终定稿/发布",
 }
@@ -176,6 +209,8 @@ MODULE_SPECS = {
         "requires": ["run_dir", "verified_core", "study_guide"],
         "produces": ["evidence_review", "publish_decision"],
     },
+    "web-evidence": {"requires": ["run_dir", "verified_core", "evidence_review"], "produces": ["web_evidence"]},
+    "qa-index": {"requires": ["run_dir", "verified_core"], "produces": ["qa_index"]},
     "image-prompts": {"requires": ["run_dir"], "produces": ["image_prompts"]},
     "final-publish": {"requires": ["run_dir", "verified_core"], "produces": ["exports"]},
 }
@@ -189,6 +224,10 @@ STAGE_ALIASES = {
     "study_guide": "study-guide",
     "review": "evidence-review",
     "evidence_review": "evidence-review",
+    "web": "web-evidence",
+    "web_evidence": "web-evidence",
+    "qa": "qa-index",
+    "qa_index": "qa-index",
     "export": "final-publish",
     "export_docs": "final-publish",
     "image_prompts": "image-prompts",
@@ -203,6 +242,8 @@ STAGE_RESOURCES = {
     "multidoc": "multidoc",
     "deep-v2": "deep-v2",
     "evidence-review": "study-guide",
+    "web-evidence": "qa-index",
+    "qa-index": "qa-index",
     "image-prompts": "image-prompts",
     "final-publish": "final-publish",
 }
@@ -216,6 +257,7 @@ RESOURCE_LIMITS = {
     "study-guide": 3,
     "multidoc": 3,
     "deep-v2": 3,
+    "qa-index": 2,
     "image-prompts": 3,
     "final-publish": 3,
 }
@@ -225,7 +267,7 @@ EXPECTED_FINAL_EXPORTS = (
     "deep_report_v2.pdf",
     "manual_evidence.pdf",
 )
-SOFT_FAILURE_STAGES = {"multidoc", "deep-v2", "image-prompts", "final-publish"}
+SOFT_FAILURE_STAGES = {"multidoc", "deep-v2", "web-evidence", "qa-index", "image-prompts", "final-publish"}
 VIDEO_PREVIEW_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 VSCODE_PORT_RANGE = tuple(
     int(part)
@@ -311,6 +353,16 @@ STAGE_PROGRESS_STEPS = {
         ("load", "读取学习证据账本", (r"study_guide", r"evidence_gaps", r"study_chapters")),
         ("review", "模型复核缺口影响", (r"evidence_review", r"review", r"publish_decision")),
         ("gate", "写出发布门禁", (r"publish_decision", r"publishable", r"blocked")),
+    ],
+    "web-evidence": [
+        ("load", "读取证据缺口", (r"evidence_gaps", r"study_guide", r"web_evidence")),
+        ("search", "联网搜索外部证据", (r"search", r"external", r"web")),
+        ("write", "写出联网证据账本", (r"web_evidence\.json", r"web_evidence\.md", r"processed_gaps")),
+    ],
+    "qa-index": [
+        ("load", "读取最终文档与证据", (r"operation_manual", r"manual_evidence", r"transcript")),
+        ("chunk", "生成问答证据切片", (r"source_chunks\.jsonl", r"chunk_count")),
+        ("write", "写出问答索引", (r"answer_index\.json", r"QA index")),
     ],
     "image-prompts": [
         ("load", "读取文档内容", (r"operation_manual", r"knowledge_notes", r"deep_report", r"manual_evidence")),
@@ -1000,6 +1052,10 @@ class VideoLinkStatusServer:
                 result = self.run_command_stage(job, stage, self.study_guide_command(job), stage_info["log_path"], stage_info)
             elif stage == "evidence-review":
                 result = self.run_command_stage(job, stage, self.evidence_review_command(job), stage_info["log_path"], stage_info)
+            elif stage == "web-evidence":
+                result = self.run_command_stage(job, stage, self.web_evidence_command(job), stage_info["log_path"], stage_info)
+            elif stage == "qa-index":
+                result = self.run_command_stage(job, stage, self.qa_index_command(job), stage_info["log_path"], stage_info)
             elif stage == "image-prompts":
                 result = self.run_command_stage(job, stage, self.image_prompts_command(job), stage_info["log_path"], stage_info)
             else:
@@ -1011,7 +1067,7 @@ class VideoLinkStatusServer:
             stage_info["exit_code"] = 0
             stage_info["duration_seconds"] = round(time.time() - start, 3)
             stage_info["finished_at"] = iso_now()
-            job["status"] = "succeeded" if stage == STAGE_ORDER[-1] else "running"
+            job["status"] = "succeeded" if self.next_stage(job) is None else "running"
         except Exception as exc:
             stage_info["status"] = "failed"
             stage_info["exit_code"] = getattr(exc, "returncode", 1)
@@ -1247,6 +1303,8 @@ class VideoLinkStatusServer:
                 pipeline_mode_for(resolved_mode),
             ]
             self.append_default_frame_extractor_options(command)
+            if resolved_mode == "operation-fast":
+                command.extend(["--vl-frame-policy", "auto", "--min-vl-frames", "8", "--max-vl-frames", "16"])
         command.append("--resume-existing-core")
         self.append_url_options(command, opts)
         return command
@@ -1337,6 +1395,27 @@ class VideoLinkStatusServer:
             job["options"].get("profile") or DEFAULT_PROFILE,
         ]
 
+    def web_evidence_command(self, job: dict[str, Any]) -> list[str]:
+        return [
+            sys.executable,
+            "-m",
+            "video_analyzer.web_evidence",
+            str(self.require_run_dir(job)),
+            "--profile",
+            job["options"].get("profile") or DEFAULT_PROFILE,
+        ]
+
+    def qa_index_command(self, job: dict[str, Any]) -> list[str]:
+        return [
+            sys.executable,
+            "-m",
+            "video_analyzer.doc_chat",
+            str(self.require_run_dir(job)),
+            "--profile",
+            job["options"].get("profile") or DEFAULT_PROFILE,
+            "--build-index",
+        ]
+
     def export_command(self, job: dict[str, Any]) -> list[str]:
         return ["tools/export_video_docs.sh", str(self.require_run_dir(job)), "--final-only", "--jobs", "3"]
 
@@ -1386,7 +1465,7 @@ class VideoLinkStatusServer:
             "log_path": None,
             "artifacts": self.collect_summary(job),
         }
-        job["status"] = "succeeded" if stage == STAGE_ORDER[-1] else "running"
+        job["status"] = "succeeded" if self.next_stage(job) is None else "running"
         job["updated_at"] = iso_now()
         job["summary"] = self.collect_summary(job)
         self.save_job(job)
@@ -1434,6 +1513,7 @@ class VideoLinkStatusServer:
             "study_guide": run_dir / "study_guide.json",
             "evidence_gaps": run_dir / "evidence_gaps.json",
             "evidence_review": run_dir / "evidence_review.json",
+            "web_evidence": run_dir / "web_evidence.json",
             "publish_decision": run_dir / "publish_decision.json",
         }
         for name, path in study_candidates.items():
@@ -1615,22 +1695,25 @@ class VideoLinkStatusServer:
         job.setdefault("stages", {})["analyze-core"] = stage_info
         self.update_job_artifacts(job, "analyze-core", artifacts)
 
+        job["summary"] = self.collect_summary(job)
+        job["updated_at"] = now
         next_stage = self.next_stage(job)
+        if next_stage:
+            self.mark_stage_queued(job, next_stage, stage_resource(next_stage))
+            job["summary"] = self.collect_summary(job)
+            self.save_job(job)
+            return job
+
         runner = dict(job.get("runner") or {})
-        runner["status"] = "queued" if next_stage else "succeeded"
-        runner["current_stage"] = next_stage
-        runner["queued_for"] = stage_resource(next_stage) if next_stage else None
+        runner["status"] = "succeeded"
+        runner["current_stage"] = None
+        runner["queued_for"] = None
         runner["error"] = None
         runner["updated_at"] = now
         runner["server_pid"] = os.getpid()
-        if not next_stage:
-            runner["finished_at"] = now
-        else:
-            runner.pop("finished_at", None)
+        runner["finished_at"] = now
         job["runner"] = runner
-        job["status"] = "queued" if next_stage else "succeeded"
-        job["summary"] = self.collect_summary(job)
-        job["updated_at"] = now
+        job["status"] = "succeeded"
         self.save_job(job)
         return job
 
@@ -1648,6 +1731,8 @@ class VideoLinkStatusServer:
         for previous in STAGE_ORDER[:stage_index]:
             previous_status = job["stages"].get(previous, {}).get("status")
             if previous_status not in {"succeeded", "skipped"}:
+                if previous in SOFT_FAILURE_STAGES and self.core_markdown_available_for_job(job):
+                    continue
                 raise BridgeError(HTTPStatus.CONFLICT, f"stage {previous} must succeed before {stage}")
 
     def require_run_dir(self, job: dict[str, Any]) -> Path:
@@ -1823,10 +1908,14 @@ class VideoLinkStatusServer:
                 }
             except Exception:
                 core_counts = {}
+        qa_summary = self.qa_summary(run_dir)
         return {
             "run_dir": str(run_dir),
             "core_counts": core_counts,
             "study": self.study_summary(run_dir),
+            "qa": qa_summary,
+            "qa_index": qa_summary.get("answer_index"),
+            "skill_candidate": self.skill_candidate_summary(run_dir),
             "markdown_files": sorted(str(path.relative_to(run_dir)) for path in run_dir.glob("**/*.md") if path.is_file()),
             "export_files": sorted(str(path.relative_to(run_dir)) for path in (run_dir / "exports").glob("*") if path.is_file())
             if (run_dir / "exports").is_dir()
@@ -1838,6 +1927,32 @@ class VideoLinkStatusServer:
             if (run_dir / "baoyu_images" / "final").is_dir()
             else [],
         }
+
+    def qa_summary(self, run_dir: Path) -> dict[str, Any]:
+        qa_dir = run_dir / QA_DIR_NAME
+        index_path = qa_dir / ANSWER_INDEX_NAME
+        chunks_path = qa_dir / CHUNKS_NAME
+        if not index_path.is_file():
+            return {"available": False, "answer_index": None, "source_chunks": None, "warnings": []}
+        try:
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {"available": False, "error": "qa index is invalid", "answer_index": str(index_path.relative_to(run_dir))}
+        return {
+            "available": chunks_path.is_file(),
+            "answer_index": str(index_path.relative_to(run_dir)),
+            "source_chunks": str(chunks_path.relative_to(run_dir)) if chunks_path.is_file() else None,
+            "source_count": index.get("source_count"),
+            "chunk_count": index.get("chunk_count"),
+            "generated_at": index.get("generated_at"),
+            "warnings": index.get("warnings") or [],
+        }
+
+    def skill_candidate_summary(self, run_dir: Path) -> dict[str, Any]:
+        try:
+            return candidate_summary(run_dir)
+        except Exception as exc:
+            return {"available": False, "error": str(exc), "warnings": []}
 
     def study_summary(self, run_dir: Path) -> dict[str, Any]:
         guide_path = run_dir / "study_guide.json"
@@ -1862,6 +1977,13 @@ class VideoLinkStatusServer:
                 summary["gaps"] = gaps.get("summary") or {}
             except Exception:
                 summary["gaps_error"] = "evidence_gaps.json is invalid"
+        web_path = run_dir / "web_evidence.json"
+        if web_path.is_file():
+            try:
+                web_evidence = json.loads(web_path.read_text(encoding="utf-8"))
+                summary["web_evidence"] = web_evidence.get("summary") or {}
+            except Exception:
+                summary["web_evidence_error"] = "web_evidence.json is invalid"
         if decision_path.is_file():
             try:
                 decision = json.loads(decision_path.read_text(encoding="utf-8"))
@@ -1963,7 +2085,7 @@ class VideoLinkStatusServer:
             guide = json.loads(path.read_text(encoding="utf-8"))
         except Exception as exc:
             raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, "study guide is invalid") from exc
-        for name in ("evidence_gaps", "evidence_review", "publish_decision"):
+        for name in ("evidence_gaps", "evidence_review", "web_evidence", "publish_decision"):
             sidecar = run_dir / f"{name}.json"
             if sidecar.is_file():
                 try:
@@ -1971,6 +2093,97 @@ class VideoLinkStatusServer:
                 except Exception:
                     guide[name] = {"status": "invalid"}
         return guide
+
+    def qa_index(self, job_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        summary = self.qa_summary(run_dir)
+        if not summary.get("available"):
+            raise BridgeError(HTTPStatus.NOT_FOUND, summary.get("error") or "QA index is not available")
+        return summary
+
+    def web_evidence(self, job_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        path = run_dir / "web_evidence.json"
+        if not path.is_file():
+            raise BridgeError(HTTPStatus.NOT_FOUND, "web evidence is not available")
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, "web evidence is invalid") from exc
+
+    def skill_candidate(self, job_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        return self.skill_candidate_summary(run_dir)
+
+    def generate_skill_candidate(self, job_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        try:
+            summary = build_tool_skill_candidate(run_dir)
+        except FileNotFoundError as exc:
+            raise BridgeError(HTTPStatus.CONFLICT, str(exc)) from exc
+        job["summary"] = self.collect_summary(job)
+        job["updated_at"] = iso_now()
+        self.save_job(job)
+        return summary
+
+    def enable_skill_candidate(self, job_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        try:
+            summary = enable_tool_skill_candidate(run_dir, self.repo_root)
+        except FileNotFoundError as exc:
+            raise BridgeError(HTTPStatus.NOT_FOUND, str(exc)) from exc
+        except (FileExistsError, ValueError) as exc:
+            raise BridgeError(HTTPStatus.CONFLICT, str(exc)) from exc
+        job["summary"] = self.collect_summary(job)
+        job["updated_at"] = iso_now()
+        self.save_job(job)
+        return summary
+
+    def ask_qa(self, job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        question = str(payload.get("question") or "").strip()
+        if not question:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "question is required")
+        profile_name = (job.get("options") or {}).get("profile") or DEFAULT_PROFILE
+        config = Config("config")
+        profile = config.get_runtime_profile(profile_name)
+        base_url = profile.get("llm_base_url") or (config.get("endpoints") or {}).get("services", {}).get("amd_fast_base_url")
+        model = profile.get("text_model")
+        if not base_url or not model:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, f"profile {profile_name} must provide llm_base_url and text_model")
+        client = GenericOpenAIAPIClient(
+            resolve_api_key(
+                api_key_env=profile.get("text_api_key_env") or profile.get("api_key_env"),
+                api_url=base_url,
+            ),
+            base_url,
+            extra_body=build_openai_extra_body(profile, base_url),
+        )
+        try:
+            result = ask_video_docs_result(
+                run_dir,
+                question,
+                client,
+                model,
+                resolve_temperature(profile, 0.2),
+                int(payload.get("max_context_chars") or 60000),
+            )
+        except FileNotFoundError as exc:
+            raise BridgeError(HTTPStatus.NOT_FOUND, str(exc)) from exc
+        history_dir = run_dir / QA_DIR_NAME / "chat_history"
+        history_dir.mkdir(parents=True, exist_ok=True)
+        record = {"question": question, **result, "created_at": iso_now()}
+        history_path = history_dir / f"{datetime.now().strftime('%Y%m%d')}.jsonl"
+        with history_path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        result["history_path"] = str(history_path.relative_to(run_dir))
+        return result
 
     def public_job(self, job: dict[str, Any], public_host: str | None = None) -> dict[str, Any]:
         public = dict(job)
@@ -3374,7 +3587,7 @@ def format_epoch(value: float) -> str:
 
 
 def pipeline_mode_for(analysis_mode: str) -> str:
-    return "fast" if analysis_mode == "long-talk-fast" else analysis_mode
+    return "fast" if analysis_mode in {"long-talk-fast", "operation-fast"} else analysis_mode
 
 
 def resolve_auto_analysis_mode(requested_mode: str, duration_seconds: int | float | None, focus_prompt: str) -> tuple[str, str]:
@@ -3391,16 +3604,21 @@ def resolve_auto_analysis_mode(requested_mode: str, duration_seconds: int | floa
     fast_score = keyword_score(prompt, AUTO_MODE_FAST_KEYWORDS)
     deep_score = keyword_score(prompt, AUTO_MODE_DEEP_KEYWORDS)
     long_talk_score = keyword_score(prompt, AUTO_MODE_LONG_TALK_KEYWORDS)
+    operation_score = keyword_score(prompt, AUTO_MODE_OPERATION_KEYWORDS)
 
     if is_long:
         if deep_score > max(fast_score, long_talk_score):
             return "deep", "focus prompt asks for deep/high-detail analysis"
+        if operation_score > long_talk_score and fast_score:
+            return "operation-fast", "long video with fast operation/tutorial intent"
         if fast_score or long_talk_score:
             return "long-talk-fast", "long video with speed/subtitle/talk intent"
         return "long-talk-fast", f"duration >= {AUTO_MODE_LONG_SECONDS}s"
 
     if deep_score > fast_score:
         return "deep", "focus prompt asks for deep/high-detail analysis"
+    if fast_score > 0 and operation_score > 0:
+        return "operation-fast", "focus prompt asks for quick operation/tutorial analysis"
     if fast_score > 0:
         return "fast", "focus prompt asks for quick/summary analysis"
     return "balanced", "focus prompt has no strong mode hint"
@@ -4343,6 +4561,18 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
                 full = parse_bool(query.get("full", ["false"])[0])
                 self.write_json(self.server_app.stage_log(match.group(1), match.group(2), limit, full))
                 return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/qa-index", path)
+            if match:
+                self.write_json(self.server_app.qa_index(match.group(1)))
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/web-evidence", path)
+            if match:
+                self.write_json(self.server_app.web_evidence(match.group(1)))
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/skill-candidate", path)
+            if match:
+                self.write_json(self.server_app.skill_candidate(match.group(1)))
+                return
             match = re.fullmatch(r"/video-link/jobs/([a-f0-9]{32})", path)
             if match:
                 self.write_redirect(f"/?job={match.group(1)}")
@@ -4385,6 +4615,18 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
                 restart = parse_bool(payload.get("restart", False))
                 host = self.headers.get("Host", "").split(":", 1)[0] or None
                 self.write_json(self.server_app.start_vscode_session(match.group(1), public_host=host, restart=restart))
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/qa/ask", path)
+            if match:
+                self.write_json(self.server_app.ask_qa(match.group(1), payload))
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/skill-candidate/generate", path)
+            if match:
+                self.write_json(self.server_app.generate_skill_candidate(match.group(1)))
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/skill-candidate/enable", path)
+            if match:
+                self.write_json(self.server_app.enable_skill_candidate(match.group(1)))
                 return
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/stages/([a-z0-9-]+)", path)
             if match:

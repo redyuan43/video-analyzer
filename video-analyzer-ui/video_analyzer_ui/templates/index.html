@@ -17,6 +17,7 @@
             <nav class="view-tabs" aria-label="视图切换">
                 <button id="consoleTab" class="view-tab active" type="button" data-view="console">控制台</button>
                 <button id="previewTab" class="view-tab" type="button" data-view="preview">预览</button>
+                <button id="qaTab" class="view-tab" type="button" data-view="qa">问答</button>
                 <button id="vscodeTab" class="view-tab" type="button" data-view="vscode">学习/资源</button>
             </nav>
         </header>
@@ -208,6 +209,39 @@
                 <button id="refreshPreviewButton" class="secondary" type="button">刷新</button>
             </section>
             <section id="previewGrid" class="preview-grid"></section>
+        </section>
+
+        <section id="qaView" class="qa-view view-panel" hidden>
+            <section class="panel qa-toolbar">
+                <div>
+                    <h2>问答</h2>
+                    <p id="qaSummary">选择一个已生成问答索引的任务</p>
+                </div>
+            </section>
+            <section class="qa-layout">
+                <section class="panel qa-chat-panel">
+                    <div id="qaMessages" class="qa-messages" aria-live="polite">
+                        <div class="qa-empty">暂无对话</div>
+                    </div>
+                    <form id="qaForm" class="qa-form">
+                        <textarea id="qaQuestion" rows="3" placeholder="输入你想追问的内容"></textarea>
+                        <button id="qaAskButton" type="submit" disabled>提问</button>
+                    </form>
+                </section>
+                <aside class="panel qa-side-panel">
+                    <h2>证据状态</h2>
+                    <div id="qaWarnings" class="qa-warnings">等待问答索引</div>
+                    <div class="skill-candidate-panel">
+                        <h2>工具 Skill</h2>
+                        <div id="skillSummary" class="skill-summary">等待生成草稿</div>
+                        <div id="skillWarnings" class="skill-warnings"></div>
+                        <div class="skill-actions">
+                            <button id="generateSkillButton" class="secondary" type="button" disabled>生成草稿</button>
+                            <button id="enableSkillButton" type="button" disabled>审核启用</button>
+                        </div>
+                    </div>
+                </aside>
+            </section>
         </section>
 
         <section id="vscodeView" class="vscode-view view-panel" hidden>

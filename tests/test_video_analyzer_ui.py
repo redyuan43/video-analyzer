@@ -60,6 +60,8 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn('id="vscodeFrame"', html)
         self.assertIn('id="docList"', html)
         self.assertIn('id="docPreviewBody"', html)
+        self.assertIn('id="generateSkillButton"', html)
+        self.assertIn('id="enableSkillButton"', html)
         self.assertIn('data-resize-pane="study"', html)
         self.assertIn('data-resize-pane="doc-list"', html)
         self.assertIn("vendor/markdown-it/markdown-it.min.js", html)
@@ -77,6 +79,10 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn("bindPaneResizers", main_js)
         self.assertIn("videoAnalyzerPaneLayout", main_js)
         self.assertIn("data-image-viewer-src", main_js)
+        self.assertIn("const changed = selectedJobId !== jobId", main_js)
+        self.assertIn("if (changed) resetQaMessages()", main_js)
+        self.assertIn("generateSkillCandidate", main_js)
+        self.assertIn("enableSkillCandidate", main_js)
         self.assertIn("study-node", styles_css)
         self.assertIn("study-frame", styles_css)
         self.assertIn(".image-viewer-stage", styles_css)
@@ -108,6 +114,34 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertEqual(list_response.get_json()["total"], 1)
         self.assertIn("resources", list_response.get_json())
         self.assertEqual(get_response.get_json()["dashboard_url"], f"/?job={job['job_id']}")
+
+    def test_video_link_skill_candidate_routes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp) / "jobs", video_link_auto_resume=False)
+            client = ui.app.test_client()
+            repo_root = Path(tmp) / "repo"
+            run_dir = Path(tmp) / "run"
+            repo_root.mkdir()
+            run_dir.mkdir()
+            ui.video_link.repo_root = repo_root
+            (run_dir / "operation_manual.md").write_text("# Demo Tool Setup\n\n1. 填写 API Token。\n", encoding="utf-8")
+            (run_dir / "manual_evidence.md").write_text("# Evidence\n\nframe_001 显示 API Token。\n", encoding="utf-8")
+            create = client.post("/api/video-link/jobs", json={"video_url": "https://example.com/video"})
+            job = create.get_json()
+            loaded = ui.video_link.load_job(job["job_id"])
+            loaded["run_dir"] = str(run_dir)
+            ui.video_link.save_job(loaded)
+
+            before = client.get(f"/api/video-link/jobs/{job['job_id']}/skill-candidate")
+            generated = client.post(f"/api/video-link/jobs/{job['job_id']}/skill-candidate/generate", json={})
+            enabled = client.post(f"/api/video-link/jobs/{job['job_id']}/skill-candidate/enable", json={})
+
+        self.assertEqual(before.status_code, 200)
+        self.assertFalse(before.get_json()["available"])
+        self.assertEqual(generated.status_code, 200)
+        self.assertTrue(generated.get_json()["available"])
+        self.assertEqual(enabled.status_code, 200)
+        self.assertTrue(enabled.get_json()["enabled"])
 
     def test_video_link_api_batch_create(self):
         with tempfile.TemporaryDirectory() as tmp:

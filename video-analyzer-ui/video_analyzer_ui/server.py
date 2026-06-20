@@ -194,6 +194,48 @@ class VideoAnalyzerUI:
                 return jsonify(self.video_link.study_guide(job_id))
             except BridgeError as exc:
                 return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>/qa-index')
+        def video_link_qa_index(job_id):
+            try:
+                return jsonify(self.video_link.qa_index(job_id))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>/web-evidence')
+        def video_link_web_evidence(job_id):
+            try:
+                return jsonify(self.video_link.web_evidence(job_id))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>/qa/ask', methods=['POST'])
+        def video_link_qa_ask(job_id):
+            try:
+                return jsonify(self.video_link.ask_qa(job_id, request.get_json(silent=True) or {}))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>/skill-candidate')
+        def video_link_skill_candidate(job_id):
+            try:
+                return jsonify(self.video_link.skill_candidate(job_id))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>/skill-candidate/generate', methods=['POST'])
+        def video_link_generate_skill_candidate(job_id):
+            try:
+                return jsonify(self.video_link.generate_skill_candidate(job_id))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>/skill-candidate/enable', methods=['POST'])
+        def video_link_enable_skill_candidate(job_id):
+            try:
+                return jsonify(self.video_link.enable_skill_candidate(job_id))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
             
         @self.app.route('/upload', methods=['POST'])
         def upload_file():

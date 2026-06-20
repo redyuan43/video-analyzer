@@ -466,14 +466,97 @@ def build_fallback_chapters(segments: list[dict[str, Any]]) -> list[dict[str, An
     for index in range(chapter_count):
         start = boundaries[index]
         end = boundaries[index + 1]
+        chapter_segments = [
+            segment
+            for segment in segments
+            if start <= segment_seconds(segment, "start") < end
+        ]
         chapters.append(
             {
                 "start": format_timestamp(start),
                 "end": format_timestamp(end),
-                "title": f"自动分段 {index + 1:02d}",
+                "title": fallback_chapter_title(chapter_segments, index + 1),
             }
         )
     return chapters
+
+
+def fallback_chapter_title(segments: list[dict[str, Any]], index: int) -> str:
+    text = " ".join(str(segment.get("text") or "").replace("\n", " ").strip() for segment in segments if segment.get("text"))
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return f"章节 {index:02d}"
+    title = concise_topic_from_text(text)
+    return title or f"章节 {index:02d}"
+
+
+def concise_topic_from_text(text: str) -> str:
+    text = clean_topic_text(text)
+    if not text:
+        return ""
+    clauses = [part.strip() for part in re.split(r"(?<=[。！？!?；;])\s*|[。！？!?；;]\s*|\n+", text) if part.strip()]
+    candidate = next((part for part in clauses if len(part) >= 8), clauses[0] if clauses else text)
+    candidate = clean_topic_text(candidate)
+    if re.search(r"[\u4e00-\u9fff]", candidate):
+        return trim_chinese_title(candidate)
+    return trim_english_title(candidate)
+
+
+def clean_topic_text(text: str) -> str:
+    text = re.sub(r"\[[0-9:.]+\s*-\s*[0-9:.]+\]", " ", text or "")
+    text = re.sub(r"\s+", " ", text).strip(" ，,；;。.!！?？:-")
+    for _ in range(4):
+        updated = re.sub(
+            r"^(today|now|so|and|okay|alright|right|basically|actually|you know|let me|let's|you can see here|you can see|we're going to|we are going to|i'm going to)\b[\s,.:;-]*",
+            "",
+            text,
+            flags=re.I,
+        ).strip(" ，,；;。.!！?？:-")
+        updated = re.sub(r"^(we're|we are|i'm|i am)\s+going\s+to\s+", "", updated, flags=re.I)
+        updated = re.sub(r"^(be|to)\s+", "", updated, flags=re.I).strip(" ，,；;。.!！?？:-")
+        if updated == text:
+            break
+        text = updated
+    return text
+
+
+def trim_chinese_title(text: str) -> str:
+    candidate = re.split(r"[，,。；;：:]", text, maxsplit=1)[0].strip()
+    return candidate[:18].strip() if candidate else text[:18].strip()
+
+
+def trim_english_title(text: str) -> str:
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'/-]*", text)
+    stop_prefix = {
+        "the",
+        "a",
+        "an",
+        "this",
+        "that",
+        "these",
+        "those",
+        "we",
+        "i",
+        "you",
+        "they",
+        "it",
+        "can",
+        "could",
+        "will",
+        "would",
+        "should",
+        "just",
+        "really",
+    }
+    while words and words[0].lower() in stop_prefix:
+        words.pop(0)
+    if not words:
+        return ""
+    title_words = words[:7]
+    suffix_stop = {"to", "of", "in", "on", "at", "for", "with", "here", "there", "right"}
+    while len(title_words) > 3 and title_words[-1].lower() in suffix_stop:
+        title_words.pop()
+    return " ".join(word if word.isupper() else word.capitalize() for word in title_words)
 
 
 def build_chapter_transcript_digest(

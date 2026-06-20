@@ -16,10 +16,14 @@ from tools.prepare_video_doc_export import rewrite_image_paths
 
 
 class VideoDocImageTests(unittest.TestCase):
-    def test_parse_chapters_splits_long_transcript_without_page_chapters(self):
+    def test_parse_chapters_names_fallback_segments_from_transcript(self):
         transcript = {
             "segments": [
-                {"start_time": index * 35.0, "end_time": (index + 1) * 35.0, "text": f"segment {index}"}
+                {
+                    "start_time": index * 35.0,
+                    "end_time": (index + 1) * 35.0,
+                    "text": "设置 Hermes Telegram 代理团队" if index < 8 else f"配置第 {index} 个步骤",
+                }
                 for index in range(49)
             ]
         }
@@ -29,7 +33,8 @@ class VideoDocImageTests(unittest.TestCase):
         self.assertGreaterEqual(len(chapters), 6)
         self.assertLessEqual(len(chapters), 10)
         self.assertNotEqual(chapters[0]["end"], "00:00:00")
-        self.assertTrue(chapters[0]["title"].startswith("自动分段"))
+        self.assertIn("设置 Hermes", chapters[0]["title"])
+        self.assertNotIn("自动分段", chapters[0]["title"])
 
     def test_augment_video_docs_images_inserts_final_and_representative_images(self):
         with tempfile.TemporaryDirectory() as tmp:

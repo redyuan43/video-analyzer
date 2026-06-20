@@ -212,6 +212,37 @@ def parse_auto_float_arg(value: str) -> float | str:
     return parsed
 
 
+def append_evidence_boundary_section(
+    markdown: str,
+    frame_selection_metadata: dict,
+    ocr_keyframe_metadata: dict,
+    ocr_events: list,
+) -> str:
+    if not markdown or "## 证据边界与需复核" in markdown:
+        return markdown
+    notes: list[str] = []
+    vl_policy = str(frame_selection_metadata.get("vl_frame_policy_resolved") or "").lower()
+    vl_frame_count = frame_selection_metadata.get("vl_frames_processed")
+    if vl_frame_count is None:
+        vl_frame_count = frame_selection_metadata.get("vl_frames_count")
+    if vl_frame_count is None:
+        vl_frame_count = len(frame_selection_metadata.get("frames") or frame_selection_metadata.get("selected_vl_frames") or [])
+    if vl_policy == "none" or int(vl_frame_count or 0) == 0:
+        notes.append("本次未运行或未选中 VL 视觉理解帧，界面细节主要依赖 OCR、ASR 与截图证据，关键操作建议人工复核。")
+    if ocr_keyframe_metadata.get("ocr_text_events_count") == 0:
+        notes.append("OCR 没有形成稳定文本事件，涉及按钮文案、菜单项和页面状态的结论需结合截图复核。")
+    failed_ocr = [
+        event for event in ocr_events
+        if getattr(event, "status", "ok") not in {"ok", "skipped"}
+    ]
+    if failed_ocr:
+        notes.append(f"有 {len(failed_ocr)} 个 OCR 帧未成功解析，对应时间点的文字证据置信度较低。")
+    if not notes:
+        return markdown
+    section = "\n\n## 证据边界与需复核\n\n" + "\n".join(f"- {note}" for note in notes)
+    return markdown.rstrip() + section + "\n"
+
+
 def analyze_frames_for_vl(
     analyzer: VideoAnalyzer,
     frames,
@@ -1039,6 +1070,12 @@ def main():
                     operation_manual.get("response", ""),
                     frames,
                     frame_assets,
+                )
+                operation_manual["response"] = append_evidence_boundary_section(
+                    operation_manual.get("response", ""),
+                    frame_selection_metadata,
+                    ocr_keyframe_metadata,
+                    ocr_events,
                 )
                 operation_manual["quality_review"] = review_operation_manual_markdown(
                     operation_manual.get("response", "")

@@ -7,6 +7,7 @@ const stageNames = {
     'deep-v2': '章节深度报告',
     'study-guide': '学习证据账本',
     'evidence-review': '证据复核/发布门禁',
+    'qa-index': '问答证据索引',
     'image-prompts': '生成配图提示词',
     'final-publish': '最终定稿/发布'
 };
@@ -18,7 +19,7 @@ let refreshTimer = null;
 let scanAnimationFrame = null;
 let currentJob = null;
 let latestJobs = [];
-let currentView = ['preview', 'vscode'].includes(initialParams.get('view'))
+let currentView = ['preview', 'qa', 'vscode'].includes(initialParams.get('view'))
     ? initialParams.get('view')
     : 'console';
 let pendingUrls = [];
@@ -49,9 +50,11 @@ const learningPanelVisibility = {
 const nodes = {
     consoleTab: document.getElementById('consoleTab'),
     previewTab: document.getElementById('previewTab'),
+    qaTab: document.getElementById('qaTab'),
     vscodeTab: document.getElementById('vscodeTab'),
     consoleView: document.getElementById('consoleView'),
     previewView: document.getElementById('previewView'),
+    qaView: document.getElementById('qaView'),
     vscodeView: document.getElementById('vscodeView'),
     jobForm: document.getElementById('jobForm'),
     formError: document.getElementById('formError'),
@@ -100,6 +103,16 @@ const nodes = {
     refreshPreviewButton: document.getElementById('refreshPreviewButton'),
     previewSummary: document.getElementById('previewSummary'),
     previewGrid: document.getElementById('previewGrid'),
+    qaSummary: document.getElementById('qaSummary'),
+    qaWarnings: document.getElementById('qaWarnings'),
+    qaMessages: document.getElementById('qaMessages'),
+    qaForm: document.getElementById('qaForm'),
+    qaQuestion: document.getElementById('qaQuestion'),
+    qaAskButton: document.getElementById('qaAskButton'),
+    skillSummary: document.getElementById('skillSummary'),
+    skillWarnings: document.getElementById('skillWarnings'),
+    generateSkillButton: document.getElementById('generateSkillButton'),
+    enableSkillButton: document.getElementById('enableSkillButton'),
     vscodeSummary: document.getElementById('vscodeSummary'),
     startVscodeButton: document.getElementById('startVscodeButton'),
     openVscodeLink: document.getElementById('openVscodeLink'),
@@ -342,8 +355,10 @@ async function createJob(event) {
 }
 
 function selectJob(jobId, updateUrl = true) {
+    const changed = selectedJobId !== jobId;
     selectedJobId = jobId;
     selectedLogStage = null;
+    if (changed) resetQaMessages();
     if (updateUrl) {
         const url = new URL(window.location.href);
         url.searchParams.set('job', jobId);
@@ -354,15 +369,18 @@ function selectJob(jobId, updateUrl = true) {
 }
 
 function setView(view, updateUrl = true) {
-    currentView = ['preview', 'vscode'].includes(view) ? view : 'console';
+    currentView = ['preview', 'qa', 'vscode'].includes(view) ? view : 'console';
     nodes.consoleView.hidden = currentView !== 'console';
     nodes.previewView.hidden = currentView !== 'preview';
+    nodes.qaView.hidden = currentView !== 'qa';
     nodes.vscodeView.hidden = currentView !== 'vscode';
     nodes.consoleView.classList.toggle('active', currentView === 'console');
     nodes.previewView.classList.toggle('active', currentView === 'preview');
+    nodes.qaView.classList.toggle('active', currentView === 'qa');
     nodes.vscodeView.classList.toggle('active', currentView === 'vscode');
     nodes.consoleTab.classList.toggle('active', currentView === 'console');
     nodes.previewTab.classList.toggle('active', currentView === 'preview');
+    nodes.qaTab.classList.toggle('active', currentView === 'qa');
     nodes.vscodeTab.classList.toggle('active', currentView === 'vscode');
     if (updateUrl) {
         const url = new URL(window.location.href);
@@ -375,6 +393,7 @@ function setView(view, updateUrl = true) {
     }
     renderPreviewGrid(latestJobs);
     if (currentView === 'preview') startScanAnimation();
+    renderQaPanel(currentJob);
     renderVscodePanel(currentJob);
 }
 
@@ -570,6 +589,7 @@ function renderEmpty() {
     nodes.selectedTitle.textContent = '未选择任务';
     nodes.selectedSubtitle.textContent = '创建或选择一个任务后查看进度。';
     nodes.stageDurationSummary.textContent = '原视频长度：- · 阶段总耗时：-';
+    renderQaPanel(null);
 }
 
 function renderServiceOffline(error) {
@@ -588,6 +608,7 @@ function renderServiceOffline(error) {
     nodes.stageDurationSummary.textContent = '原视频长度：- · 阶段总耗时：-';
     nodes.progressText.textContent = '0/0 · 0%';
     nodes.progressBar.style.width = '0%';
+    renderQaPanel(null);
 }
 
 function activeProcess(job) {
@@ -661,6 +682,7 @@ function renderJob(job) {
     renderStageProgress(stageProgress);
     renderCoreDiagnostics(job.core_diagnostics);
     renderArtifacts(job.summary || {});
+    renderQaPanel(job);
     renderVscodePanel(job);
     loadSelectedLog(job);
 }
@@ -813,6 +835,162 @@ function renderArtifacts(summary) {
     ].join('<br>');
 }
 
+function renderQaPanel(job) {
+    if (!nodes.qaView) return;
+    const qa = job?.summary?.qa || {};
+    const available = Boolean(qa.available || qa.answer_index?.exists);
+    const chunkCount = qa.answer_index?.chunk_count || qa.chunk_count || 0;
+    const runDir = job?.summary?.run_dir || job?.run_dir || '';
+    nodes.qaAskButton.disabled = !job || !available;
+    nodes.qaQuestion.disabled = !job || !available;
+    if (!job) {
+        nodes.qaSummary.textContent = '选择一个已生成问答索引的任务';
+        nodes.qaWarnings.textContent = '等待问答索引';
+        resetQaMessages();
+        renderSkillCandidatePanel(null);
+        return;
+    }
+    if (!available) {
+        nodes.qaSummary.textContent = runDir ? '问答索引尚未生成' : '资源目录尚未生成';
+        nodes.qaWarnings.textContent = '等待“问答证据索引”阶段完成';
+        resetQaMessages();
+        renderSkillCandidatePanel(job);
+        return;
+    }
+    nodes.qaSummary.textContent = `已索引 ${chunkCount} 个证据片段 · ${runDir}`;
+    const warnings = qa.answer_index?.quality_warnings || qa.quality_warnings || qa.warnings || [];
+    nodes.qaWarnings.innerHTML = warnings.length
+        ? warnings.map(item => `<div class="qa-warning">${escapeHtml(item.message || item.code || item)}</div>`).join('')
+        : '<div class="qa-ok">未发现明显证据边界警告</div>';
+    renderSkillCandidatePanel(job);
+}
+
+function resetQaMessages() {
+    if (!nodes.qaMessages) return;
+    nodes.qaMessages.innerHTML = '<div class="qa-empty">暂无对话</div>';
+}
+
+function renderSkillCandidatePanel(job) {
+    if (!nodes.skillSummary) return;
+    const skill = job?.summary?.skill_candidate || {};
+    const runDir = job?.summary?.run_dir || job?.run_dir || '';
+    const available = Boolean(skill.available);
+    const enabled = Boolean(skill.enabled);
+    nodes.generateSkillButton.disabled = !job || !runDir;
+    nodes.enableSkillButton.disabled = !job || !available || enabled;
+    if (!job) {
+        nodes.skillSummary.textContent = '选择一个任务后生成工具 Skill 草稿';
+        nodes.skillWarnings.innerHTML = '';
+        return;
+    }
+    if (!available) {
+        nodes.skillSummary.textContent = runDir ? '尚未生成草稿' : '资源目录尚未生成';
+        nodes.skillWarnings.innerHTML = '';
+        return;
+    }
+    nodes.skillSummary.textContent = enabled
+        ? `已启用 · ${skill.skill_name || '-'}`
+        : `待审核 · ${skill.skill_name || '-'}`;
+    const warnings = skill.warnings || [];
+    nodes.skillWarnings.innerHTML = warnings.length
+        ? warnings.map(item => `<div class="skill-warning">${escapeHtml(item.message || item.code || item)}</div>`).join('')
+        : '<div class="skill-ok">草稿已生成，启用前请人工复核内容。</div>';
+}
+
+function appendQaMessage(role, html) {
+    const empty = nodes.qaMessages.querySelector('.qa-empty');
+    if (empty) empty.remove();
+    const message = document.createElement('article');
+    message.className = `qa-message ${role}`;
+    message.innerHTML = html;
+    nodes.qaMessages.appendChild(message);
+    nodes.qaMessages.scrollTop = nodes.qaMessages.scrollHeight;
+}
+
+function renderQaCitations(citations) {
+    if (!citations?.length) return '';
+    return `<div class="qa-citations">
+        ${citations.map(item => {
+            const source = item.source || item.name || item.path || item.label || '-';
+            const score = item.score == null ? '' : ` · ${Number(item.score).toFixed(2)}`;
+            const lowConfidence = item.confidence === 'low' || item.source_type === 'comments';
+            return `<div class="${lowConfidence ? 'low-confidence' : ''}">
+                <strong>${escapeHtml(source)}</strong><span>${escapeHtml(score)}</span>
+            </div>`;
+        }).join('')}
+    </div>`;
+}
+
+async function askQa(event) {
+    event.preventDefault();
+    if (!selectedJobId || nodes.qaAskButton.disabled) return;
+    const question = nodes.qaQuestion.value.trim();
+    if (!question) return;
+    nodes.qaQuestion.value = '';
+    nodes.qaAskButton.disabled = true;
+    appendQaMessage('user', `<p>${escapeHtml(question)}</p>`);
+    try {
+        const result = await getJson(`/api/video-link/jobs/${selectedJobId}/qa/ask`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ question })
+        });
+        const warningHtml = (result.warnings || []).length
+            ? `<div class="qa-answer-warnings">${(result.warnings || []).map(item => escapeHtml(item.message || item.code || item)).join('<br>')}</div>`
+            : '';
+        appendQaMessage('assistant', `
+            ${warningHtml}
+            <div class="qa-answer">${renderMarkdown(result.answer || '没有生成答案。')}</div>
+            ${renderQaCitations(result.citations || [])}
+        `);
+    } catch (error) {
+        appendQaMessage('assistant error', `<p>${escapeHtml(error.message)}</p>`);
+    } finally {
+        renderQaPanel(currentJob);
+    }
+}
+
+async function generateSkillCandidate() {
+    if (!selectedJobId || nodes.generateSkillButton.disabled) return;
+    nodes.generateSkillButton.disabled = true;
+    nodes.skillSummary.textContent = '正在生成草稿...';
+    try {
+        const result = await getJson(`/api/video-link/jobs/${selectedJobId}/skill-candidate/generate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}'
+        });
+        if (currentJob?.summary) currentJob.summary.skill_candidate = result;
+        renderSkillCandidatePanel(currentJob);
+        await refreshSelectedJob();
+    } catch (error) {
+        nodes.skillSummary.textContent = `生成失败：${error.message}`;
+        renderSkillCandidatePanel(currentJob);
+    }
+}
+
+async function enableSkillCandidate() {
+    if (!selectedJobId || nodes.enableSkillButton.disabled) return;
+    const skill = currentJob?.summary?.skill_candidate || {};
+    const name = skill.skill_name || 'tool skill';
+    if (!window.confirm(`审核并启用这个 Skill？\n\n${name}\n\n启用后会写入项目 .codex/skills，后续 agent 可能自动触发使用。`)) return;
+    nodes.enableSkillButton.disabled = true;
+    nodes.skillSummary.textContent = '正在启用...';
+    try {
+        const result = await getJson(`/api/video-link/jobs/${selectedJobId}/skill-candidate/enable`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}'
+        });
+        if (currentJob?.summary) currentJob.summary.skill_candidate = result;
+        renderSkillCandidatePanel(currentJob);
+        await refreshSelectedJob();
+    } catch (error) {
+        nodes.skillSummary.textContent = `启用失败：${error.message}`;
+        renderSkillCandidatePanel(currentJob);
+    }
+}
+
 function renderVscodePanel(job) {
     if (!nodes.vscodeView) return;
     const runDir = job?.summary?.run_dir || job?.run_dir || job?.vscode_preview?.run_dir || '';
@@ -903,11 +1081,13 @@ async function loadStudyGuide(jobId) {
 function renderStudyGuide(guide, jobId) {
     const chapters = guide.chapters || [];
     const overview = guide.overview || {};
+    const webEvidenceHtml = renderWebEvidenceSummary(guide.web_evidence);
     if (!chapters.length) {
         return `<section class="study-learning-shell">
             <div class="study-content-summary">
                 <span>内容总结</span>
                 <p>${escapeHtml(overview.summary || '暂无学习总览')}</p>
+                ${webEvidenceHtml}
             </div>
             <div class="doc-empty">暂无可展示的学习步骤</div>
         </section>`;
@@ -918,6 +1098,7 @@ function renderStudyGuide(guide, jobId) {
             <div class="study-content-summary">
                 <span>内容总结</span>
                 <p>${escapeHtml(overview.summary || '暂无学习总览')}</p>
+                ${webEvidenceHtml}
                 <div class="study-progress-meta">
                     <strong data-study-progress-text>当前步骤：1 / ${escapeHtml(chapters.length)}</strong>
                     <div class="bar study-progress-bar"><div data-study-progress-bar style="width:${escapeHtml(progressPercent(1, chapters.length))}%"></div></div>
@@ -935,6 +1116,19 @@ function renderStudyGuide(guide, jobId) {
         </section>`
     ];
     return html.join('');
+}
+
+function renderWebEvidenceSummary(webEvidence) {
+    const summary = webEvidence?.summary || {};
+    const processed = Number(summary.processed_gaps || 0);
+    if (!processed) return '';
+    const external = Number(summary.resolved_by_external || 0);
+    const partial = Number(summary.partial_external_support || 0);
+    const unresolved = Number(summary.unresolved || 0) + Number(summary.video_only_gap || 0);
+    return `<div class="study-evidence-boundary">
+        <strong>联网补证据</strong>
+        <span>已处理 ${escapeHtml(processed)} 个缺口 · 外部补强 ${escapeHtml(external)} · 部分补强 ${escapeHtml(partial)} · 仍需复核 ${escapeHtml(unresolved)}</span>
+    </div>`;
 }
 
 function renderStudyNode(chapter, selected, index) {
@@ -2291,6 +2485,7 @@ async function runSelectedJob() {
 async function boot() {
     nodes.consoleTab.addEventListener('click', () => setView('console'));
     nodes.previewTab.addEventListener('click', () => setView('preview'));
+    nodes.qaTab.addEventListener('click', () => setView('qa'));
     nodes.vscodeTab.addEventListener('click', () => setView('vscode'));
     nodes.jobForm.addEventListener('submit', createJob);
     nodes.addUrlButton.addEventListener('click', addPendingUrls);
@@ -2303,6 +2498,9 @@ async function boot() {
     renderUrlList();
     nodes.refreshJobsButton.addEventListener('click', refreshJobs);
     nodes.refreshPreviewButton.addEventListener('click', refreshJobs);
+    nodes.qaForm.addEventListener('submit', askQa);
+    nodes.generateSkillButton.addEventListener('click', generateSkillCandidate);
+    nodes.enableSkillButton.addEventListener('click', enableSkillCandidate);
     nodes.startVscodeButton.addEventListener('click', () => ensureVscodeSession(false));
     nodes.restartVscodeButton.addEventListener('click', () => ensureVscodeSession(true));
     nodes.stopVscodeButton.addEventListener('click', stopVscodeSession);

@@ -77,6 +77,8 @@ class StudyGuideTests(unittest.TestCase):
             self.assertGreaterEqual(result["summary"]["chapters"], 2)
             guide = json.loads((run_dir / "study_guide.json").read_text(encoding="utf-8"))
             self.assertTrue(any(item["source_type"] == "asr" and "硬件选择" in item["text"] for item in guide["evidence"]))
+            self.assertTrue(all("自动分段" not in chapter["title"] for chapter in guide["chapters"]))
+            self.assertTrue(any("硬件选择" in chapter["title"] or "固件配置" in chapter["title"] for chapter in guide["chapters"]))
 
     def test_learning_copy_uses_chapter_content_instead_of_repeated_manual(self):
         with tempfile.TemporaryDirectory() as tmp:
