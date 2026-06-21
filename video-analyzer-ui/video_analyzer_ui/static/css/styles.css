@@ -1089,6 +1089,12 @@ th {
     background: #fffbeb;
 }
 
+.qa-saved-at {
+    margin-top: 10px;
+    color: #667085;
+    font-size: 12px;
+}
+
 .qa-form {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;

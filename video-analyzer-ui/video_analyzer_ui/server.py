@@ -202,6 +202,16 @@ class VideoAnalyzerUI:
             except BridgeError as exc:
                 return jsonify({'error': exc.message}), int(exc.status)
 
+        @self.app.route('/api/video-link/jobs/<job_id>/qa/history')
+        def video_link_qa_history(job_id):
+            try:
+                limit = int(request.args.get('limit', '50'))
+                return jsonify(self.video_link.qa_history(job_id, limit=limit))
+            except ValueError:
+                return jsonify({'error': 'limit must be an integer'}), int(HTTPStatus.BAD_REQUEST)
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
         @self.app.route('/api/video-link/jobs/<job_id>/web-evidence')
         def video_link_web_evidence(job_id):
             try:

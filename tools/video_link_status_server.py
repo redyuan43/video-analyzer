@@ -2102,6 +2102,31 @@ class VideoLinkStatusServer:
             raise BridgeError(HTTPStatus.NOT_FOUND, summary.get("error") or "QA index is not available")
         return summary
 
+    def qa_history(self, job_id: str, limit: int = 50) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        history_dir = run_dir / QA_DIR_NAME / "chat_history"
+        records: list[dict[str, Any]] = []
+        if history_dir.is_dir():
+            for path in sorted(history_dir.glob("*.jsonl")):
+                try:
+                    for line in path.read_text(encoding="utf-8").splitlines():
+                        if line.strip():
+                            record = json.loads(line)
+                            record["history_file"] = str(path.relative_to(run_dir))
+                            records.append(record)
+                except Exception:
+                    continue
+        records.sort(key=lambda item: str(item.get("created_at") or ""))
+        if limit > 0:
+            records = records[-limit:]
+        return {
+            "available": bool(records),
+            "history_dir": str(history_dir.relative_to(run_dir)),
+            "messages": records,
+            "count": len(records),
+        }
+
     def web_evidence(self, job_id: str) -> dict[str, Any]:
         job = self.load_job(job_id)
         run_dir = self.require_run_dir(job)
@@ -2183,6 +2208,7 @@ class VideoLinkStatusServer:
         with history_path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
         result["history_path"] = str(history_path.relative_to(run_dir))
+        result["created_at"] = record["created_at"]
         return result
 
     def public_job(self, job: dict[str, Any], public_host: str | None = None) -> dict[str, Any]:
@@ -4564,6 +4590,11 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/qa-index", path)
             if match:
                 self.write_json(self.server_app.qa_index(match.group(1)))
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/qa/history", path)
+            if match:
+                limit = int(query.get("limit", ["50"])[0])
+                self.write_json(self.server_app.qa_history(match.group(1), limit=limit))
                 return
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/web-evidence", path)
             if match:

@@ -854,6 +854,30 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(summary["chunk_count"], 3)
         self.assertEqual(summary["warnings"][0]["code"], "vl_skipped")
 
+    def test_qa_answer_is_saved_to_chat_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            job = server.create_job({"video_url": "https://example.com/video", "profile": "deepseek_v4_pro"})
+            loaded = server.load_job(job["job_id"])
+            loaded["run_dir"] = str(run_dir)
+            server.save_job(loaded)
+            answer = {"answer": "这是已保存的回答。", "citations": [], "warnings": [], "context_chars": 12}
+
+            with patch.object(server_mod, "resolve_api_key", return_value="0"), patch.object(
+                server_mod, "ask_video_docs_result", return_value=answer
+            ):
+                result = server.ask_qa(job["job_id"], {"question": "怎么配置？"})
+                history = server.qa_history(job["job_id"])
+
+        self.assertEqual(result["answer"], answer["answer"])
+        self.assertIn("qa/chat_history/", result["history_path"])
+        self.assertEqual(history["count"], 1)
+        self.assertEqual(history["messages"][0]["question"], "怎么配置？")
+        self.assertEqual(history["messages"][0]["answer"], answer["answer"])
+        self.assertIn("created_at", history["messages"][0])
+
     def test_skill_candidate_generate_and_enable(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp) / "repo"

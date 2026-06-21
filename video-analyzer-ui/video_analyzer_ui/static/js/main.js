@@ -28,6 +28,7 @@ let selectedDocPath = '';
 let renderedDocListKey = '';
 let loadedDocPreviewKey = '';
 let loadedStudyKey = '';
+let loadedQaHistoryKey = '';
 const videoLoadErrors = {};
 const imageViewer = {
     node: null,
@@ -862,10 +863,17 @@ function renderQaPanel(job) {
     nodes.qaWarnings.innerHTML = warnings.length
         ? warnings.map(item => `<div class="qa-warning">${escapeHtml(item.message || item.code || item)}</div>`).join('')
         : '<div class="qa-ok">未发现明显证据边界警告</div>';
+    loadQaHistory(job.job_id);
     renderSkillCandidatePanel(job);
 }
 
 function resetQaMessages() {
+    if (!nodes.qaMessages) return;
+    loadedQaHistoryKey = '';
+    nodes.qaMessages.innerHTML = '<div class="qa-empty">暂无对话</div>';
+}
+
+function clearQaMessages() {
     if (!nodes.qaMessages) return;
     nodes.qaMessages.innerHTML = '<div class="qa-empty">暂无对话</div>';
 }
@@ -907,6 +915,41 @@ function appendQaMessage(role, html) {
     nodes.qaMessages.scrollTop = nodes.qaMessages.scrollHeight;
 }
 
+async function loadQaHistory(jobId) {
+    if (!nodes.qaMessages || loadedQaHistoryKey === jobId) return;
+    loadedQaHistoryKey = jobId;
+    try {
+        const history = await getJson(`/api/video-link/jobs/${jobId}/qa/history?limit=50`);
+        if (currentJob?.job_id !== jobId) return;
+        renderQaHistory(history.messages || []);
+    } catch (error) {
+        if (currentJob?.job_id !== jobId) return;
+        clearQaMessages();
+    }
+}
+
+function renderQaHistory(records) {
+    clearQaMessages();
+    if (!records.length) return;
+    for (const record of records) {
+        appendQaMessage('user', `<p>${escapeHtml(record.question || '')}</p>`);
+        appendQaMessage('assistant', renderQaAnswer(record));
+    }
+}
+
+function renderQaAnswer(result) {
+    const warningHtml = (result.warnings || []).length
+        ? `<div class="qa-answer-warnings">${(result.warnings || []).map(item => escapeHtml(item.message || item.code || item)).join('<br>')}</div>`
+        : '';
+    const savedAt = result.created_at ? `<div class="qa-saved-at">已保存 · ${escapeHtml(formatDateTime(result.created_at))}</div>` : '';
+    return `
+        ${warningHtml}
+        <div class="qa-answer">${renderMarkdown(result.answer || '没有生成答案。')}</div>
+        ${renderQaCitations(result.citations || [])}
+        ${savedAt}
+    `;
+}
+
 function renderQaCitations(citations) {
     if (!citations?.length) return '';
     return `<div class="qa-citations">
@@ -935,14 +978,7 @@ async function askQa(event) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ question })
         });
-        const warningHtml = (result.warnings || []).length
-            ? `<div class="qa-answer-warnings">${(result.warnings || []).map(item => escapeHtml(item.message || item.code || item)).join('<br>')}</div>`
-            : '';
-        appendQaMessage('assistant', `
-            ${warningHtml}
-            <div class="qa-answer">${renderMarkdown(result.answer || '没有生成答案。')}</div>
-            ${renderQaCitations(result.citations || [])}
-        `);
+        appendQaMessage('assistant', renderQaAnswer(result));
     } catch (error) {
         appendQaMessage('assistant error', `<p>${escapeHtml(error.message)}</p>`);
     } finally {
