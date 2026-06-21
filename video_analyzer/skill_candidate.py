@@ -177,7 +177,7 @@ def render_skill_md(skill_name: str, title: str, artifacts: dict[str, Any], revi
     )
     return f"""---
 name: {skill_name}
-description: {description}
+description: {yaml_string(description)}
 ---
 
 # {title}
@@ -199,6 +199,10 @@ Use this skill when the user asks for help with this tool or workflow.
 
 {summary}
 """
+
+
+def yaml_string(value: str) -> str:
+    return json.dumps(str(value or ""), ensure_ascii=False)
 
 
 def render_evidence_reference(run_dir: Path, artifacts: dict[str, Any], review: dict[str, Any]) -> str:

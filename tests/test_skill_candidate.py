@@ -87,6 +87,18 @@ class SkillCandidateTests(unittest.TestCase):
         self.assertIn("Configure The Demo Tool API Token", text)
         self.assertNotIn("自动分段 01", text)
 
+    def test_skill_description_escapes_yaml_colon_titles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            write_artifacts(run_dir, title="Demo Tool: Setup")
+
+            summary = build_tool_skill_candidate(run_dir)
+            text = (run_dir / summary["skill_path"]).read_text(encoding="utf-8")
+
+        self.assertIn('description: "Use when the user asks', text)
+        self.assertIn("Demo Tool: Setup", text)
+
 
 def write_artifacts(run_dir: Path, title: str = "Demo Tool Setup") -> None:
     (run_dir / "operation_manual.md").write_text(
