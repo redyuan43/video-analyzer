@@ -986,6 +986,12 @@ async function askQa(event) {
     }
 }
 
+function formatDateTime(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return value;
+    return date.toLocaleString('zh-CN', { hour12: false });
+}
+
 async function generateSkillCandidate() {
     if (!selectedJobId || nodes.generateSkillButton.disabled) return;
     nodes.generateSkillButton.disabled = true;
@@ -1824,17 +1830,34 @@ function markdownAssetPath(docPath, rawPath) {
 
 function parseMermaidNode(rawNode) {
     const cleaned = String(rawNode || '').trim().replace(/;$/, '');
-    const match = cleaned.match(/^([A-Za-z][A-Za-z0-9_]*)(?:([\[\{\(])(.*)([\]\}\)]))?$/);
+    const match = cleaned.match(/^([A-Za-z][A-Za-z0-9_-]*)(.*)$/);
     if (!match) return { id: cleaned, label: '', shape: 'box' };
-    let label = match[3] || '';
+    const id = match[1];
+    const rest = (match[2] || '').trim();
+    let label = '';
+    let shape = 'box';
+    if (rest) {
+        const wrappers = [
+            [/^\[\[(.*)\]\]$/, 'box'],
+            [/^\[(.*)\]$/, 'box'],
+            [/^\{\{(.*)\}\}$/, 'decision'],
+            [/^\{(.*)\}$/, 'decision'],
+            [/^\(\((.*)\)\)$/, 'circle'],
+            [/^\((.*)\)$/, 'box'],
+        ];
+        const wrapper = wrappers.find(([pattern]) => pattern.test(rest));
+        if (!wrapper) return { id: cleaned, label: '', shape: 'box' };
+        label = rest.match(wrapper[0])?.[1] || '';
+        shape = wrapper[1];
+    }
     label = label.trim();
     if (label.length >= 2 && label[0] === '"' && label[label.length - 1] === '"') {
         label = label.slice(1, -1);
     }
     return {
-        id: match[1],
+        id,
         label,
-        shape: match[2] === '{' ? 'decision' : 'box'
+        shape
     };
 }
 
@@ -1843,8 +1866,8 @@ function mermaidLabelHtml(label) {
 }
 
 function renderSimpleMermaidFlowchart(diagram) {
-    const lines = String(diagram || '')
-        .split(/\r?\n/)
+    const lines = normalizeMermaidPreviewLines(diagram)
+        .flatMap(line => line.split(';'))
         .map(line => line.trim())
         .filter(line => line && !line.startsWith('%%'));
     if (!lines.length) return '';
@@ -1864,17 +1887,17 @@ function renderSimpleMermaidFlowchart(diagram) {
         return true;
     };
     for (const line of lines.slice(1)) {
-        if (/^(subgraph|end\b|direction\b|style\b|classDef\b|class\b)/i.test(line)) continue;
+        if (/^(subgraph|end\b|direction\b|style\b|classDef\b|class\b|click\b|linkStyle\b)/i.test(line)) continue;
         if (/^[};\s]+$/.test(line)) continue;
-        const edgeMatch = line.match(/^(.+?)\s*-->\s*(?:\|.*?\|\s*)?(.+?)\s*;?$/);
+        const edgeMatch = parseMermaidEdge(line);
         if (!edgeMatch) {
             const node = parseMermaidNode(line);
             if (!rememberNode(node)) return '';
             if (!standaloneNodes.includes(node.id)) standaloneNodes.push(node.id);
             continue;
         }
-        const left = parseMermaidNode(edgeMatch[1]);
-        const right = parseMermaidNode(edgeMatch[2]);
+        const left = parseMermaidNode(edgeMatch.left);
+        const right = parseMermaidNode(edgeMatch.right);
         if (/[{}()[\]]/.test(left.id) || /[{}()[\]]/.test(right.id)) continue;
         rememberNode(left);
         rememberNode(right);
@@ -1933,8 +1956,9 @@ function renderSimpleMermaidFlowchart(diagram) {
         parts.push('<div class="flow-row">');
         row.forEach(node => {
             const shape = shapes.get(node) === 'decision' ? ' decision' : '';
+            const circle = shapes.get(node) === 'circle' ? ' circle' : '';
             const label = mermaidLabelHtml(labels.get(node) || node);
-            parts.push(`<div class="flow-node${shape}"><span class="flow-index">${index}</span>${label}</div>`);
+            parts.push(`<div class="flow-node${shape}${circle}"><span class="flow-index">${index}</span>${label}</div>`);
             index += 1;
         });
         parts.push('</div>');
@@ -1950,6 +1974,28 @@ function renderSimpleMermaidFlowchart(diagram) {
     }
     parts.push('</div>');
     return parts.join('\n');
+}
+
+function normalizeMermaidPreviewLines(diagram) {
+    return String(diagram || '')
+        .split(/\r?\n/)
+        .map(line => line.replace(/\s+%%.*$/, ''));
+}
+
+function parseMermaidEdge(line) {
+    const value = String(line || '').trim().replace(/;$/, '');
+    const patterns = [
+        /^(.+?)\s*--\s*[^-<>|]+?\s*-->\s*(.+?)$/,
+        /^(.+?)\s*-->\s*(?:\|.*?\|\s*)?(.+?)$/,
+        /^(.+?)\s*-.->\s*(?:\|.*?\|\s*)?(.+?)$/,
+        /^(.+?)\s*==>\s*(?:\|.*?\|\s*)?(.+?)$/,
+        /^(.+?)\s*--[ox]\s*(?:\|.*?\|\s*)?(.+?)$/,
+    ];
+    for (const pattern of patterns) {
+        const match = value.match(pattern);
+        if (match) return { left: match[1].trim(), right: match[2].trim() };
+    }
+    return null;
 }
 
 async function ensureVscodeSession(restart = false) {
