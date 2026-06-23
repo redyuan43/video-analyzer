@@ -16,10 +16,9 @@ const initialParams = new URLSearchParams(window.location.search);
 let selectedJobId = initialParams.get('job') || document.querySelector('.app-shell')?.dataset.initialJob || null;
 let selectedLogStage = null;
 let refreshTimer = null;
-let scanAnimationFrame = null;
 let currentJob = null;
 let latestJobs = [];
-let currentView = ['preview', 'qa', 'vscode'].includes(initialParams.get('view'))
+let currentView = ['qa', 'vscode'].includes(initialParams.get('view'))
     ? initialParams.get('view')
     : 'console';
 let pendingUrls = [];
@@ -29,12 +28,20 @@ let renderedDocListKey = '';
 let loadedDocPreviewKey = '';
 let loadedStudyKey = '';
 let loadedQaHistoryKey = '';
-const videoLoadErrors = {};
+const frameTimeMaps = {};
+const sourcePlayerState = {
+    jobId: '',
+    seconds: null,
+    loaded: false
+};
 const imageViewer = {
     node: null,
     image: null,
+    playButton: null,
     scaleLabel: null,
-    scale: 1
+    scale: 1,
+    jobId: '',
+    seconds: null
 };
 const paneResizeState = {
     active: null,
@@ -50,11 +57,9 @@ const learningPanelVisibility = {
 
 const nodes = {
     consoleTab: document.getElementById('consoleTab'),
-    previewTab: document.getElementById('previewTab'),
     qaTab: document.getElementById('qaTab'),
     vscodeTab: document.getElementById('vscodeTab'),
     consoleView: document.getElementById('consoleView'),
-    previewView: document.getElementById('previewView'),
     qaView: document.getElementById('qaView'),
     vscodeView: document.getElementById('vscodeView'),
     jobForm: document.getElementById('jobForm'),
@@ -101,15 +106,21 @@ const nodes = {
     logText: document.getElementById('logText'),
     copyLogButton: document.getElementById('copyLogButton'),
     copyMessage: document.getElementById('copyMessage'),
-    refreshPreviewButton: document.getElementById('refreshPreviewButton'),
-    previewSummary: document.getElementById('previewSummary'),
-    previewGrid: document.getElementById('previewGrid'),
     qaSummary: document.getElementById('qaSummary'),
     qaWarnings: document.getElementById('qaWarnings'),
     qaMessages: document.getElementById('qaMessages'),
     qaForm: document.getElementById('qaForm'),
     qaQuestion: document.getElementById('qaQuestion'),
     qaAskButton: document.getElementById('qaAskButton'),
+    qaSourcePlayerPanel: document.querySelector('.qa-source-player'),
+    qaLayout: document.querySelector('.qa-layout'),
+    qaSidePanel: document.querySelector('.qa-side-panel'),
+    qaSourcePlayerSummary: document.getElementById('qaSourcePlayerSummary'),
+    qaSourcePlayerOpenLink: document.getElementById('qaSourcePlayerOpenLink'),
+    qaSourcePlayerStopButton: document.getElementById('qaSourcePlayerStopButton'),
+    qaSourcePlayerBody: document.getElementById('qaSourcePlayerBody'),
+    qaSourceResizer: document.querySelector('.qa-source-resizer'),
+    qaSourceHeightResizer: document.querySelector('.qa-source-height-resizer'),
     skillSummary: document.getElementById('skillSummary'),
     skillWarnings: document.getElementById('skillWarnings'),
     generateSkillButton: document.getElementById('generateSkillButton'),
@@ -131,6 +142,12 @@ const nodes = {
     docListResizer: document.querySelector('.doc-list-resizer'),
     studyPanel: document.getElementById('studyPanel'),
     studyResizer: document.querySelector('[data-resize-pane="study"]'),
+    sourcePlayerPanel: document.getElementById('sourcePlayerPanel'),
+    sourcePlayerResizer: document.querySelector('[data-resize-pane="source-player"]'),
+    sourcePlayerSummary: document.getElementById('sourcePlayerSummary'),
+    sourcePlayerOpenLink: document.getElementById('sourcePlayerOpenLink'),
+    sourcePlayerStopButton: document.getElementById('sourcePlayerStopButton'),
+    sourcePlayerBody: document.getElementById('sourcePlayerBody'),
     docPreviewPanel: document.querySelector('.doc-preview-panel'),
     docPreviewTitle: document.getElementById('docPreviewTitle'),
     docOpenLink: document.getElementById('docOpenLink'),
@@ -370,17 +387,14 @@ function selectJob(jobId, updateUrl = true) {
 }
 
 function setView(view, updateUrl = true) {
-    currentView = ['preview', 'qa', 'vscode'].includes(view) ? view : 'console';
+    currentView = ['qa', 'vscode'].includes(view) ? view : 'console';
     nodes.consoleView.hidden = currentView !== 'console';
-    nodes.previewView.hidden = currentView !== 'preview';
     nodes.qaView.hidden = currentView !== 'qa';
     nodes.vscodeView.hidden = currentView !== 'vscode';
     nodes.consoleView.classList.toggle('active', currentView === 'console');
-    nodes.previewView.classList.toggle('active', currentView === 'preview');
     nodes.qaView.classList.toggle('active', currentView === 'qa');
     nodes.vscodeView.classList.toggle('active', currentView === 'vscode');
     nodes.consoleTab.classList.toggle('active', currentView === 'console');
-    nodes.previewTab.classList.toggle('active', currentView === 'preview');
     nodes.qaTab.classList.toggle('active', currentView === 'qa');
     nodes.vscodeTab.classList.toggle('active', currentView === 'vscode');
     if (updateUrl) {
@@ -392,8 +406,6 @@ function setView(view, updateUrl = true) {
         }
         window.history.replaceState({}, '', url);
     }
-    renderPreviewGrid(latestJobs);
-    if (currentView === 'preview') startScanAnimation();
     renderQaPanel(currentJob);
     renderVscodePanel(currentJob);
 }
@@ -474,7 +486,6 @@ async function refreshJobs() {
     latestJobs = jobs;
     renderJobList(jobs);
     renderSelectedJobSnapshot(jobs);
-    renderPreviewGrid(jobs);
     const first = preferredJob(jobs);
     if (!selectedJobId && first) selectJob(first.job_id, true);
 }
@@ -500,7 +511,6 @@ async function refreshJobsNoSelect() {
     latestJobs = jobs;
     renderJobList(jobs);
     renderSelectedJobSnapshot(jobs);
-    renderPreviewGrid(jobs);
 }
 
 function renderGlobal(data) {
@@ -630,6 +640,11 @@ function jobIsActive(job) {
 
 function renderJob(job) {
     currentJob = job;
+    if (sourcePlayerState.jobId && sourcePlayerState.jobId !== job.job_id) {
+        sourcePlayerState.jobId = job.job_id;
+        sourcePlayerState.seconds = null;
+        sourcePlayerState.loaded = false;
+    }
     const progress = job.progress || {};
     const stageProgress = job.stage_progress || job.core_progress;
     const queue = job.queue || {};
@@ -863,6 +878,7 @@ function renderQaPanel(job) {
     nodes.qaWarnings.innerHTML = warnings.length
         ? warnings.map(item => `<div class="qa-warning">${escapeHtml(item.message || item.code || item)}</div>`).join('')
         : '<div class="qa-ok">未发现明显证据边界警告</div>';
+    loadFrameTimeMap(job.job_id);
     loadQaHistory(job.job_id);
     renderSkillCandidatePanel(job);
 }
@@ -957,11 +973,35 @@ function renderQaCitations(citations) {
             const source = item.source || item.name || item.path || item.label || '-';
             const score = item.score == null ? '' : ` · ${Number(item.score).toFixed(2)}`;
             const lowConfidence = item.confidence === 'low' || item.source_type === 'comments';
+            const times = citationTimes(item);
             return `<div class="${lowConfidence ? 'low-confidence' : ''}">
                 <strong>${escapeHtml(source)}</strong><span>${escapeHtml(score)}</span>
+                ${times.length ? `<div class="qa-citation-times">${times.map(seconds => videoTimeButtonHtml(selectedJobId, seconds)).join('')}</div>` : ''}
             </div>`;
         }).join('')}
     </div>`;
+}
+
+function citationTimes(item) {
+    const values = [];
+    for (const value of item.timestamps || []) {
+        const seconds = typeof value === 'string' ? parseTimestampToSeconds(value) : Number(value);
+        if (Number.isFinite(seconds)) values.push(seconds);
+    }
+    for (const frame of item.frames || []) {
+        const seconds = Number(frame?.timestamp_sec ?? frame?.timestamp);
+        if (Number.isFinite(seconds)) {
+            values.push(seconds);
+            continue;
+        }
+        const mapped = frameTimestampFromMap(selectedJobId, frame?.path || frame?.frame_path || frame);
+        if (mapped != null) values.push(mapped);
+    }
+    return [...new Set(values.map(value => Math.max(0, Math.floor(value))))].slice(0, 4);
+}
+
+function videoTimeButtonHtml(jobId, seconds) {
+    return `<button class="video-time-link" type="button" data-job-id="${escapeHtml(jobId || '')}" data-seconds="${escapeHtml(seconds)}">${escapeHtml(formatTimestampFromSeconds(seconds))}</button>`;
 }
 
 async function askQa(event) {
@@ -1050,6 +1090,7 @@ function renderVscodePanel(job) {
     if (!job) {
         nodes.vscodeSummary.textContent = '选择一个已生成资源包的任务';
         resetVscodeShell();
+        renderSourcePlayer(job);
         renderStudyPanel(job);
         renderDocPreviewPanel(job);
         return;
@@ -1057,6 +1098,7 @@ function renderVscodePanel(job) {
     if (!runDir) {
         nodes.vscodeSummary.textContent = '资源包目录尚未生成';
         resetVscodeShell();
+        renderSourcePlayer(job);
         renderStudyPanel(job);
         renderDocPreviewPanel(job);
         return;
@@ -1065,6 +1107,7 @@ function renderVscodePanel(job) {
         ? `WebIDE 已就绪 · PID ${preview.pid} · ${runDir}`
         : `${vscodeStarting ? '正在启动 WebIDE' : '资源包目录'} · ${runDir}`;
     resetVscodeShell();
+    renderSourcePlayer(job);
     renderStudyPanel(job);
     renderDocPreviewPanel(job);
 }
@@ -1109,7 +1152,10 @@ async function loadStudyGuide(jobId) {
     if (loadedStudyKey === jobId) return;
     nodes.studyBody.innerHTML = '<div class="doc-empty">加载学习视图...</div>';
     try {
-        const guide = await getJson(`/api/video-link/jobs/${jobId}/study-guide`);
+        const [guide] = await Promise.all([
+            getJson(`/api/video-link/jobs/${jobId}/study-guide`),
+            loadFrameTimeMap(jobId)
+        ]);
         if (currentJob?.job_id !== jobId) return;
         nodes.studyBody.innerHTML = renderStudyGuide(guide, jobId);
         wireStudyGuideInteractions(guide, jobId);
@@ -1224,7 +1270,12 @@ function renderStudyFrame(chapter, jobId) {
     }
     const src = resourceUrl(jobId, path);
     const alt = chapter.title || '章节代表截图';
-    return `<img src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" loading="lazy" data-image-viewer-src="${escapeHtml(src)}" data-image-viewer-alt="${escapeHtml(alt)}">`;
+    const frameSeconds = Number(frame.timestamp_sec ?? frame.timestamp ?? frameTimestampFromMap(jobId, path));
+    const secondsAttr = Number.isFinite(frameSeconds) ? ` data-frame-seconds="${escapeHtml(frameSeconds)}"` : '';
+    const playButton = Number.isFinite(frameSeconds)
+        ? `<button class="image-frame-play" type="button" data-job-id="${escapeHtml(jobId)}" data-seconds="${escapeHtml(frameSeconds)}">播放此帧</button>`
+        : '';
+    return `<img src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" loading="lazy" data-image-viewer-src="${escapeHtml(src)}" data-image-viewer-alt="${escapeHtml(alt)}" data-job-id="${escapeHtml(jobId)}" data-source-path="${escapeHtml(path)}"${secondsAttr}>${playButton}`;
 }
 
 function wireStudyGuideInteractions(guide, jobId) {
@@ -1260,6 +1311,9 @@ function wireStudyDetailActions(selectChapter) {
     nodes.studyBody.querySelectorAll('.study-play').forEach(button => {
         button.addEventListener('click', () => jumpToVideoTime(button.dataset.jobId, Number(button.dataset.seconds || 0)));
     });
+    nodes.studyBody.querySelectorAll('.image-frame-play').forEach(button => {
+        button.addEventListener('click', () => jumpToVideoTime(button.dataset.jobId, Number(button.dataset.seconds || 0)));
+    });
 }
 
 function studyTimeRange(chapter) {
@@ -1287,25 +1341,211 @@ function formatTimestampFromSeconds(value) {
 
 async function jumpToVideoTime(jobId, seconds) {
     if (!jobId || !Number.isFinite(seconds)) return;
-    setView('preview');
-    await refreshJobs();
-    const video = previewVideo(jobId);
-    if (!video) return;
-    const seek = () => {
-        video.currentTime = Math.max(0, seconds);
-        updateVideoControls(video);
-        video.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    };
-    if (Number.isFinite(video.duration) && video.duration > 0) {
-        seek();
-    } else {
-        video.addEventListener('loadedmetadata', seek, { once: true });
-        video.load();
+    if (selectedJobId !== jobId) {
+        selectedJobId = jobId;
+        await refreshSelectedJob();
     }
+    if (!['qa', 'vscode'].includes(currentView)) setView('vscode');
+    sourcePlayerState.jobId = jobId;
+    sourcePlayerState.seconds = Math.max(0, Math.floor(seconds));
+    sourcePlayerState.loaded = true;
+    renderSourcePlayer(currentJob, sourcePlayerState.seconds);
+    const activePanel = currentView === 'qa' ? nodes.qaSourcePlayerPanel : nodes.sourcePlayerPanel;
+    activePanel?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function renderSourcePlayer(job, seconds = sourcePlayerState.seconds) {
+    const targets = sourcePlayerTargets();
+    if (!targets.length) return;
+    const player = job?.source_player || {};
+    const value = Number(seconds);
+    const seekSeconds = Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
+    const label = formatTimestampFromSeconds(seekSeconds);
+    if (!job || !player.source_url) {
+        renderSourcePlayerEmpty(targets, '选择一个任务后播放', '暂无可嵌入播放器');
+        return;
+    }
+
+    const watchUrl = sourceWatchUrl(player, seekSeconds);
+    const summary = player.can_embed
+        ? `${sourceProviderLabel(player.provider)} · ${label || '0:00'}`
+        : '当前来源不支持内嵌播放';
+    renderSourcePlayerHeaders(targets, summary, watchUrl || player.source_url, Boolean(watchUrl));
+
+    if (!sourcePlayerState.loaded) {
+        renderSourcePlayerBody(targets, 'empty', '', `<div class="source-player-empty">
+            选择文档或问答中的时间戳后加载播放器；不会自动播放。
+        </div>`);
+        return;
+    }
+
+    if (!player.can_embed || !player.embed_url) {
+        renderSourcePlayerBody(targets, 'empty', '', `<div class="source-player-empty">
+            当前平台不能稳定内嵌播放，请使用“原站打开”跳到 ${escapeHtml(label || '0:00')}。
+        </div>`);
+        return;
+    }
+
+    const embedUrl = sourceEmbedUrl(player, seekSeconds);
+    if (!embedUrl) {
+        renderSourcePlayerBody(targets, 'empty', '', '<div class="source-player-empty">播放器地址无效，请使用“原站打开”。</div>');
+        return;
+    }
+    const html = `<iframe
+        title="${escapeHtml(jobDisplayTitle(job))}"
+        src="${escapeHtml(embedUrl)}"
+        allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+        allowfullscreen></iframe>`;
+    renderSourcePlayerBody(targets, 'iframe', embedUrl, html);
+}
+
+function sourcePlayerTargets() {
+    return [
+        {
+            summary: nodes.qaSourcePlayerSummary,
+            openLink: nodes.qaSourcePlayerOpenLink,
+            stopButton: nodes.qaSourcePlayerStopButton,
+            body: nodes.qaSourcePlayerBody
+        },
+        {
+            summary: nodes.sourcePlayerSummary,
+            openLink: nodes.sourcePlayerOpenLink,
+            stopButton: nodes.sourcePlayerStopButton,
+            body: nodes.sourcePlayerBody
+        }
+    ].filter(target => target.summary && target.openLink && target.body);
+}
+
+function renderSourcePlayerEmpty(targets, summary, message) {
+    renderSourcePlayerHeaders(targets, summary, '', false);
+    renderSourcePlayerBody(targets, 'empty', '', `<div class="source-player-empty">${escapeHtml(message)}</div>`);
+}
+
+function renderSourcePlayerHeaders(targets, summary, href, showLink) {
+    targets.forEach(target => {
+        target.summary.textContent = summary;
+        target.openLink.href = href || '#';
+        target.openLink.hidden = !showLink;
+        if (target.stopButton) target.stopButton.hidden = !sourcePlayerState.loaded;
+    });
+}
+
+function renderSourcePlayerBody(targets, playerKind, playerUrl, html) {
+    targets.forEach(target => {
+        if (
+            target.body.dataset.playerKind === playerKind
+            && target.body.dataset.playerUrl === playerUrl
+        ) return;
+        target.body.dataset.playerKind = playerKind;
+        target.body.dataset.playerUrl = playerUrl;
+        target.body.innerHTML = html;
+    });
+}
+
+function pauseSourcePlayer() {
+    sourcePlayerState.loaded = false;
+    renderSourcePlayer(currentJob);
+}
+
+function sourceProviderLabel(provider) {
+    return {
+        youtube: 'YouTube',
+        bilibili: 'Bilibili',
+        external: '原站'
+    }[provider] || '原站';
+}
+
+function sourceEmbedUrl(player, seconds = 0) {
+    let url;
+    try {
+        url = new URL(player.embed_url, window.location.href);
+    } catch (_error) {
+        return '';
+    }
+    const value = Math.max(0, Math.floor(Number(seconds) || 0));
+    if (player.provider === 'youtube') {
+        url.searchParams.set('start', String(value));
+        url.searchParams.set('rel', '0');
+    } else if (player.provider === 'bilibili') {
+        url.searchParams.set('t', String(value));
+    }
+    return url.toString();
+}
+
+function sourceWatchUrl(player, seconds = 0) {
+    const raw = player.watch_url || player.source_url || '';
+    if (!raw) return '';
+    const value = Math.max(0, Math.floor(Number(seconds) || 0));
+    let url;
+    try {
+        url = new URL(raw, window.location.href);
+    } catch (_error) {
+        return raw;
+    }
+    if (player.provider === 'youtube') {
+        url.searchParams.set('t', `${value}s`);
+    } else if (player.provider === 'bilibili') {
+        url.searchParams.set('t', String(value));
+    } else if (value > 0) {
+        url.hash = `t=${value}`;
+    }
+    return url.toString();
 }
 
 function resourceUrl(jobId, path) {
     return `/api/video-link/jobs/${jobId}/resource?path=${encodeURIComponent(path)}`;
+}
+
+async function loadFrameTimeMap(jobId) {
+    if (!jobId) return {};
+    if (frameTimeMaps[jobId]) return frameTimeMaps[jobId];
+    try {
+        const payload = await getJson(`/api/video-link/jobs/${jobId}/frame-time-map`);
+        if (payload.available) {
+            frameTimeMaps[jobId] = payload.frames || {};
+            return frameTimeMaps[jobId];
+        }
+    } catch (_error) {
+        return {};
+    }
+    return {};
+}
+
+function frameTimestampFromMap(jobId, sourcePath) {
+    const map = frameTimeMaps[jobId] || {};
+    const keys = framePathKeys(sourcePath);
+    for (const key of keys) {
+        const entry = map[key];
+        const seconds = Number(entry?.timestamp_sec);
+        if (Number.isFinite(seconds)) return seconds;
+    }
+    return null;
+}
+
+function framePathKeys(sourcePath) {
+    const value = String(sourcePath || '').replace(/\\/g, '/');
+    if (!value) return [];
+    const keys = new Set([value]);
+    try {
+        const url = new URL(value, window.location.href);
+        const resourcePath = url.searchParams.get('path');
+        if (resourcePath) keys.add(resourcePath.replace(/\\/g, '/'));
+        keys.add(decodeURIComponent(url.pathname.split('/').pop() || ''));
+    } catch (_error) {
+        keys.add(value.split('/').pop() || value);
+    }
+    const basename = value.split('/').pop();
+    if (basename) keys.add(basename);
+    return [...keys].filter(Boolean);
+}
+
+function parseTimestampToSeconds(value) {
+    const match = String(value || '').trim().match(/^(\d{1,2}):([0-5]\d)(?::([0-5]\d))?$/);
+    if (!match) return null;
+    const first = Number(match[1]);
+    const second = Number(match[2]);
+    const third = match[3] == null ? null : Number(match[3]);
+    return third == null ? first * 60 + second : first * 3600 + second * 60 + third;
 }
 
 function previewableDocs(job) {
@@ -1369,26 +1609,34 @@ function updateLearningDocsLayout() {
     const docListVisible = learningPanelVisibility.docList;
     const studyVisible = learningPanelVisibility.study;
     const contentVisible = hasDocContent();
-    const visiblePanelCount = [docListVisible, studyVisible, contentVisible].filter(Boolean).length;
+    const playerVisible = Boolean(nodes.sourcePlayerPanel);
+    const visiblePanelCount = [docListVisible, studyVisible, playerVisible, contentVisible].filter(Boolean).length;
     const columns = [];
 
     nodes.docListPanel.hidden = !docListVisible;
     nodes.studyPanel.hidden = !studyVisible;
+    if (nodes.sourcePlayerPanel) nodes.sourcePlayerPanel.hidden = !playerVisible;
     nodes.docPreviewPanel.hidden = !contentVisible;
     nodes.vscodeDocs.classList.toggle('preview-open', contentVisible);
     nodes.vscodeDocs.classList.toggle('empty-layout', visiblePanelCount === 0);
 
     if (docListVisible) columns.push('minmax(220px, var(--doc-list-pane-width, 300px))');
-    const docListNeedsHandle = docListVisible && (studyVisible || contentVisible);
+    const docListNeedsHandle = docListVisible && (studyVisible || playerVisible || contentVisible);
     nodes.docListResizer?.classList.toggle('active', docListNeedsHandle);
     if (nodes.docListResizer) nodes.docListResizer.hidden = !docListNeedsHandle;
     if (docListNeedsHandle) columns.push('14px');
 
     if (studyVisible) columns.push('minmax(280px, var(--study-pane-width, 1fr))');
-    const studyNeedsHandle = studyVisible && contentVisible;
+    const studyNeedsHandle = studyVisible && (playerVisible || contentVisible);
     nodes.studyResizer?.classList.toggle('active', studyNeedsHandle);
     if (nodes.studyResizer) nodes.studyResizer.hidden = !studyNeedsHandle;
     if (studyNeedsHandle) columns.push('14px');
+
+    if (playerVisible) columns.push('minmax(320px, var(--source-player-pane-width, 560px))');
+    const sourcePlayerNeedsHandle = playerVisible && (docListVisible || studyVisible || contentVisible);
+    nodes.sourcePlayerResizer?.classList.toggle('active', sourcePlayerNeedsHandle);
+    if (nodes.sourcePlayerResizer) nodes.sourcePlayerResizer.hidden = !sourcePlayerNeedsHandle;
+    if (sourcePlayerNeedsHandle) columns.push('14px');
 
     if (contentVisible) columns.push('minmax(320px, 1fr)');
     nodes.vscodeDocs.style.gridTemplateColumns = columns.join(' ') || '1fr';
@@ -1514,6 +1762,7 @@ async function loadDocPreview(job, path) {
         nodes.docPreviewBody.className = 'doc-preview-body markdown';
         nodes.docPreviewBody.innerHTML = renderMarkdown(markdown, job.job_id, path);
         renderMarkdownMath(nodes.docPreviewBody);
+        await enhanceTimestampTargets(nodes.docPreviewBody, job.job_id);
         loadedDocPreviewKey = previewKey;
     } catch (error) {
         nodes.docPreviewBody.className = 'doc-preview-body markdown';
@@ -1529,7 +1778,7 @@ function renderMarkdown(markdown, jobId = '', docPath = '') {
     const renderer = createMarkdownRenderer(jobId, docPath);
     return window.DOMPurify.sanitize(renderer.render(normalizeMarkdownForPreview(markdown)), {
         ADD_TAGS: ['figure', 'figcaption'],
-        ADD_ATTR: ['target', 'rel', 'loading']
+        ADD_ATTR: ['target', 'rel', 'loading', 'data-image-viewer-src', 'data-image-viewer-alt', 'data-job-id', 'data-source-path', 'data-frame-seconds']
     });
 }
 
@@ -1589,6 +1838,10 @@ function createMarkdownRenderer(jobId = '', docPath = '') {
             token.attrs[srcIndex][1] = resolvedSrc;
             token.attrSet('data-image-viewer-src', resolvedSrc);
             token.attrSet('data-image-viewer-alt', token.content || '');
+            if (jobId) token.attrSet('data-job-id', jobId);
+            if (assetPath) token.attrSet('data-source-path', assetPath);
+            const seconds = frameTimestampFromMap(jobId, assetPath);
+            if (seconds != null) token.attrSet('data-frame-seconds', String(seconds));
         }
         token.attrSet('loading', 'lazy');
         token.attrSet('class', 'markdown-image');
@@ -1615,6 +1868,59 @@ function createMarkdownRenderer(jobId = '', docPath = '') {
         return defaultLinkOpen(tokens, idx, options, env, self);
     };
     return md;
+}
+
+async function enhanceTimestampTargets(container, jobId) {
+    if (!container || !jobId) return;
+    await loadFrameTimeMap(jobId);
+    container.querySelectorAll('img[data-image-viewer-src]').forEach(image => {
+        if (!image.dataset.jobId) image.dataset.jobId = jobId;
+        const seconds = Number(image.dataset.frameSeconds);
+        if (Number.isFinite(seconds)) return;
+        const mapped = frameTimestampFromMap(jobId, image.dataset.sourcePath || image.dataset.imageViewerSrc || image.currentSrc || image.src);
+        if (mapped != null) image.dataset.frameSeconds = String(mapped);
+    });
+    linkTimestampTextNodes(container, jobId);
+}
+
+function linkTimestampTextNodes(container, jobId) {
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+        acceptNode(node) {
+            const parent = node.parentElement;
+            if (!parent || parent.closest('button, a, pre, code, script, style, .katex')) {
+                return NodeFilter.FILTER_REJECT;
+            }
+            return /\b\d{1,2}:[0-5]\d(?::[0-5]\d)?\b/.test(node.nodeValue || '')
+                ? NodeFilter.FILTER_ACCEPT
+                : NodeFilter.FILTER_REJECT;
+        }
+    });
+    const nodesToReplace = [];
+    while (walker.nextNode()) nodesToReplace.push(walker.currentNode);
+    for (const node of nodesToReplace) {
+        const fragment = document.createDocumentFragment();
+        const text = node.nodeValue || '';
+        let cursor = 0;
+        text.replace(/\b\d{1,2}:[0-5]\d(?::[0-5]\d)?\b/g, (match, offset) => {
+            if (offset > cursor) fragment.append(document.createTextNode(text.slice(cursor, offset)));
+            const seconds = parseTimestampToSeconds(match);
+            if (seconds == null) {
+                fragment.append(document.createTextNode(match));
+            } else {
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.className = 'video-time-link';
+                button.dataset.jobId = jobId;
+                button.dataset.seconds = String(seconds);
+                button.textContent = match;
+                fragment.append(button);
+            }
+            cursor = offset + match.length;
+            return match;
+        });
+        if (cursor < text.length) fragment.append(document.createTextNode(text.slice(cursor)));
+        node.replaceWith(fragment);
+    }
 }
 
 function renderMarkdownMath(container) {
@@ -1794,8 +2100,10 @@ function inlineMarkdown(text, jobId = '', docPath = '') {
         const alt = match[1] || '';
         const imagePath = markdownAssetPath(docPath, match[2] || '');
         const src = imagePath && jobId ? resourceUrl(jobId, imagePath) : imagePath;
+        const seconds = frameTimestampFromMap(jobId, imagePath);
+        const secondsAttr = seconds != null ? ` data-frame-seconds="${escapeHtml(seconds)}"` : '';
         html += src
-            ? `<figure class="markdown-image"><img src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" loading="lazy" data-image-viewer-src="${escapeHtml(src)}" data-image-viewer-alt="${escapeHtml(alt)}"><figcaption>${escapeHtml(alt)}</figcaption></figure>`
+            ? `<figure class="markdown-image"><img src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" loading="lazy" data-image-viewer-src="${escapeHtml(src)}" data-image-viewer-alt="${escapeHtml(alt)}" data-job-id="${escapeHtml(jobId)}" data-source-path="${escapeHtml(imagePath)}"${secondsAttr}><figcaption>${escapeHtml(alt)}</figcaption></figure>`
             : escapeHtml(match[0]);
         lastIndex = (match.index || 0) + match[0].length;
     }
@@ -2050,219 +2358,6 @@ function scanStartTime(job) {
     return stageInfo.started_at || job.runner?.started_at || job.updated_at || job.created_at || '';
 }
 
-function scanPercent(job, now = Date.now()) {
-    const status = job.status || 'created';
-    const baseProgress = clampPercent(job.progress?.percent || 0);
-    if (videoLoadErrors[job.job_id]) return baseProgress;
-    if (status === 'succeeded') return 100;
-    if (status !== 'running') return baseProgress;
-    const durationSeconds = Number(job.preview?.duration_seconds || 0) || 600;
-    const startedAt = Date.parse(scanStartTime(job));
-    if (Number.isNaN(startedAt)) return Math.min(99, baseProgress);
-    const elapsedSeconds = Math.max(0, (now - startedAt) / 1000);
-    return Math.min(99, Math.max(baseProgress, (elapsedSeconds / durationSeconds) * 100));
-}
-
-function renderPreviewGrid(jobs) {
-    if (!nodes.previewGrid) return;
-    const visibleJobs = jobs || [];
-    nodes.previewSummary.textContent = visibleJobs.length ? `最近 ${visibleJobs.length} 个任务` : '暂无任务';
-    nodes.previewGrid.innerHTML = visibleJobs.length ? visibleJobs.map(job => renderPreviewCard(job)).join('') : '<div class="empty preview-empty">暂无任务</div>';
-    bindPreviewControls();
-    updateScanFrames();
-}
-
-function previewStatusControl(job) {
-    if (job.status === 'succeeded') {
-        return `<button class="status succeeded preview-success-link" type="button" data-job-id="${escapeHtml(job.job_id)}" title="打开资源目录">succeeded</button>`;
-    }
-    return statusBadge(videoLoadErrors[job.job_id] ? 'failed' : job.status);
-}
-
-function renderPreviewCard(job) {
-    const preview = job.preview || {};
-    const ready = Boolean(preview.video_ready && preview.video_url && !videoLoadErrors[job.job_id]);
-    const failed = job.status === 'failed' || Boolean(videoLoadErrors[job.job_id]);
-    const scanning = job.status === 'running' && !failed;
-    const percent = scanPercent(job);
-    const durationSeconds = Number(preview.duration_seconds || 0);
-    const video = ready
-        ? `<video class="preview-video" preload="none" playsinline data-src="${escapeHtml(preview.video_url)}"></video>`
-        : `<div class="preview-placeholder">${failed ? '加载停止' : '等待视频'}</div>`;
-    const buttonLabel = ready ? '播放' : (failed ? '失败' : '等待');
-    const sourceLink = job.video_url
-        ? `<a class="preview-source-link" href="${escapeHtml(job.video_url)}" target="_blank" rel="noreferrer">原站</a>`
-        : '';
-    return `<article class="preview-card ${escapeHtml(job.status || 'created')} ${scanning ? 'scanning' : ''} ${failed ? 'preview-failed' : ''}"
-        data-job-id="${escapeHtml(job.job_id)}"
-        data-status="${escapeHtml(job.status || 'created')}"
-        data-duration="${escapeHtml(durationSeconds || '')}"
-        data-started-at="${escapeHtml(scanStartTime(job))}"
-        data-progress="${escapeHtml(job.progress?.percent || 0)}">
-        <div class="preview-frame">
-            ${video}
-            <div class="scan-line" aria-hidden="true"></div>
-            <div class="preview-status-row">
-                ${previewStatusControl(job)}
-                <span>${escapeHtml(previewStage(job))}</span>
-            </div>
-        </div>
-        <div class="preview-body">
-            <strong title="${escapeHtml(jobDisplayTitle(job))}">${escapeHtml(jobDisplayTitle(job))}</strong>
-            <div class="video-controls">
-                <button class="preview-play" type="button" data-job-id="${escapeHtml(job.job_id)}" ${ready ? '' : 'disabled'}>${buttonLabel}</button>
-                <span class="preview-time" data-job-id="${escapeHtml(job.job_id)}">0:00 / ${escapeHtml(formatClock(durationSeconds))}</span>
-                ${sourceLink}
-            </div>
-            <input class="video-seek" data-job-id="${escapeHtml(job.job_id)}" type="range" min="0" max="1000" value="0" ${ready ? '' : 'disabled'} aria-label="视频进度">
-            <div class="scan-meter">
-                <div class="scan-meter-head">
-                    <span>扫描</span>
-                    <strong class="scan-percent">${Math.round(percent)}%</strong>
-                </div>
-                <div class="bar scan-bar"><div class="preview-scan-progress" style="width:${percent}%"></div></div>
-            </div>
-        </div>
-    </article>`;
-}
-
-function bindPreviewControls() {
-    document.querySelectorAll('.preview-video').forEach(video => {
-        video.addEventListener('loadedmetadata', () => updateVideoControls(video));
-        video.addEventListener('timeupdate', () => updateVideoControls(video));
-        video.addEventListener('play', () => setPreviewButton(video, '暂停'));
-        video.addEventListener('pause', () => setPreviewButton(video, '播放'));
-        video.addEventListener('error', () => markPreviewVideoError(video));
-    });
-    document.querySelectorAll('.preview-play').forEach(button => {
-        button.addEventListener('click', () => togglePreviewPlayback(button.dataset.jobId));
-    });
-    document.querySelectorAll('.preview-success-link').forEach(button => {
-        button.addEventListener('click', () => openPreviewRunDir(button.dataset.jobId));
-    });
-    document.querySelectorAll('.video-seek').forEach(input => {
-        input.addEventListener('input', () => seekPreviewVideo(input));
-    });
-}
-
-function previewCard(jobId) {
-    return document.querySelector(`.preview-card[data-job-id="${CSS.escape(jobId)}"]`);
-}
-
-function previewVideo(jobId) {
-    return previewCard(jobId)?.querySelector('video');
-}
-
-function setPreviewButton(video, label) {
-    const jobId = video.closest('.preview-card')?.dataset.jobId;
-    const button = jobId ? document.querySelector(`.preview-play[data-job-id="${CSS.escape(jobId)}"]`) : null;
-    if (button && !button.disabled) button.textContent = label;
-}
-
-async function togglePreviewPlayback(jobId) {
-    const video = previewVideo(jobId);
-    if (!video) return;
-    ensurePreviewVideoSource(video);
-    if (video.paused) {
-        await video.play().catch(() => markPreviewVideoError(video));
-    } else {
-        video.pause();
-    }
-}
-
-function ensurePreviewVideoSource(video) {
-    if (!video || video.src) return;
-    const source = video.dataset.src || '';
-    if (!source) return;
-    video.src = source;
-    video.load();
-}
-
-async function openPreviewRunDir(jobId) {
-    if (!jobId) return;
-    const button = document.querySelector(`.preview-success-link[data-job-id="${CSS.escape(jobId)}"]`);
-    if (button) button.disabled = true;
-    try {
-        await getJson(`/api/video-link/jobs/${jobId}/open-run-dir`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: '{}'
-        });
-    } catch (error) {
-        if (button) {
-            button.textContent = '打开失败';
-            button.title = error.message;
-        }
-    } finally {
-        if (button) button.disabled = false;
-    }
-}
-
-function seekPreviewVideo(input) {
-    const video = previewVideo(input.dataset.jobId);
-    if (!video || !Number.isFinite(video.duration) || video.duration <= 0) return;
-    video.currentTime = (Number(input.value) / 1000) * video.duration;
-    updateVideoControls(video);
-}
-
-function updateVideoControls(video) {
-    const card = video.closest('.preview-card');
-    const jobId = card?.dataset.jobId;
-    if (!jobId) return;
-    const durationSeconds = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : Number(card.dataset.duration || 0);
-    const input = document.querySelector(`.video-seek[data-job-id="${CSS.escape(jobId)}"]`);
-    const time = document.querySelector(`.preview-time[data-job-id="${CSS.escape(jobId)}"]`);
-    if (input && durationSeconds > 0) input.value = String(Math.round((video.currentTime / durationSeconds) * 1000));
-    if (time) time.textContent = `${formatClock(video.currentTime)} / ${formatClock(durationSeconds)}`;
-}
-
-function markPreviewVideoError(video) {
-    const jobId = video.closest('.preview-card')?.dataset.jobId;
-    if (!jobId) return;
-    videoLoadErrors[jobId] = true;
-    const card = previewCard(jobId);
-    if (card) {
-        card.classList.add('preview-failed');
-        card.classList.remove('scanning');
-        const button = card.querySelector('.preview-play');
-        if (button) {
-            button.disabled = true;
-            button.textContent = '失败';
-        }
-    }
-}
-
-function startScanAnimation() {
-    if (scanAnimationFrame) return;
-    const tick = () => {
-        updateScanFrames();
-        scanAnimationFrame = requestAnimationFrame(tick);
-    };
-    scanAnimationFrame = requestAnimationFrame(tick);
-}
-
-function updateScanFrames(now = Date.now()) {
-    if (!nodes.previewGrid) return;
-    document.querySelectorAll('.preview-card').forEach(card => {
-        const status = card.dataset.status || 'created';
-        const failed = card.classList.contains('preview-failed');
-        const baseProgress = clampPercent(Number(card.dataset.progress || 0));
-        let percent = baseProgress;
-        if (status === 'succeeded') {
-            percent = 100;
-        } else if (status === 'running' && !failed) {
-            const durationSeconds = Number(card.dataset.duration || 0) || 600;
-            const startedAt = Date.parse(card.dataset.startedAt || '');
-            const elapsed = Number.isNaN(startedAt) ? 0 : Math.max(0, (now - startedAt) / 1000);
-            percent = Math.min(99, Math.max(baseProgress, (elapsed / durationSeconds) * 100));
-        }
-        const bar = card.querySelector('.preview-scan-progress');
-        const label = card.querySelector('.scan-percent');
-        if (bar) bar.style.width = `${percent}%`;
-        if (label) label.textContent = `${Math.round(percent)}%`;
-    });
-}
-
 function chooseLogStage(job) {
     if (selectedLogStage) return selectedLogStage;
     return job.current_stage || job.error_summary?.stage || job.next_stage || [...(job.stage_order || [])].reverse().find(stage => job.stages?.[stage]?.log_path);
@@ -2335,6 +2430,7 @@ function ensureImageViewer() {
             <div class="image-viewer-toolbar">
                 <strong class="image-viewer-title">图片预览</strong>
                 <div class="image-viewer-actions">
+                    <button type="button" data-image-viewer-play hidden>播放此帧</button>
                     <button type="button" data-image-viewer-zoom="out" aria-label="缩小">−</button>
                     <span data-image-viewer-scale>100%</span>
                     <button type="button" data-image-viewer-zoom="in" aria-label="放大">+</button>
@@ -2349,6 +2445,7 @@ function ensureImageViewer() {
     document.body.appendChild(viewer);
     imageViewer.node = viewer;
     imageViewer.image = viewer.querySelector('img');
+    imageViewer.playButton = viewer.querySelector('[data-image-viewer-play]');
     imageViewer.scaleLabel = viewer.querySelector('[data-image-viewer-scale]');
     viewer.addEventListener('click', event => {
         if (event.target.closest('[data-image-viewer-close]')) {
@@ -2362,6 +2459,12 @@ function ensureImageViewer() {
         }
         if (event.target.closest('[data-image-viewer-reset]')) {
             setImageViewerScale(1);
+            return;
+        }
+        if (event.target.closest('[data-image-viewer-play]')) {
+            if (imageViewer.jobId && Number.isFinite(imageViewer.seconds)) {
+                jumpToVideoTime(imageViewer.jobId, imageViewer.seconds);
+            }
         }
     });
     viewer.querySelector('.image-viewer-stage')?.addEventListener('wheel', event => {
@@ -2371,11 +2474,18 @@ function ensureImageViewer() {
     return viewer;
 }
 
-function openImageViewer(src, alt = '') {
+function openImageViewer(src, alt = '', jobId = '', seconds = '') {
     if (!src) return;
     const viewer = ensureImageViewer();
     imageViewer.image.src = src;
     imageViewer.image.alt = alt || '图片预览';
+    imageViewer.jobId = jobId || '';
+    imageViewer.seconds = Number(seconds);
+    const canPlay = imageViewer.jobId && Number.isFinite(imageViewer.seconds);
+    if (imageViewer.playButton) {
+        imageViewer.playButton.hidden = !canPlay;
+        imageViewer.playButton.textContent = canPlay ? `播放此帧 ${formatTimestampFromSeconds(imageViewer.seconds)}` : '播放此帧';
+    }
     viewer.hidden = false;
     document.body.classList.add('image-viewer-open');
     setImageViewerScale(1);
@@ -2406,7 +2516,12 @@ function bindImageViewer() {
         const image = event.target.closest('img[data-image-viewer-src]');
         if (!image) return;
         event.preventDefault();
-        openImageViewer(image.dataset.imageViewerSrc || image.currentSrc || image.src, image.dataset.imageViewerAlt || image.alt || '');
+        openImageViewer(
+            image.dataset.imageViewerSrc || image.currentSrc || image.src,
+            image.dataset.imageViewerAlt || image.alt || '',
+            image.dataset.jobId || selectedJobId || '',
+            image.dataset.frameSeconds || ''
+        );
     });
     document.addEventListener('keydown', event => {
         if (!imageViewer.node || imageViewer.node.hidden) return;
@@ -2417,12 +2532,22 @@ function bindImageViewer() {
     });
 }
 
+function bindVideoTimeLinks() {
+    document.addEventListener('click', async event => {
+        const button = event.target.closest('.video-time-link, .image-frame-play, [data-video-time-seconds]');
+        if (!button) return;
+        event.preventDefault();
+        const jobId = button.dataset.jobId || selectedJobId;
+        const seconds = Number(button.dataset.seconds || button.dataset.videoTimeSeconds);
+        if (jobId && Number.isFinite(seconds)) await jumpToVideoTime(jobId, seconds);
+    });
+}
+
 function clamp(value, min, max) {
     return Math.max(min, Math.min(max, value));
 }
 
 function loadPaneLayout() {
-    if (!nodes.vscodeDocs) return;
     let layout = {};
     try {
         layout = JSON.parse(localStorage.getItem(paneLayoutStorageKey) || '{}') || {};
@@ -2431,14 +2556,20 @@ function loadPaneLayout() {
     }
     applyPaneWidth('study', Number(layout.study));
     applyPaneWidth('doc-list', Number(layout.docList));
+    applyPaneWidth('source-player', Number(layout.sourcePlayer));
+    applyPaneWidth('qa-source', Number(layout.qaSource));
+    applySourcePlayerHeight(Number(layout.qaSourceHeight));
 }
 
 function savePaneLayout() {
-    if (!nodes.vscodeDocs) return;
-    const style = nodes.vscodeDocs.style;
+    const vscodeStyle = nodes.vscodeDocs?.style;
+    const qaStyle = nodes.qaLayout?.style;
     const layout = {
-        study: parsePanePixels(style.getPropertyValue('--study-pane-width')),
-        docList: parsePanePixels(style.getPropertyValue('--doc-list-pane-width'))
+        study: parsePanePixels(vscodeStyle?.getPropertyValue('--study-pane-width')),
+        docList: parsePanePixels(vscodeStyle?.getPropertyValue('--doc-list-pane-width')),
+        sourcePlayer: parsePanePixels(vscodeStyle?.getPropertyValue('--source-player-pane-width')),
+        qaSource: parsePanePixels(qaStyle?.getPropertyValue('--qa-source-pane-width')),
+        qaSourceHeight: parsePanePixels(nodes.qaSourcePlayerPanel?.style.getPropertyValue('--qa-source-player-height'))
     };
     localStorage.setItem(paneLayoutStorageKey, JSON.stringify(layout));
 }
@@ -2449,18 +2580,44 @@ function parsePanePixels(value) {
 }
 
 function applyPaneWidth(pane, width) {
-    if (!nodes.vscodeDocs || !Number.isFinite(width)) return;
-    const property = pane === 'doc-list' ? '--doc-list-pane-width' : '--study-pane-width';
+    if (!Number.isFinite(width)) return;
+    if (pane === 'qa-source') {
+        nodes.qaLayout?.style.setProperty('--qa-source-pane-width', `${Math.round(width)}px`);
+        return;
+    }
+    if (!nodes.vscodeDocs) return;
+    const property = paneWidthProperty(pane);
     nodes.vscodeDocs.style.setProperty(property, `${Math.round(width)}px`);
 }
 
 function paneWidth(pane) {
+    if (pane === 'qa-source') {
+        const explicit = parsePanePixels(nodes.qaLayout?.style.getPropertyValue('--qa-source-pane-width'));
+        if (explicit) return explicit;
+        return nodes.qaSidePanel?.getBoundingClientRect().width || 0;
+    }
     if (!nodes.vscodeDocs) return 0;
-    const property = pane === 'doc-list' ? '--doc-list-pane-width' : '--study-pane-width';
+    const property = paneWidthProperty(pane);
     const explicit = parsePanePixels(nodes.vscodeDocs.style.getPropertyValue(property));
     if (explicit) return explicit;
-    const selector = pane === 'doc-list' ? '.doc-list-panel' : '.study-panel';
+    const selector = paneSelector(pane);
     return nodes.vscodeDocs.querySelector(selector)?.getBoundingClientRect().width || 0;
+}
+
+function paneWidthProperty(pane) {
+    if (pane === 'doc-list') return '--doc-list-pane-width';
+    if (pane === 'source-player') return '--source-player-pane-width';
+    return '--study-pane-width';
+}
+
+function paneSelector(pane) {
+    if (pane === 'doc-list') return '.doc-list-panel';
+    if (pane === 'source-player') return '.source-player-panel';
+    return '.study-panel';
+}
+
+function sourcePlayerVisible() {
+    return Boolean(nodes.sourcePlayerPanel && !nodes.sourcePlayerPanel.hidden);
 }
 
 function resizeStudyPane(clientX) {
@@ -2468,9 +2625,10 @@ function resizeStudyPane(clientX) {
     if (!docs || !learningPanelVisibility.study) return;
     const rect = docs.getBoundingClientRect();
     const docListOffset = learningPanelVisibility.docList ? (paneWidth('doc-list') || 300) + 14 : 0;
+    const sourceReserve = sourcePlayerVisible() ? 14 + (paneWidth('source-player') || 560) : 0;
     const contentReserve = hasDocContent() ? 14 + 320 : 0;
     const leftEdge = rect.left + docListOffset;
-    const max = Math.max(280, rect.right - leftEdge - contentReserve);
+    const max = Math.max(280, rect.right - leftEdge - sourceReserve - contentReserve);
     applyPaneWidth('study', clamp(clientX - leftEdge, 280, max));
 }
 
@@ -2479,68 +2637,154 @@ function resizeDocListPane(clientX) {
     if (!docs || !learningPanelVisibility.docList) return;
     const rect = docs.getBoundingClientRect();
     const studyReserve = learningPanelVisibility.study ? 14 + 280 : 0;
+    const sourceReserve = sourcePlayerVisible() ? 14 + (paneWidth('source-player') || 560) : 0;
     const contentReserve = hasDocContent() ? 14 + 320 : 0;
-    const max = Math.max(220, rect.width - studyReserve - contentReserve);
+    const max = Math.max(220, rect.width - studyReserve - sourceReserve - contentReserve);
     applyPaneWidth('doc-list', clamp(clientX - rect.left, 220, max));
 }
 
+function resizeSourcePlayerPane(clientX) {
+    const docs = nodes.vscodeDocs;
+    if (!docs || !sourcePlayerVisible()) return;
+    const rect = docs.getBoundingClientRect();
+    const docListOffset = learningPanelVisibility.docList ? (paneWidth('doc-list') || 300) + 14 : 0;
+    const studyOffset = learningPanelVisibility.study ? (paneWidth('study') || 420) + 14 : 0;
+    const leftEdge = rect.left + docListOffset + studyOffset;
+    const contentReserve = hasDocContent() ? 14 + 320 : 0;
+    const max = Math.max(320, rect.right - leftEdge - contentReserve);
+    applyPaneWidth('source-player', clamp(clientX - leftEdge, 320, max));
+}
+
 function resizePaneFromPointer(pane, clientX) {
+    if (pane === 'qa-source') {
+        resizeQaSourcePane(clientX);
+        return;
+    }
     if (pane === 'doc-list') {
         resizeDocListPane(clientX);
+    } else if (pane === 'source-player') {
+        resizeSourcePlayerPane(clientX);
     } else {
         resizeStudyPane(clientX);
     }
 }
 
 function adjustPaneWidth(pane, delta) {
+    if (pane === 'qa-source') {
+        const rect = nodes.qaLayout?.getBoundingClientRect();
+        if (!rect) return;
+        const max = Math.max(320, rect.width - 360);
+        applyPaneWidth('qa-source', clamp(paneWidth('qa-source') + delta, 320, max));
+        return;
+    }
     if (!nodes.vscodeDocs) return;
     const rect = nodes.vscodeDocs.getBoundingClientRect();
     if (pane === 'doc-list') {
         const studyReserve = learningPanelVisibility.study ? 14 + 280 : 0;
+        const sourceReserve = sourcePlayerVisible() ? 14 + (paneWidth('source-player') || 560) : 0;
         const contentReserve = hasDocContent() ? 14 + 320 : 0;
-        const max = Math.max(220, rect.width - studyReserve - contentReserve);
+        const max = Math.max(220, rect.width - studyReserve - sourceReserve - contentReserve);
         applyPaneWidth('doc-list', clamp(paneWidth('doc-list') + delta, 220, max));
         return;
     }
+    if (pane === 'source-player') {
+        const docListReserve = learningPanelVisibility.docList ? (paneWidth('doc-list') || 300) + 14 : 0;
+        const studyReserve = learningPanelVisibility.study ? (paneWidth('study') || 420) + 14 : 0;
+        const contentReserve = hasDocContent() ? 14 + 320 : 0;
+        const max = Math.max(320, rect.width - docListReserve - studyReserve - contentReserve);
+        applyPaneWidth('source-player', clamp(paneWidth('source-player') + delta, 320, max));
+        return;
+    }
     const docListReserve = learningPanelVisibility.docList ? (paneWidth('doc-list') || 300) + 14 : 0;
+    const sourceReserve = sourcePlayerVisible() ? 14 + (paneWidth('source-player') || 560) : 0;
     const contentReserve = hasDocContent() ? 14 + 320 : 0;
-    const max = Math.max(280, rect.width - docListReserve - contentReserve);
+    const max = Math.max(280, rect.width - docListReserve - sourceReserve - contentReserve);
     applyPaneWidth('study', clamp(paneWidth('study') + delta, 280, max));
 }
 
+function resizeQaSourcePane(clientX) {
+    const layout = nodes.qaLayout;
+    if (!layout) return;
+    const rect = layout.getBoundingClientRect();
+    const max = Math.max(320, rect.width - 360);
+    applyPaneWidth('qa-source', clamp(rect.right - clientX, 320, max));
+}
+
+function sourcePlayerHeight() {
+    const explicit = parsePanePixels(nodes.qaSourcePlayerPanel?.style.getPropertyValue('--qa-source-player-height'));
+    if (explicit) return explicit;
+    return nodes.qaSourcePlayerBody?.getBoundingClientRect().height || 260;
+}
+
+function applySourcePlayerHeight(height) {
+    if (!nodes.qaSourcePlayerPanel || !Number.isFinite(height)) return;
+    nodes.qaSourcePlayerPanel.style.setProperty('--qa-source-player-height', `${Math.round(height)}px`);
+}
+
+function resizeSourcePlayerHeight(clientY) {
+    const panel = nodes.qaSourcePlayerPanel;
+    const header = panel?.querySelector('.source-player-header');
+    if (!panel || !header) return;
+    const rect = panel.getBoundingClientRect();
+    const headerHeight = header.getBoundingClientRect().height;
+    const max = Math.max(220, window.innerHeight - rect.top - 180);
+    applySourcePlayerHeight(clamp(clientY - rect.top - headerHeight, 180, max));
+}
+
+function adjustSourcePlayerHeight(delta) {
+    const max = Math.max(220, window.innerHeight - (nodes.qaSourcePlayerPanel?.getBoundingClientRect().top || 0) - 180);
+    applySourcePlayerHeight(clamp(sourcePlayerHeight() + delta, 180, max));
+}
+
 function bindPaneResizers() {
-    if (!nodes.vscodeDocs) return;
     loadPaneLayout();
-    nodes.vscodeDocs.querySelectorAll('.pane-resizer').forEach(handle => {
+    document.querySelectorAll('.pane-resizer').forEach(handle => {
         handle.addEventListener('pointerdown', event => {
             paneResizeState.active = handle.dataset.resizePane || 'study';
             paneResizeState.pointerId = event.pointerId;
             handle.setPointerCapture?.(event.pointerId);
-            nodes.vscodeDocs.classList.add('resizing');
-            resizePaneFromPointer(paneResizeState.active, event.clientX);
+            resizerContainer(paneResizeState.active)?.classList.add('resizing');
+            if (paneResizeState.active === 'qa-source-height') {
+                resizeSourcePlayerHeight(event.clientY);
+            } else {
+                resizePaneFromPointer(paneResizeState.active, event.clientX);
+            }
             event.preventDefault();
         });
         handle.addEventListener('keydown', event => {
-            if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
             const pane = handle.dataset.resizePane || 'study';
-            const delta = event.key === 'ArrowRight' ? 24 : -24;
-            adjustPaneWidth(pane, delta);
+            if (pane === 'qa-source-height') {
+                if (!['ArrowUp', 'ArrowDown'].includes(event.key)) return;
+                adjustSourcePlayerHeight(event.key === 'ArrowDown' ? 24 : -24);
+            } else {
+                if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+                const delta = event.key === 'ArrowRight' ? 24 : -24;
+                adjustPaneWidth(pane, delta);
+            }
             savePaneLayout();
             event.preventDefault();
         });
     });
     document.addEventListener('pointermove', event => {
         if (!paneResizeState.active) return;
-        resizePaneFromPointer(paneResizeState.active, event.clientX);
+        if (paneResizeState.active === 'qa-source-height') {
+            resizeSourcePlayerHeight(event.clientY);
+        } else {
+            resizePaneFromPointer(paneResizeState.active, event.clientX);
+        }
     });
     document.addEventListener('pointerup', event => {
         if (!paneResizeState.active) return;
         if (paneResizeState.pointerId !== null && event.pointerId !== paneResizeState.pointerId) return;
-        nodes.vscodeDocs.classList.remove('resizing');
+        resizerContainer(paneResizeState.active)?.classList.remove('resizing');
         paneResizeState.active = null;
         paneResizeState.pointerId = null;
         savePaneLayout();
     });
+}
+
+function resizerContainer(pane) {
+    return pane?.startsWith('qa-source') ? nodes.qaLayout : nodes.vscodeDocs;
 }
 
 async function runSelectedJob() {
@@ -2566,7 +2810,6 @@ async function runSelectedJob() {
 
 async function boot() {
     nodes.consoleTab.addEventListener('click', () => setView('console'));
-    nodes.previewTab.addEventListener('click', () => setView('preview'));
     nodes.qaTab.addEventListener('click', () => setView('qa'));
     nodes.vscodeTab.addEventListener('click', () => setView('vscode'));
     nodes.jobForm.addEventListener('submit', createJob);
@@ -2579,7 +2822,6 @@ async function boot() {
     });
     renderUrlList();
     nodes.refreshJobsButton.addEventListener('click', refreshJobs);
-    nodes.refreshPreviewButton.addEventListener('click', refreshJobs);
     nodes.qaForm.addEventListener('submit', askQa);
     nodes.generateSkillButton.addEventListener('click', generateSkillCandidate);
     nodes.enableSkillButton.addEventListener('click', enableSkillCandidate);
@@ -2587,16 +2829,18 @@ async function boot() {
     nodes.restartVscodeButton.addEventListener('click', () => ensureVscodeSession(true));
     nodes.stopVscodeButton.addEventListener('click', stopVscodeSession);
     nodes.docPreviewClose.addEventListener('click', closeDocPreview);
+    nodes.qaSourcePlayerStopButton?.addEventListener('click', pauseSourcePlayer);
+    nodes.sourcePlayerStopButton?.addEventListener('click', pauseSourcePlayer);
     nodes.runButton.addEventListener('click', runSelectedJob);
     nodes.copyLogButton.addEventListener('click', copySelectedLog);
     bindImageViewer();
+    bindVideoTimeLinks();
     bindLearningPanelToggles();
     bindPaneResizers();
     await loadOptions();
-    setView(currentView, false);
+    setView(currentView, true);
     await refreshJobs();
     if (selectedJobId) await refreshSelectedJob();
-    startScanAnimation();
     refreshTimer = setInterval(() => {
         if (selectedJobId) {
             refreshSelectedJob();

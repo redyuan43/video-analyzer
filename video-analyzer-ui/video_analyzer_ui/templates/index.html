@@ -16,7 +16,6 @@
             </div>
             <nav class="view-tabs" aria-label="视图切换">
                 <button id="consoleTab" class="view-tab active" type="button" data-view="console">控制台</button>
-                <button id="previewTab" class="view-tab" type="button" data-view="preview">预览</button>
                 <button id="qaTab" class="view-tab" type="button" data-view="qa">问答</button>
                 <button id="vscodeTab" class="view-tab" type="button" data-view="vscode">学习/资源</button>
             </nav>
@@ -200,17 +199,6 @@
             </section>
         </section>
 
-        <section id="previewView" class="preview-view view-panel" hidden>
-            <section class="panel preview-toolbar">
-                <div>
-                    <h2>视频预览</h2>
-                    <p id="previewSummary">最近任务</p>
-                </div>
-                <button id="refreshPreviewButton" class="secondary" type="button">刷新</button>
-            </section>
-            <section id="previewGrid" class="preview-grid"></section>
-        </section>
-
         <section id="qaView" class="qa-view view-panel" hidden>
             <section class="panel qa-toolbar">
                 <div>
@@ -228,18 +216,37 @@
                         <button id="qaAskButton" type="submit" disabled>提问</button>
                     </form>
                 </section>
+                <div class="pane-resizer qa-source-resizer" data-resize-pane="qa-source" role="separator" aria-orientation="vertical" aria-label="调整问答视频宽度" tabindex="0"></div>
                 <aside class="panel qa-side-panel">
-                    <h2>证据状态</h2>
-                    <div id="qaWarnings" class="qa-warnings">等待问答索引</div>
-                    <div class="skill-candidate-panel">
-                        <h2>工具 Skill</h2>
-                        <div id="skillSummary" class="skill-summary">等待生成草稿</div>
-                        <div id="skillWarnings" class="skill-warnings"></div>
-                        <div class="skill-actions">
-                            <button id="generateSkillButton" class="secondary" type="button" disabled>生成草稿</button>
-                            <button id="enableSkillButton" type="button" disabled>审核启用</button>
+                    <section class="qa-source-player source-player-panel">
+                        <div class="source-player-header">
+                            <div>
+                                <h3>在线视频</h3>
+                                <span id="qaSourcePlayerSummary">选择时间戳后播放</span>
+                            </div>
+                            <div class="source-player-actions">
+                                <button id="qaSourcePlayerStopButton" class="secondary tiny" type="button" hidden>暂停</button>
+                                <a id="qaSourcePlayerOpenLink" class="secondary-link" href="#" target="_blank" rel="noreferrer" hidden>原站打开</a>
+                            </div>
                         </div>
-                    </div>
+                        <div id="qaSourcePlayerBody" class="source-player-body">
+                            <div class="source-player-empty">暂无可嵌入播放器</div>
+                        </div>
+                        <div class="pane-resizer row-resizer qa-source-height-resizer" data-resize-pane="qa-source-height" role="separator" aria-orientation="horizontal" aria-label="调整问答视频高度" tabindex="0"></div>
+                    </section>
+                    <section class="qa-status-panel">
+                        <h2>证据状态</h2>
+                        <div id="qaWarnings" class="qa-warnings">等待问答索引</div>
+                        <div class="skill-candidate-panel">
+                            <h2>工具 Skill</h2>
+                            <div id="skillSummary" class="skill-summary">等待生成草稿</div>
+                            <div id="skillWarnings" class="skill-warnings"></div>
+                            <div class="skill-actions">
+                                <button id="generateSkillButton" class="secondary" type="button" disabled>生成草稿</button>
+                                <button id="enableSkillButton" type="button" disabled>审核启用</button>
+                            </div>
+                        </div>
+                    </section>
                 </aside>
             </section>
         </section>
@@ -289,6 +296,22 @@
                     <div id="studyBody" class="study-body">暂无结构化学习数据</div>
                 </section>
                 <div class="pane-resizer" data-resize-pane="study" role="separator" aria-orientation="vertical" aria-label="调整学习视图宽度" tabindex="0"></div>
+                <section id="sourcePlayerPanel" class="source-player-panel">
+                    <div class="source-player-header">
+                        <div>
+                            <h3>在线视频</h3>
+                            <span id="sourcePlayerSummary">选择时间戳后播放</span>
+                        </div>
+                        <div class="source-player-actions">
+                            <button id="sourcePlayerStopButton" class="secondary tiny" type="button" hidden>暂停</button>
+                            <a id="sourcePlayerOpenLink" class="secondary-link" href="#" target="_blank" rel="noreferrer" hidden>原站打开</a>
+                        </div>
+                    </div>
+                    <div id="sourcePlayerBody" class="source-player-body">
+                        <div class="source-player-empty">暂无可嵌入播放器</div>
+                    </div>
+                </section>
+                <div class="pane-resizer source-player-resizer" data-resize-pane="source-player" role="separator" aria-orientation="vertical" aria-label="调整在线视频宽度" tabindex="0"></div>
                 <section class="doc-preview-panel" hidden>
                     <div class="doc-preview-header">
                         <strong id="docPreviewTitle">选择文档</strong>
