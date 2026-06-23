@@ -1391,11 +1391,14 @@ function renderSourcePlayer(job, seconds = sourcePlayerState.seconds) {
         renderSourcePlayerBody(targets, 'empty', '', '<div class="source-player-empty">播放器地址无效，请使用“原站打开”。</div>');
         return;
     }
-    const html = `<iframe
-        title="${escapeHtml(jobDisplayTitle(job))}"
-        src="${escapeHtml(embedUrl)}"
-        allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-        allowfullscreen></iframe>`;
+    const html = `<div class="source-player-frame-wrap">
+        <iframe
+            title="${escapeHtml(jobDisplayTitle(job))}"
+            src="${escapeHtml(embedUrl)}"
+            allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+            allowfullscreen></iframe>
+        <button class="source-player-click-catcher" type="button" aria-label="暂停在线视频" title="暂停在线视频"></button>
+    </div>`;
     renderSourcePlayerBody(targets, 'iframe', embedUrl, html);
 }
 
@@ -2543,6 +2546,15 @@ function bindVideoTimeLinks() {
     });
 }
 
+function bindSourcePlayerSurfacePause() {
+    document.addEventListener('click', event => {
+        const button = event.target.closest('.source-player-click-catcher');
+        if (!button) return;
+        event.preventDefault();
+        pauseSourcePlayer();
+    });
+}
+
 function clamp(value, min, max) {
     return Math.max(min, Math.min(max, value));
 }
@@ -2835,6 +2847,7 @@ async function boot() {
     nodes.copyLogButton.addEventListener('click', copySelectedLog);
     bindImageViewer();
     bindVideoTimeLinks();
+    bindSourcePlayerSurfacePause();
     bindLearningPanelToggles();
     bindPaneResizers();
     await loadOptions();
