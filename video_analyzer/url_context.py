@@ -66,6 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ocr-concurrency", help="OCR concurrency per endpoint, or auto")
     parser.add_argument("--ocr-cache", choices=["on", "off", "refresh"], help="OCR cache mode")
     parser.add_argument("--ocr-cache-dir", help="OCR cache directory")
+    parser.add_argument("--ocr-timeout-seconds", type=float, help="Per-frame OCR request timeout")
     parser.add_argument("--ocr-keyframe-strategy", choices=["auto", "scan-text", "legacy"])
     parser.add_argument("--ocr-keyframe-budget", help="auto or explicit OCR keyframe count")
     parser.add_argument("--ocr-scan-sample-fps", help="auto or low-cost preview scan FPS for OCR keyframe discovery")
@@ -160,6 +161,7 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
         "ocr_concurrency": profile.get("ocr_concurrency", "auto"),
         "ocr_cache": profile.get("ocr_cache", "on"),
         "ocr_cache_dir": profile.get("ocr_cache_dir", ".cache/video-analyzer/ocr"),
+        "ocr_timeout_seconds": profile.get("ocr_timeout_seconds"),
         "ocr_keyframe_strategy": profile.get("ocr_keyframe_strategy", "scan-text"),
         "ocr_keyframe_budget": profile.get("ocr_keyframe_budget", "auto"),
         "ocr_scan_sample_fps": profile.get("ocr_scan_sample_fps", "auto"),
@@ -1065,6 +1067,8 @@ def build_analyzer_command(args: argparse.Namespace, video_path: Path, context_p
             getattr(args, "ocr_cache", "on"),
             "--ocr-cache-dir",
             getattr(args, "ocr_cache_dir", ".cache/video-analyzer/ocr"),
+            "--ocr-timeout-seconds",
+            str(getattr(args, "ocr_timeout_seconds", 120)),
             "--ocr-keyframe-strategy",
             getattr(args, "ocr_keyframe_strategy", "auto"),
             "--ocr-keyframe-budget",
