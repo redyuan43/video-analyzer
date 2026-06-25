@@ -602,11 +602,22 @@ def materialize_highres_candidates(video, output_dir, candidates):
     highres_dir = output_dir / "candidates"
     highres_dir.mkdir(parents=True, exist_ok=True)
     materialized = []
+    missing = []
     still_backends = set()
     for index, item in enumerate(candidates):
         timestamp = float(item["timestamp"])
         highres_path = highres_dir / f"candidate_{index:06d}.jpg"
         still_backends.add(extract_highres_candidate(video, timestamp, highres_path))
+        if not highres_path.is_file() or highres_path.stat().st_size <= 0:
+            missing.append(
+                {
+                    "index": index,
+                    "timestamp": timestamp,
+                    "path": str(highres_path),
+                    "preview_path": item.get("path", ""),
+                }
+            )
+            continue
         materialized.append(
             {
                 **item,
@@ -614,7 +625,7 @@ def materialize_highres_candidates(video, output_dir, candidates):
                 "path": str(highres_path),
             }
         )
-    return materialized, sorted(still_backends)
+    return materialized, sorted(still_backends), missing
 
 
 def read_candidates_json(value):
@@ -786,13 +797,14 @@ def main():
         video = Path(args.video)
         candidates = read_candidates_json(args.materialize_candidates_json)
         materialize_started = time.perf_counter()
-        candidates, still_backends = materialize_highres_candidates(video, output_dir, candidates)
+        candidates, still_backends, missing_candidates = materialize_highres_candidates(video, output_dir, candidates)
         materialize_seconds = round(time.perf_counter() - materialize_started, 3)
         manifest = {
             "success": True,
             "materialize_only": True,
             "candidate_still_backends": still_backends,
             "candidate_frames": len(candidates),
+            "missing_materialized_candidates": missing_candidates,
             "candidates": candidates,
             "timings": {
                 "preview_seconds": 0.0,
@@ -830,13 +842,16 @@ def main():
         materialize_seconds = 0.0
         if not args.metadata_only:
             materialize_started = time.perf_counter()
-            candidates, still_backends = materialize_highres_candidates(video, output_dir, candidates)
+            candidates, still_backends, missing_candidates = materialize_highres_candidates(video, output_dir, candidates)
             materialize_seconds = round(time.perf_counter() - materialize_started, 3)
+        else:
+            missing_candidates = []
         manifest = {
             "success": True,
             "decode_backend": status["decode_backend"],
             "preview_fallback": None,
             "candidate_still_backends": still_backends,
+            "missing_materialized_candidates": missing_candidates,
             "metadata_only": args.metadata_only,
             "paper_backends": paper_backends,
             "segment_start": args.start,
@@ -892,13 +907,16 @@ def main():
     materialize_seconds = 0.0
     if not args.metadata_only:
         materialize_started = time.perf_counter()
-        candidates, still_backends = materialize_highres_candidates(video, output_dir, candidates)
+        candidates, still_backends, missing_candidates = materialize_highres_candidates(video, output_dir, candidates)
         materialize_seconds = round(time.perf_counter() - materialize_started, 3)
+    else:
+        missing_candidates = []
     manifest = {
         "success": True,
         "decode_backend": backend,
         "preview_fallback": preview_fallback,
         "candidate_still_backends": still_backends,
+        "missing_materialized_candidates": missing_candidates,
         "metadata_only": args.metadata_only,
         "paper_backends": paper_backends,
         "segment_start": args.start,

@@ -84,6 +84,32 @@ class JetsonFrameSelectionTests(TestCase):
         self.assertEqual(candidates[0]["timestamp"], 0.0)
         self.assertEqual(candidates[-1]["timestamp"], 660.0)
 
+    def test_materialize_skips_missing_highres_outputs(self):
+        namespace = {}
+        exec(REMOTE_WORKER_SCRIPT, namespace)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "out"
+
+            def fake_extract(_video, _timestamp, output_path):
+                if _timestamp < 10.0:
+                    output_path.write_bytes(b"jpg")
+                return "ffmpeg-nvdec"
+
+            namespace["extract_highres_candidate"] = fake_extract
+            materialized, backends, missing = namespace["materialize_highres_candidates"](
+                Path(temp_dir) / "video.mp4",
+                output_dir,
+                [
+                    {"path": "preview_000000.jpg", "timestamp": 0.0, "score": 1.0},
+                    {"path": "preview_000001.jpg", "timestamp": 10.0, "score": 2.0},
+                ],
+            )
+
+        self.assertEqual(len(materialized), 1)
+        self.assertEqual(backends, ["ffmpeg-nvdec"])
+        self.assertEqual(len(missing), 1)
+        self.assertEqual(missing[0]["index"], 1)
+
     def make_worker(self, name: str) -> JetsonFrameWorker:
         return JetsonFrameWorker(
             host="agx",
