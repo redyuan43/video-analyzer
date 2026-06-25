@@ -1397,7 +1397,6 @@ function renderSourcePlayer(job, seconds = sourcePlayerState.seconds) {
             src="${escapeHtml(embedUrl)}"
             allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
             allowfullscreen></iframe>
-        <button class="source-player-click-catcher" type="button" aria-label="暂停在线视频" title="暂停在线视频"></button>
     </div>`;
     renderSourcePlayerBody(targets, 'iframe', embedUrl, html);
 }
@@ -2546,15 +2545,6 @@ function bindVideoTimeLinks() {
     });
 }
 
-function bindSourcePlayerSurfacePause() {
-    document.addEventListener('click', event => {
-        const button = event.target.closest('.source-player-click-catcher');
-        if (!button) return;
-        event.preventDefault();
-        pauseSourcePlayer();
-    });
-}
-
 function clamp(value, min, max) {
     return Math.max(min, Math.min(max, value));
 }
@@ -2847,7 +2837,6 @@ async function boot() {
     nodes.copyLogButton.addEventListener('click', copySelectedLog);
     bindImageViewer();
     bindVideoTimeLinks();
-    bindSourcePlayerSurfacePause();
     bindLearningPanelToggles();
     bindPaneResizers();
     await loadOptions();
