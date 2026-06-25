@@ -195,6 +195,13 @@ class VideoAnalyzerUI:
             except BridgeError as exc:
                 return jsonify({'error': exc.message}), int(exc.status)
 
+        @self.app.route('/api/video-link/jobs/<job_id>/frame-time-map')
+        def video_link_frame_time_map(job_id):
+            try:
+                return jsonify(self.video_link.frame_time_map(job_id))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
         @self.app.route('/api/video-link/jobs/<job_id>/qa-index')
         def video_link_qa_index(job_id):
             try:

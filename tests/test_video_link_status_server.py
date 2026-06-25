@@ -1685,6 +1685,61 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(result["preview"]["video_url"], f"/api/video-link/jobs/{job['job_id']}/video")
         self.assertEqual(result["preview"]["duration_seconds"], 125)
 
+    def test_public_job_includes_youtube_source_player(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job = server.create_job({"video_url": "https://www.youtube.com/watch?v=abc123XYZ_0"})
+
+            result = server.public_job(server.load_job(job["job_id"]))
+
+        self.assertEqual(result["source_player"]["provider"], "youtube")
+        self.assertTrue(result["source_player"]["can_embed"])
+        self.assertEqual(result["source_player"]["embed_url"], "https://www.youtube.com/embed/abc123XYZ_0")
+        self.assertEqual(result["source_player"]["watch_url"], "https://www.youtube.com/watch?v=abc123XYZ_0")
+
+    def test_public_job_includes_bilibili_source_player(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job = server.create_job({"video_url": "https://www.bilibili.com/video/BV1xx411c7mD/"})
+
+            result = server.public_job(server.load_job(job["job_id"]))
+
+        self.assertEqual(result["source_player"]["provider"], "bilibili")
+        self.assertTrue(result["source_player"]["can_embed"])
+        self.assertEqual(result["source_player"]["embed_url"], "https://player.bilibili.com/player.html?bvid=BV1xx411c7mD")
+        self.assertEqual(result["source_player"]["watch_url"], "https://www.bilibili.com/video/BV1xx411c7mD")
+
+    def test_public_job_marks_unknown_source_as_external_player(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/watch/123"})
+
+            result = server.public_job(server.load_job(job["job_id"]))
+
+        self.assertEqual(result["source_player"]["provider"], "external")
+        self.assertFalse(result["source_player"]["can_embed"])
+        self.assertEqual(result["source_player"]["watch_url"], "https://example.com/watch/123")
+
+    def test_frame_time_map_indexes_manifest_paths_and_manual_assets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "run"
+            frames_dir = output_dir / "frames"
+            frames_dir.mkdir(parents=True)
+            frame_path = frames_dir / "frame_003.jpg"
+            frame_path.write_bytes(b"fake frame")
+            write_frame_manifest([Frame(3, frame_path, 42.5, 0.8)], output_dir, source="local")
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job = server.create_job({"video_url": "https://www.youtube.com/watch?v=abc123XYZ_0"})
+            loaded = server.load_job(job["job_id"])
+            loaded["run_dir"] = str(output_dir)
+            server.save_job(loaded)
+
+            result = server.frame_time_map(job["job_id"])
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["frames"]["frames/frame_003.jpg"]["timestamp_sec"], 42.5)
+        self.assertEqual(result["frames"]["manual_assets/frame_003.jpg"]["timestamp_label"], "0:42")
+
     def test_public_job_falls_back_to_downloaded_video_for_preview(self):
         video_dir = REPO_ROOT / "downloads" / "url-videos" / "preview-fallback-test"
         video_dir.mkdir(parents=True, exist_ok=True)

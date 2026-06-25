@@ -16,7 +16,7 @@ import subprocess
 import sys
 import threading
 import time
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 import uuid
 from datetime import datetime
 from http import HTTPStatus
@@ -2046,6 +2046,89 @@ class VideoLinkStatusServer:
             "duration_seconds": self.preview_duration_seconds(job),
         }
 
+    def source_player_metadata(self, job: dict[str, Any]) -> dict[str, Any]:
+        source_url = str(job.get("video_url") or "").strip()
+        duration_seconds = self.preview_duration_seconds(job)
+        base = {
+            "source_url": source_url,
+            "provider": "external",
+            "can_embed": False,
+            "supports_timestamp": bool(source_url),
+            "embed_url": None,
+            "watch_url": source_url or None,
+            "duration_seconds": duration_seconds,
+        }
+        if not source_url:
+            return base
+
+        parsed = urlparse(source_url)
+        host = parsed.netloc.lower()
+        video_id = infer_video_id_from_url(source_url)
+        if video_id and ("youtube.com" in host or "youtu.be" in host):
+            base.update(
+                {
+                    "provider": "youtube",
+                    "can_embed": True,
+                    "supports_timestamp": True,
+                    "embed_url": f"https://www.youtube.com/embed/{quote(video_id)}",
+                    "watch_url": f"https://www.youtube.com/watch?v={quote(video_id)}",
+                }
+            )
+            return base
+        if video_id and ("bilibili.com" in host or "b23.tv" in host):
+            base.update(
+                {
+                    "provider": "bilibili",
+                    "can_embed": True,
+                    "supports_timestamp": True,
+                    "embed_url": f"https://player.bilibili.com/player.html?bvid={quote(video_id)}",
+                    "watch_url": f"https://www.bilibili.com/video/{quote(video_id)}",
+                }
+            )
+        return base
+
+    def frame_time_map(self, job_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        manifest_path = run_dir / "frames_manifest.json"
+        if not manifest_path.is_file():
+            return {"available": False, "frames": {}, "count": 0}
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, "frame manifest is invalid") from exc
+
+        frames: dict[str, dict[str, Any]] = {}
+        for item in payload.get("frames") or []:
+            if not isinstance(item, dict):
+                continue
+            frame_number = item.get("frame_number", item.get("number"))
+            timestamp = item.get("timestamp", item.get("timestamp_sec"))
+            frame_path = item.get("path") or item.get("frame_path")
+            if frame_number is None or timestamp is None:
+                continue
+            try:
+                number = int(frame_number)
+                seconds = float(timestamp)
+            except (TypeError, ValueError):
+                continue
+            entry = {
+                "frame_number": number,
+                "timestamp_sec": seconds,
+                "timestamp_label": format_seconds_label(seconds),
+            }
+            keys = set()
+            for extension in ("jpg", "jpeg", "png", "webp"):
+                keys.add(f"manual_assets/frame_{number:03d}.{extension}")
+                keys.add(f"manual_assets/frame_{number}.{extension}")
+            if frame_path:
+                path_value = str(frame_path).replace("\\", "/")
+                keys.update({path_value, Path(path_value).name})
+            for key in keys:
+                if key:
+                    frames[key] = entry
+        return {"available": True, "frames": frames, "count": len(frames)}
+
     def preview_video_file(self, job_id: str) -> tuple[Path, str | None]:
         job = self.load_job(job_id)
         video_path = self.preview_video_candidate(job)
@@ -2229,6 +2312,7 @@ class VideoLinkStatusServer:
         public["stage_progress"] = self.stage_progress(public)
         public["core_diagnostics"] = self.core_diagnostics(public)
         public["preview"] = self.preview_metadata(public)
+        public["source_player"] = self.source_player_metadata(public)
         public["vscode_preview"] = self.vscode_preview_metadata(public, public_host)
         public["warnings"] = self.active_warnings(public)
         queued_stage = public["queue"].get("stage")
@@ -2265,6 +2349,7 @@ class VideoLinkStatusServer:
         public["next_stage"] = self.next_stage(job)
         public["error_summary"] = self.error_summary(job)
         public["dashboard_url"] = self.dashboard_url(job["job_id"])
+        public["source_player"] = self.source_player_metadata(public)
         current_info = public["stages"].get(public.get("current_stage") or "", {})
         public["process"] = self.public_process_info(current_info.get("process"))
         return public
@@ -4092,6 +4177,16 @@ def tail_lines(text: str, limit: int = 40) -> list[str]:
 
 def iso_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def format_seconds_label(value: float) -> str:
+    seconds = max(0, int(value))
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    remaining = seconds % 60
+    if hours:
+        return f"{hours}:{minutes:02d}:{remaining:02d}"
+    return f"{minutes}:{remaining:02d}"
 
 
 def parse_iso_timestamp(value: Any) -> float | None:
