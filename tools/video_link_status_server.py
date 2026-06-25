@@ -963,6 +963,8 @@ class VideoLinkStatusServer:
             job["updated_at"] = now
             self.save_job(job)
             return self.public_job(job)
+        if stage == "final-publish" and current_status == "skipped" and not self.export_outputs_complete(job):
+            current_status = None
         if current_status in {"succeeded", "skipped"}:
             return self.public_job(job)
         if stage == "image-prompts" and job["options"].get("skip_images"):
@@ -1086,6 +1088,27 @@ class VideoLinkStatusServer:
         job["updated_at"] = iso_now()
         job["stages"][stage] = stage_info
         job["summary"] = self.collect_summary(job)
+        next_stage = self.next_stage(job)
+        runner = dict(job.get("runner") or {})
+        runner["updated_at"] = job["updated_at"]
+        runner["server_pid"] = os.getpid()
+        runner["error"] = None if job["status"] != "failed" else stage_info.get("error")
+        if job["status"] == "succeeded":
+            runner["status"] = "succeeded"
+            runner["current_stage"] = None
+            runner["queued_for"] = None
+            runner["finished_at"] = job["updated_at"]
+        elif job["status"] == "failed":
+            runner["status"] = "failed"
+            runner["current_stage"] = stage
+            runner["queued_for"] = stage_resource(stage)
+            runner["finished_at"] = job["updated_at"]
+        else:
+            runner["status"] = "running"
+            runner["current_stage"] = next_stage
+            runner["queued_for"] = stage_resource(next_stage) if next_stage else None
+            runner.pop("finished_at", None)
+        job["runner"] = runner
         self.save_job(job)
         if stage_info["status"] == "failed":
             raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, f"{stage} failed: {stage_info.get('error')}")
