@@ -22,6 +22,27 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   PYTHON_BIN="$(command -v python3)"
 fi
 
+detect_agx_lan_host() {
+  if [[ -n "${JETSON_AGX_LAN_HOST:-}" ]]; then
+    printf '%s\n' "$JETSON_AGX_LAN_HOST"
+    return 0
+  fi
+
+  local candidates="${VIDEO_LINK_AGX_LAN_HOST_CANDIDATES:-agx-lan,agx.local,ubuntu.local}"
+  local candidate
+  local -a candidate_list
+  IFS=, read -r -a candidate_list <<<"$candidates"
+  for candidate in "${candidate_list[@]}"; do
+    candidate="${candidate//[[:space:]]/}"
+    [[ -n "$candidate" ]] || continue
+    timeout 2 getent ahostsv4 "$candidate" >/dev/null 2>&1 || continue
+    timeout 4 ssh -o BatchMode=yes -o ConnectTimeout=2 -o ConnectionAttempts=1 \
+      -o HostKeyAlias=agx-lan "agx@$candidate" true >/dev/null 2>&1 || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done
+}
+
 mkdir -p "$RUNTIME_DIR"
 
 is_running() {
@@ -41,11 +62,20 @@ start_server() {
     return 0
   fi
   cd "$ROOT_DIR"
+  AGX_LAN_HOST="$(detect_agx_lan_host || true)"
+  if [[ -n "$AGX_LAN_HOST" ]]; then
+    export JETSON_AGX_LAN_HOST="$AGX_LAN_HOST"
+  fi
   PYTHONPATH="$ROOT_DIR/video-analyzer-ui:$ROOT_DIR:${PYTHONPATH:-}" \
     setsid "$PYTHON_BIN" -m video_analyzer_ui.server --host "$BIND_HOST" --port "$PORT" --jobs-dir "$RUNTIME_DIR/jobs" \
     >"$LOG_FILE" 2>&1 < /dev/null &
   echo "$!" >"$PID_FILE"
   echo "video-link status server started: http://$PUBLIC_HOST:$PORT/ (bind: $BIND_HOST)"
+  if [[ -n "${JETSON_AGX_LAN_HOST:-}" ]]; then
+    echo "AGX LAN host: $JETSON_AGX_LAN_HOST"
+  else
+    echo "AGX LAN host: not detected; set JETSON_AGX_LAN_HOST or VIDEO_LINK_AGX_LAN_HOST_CANDIDATES"
+  fi
   echo "log: $LOG_FILE"
 }
 

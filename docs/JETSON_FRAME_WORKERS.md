@@ -50,8 +50,12 @@ tools/start_jetson_frame_ray.sh
 The default Ray resource shape is `frame_worker=2` on AGX. The startup script
 uses the control host `agx` first, then resolves the current private LAN address
 from AGX itself for Ray's `--node-ip-address`. Do not hard-code transient DHCP
-addresses in the default path. Set `JETSON_AGX_LAN_HOST=agx-lan` only after
-adding a stable LAN DNS/DHCP hostname for AGX. Use
+addresses in the default path. The video-link status launcher probes
+`agx-lan,agx.local,ubuntu.local` by default and exports
+`JETSON_AGX_LAN_HOST` only when a candidate resolves and accepts
+`ssh agx@<name>`. Override candidates with
+`VIDEO_LINK_AGX_LAN_HOST_CANDIDATES`, or set `JETSON_AGX_LAN_HOST=agx-lan`
+after adding a stable LAN DNS/DHCP hostname for AGX. Use
 `JETSON_RAY_HEAD_FRAME_WORKERS=N` only for explicit benchmarking.
 
 ## API / CLI Contract
@@ -113,7 +117,9 @@ Expected minimum for the AGX long-talk path:
 - AGX has a private LAN IPv4 address discoverable through
   `ip -4 -o addr show scope global`, or `JETSON_RAY_HEAD_IP` is set explicitly;
 - if `JETSON_AGX_LAN_HOST` is set, it must point to a stable reachable LAN DNS
-  name such as `agx-lan`, not a transient DHCP address;
+  name such as `agx-lan`, not a transient DHCP address. The video-link launcher
+  can detect this automatically when `agx-lan`, `agx.local`, or `ubuntu.local`
+  is resolvable and reachable;
 - `ffmpeg` present;
 - Python can import `numpy` and `PIL`;
 - `rsync` present.

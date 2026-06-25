@@ -153,7 +153,7 @@ A passing local response includes:
   - `nx3`: `nx@192.168.31.35`, Tailscale `100.127.71.86`
   - `nx4`: `nx@192.168.31.10`, Tailscale `100.82.227.71`
   - `agx`: `agx@192.168.31.201`, Tailscale `100.103.199.121`
-- For AGX Ray startup, default to the `agx` control host and let `tools/start_jetson_frame_ray.sh` resolve the current private LAN IP from AGX before starting Ray. Set `JETSON_AGX_LAN_HOST=agx-lan` only when a stable LAN DNS/DHCP hostname exists; set `JETSON_RAY_HEAD_IP` only as an explicit temporary override.
+- For AGX Ray startup, default to the `agx` control host and let `tools/start_jetson_frame_ray.sh` resolve the current private LAN IP from AGX before starting Ray. The video-link status launcher probes LAN device names (`agx-lan,agx.local,ubuntu.local` by default) and exports `JETSON_AGX_LAN_HOST` only when the name resolves and `ssh agx@<name>` works. Set `JETSON_AGX_LAN_HOST=agx-lan` only when a stable LAN DNS/DHCP hostname exists; customize probe names with `VIDEO_LINK_AGX_LAN_HOST_CANDIDATES`; set `JETSON_RAY_HEAD_IP` only as an explicit temporary override.
 - All `nx*` device passwords are `nx`; AGX password is `agx`. Prefer using those only to bootstrap public-key auth, then keep automated runs passwordless.
 - Before large syncs, validate LAN mesh with direct device-to-device SSH, for example:
   `ssh nx1 "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new nx@192.168.31.10 hostname"`
