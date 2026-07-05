@@ -23,6 +23,11 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 from video_analyzer.config import Config
+from video_analyzer.douyin_browser import (
+    DouyinBrowserDownloadError,
+    download_douyin_with_browser,
+    is_douyin_url,
+)
 
 
 FALLBACK_OUTPUT_ROOT = "downloads/url-videos"
@@ -209,16 +214,28 @@ def main() -> int:
         if args.keep_existing and (not args.refresh_context or args.resume_existing_core)
         else None
     )
+    browser_result = None
     if video_dir:
         info = load_downloaded_info(video_dir) or {}
     elif args.download_device != LOCAL_DOWNLOAD_DEVICE:
         video_dir = remote_download_video_dir(args, output_root)
         info = load_downloaded_info(video_dir) or {}
     else:
-        info = fetch_metadata(args.url, args)
-        video_id = safe_slug(str(info.get("id") or info.get("display_id") or info.get("title") or "video"))
-        video_dir = output_root / video_id
-        video_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            info = fetch_metadata(args.url, args)
+            video_id = safe_slug(str(info.get("id") or info.get("display_id") or info.get("title") or "video"))
+            video_dir = output_root / video_id
+            video_dir.mkdir(parents=True, exist_ok=True)
+        except subprocess.CalledProcessError:
+            if not is_douyin_url(args.url):
+                raise
+            print("[download] yt-dlp failed for Douyin; trying browser-session fallback", file=sys.stderr)
+            try:
+                browser_result = download_douyin_with_browser(args.url, output_root, args)
+            except DouyinBrowserDownloadError as exc:
+                raise SystemExit(f"Douyin browser fallback failed: {exc}") from exc
+            info = browser_result.info
+            video_dir = browser_result.video_dir
 
     video_path = materialized_media_path(video_dir) or video_dir / "video.mp4"
     info_path = video_dir / "info.json"
@@ -233,7 +250,9 @@ def main() -> int:
         print(f"[download] context: {page_context_path}")
         info = load_downloaded_info(video_dir) or info
     else:
-        if args.download_device != LOCAL_DOWNLOAD_DEVICE and video_path.exists():
+        if browser_result is not None:
+            video_path = browser_result.video_path
+        elif args.download_device != LOCAL_DOWNLOAD_DEVICE and video_path.exists():
             pass
         elif args.download_device != LOCAL_DOWNLOAD_DEVICE:
             video_dir = remote_download_video_dir(args, output_root)

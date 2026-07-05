@@ -35,7 +35,7 @@ for arg in "${ARGS[@]}"; do
     has_youtube_url=1
   fi
 done
-if [[ "$has_ytdlp_proxy" -eq 0 ]] && timeout 1 bash -c '</dev/tcp/127.0.0.1/10808' 2>/dev/null; then
+if [[ "$has_ytdlp_proxy" -eq 0 && "$has_youtube_url" -eq 1 ]] && timeout 1 bash -c '</dev/tcp/127.0.0.1/10808' 2>/dev/null; then
   ARGS+=("--ytdlp-proxy" "http://127.0.0.1:10808")
 fi
 if [[ "$has_youtube_url" -eq 1 && "$has_ytdlp_extractor_args" -eq 0 ]]; then

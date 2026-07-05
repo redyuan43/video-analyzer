@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from video_analyzer import cli as cli_mod
+from video_analyzer import douyin_browser as douyin_browser_mod
 from video_analyzer.frame import Frame
 from video_analyzer.frame_manifest import write_frame_manifest
 
@@ -130,6 +131,35 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertIn("Referer: https://www.bilibili.com/video/BV1YtVz6eEAz/", remote_command)
         self.assertIn("Origin: https://www.bilibili.com", remote_command)
         self.assertIn("User-Agent: Mozilla/5.0", remote_command)
+
+    def test_douyin_browser_helpers_recognize_url_and_profile(self):
+        self.assertTrue(douyin_browser_mod.is_douyin_url("https://v.douyin.com/sdYOxlCtlrY/"))
+        self.assertTrue(douyin_browser_mod.is_douyin_url("https://www.douyin.com/video/7656377961499250097"))
+        self.assertFalse(douyin_browser_mod.is_douyin_url("https://www.bilibili.com/video/BV1YtVz6eEAz/"))
+        self.assertEqual(douyin_browser_mod.infer_douyin_id("https://www.douyin.com/video/7656377961499250097"), "7656377961499250097")
+        self.assertEqual(douyin_browser_mod.parse_browser_profile("chrome:Profile 1"), ("chrome", "Profile 1"))
+        self.assertEqual(douyin_browser_mod.parse_browser_profile("chrome+gnomekeyring:Default"), ("chrome", "Default"))
+
+    def test_douyin_aweme_detail_maps_to_info(self):
+        detail = {
+            "aweme_id": "7656377961499250097",
+            "desc": "安装这些skill，让Codex接管电路设计和三维建模 #Codex",
+            "video": {"duration": 158802},
+            "author": {"nickname": "作者", "uid": "123", "sec_uid": "sec"},
+            "text_extra": [{"hashtag_name": "Codex"}],
+        }
+
+        info = douyin_browser_mod.aweme_detail_to_info(
+            detail,
+            "https://v.douyin.com/sdYOxlCtlrY/",
+            {"final_url": "https://www.douyin.com/video/7656377961499250097"},
+        )
+
+        self.assertEqual(info["id"], "7656377961499250097")
+        self.assertEqual(info["extractor"], "douyin_browser")
+        self.assertEqual(info["duration"], 158.802)
+        self.assertEqual(info["uploader"], "作者")
+        self.assertIn("Codex", info["tags"])
 
     def test_infer_video_id_from_bilibili_url(self):
         self.assertEqual(
