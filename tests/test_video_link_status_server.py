@@ -284,6 +284,52 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertTrue(job["options"]["refresh_context"])
         self.assertEqual(job["options"]["focus_prompt"], "重点关注部署参数和失败恢复")
 
+    def test_create_uploaded_media_job_materializes_file_context_and_options(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            source = Path(tmp) / "demo.mp3"
+            source.write_bytes(b"fake audio")
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", repo_root)
+
+            job = server.create_uploaded_media_job(
+                {
+                    "analysis_mode": "auto",
+                    "run_name": "audio-run",
+                    "include_subtitles": True,
+                    "include_comments": True,
+                    "download_device": "mi",
+                },
+                source,
+                "../demo.mp3",
+            )
+            loaded = server.load_job(job["job_id"])
+            self.assertEqual(loaded["source_type"], "upload")
+            self.assertEqual(loaded["source_name"], "demo.mp3")
+            self.assertEqual(loaded["options"]["download_device"], "local")
+            self.assertFalse(loaded["options"]["include_subtitles"])
+            self.assertFalse(loaded["options"]["include_comments"])
+            self.assertTrue(Path(loaded["media_path"]).is_file())
+            self.assertIn("本地上传媒体文件", Path(loaded["page_context_path"]).read_text(encoding="utf-8"))
+
+    def test_uploaded_media_probe_uses_ffprobe_and_avoids_ytdlp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            source = Path(tmp) / "demo.mp3"
+            source.write_bytes(b"fake audio")
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", repo_root)
+            job = server.create_uploaded_media_job({"analysis_mode": "auto"}, source, "demo.mp3")
+            loaded = server.load_job(job["job_id"])
+            completed = subprocess.CompletedProcess(args=["ffprobe"], returncode=0, stdout="3600.5\n", stderr="")
+
+            with patch.object(server_mod.subprocess, "run", return_value=completed) as run:
+                result = server.stage_probe(loaded)
+
+        self.assertEqual(result["artifacts"]["duration_seconds"], 3600)
+        self.assertEqual(loaded["resolved_mode"], "fast")
+        self.assertEqual(run.call_args.args[0][0], "ffprobe")
+
     def test_command_mapping_for_collection_options(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)

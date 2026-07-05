@@ -22,6 +22,7 @@ let currentView = ['qa', 'vscode'].includes(initialParams.get('view'))
     ? initialParams.get('view')
     : 'console';
 let pendingUrls = [];
+let sourceMode = 'url';
 let vscodeStarting = false;
 let selectedDocPath = '';
 let renderedDocListKey = '';
@@ -52,6 +53,7 @@ const panelVisibilityStorageKey = 'videoAnalyzerLearningPanels';
 const learningPanelVisibility = {
     docList: true,
     study: true,
+    sourcePlayer: true,
     docContent: true
 };
 
@@ -66,6 +68,11 @@ const nodes = {
     formError: document.getElementById('formError'),
     createButton: document.getElementById('createButton'),
     batchResult: document.getElementById('batchResult'),
+    urlSourceTab: document.getElementById('urlSourceTab'),
+    fileSourceTab: document.getElementById('fileSourceTab'),
+    urlEntry: document.getElementById('urlEntry'),
+    mediaEntry: document.getElementById('mediaEntry'),
+    mediaFile: document.getElementById('mediaFile'),
     videoUrlInput: document.getElementById('videoUrlInput'),
     addUrlButton: document.getElementById('addUrlButton'),
     videoUrls: document.getElementById('videoUrls'),
@@ -133,6 +140,7 @@ const nodes = {
     vscodeDocs: document.querySelector('.vscode-docs'),
     toggleDocListPanel: document.getElementById('toggleDocListPanel'),
     toggleStudyPanel: document.getElementById('toggleStudyPanel'),
+    toggleSourcePlayerPanel: document.getElementById('toggleSourcePlayerPanel'),
     toggleDocContentPanel: document.getElementById('toggleDocContentPanel'),
     vscodePlaceholder: document.getElementById('vscodePlaceholder'),
     vscodeFrame: document.getElementById('vscodeFrame'),
@@ -299,6 +307,24 @@ function addPendingUrls() {
     renderUrlList();
 }
 
+function setSourceMode(mode) {
+    sourceMode = mode === 'file' ? 'file' : 'url';
+    nodes.urlSourceTab?.classList.toggle('active', sourceMode === 'url');
+    nodes.fileSourceTab?.classList.toggle('active', sourceMode === 'file');
+    if (nodes.urlEntry) nodes.urlEntry.hidden = sourceMode !== 'url';
+    if (nodes.urlList) nodes.urlList.hidden = sourceMode !== 'url';
+    if (nodes.mediaEntry) nodes.mediaEntry.hidden = sourceMode !== 'file';
+    const urlOnlyDisabled = sourceMode === 'file';
+    ['cookieBrowser', 'downloadDevice', 'includeSubtitles', 'preferSubtitleTranscript', 'includeComments', 'refreshContext', 'maxComments', 'subtitleLangs']
+        .forEach(id => {
+            const node = document.getElementById(id);
+            if (node) node.disabled = urlOnlyDisabled;
+        });
+    nodes.createButton.textContent = sourceMode === 'file' ? '上传并启动' : '启动任务';
+    nodes.formError.textContent = '';
+    nodes.batchResult.textContent = '';
+}
+
 async function loadOptions() {
     const options = await getJson('/api/video-link/options');
     const defaults = options.defaults || {};
@@ -342,12 +368,46 @@ function jobPayload() {
     };
 }
 
+function appendCommonJobFields(formData) {
+    formData.append('focus_prompt', nodes.focusPrompt.value.trim());
+    formData.append('analysis_mode', document.getElementById('analysisMode').value);
+    formData.append('profile', document.getElementById('profile').value);
+    formData.append('run_name', document.getElementById('runName').value.trim());
+    formData.append('skip_images', document.getElementById('skipImages').checked ? 'true' : 'false');
+    formData.append('keep_existing', document.getElementById('keepExisting').checked ? 'true' : 'false');
+    formData.append('auto_start', 'true');
+}
+
+async function createUploadJob() {
+    const file = nodes.mediaFile?.files?.[0];
+    if (!file) throw new Error('请选择一个媒体文件');
+    const formData = new FormData();
+    formData.append('media', file);
+    appendCommonJobFields(formData);
+    return getJson('/api/video-link/jobs/upload', {
+        method: 'POST',
+        body: formData
+    });
+}
+
 async function createJob(event) {
     event.preventDefault();
     nodes.formError.textContent = '';
     nodes.batchResult.textContent = '';
     nodes.createButton.disabled = true;
     try {
+        if (sourceMode === 'file') {
+            const job = await createUploadJob();
+            selectJob(job.job_id, true);
+            nodes.batchResult.textContent = '已创建 1/1 个文件任务';
+            nodes.jobForm.reset();
+            pendingUrls = [];
+            renderUrlList();
+            await loadOptions();
+            setSourceMode('file');
+            await refreshJobs();
+            return;
+        }
         const result = await getJson('/api/video-link/jobs/batch', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -430,7 +490,11 @@ function preferredJob(jobs) {
 }
 
 function jobDisplayTitle(job) {
-    return job.display_title || job.title || job.summary?.study?.title || job.video_url || job.job_id || '-';
+    return job.display_title || job.title || job.source_name || job.summary?.study?.title || job.video_url || job.job_id || '-';
+}
+
+function jobSourceLabel(job) {
+    return job.source_name || job.video_url || '-';
 }
 
 function renderJobList(jobs) {
@@ -439,7 +503,7 @@ function renderJobList(jobs) {
         const selected = job.job_id === selectedJobId ? ' selected' : '';
         const statusClass = job.status ? ` ${job.status}` : '';
         const title = escapeHtml(jobDisplayTitle(job));
-        const url = escapeHtml(job.video_url || '-');
+        const url = escapeHtml(jobSourceLabel(job));
         const stage = job.current_stage || job.error_summary?.stage || job.next_stage || '-';
         return `<div class="job-item${selected}${statusClass}" data-job-id="${escapeHtml(job.job_id)}">
             <button class="job-select" type="button" data-job-id="${escapeHtml(job.job_id)}">
@@ -551,7 +615,7 @@ function renderGlobal(data) {
 
 function resourceItem(item, queued = false) {
     const prefix = queued && item.position ? `#${item.position} · ` : '';
-    const title = item.video_url || item.job_id || '-';
+    const title = item.source_name || item.video_url || item.job_id || '-';
     return `<button class="lane-item" type="button" data-job-id="${escapeHtml(item.job_id || '')}">
         <strong>${escapeHtml(prefix + (item.stage_label || item.stage || '-'))}</strong>
         <span>${escapeHtml(title)} · ${escapeHtml(item.progress_percent ?? 0)}%</span>
@@ -656,7 +720,7 @@ function renderJob(job) {
     const missingRunDir = isSucceeded && !runDir;
     nodes.selectedTitle.textContent = jobDisplayTitle(job);
     const subtitleReason = missingRunDir ? '资源目录不可用' : reason;
-    const subtitleBase = `任务 ID: ${job.job_id} · ${job.video_url || '-'}`;
+    const subtitleBase = `任务 ID: ${job.job_id} · ${jobSourceLabel(job)}`;
     nodes.selectedSubtitle.textContent = subtitleReason ? `${subtitleBase} · ${subtitleReason}` : subtitleBase;
     nodes.runButton.disabled = Boolean(missingRunDir);
     nodes.runButton.dataset.action = isActive ? 'stop' : (isSucceeded ? 'open-run-dir' : 'run');
@@ -675,7 +739,7 @@ function renderJob(job) {
         : '';
     nodes.progressText.textContent = `${progress.completed || 0}/${progress.total || 0} · ${progress.percent || 0}%${subProgress}`;
     nodes.progressBar.style.width = `${progress.percent || 0}%`;
-    setText(nodes.detailUrl, job.video_url);
+    setText(nodes.detailUrl, jobSourceLabel(job));
     setText(nodes.detailRunDir, job.summary?.run_dir || job.run_dir);
     setText(nodes.detailMode, `${job.options?.analysis_mode || '-'} -> ${job.resolved_mode || '-'}`);
     setText(nodes.detailUpdated, job.updated_at);
@@ -1584,7 +1648,7 @@ function previewableDocs(job) {
 function loadLearningPanelVisibility() {
     try {
         const stored = JSON.parse(localStorage.getItem(panelVisibilityStorageKey) || '{}') || {};
-        ['docList', 'study', 'docContent'].forEach(key => {
+        ['docList', 'study', 'sourcePlayer', 'docContent'].forEach(key => {
             if (typeof stored[key] === 'boolean') learningPanelVisibility[key] = stored[key];
         });
     } catch (_error) {
@@ -1599,6 +1663,7 @@ function saveLearningPanelVisibility() {
 function syncLearningPanelToggles() {
     if (nodes.toggleDocListPanel) nodes.toggleDocListPanel.checked = learningPanelVisibility.docList;
     if (nodes.toggleStudyPanel) nodes.toggleStudyPanel.checked = learningPanelVisibility.study;
+    if (nodes.toggleSourcePlayerPanel) nodes.toggleSourcePlayerPanel.checked = learningPanelVisibility.sourcePlayer;
     if (nodes.toggleDocContentPanel) nodes.toggleDocContentPanel.checked = learningPanelVisibility.docContent;
 }
 
@@ -1611,7 +1676,7 @@ function updateLearningDocsLayout() {
     const docListVisible = learningPanelVisibility.docList;
     const studyVisible = learningPanelVisibility.study;
     const contentVisible = hasDocContent();
-    const playerVisible = Boolean(nodes.sourcePlayerPanel);
+    const playerVisible = Boolean(nodes.sourcePlayerPanel && learningPanelVisibility.sourcePlayer);
     const visiblePanelCount = [docListVisible, studyVisible, playerVisible, contentVisible].filter(Boolean).length;
     const columns = [];
 
@@ -1659,6 +1724,9 @@ function bindLearningPanelToggles() {
     });
     nodes.toggleStudyPanel?.addEventListener('change', event => {
         setLearningPanelVisibility('study', event.target.checked);
+    });
+    nodes.toggleSourcePlayerPanel?.addEventListener('change', event => {
+        setLearningPanelVisibility('sourcePlayer', event.target.checked);
     });
     nodes.toggleDocContentPanel?.addEventListener('change', event => {
         setLearningPanelVisibility('docContent', event.target.checked);
@@ -2815,6 +2883,8 @@ async function boot() {
     nodes.qaTab.addEventListener('click', () => setView('qa'));
     nodes.vscodeTab.addEventListener('click', () => setView('vscode'));
     nodes.jobForm.addEventListener('submit', createJob);
+    nodes.urlSourceTab?.addEventListener('click', () => setSourceMode('url'));
+    nodes.fileSourceTab?.addEventListener('click', () => setSourceMode('file'));
     nodes.addUrlButton.addEventListener('click', addPendingUrls);
     nodes.videoUrlInput.addEventListener('keydown', event => {
         if (event.key === 'Enter') {
@@ -2840,6 +2910,7 @@ async function boot() {
     bindLearningPanelToggles();
     bindPaneResizers();
     await loadOptions();
+    setSourceMode(sourceMode);
     setView(currentView, true);
     await refreshJobs();
     if (selectedJobId) await refreshSelectedJob();

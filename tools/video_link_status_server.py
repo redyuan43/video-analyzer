@@ -35,7 +35,16 @@ from video_analyzer.skill_candidate import (
     enable_tool_skill_candidate,
 )
 from video_analyzer.resource_locks import DEFAULT_LOCK_DIR
-from video_analyzer.url_context import FALLBACK_OUTPUT_ROOT, infer_video_id_from_url, safe_slug
+from video_analyzer.url_context import (
+    AUDIO_MEDIA_EXTENSIONS,
+    FALLBACK_OUTPUT_ROOT,
+    MEDIA_EXTENSIONS,
+    apply_runtime_profile,
+    build_analyzer_command,
+    infer_video_id_from_url,
+    materialize_analysis_context,
+    safe_slug,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -163,6 +172,8 @@ AUTO_MODE_OPERATION_KEYWORDS = (
 )
 DEFAULT_RUN_NAME = "operation-manual"
 DEFAULT_SUBTITLE_LANGS = "zh-CN,zh-Hans,zh,en"
+UPLOAD_SOURCE_TYPE = "upload"
+UPLOAD_OUTPUT_PREFIX = "upload-"
 MODULE_ORDER = [
     "probe",
     "prepare",
@@ -438,18 +449,85 @@ class VideoLinkStatusServer:
         video_url = str(payload.get("video_url") or payload.get("videoUrl") or "").strip()
         if not video_url.startswith(("http://", "https://")):
             raise BridgeError(HTTPStatus.BAD_REQUEST, "video_url must be an http(s) URL")
+        return self._create_job(payload, video_url=video_url)
+
+    def create_uploaded_media_job(self, payload: dict[str, Any], media_path: Path, source_filename: str) -> dict[str, Any]:
+        source_name = sanitize_upload_filename(source_filename)
+        suffix = Path(source_name).suffix.lower()
+        if suffix not in MEDIA_EXTENSIONS:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, f"media file must be one of {sorted(MEDIA_EXTENSIONS)}")
+        if not media_path.is_file():
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "media file is not available")
+
+        create_payload = dict(payload)
+        create_payload["auto_start"] = False
+        job = self._create_job(
+            create_payload,
+            video_url=f"upload://{source_name}",
+            source_type=UPLOAD_SOURCE_TYPE,
+            source_name=source_name,
+            upload_suffix=suffix,
+        )
+        loaded = self.load_job(job["job_id"])
+        video_dir = self.upload_video_dir(loaded["job_id"])
+        video_dir.mkdir(parents=True, exist_ok=True)
+        target_name = f"audio{suffix}" if suffix in AUDIO_MEDIA_EXTENSIONS else f"video{suffix}"
+        target_path = video_dir / target_name
+        shutil.copy2(media_path, target_path)
+        context_path = video_dir / "page_context.md"
+        info_path = video_dir / "info.json"
+        context_path.write_text(upload_page_context(source_name, target_path), encoding="utf-8")
+        info_path.write_text(
+            json.dumps(
+                {
+                    "id": f"{UPLOAD_OUTPUT_PREFIX}{loaded['job_id']}",
+                    "title": source_name,
+                    "source": UPLOAD_SOURCE_TYPE,
+                    "filename": source_name,
+                    "media_path": str(target_path),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        loaded.update(
+            {
+                "media_path": str(target_path),
+                "video_path": str(target_path),
+                "page_context_path": str(context_path),
+                "video_dir": str(video_dir),
+                "title": source_name,
+                "source_name": source_name,
+            }
+        )
+        loaded["run_dir"] = str(video_dir / loaded["options"]["run_name"])
+        self.save_job(loaded)
+        if parse_bool(normalize_optional_template(payload.get("auto_start") if "auto_start" in payload else payload.get("autoStart", False))):
+            return self.start_run(loaded["job_id"])
+        return self.public_job(loaded)
+
+    def _create_job(
+        self,
+        payload: dict[str, Any],
+        *,
+        video_url: str,
+        source_type: str = "url",
+        source_name: str | None = None,
+        upload_suffix: str | None = None,
+    ) -> dict[str, Any]:
 
         analysis_mode = str(payload.get("analysis_mode") or payload.get("analysisMode") or "auto").strip() or "auto"
         if analysis_mode not in ALLOWED_ANALYSIS_MODES:
             raise BridgeError(HTTPStatus.BAD_REQUEST, f"analysis_mode must be one of {sorted(ALLOWED_ANALYSIS_MODES)}")
 
-        cookie_browser = normalize_cookie_browser(payload.get("cookies_from_browser") or payload.get("cookiesFromBrowser"))
+        cookie_browser = "" if source_type == UPLOAD_SOURCE_TYPE else normalize_cookie_browser(payload.get("cookies_from_browser") or payload.get("cookiesFromBrowser"))
         if cookie_browser not in ALLOWED_COOKIE_BROWSERS:
             raise BridgeError(
                 HTTPStatus.BAD_REQUEST,
                 f"cookies_from_browser must be one of {sorted(ALLOWED_COOKIE_BROWSERS)} or none",
             )
-        download_device = str(payload.get("download_device") or payload.get("downloadDevice") or "local").strip() or "local"
+        download_device = "local" if source_type == UPLOAD_SOURCE_TYPE else str(payload.get("download_device") or payload.get("downloadDevice") or "local").strip() or "local"
         if download_device not in ALLOWED_DOWNLOAD_DEVICES:
             raise BridgeError(HTTPStatus.BAD_REQUEST, f"download_device must be one of {sorted(ALLOWED_DOWNLOAD_DEVICES)}")
 
@@ -462,15 +540,15 @@ class VideoLinkStatusServer:
         skip_images = parse_bool_option(payload, "skip_images", "skipImages", defaults["skip_images"])
         auto_start = parse_bool(normalize_optional_template(payload.get("auto_start") if "auto_start" in payload else payload.get("autoStart", False)))
         keep_existing = parse_bool_option(payload, "keep_existing", "keepExisting", defaults["keep_existing"])
-        include_subtitles = parse_bool_option(payload, "include_subtitles", "includeSubtitles", defaults["include_subtitles"])
+        include_subtitles = False if source_type == UPLOAD_SOURCE_TYPE else parse_bool_option(payload, "include_subtitles", "includeSubtitles", defaults["include_subtitles"])
         prefer_subtitle_transcript = parse_bool_option(
             payload,
             "prefer_subtitle_transcript",
             "preferSubtitleTranscript",
-            defaults["prefer_subtitle_transcript"],
+            False if source_type == UPLOAD_SOURCE_TYPE else defaults["prefer_subtitle_transcript"],
         )
-        include_comments = parse_bool_option(payload, "include_comments", "includeComments", defaults["include_comments"])
-        refresh_context = parse_bool_option(payload, "refresh_context", "refreshContext", defaults["refresh_context"])
+        include_comments = False if source_type == UPLOAD_SOURCE_TYPE else parse_bool_option(payload, "include_comments", "includeComments", defaults["include_comments"])
+        refresh_context = False if source_type == UPLOAD_SOURCE_TYPE else parse_bool_option(payload, "refresh_context", "refreshContext", defaults["refresh_context"])
         max_comments = parse_int_option(payload.get("max_comments") if "max_comments" in payload else payload.get("maxComments"), defaults["max_comments"])
         subtitle_langs = str(payload.get("subtitle_langs") or payload.get("subtitleLangs") or defaults["subtitle_langs"]).strip()
         focus_prompt = normalize_focus_prompt(payload.get("focus_prompt") if "focus_prompt" in payload else payload.get("focusPrompt", ""))
@@ -484,6 +562,9 @@ class VideoLinkStatusServer:
             "created_at": iso_now(),
             "updated_at": iso_now(),
             "video_url": video_url,
+            "source_type": source_type,
+            "source_name": source_name,
+            "upload_suffix": upload_suffix,
             "options": {
                 "analysis_mode": analysis_mode,
                 "profile": profile,
@@ -1159,13 +1240,16 @@ class VideoLinkStatusServer:
         self.save_job(job)
 
     def stage_probe(self, job: dict[str, Any]) -> dict[str, Any]:
-        duration = probe_duration_seconds(job["video_url"])
+        duration = probe_media_duration_seconds(job["media_path"]) if self.uploaded_media_job(job) else probe_duration_seconds(job["video_url"])
         requested_mode = job["options"]["analysis_mode"]
         resolved_mode, reason = resolve_auto_analysis_mode(
             requested_mode=requested_mode,
             duration_seconds=duration,
             focus_prompt=(job.get("options") or {}).get("focus_prompt") or "",
         )
+        if self.uploaded_media_job(job) and resolved_mode == "long-talk-fast":
+            resolved_mode = "fast"
+            reason = f"{reason}; upload media uses direct fast pipeline"
         job["resolved_mode"] = resolved_mode
         job["resolved_mode_reason"] = reason
         return {"artifacts": {"duration_seconds": duration, "resolved_mode": resolved_mode, "resolved_mode_reason": reason}}
@@ -1176,6 +1260,8 @@ class VideoLinkStatusServer:
     def stage_prepare(self, job: dict[str, Any], log_path: str, stage_info: dict[str, Any] | None = None) -> dict[str, Any]:
         if not job.get("resolved_mode"):
             self.stage_probe(job)
+        if self.uploaded_media_job(job):
+            return self.stage_prepare_uploaded_media(job)
         command = self.prepare_command(job)
         result = self.run_command(command, log_path, on_start=self.record_stage_process(job, "prepare", stage_info))
         text = Path(log_path).read_text(encoding="utf-8", errors="replace")
@@ -1207,7 +1293,7 @@ class VideoLinkStatusServer:
             self.stage_probe(job)
         command = self.operation_command(job)
         result = self.run_command(command, log_path, on_start=self.record_stage_process(job, "analyze-core", stage_info))
-        run_dir = parse_run_dir(Path(log_path).read_text(encoding="utf-8", errors="replace"))
+        run_dir = str(job.get("run_dir") or "") if self.uploaded_media_job(job) else parse_run_dir(Path(log_path).read_text(encoding="utf-8", errors="replace"))
         if not run_dir:
             raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, "operation stage did not print a run directory")
         job["run_dir"] = str(self.resolve_output_path(run_dir))
@@ -1303,6 +1389,8 @@ class VideoLinkStatusServer:
         return _record
 
     def operation_command(self, job: dict[str, Any]) -> list[str]:
+        if self.uploaded_media_job(job):
+            return self.uploaded_media_operation_command(job)
         opts = job["options"]
         resolved_mode = job.get("resolved_mode") or opts["analysis_mode"]
         if resolved_mode == "long-talk-fast":
@@ -1332,6 +1420,34 @@ class VideoLinkStatusServer:
         self.append_url_options(command, opts)
         return command
 
+    def uploaded_media_operation_command(self, job: dict[str, Any]) -> list[str]:
+        opts = job["options"]
+        media_path = Path(str(job.get("media_path") or job.get("video_path") or ""))
+        context_path = Path(str(job.get("page_context_path") or ""))
+        run_dir = Path(str(job.get("run_dir") or ""))
+        if not media_path.is_file():
+            raise BridgeError(HTTPStatus.BAD_REQUEST, f"uploaded media file does not exist: {media_path}")
+        if not context_path.is_file():
+            raise BridgeError(HTTPStatus.BAD_REQUEST, f"uploaded media context does not exist: {context_path}")
+        if not run_dir:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "uploaded media job is missing run_dir")
+
+        args = argparse.Namespace(
+            config="config",
+            profile=opts["profile"],
+            python=os.environ.get("PYTHON") or sys.executable,
+            pipeline_mode=pipeline_mode_for(job.get("resolved_mode") or opts["analysis_mode"]),
+            run_name=opts["run_name"],
+            log_level="INFO",
+            resume_existing_core=True,
+            no_keep_frames=False,
+            max_frames=None,
+            duration=None,
+        )
+        apply_runtime_profile(args)
+        context_for_analysis = materialize_analysis_context(context_path, run_dir, opts.get("focus_prompt") or "")
+        return build_analyzer_command(args, media_path, context_for_analysis, run_dir)
+
     def prepare_command(self, job: dict[str, Any]) -> list[str]:
         opts = job["options"]
         resolved_mode = job.get("resolved_mode") or opts["analysis_mode"]
@@ -1348,6 +1464,30 @@ class VideoLinkStatusServer:
         ]
         self.append_url_options(command, opts)
         return command
+
+    def stage_prepare_uploaded_media(self, job: dict[str, Any]) -> dict[str, Any]:
+        media_path = Path(str(job.get("media_path") or job.get("video_path") or ""))
+        page_context = Path(str(job.get("page_context_path") or ""))
+        if not media_path.is_file():
+            raise BridgeError(HTTPStatus.BAD_REQUEST, f"uploaded media file does not exist: {media_path}")
+        if media_path.suffix.lower() not in MEDIA_EXTENSIONS:
+            raise BridgeError(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "uploaded media file is not supported")
+        if not page_context.is_file():
+            page_context.write_text(upload_page_context(str(job.get("source_name") or media_path.name), media_path), encoding="utf-8")
+        job["video_path"] = str(media_path)
+        job["media_path"] = str(media_path)
+        job["page_context_path"] = str(page_context)
+        job["video_dir"] = str(media_path.parent)
+        job["run_dir"] = str(media_path.parent / job["options"]["run_name"])
+        title = self.resolve_job_title(job)
+        artifacts = {
+            "video_path": job["video_path"],
+            "page_context": job["page_context_path"],
+            "video_dir": job["video_dir"],
+            "title": title,
+            "command": ["prepare-uploaded-media", str(media_path)],
+        }
+        return {"artifacts": artifacts, "stdout_tail": []}
 
     def append_url_options(self, command: list[str], opts: dict[str, Any]) -> None:
         if opts.get("keep_existing"):
@@ -2070,6 +2210,16 @@ class VideoLinkStatusServer:
         }
 
     def source_player_metadata(self, job: dict[str, Any]) -> dict[str, Any]:
+        if self.uploaded_media_job(job):
+            return {
+                "source_url": None,
+                "provider": "local_media",
+                "can_embed": False,
+                "supports_timestamp": False,
+                "embed_url": None,
+                "watch_url": None,
+                "duration_seconds": self.preview_duration_seconds(job),
+            }
         source_url = str(job.get("video_url") or "").strip()
         duration_seconds = self.preview_duration_seconds(job)
         base = {
@@ -2323,7 +2473,7 @@ class VideoLinkStatusServer:
         public["summary"] = self.collect_summary(job)
         title = self.resolve_job_title(public)
         public["title"] = title
-        public["display_title"] = title or job.get("video_url") or job.get("job_id")
+        public["display_title"] = title or job.get("source_name") or job.get("video_url") or job.get("job_id")
         public["stage_order"] = STAGE_ORDER
         public["progress"] = self.progress(job)
         public["current_stage"] = self.current_stage(job)
@@ -2351,6 +2501,8 @@ class VideoLinkStatusServer:
         public = {
             "job_id": job["job_id"],
             "video_url": job.get("video_url"),
+            "source_type": job.get("source_type") or "url",
+            "source_name": job.get("source_name"),
             "status": job.get("status"),
             "created_at": job.get("created_at"),
             "updated_at": job.get("updated_at"),
@@ -2365,7 +2517,7 @@ class VideoLinkStatusServer:
         }
         title = self.resolve_job_title(public)
         public["title"] = title
-        public["display_title"] = title or job.get("video_url") or job.get("job_id")
+        public["display_title"] = title or job.get("source_name") or job.get("video_url") or job.get("job_id")
         public["stage_order"] = STAGE_ORDER
         public["progress"] = self.progress(job)
         public["current_stage"] = self.current_stage(job)
@@ -2407,6 +2559,7 @@ class VideoLinkStatusServer:
     def resolve_job_title(self, job: dict[str, Any]) -> str:
         for value in (
             job.get("title"),
+            job.get("source_name"),
             ((job.get("summary") or {}).get("study") or {}).get("title"),
         ):
             title = clean_display_title(value)
@@ -2867,6 +3020,12 @@ class VideoLinkStatusServer:
 
     def job_dir(self, job_id: str) -> Path:
         return self.jobs_dir / job_id
+
+    def upload_video_dir(self, job_id: str) -> Path:
+        return self.resolve_output_path(str(Path(FALLBACK_OUTPUT_ROOT) / f"{UPLOAD_OUTPUT_PREFIX}{job_id}"))
+
+    def uploaded_media_job(self, job: dict[str, Any]) -> bool:
+        return (job.get("source_type") or "") == UPLOAD_SOURCE_TYPE
 
     def job_path(self, job_id: str) -> Path:
         return self.job_dir(job_id) / "job.json"
@@ -4160,6 +4319,50 @@ def probe_duration_seconds(video_url: str) -> int | None:
         return int(float(duration)) if duration else None
     except Exception:
         return None
+
+
+def probe_media_duration_seconds(media_path: str | Path) -> int | None:
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(media_path),
+    ]
+    try:
+        completed = subprocess.run(command, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=operation_env())
+        duration = completed.stdout.strip()
+        return int(float(duration)) if duration else None
+    except Exception:
+        return None
+
+
+def sanitize_upload_filename(filename: str) -> str:
+    candidate = Path(str(filename or "media")).name.strip()
+    candidate = re.sub(r"[^A-Za-z0-9._-]+", "-", candidate).strip(".-")
+    if not candidate:
+        candidate = "media"
+    suffix = Path(candidate).suffix.lower()
+    stem = Path(candidate).stem[:80].strip(".-") or "media"
+    return f"{stem}{suffix}"
+
+
+def upload_page_context(source_name: str, media_path: Path) -> str:
+    return "\n".join(
+        [
+            f"# {source_name}",
+            "",
+            "## 来源",
+            "",
+            "- 类型：本地上传媒体文件",
+            f"- 文件名：{source_name}",
+            f"- 服务端路径：{media_path}",
+            "",
+        ]
+    )
 
 
 def can_connect_local_proxy() -> bool:

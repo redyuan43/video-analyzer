@@ -24,17 +24,25 @@
         <section id="consoleView" class="workspace view-panel active">
             <aside class="sidebar">
                 <section class="panel">
-                    <h2>新建任务</h2>
-                    <form id="jobForm" class="job-form">
-                        <label class="wide url-entry">
-                            <span>视频链接</span>
-                            <div class="url-add-row">
-                                <input id="videoUrlInput" name="video_url_input" type="text" inputmode="url" placeholder="https://">
-                                <button id="addUrlButton" class="icon-button" type="button" title="添加链接" aria-label="添加链接">+</button>
-                            </div>
-                        </label>
-                        <textarea id="videoUrls" name="video_urls" hidden></textarea>
-                        <div id="urlList" class="url-list" aria-live="polite"></div>
+	                    <h2>新建任务</h2>
+	                    <form id="jobForm" class="job-form">
+	                        <div class="source-mode-tabs" role="tablist" aria-label="任务来源">
+	                            <button id="urlSourceTab" class="source-mode-tab active" type="button" data-source-mode="url">链接</button>
+	                            <button id="fileSourceTab" class="source-mode-tab" type="button" data-source-mode="file">文件</button>
+	                        </div>
+	                        <label id="urlEntry" class="wide url-entry">
+	                            <span>视频链接</span>
+	                            <div class="url-add-row">
+	                                <input id="videoUrlInput" name="video_url_input" type="text" inputmode="url" placeholder="https://">
+	                                <button id="addUrlButton" class="icon-button" type="button" title="添加链接" aria-label="添加链接">+</button>
+	                            </div>
+	                        </label>
+	                        <textarea id="videoUrls" name="video_urls" hidden></textarea>
+	                        <div id="urlList" class="url-list" aria-live="polite"></div>
+	                        <label id="mediaEntry" class="wide media-entry" hidden>
+	                            <span>媒体文件</span>
+	                            <input id="mediaFile" name="media" type="file" accept=".mp3,.m4a,.wav,.aac,.opus,.ogg,.flac,.mp4,.mov,.mkv,.webm,.avi,.m4v,audio/*,video/*">
+	                        </label>
                         <label class="wide focus-prompt">
                             <span>Focus Prompt / 关注重点</span>
                             <textarea id="focusPrompt" name="focus_prompt" rows="4" placeholder="希望分析时特别关注的问题、模块、风险点或输出角度"></textarea>
@@ -265,6 +273,10 @@
                     <label class="view-switch">
                         <input id="toggleStudyPanel" type="checkbox" checked>
                         <span>学习视图</span>
+                    </label>
+                    <label class="view-switch">
+                        <input id="toggleSourcePlayerPanel" type="checkbox" checked>
+                        <span>在线视频</span>
                     </label>
                     <label class="view-switch">
                         <input id="toggleDocContentPanel" type="checkbox" checked>

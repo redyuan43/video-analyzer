@@ -151,6 +151,26 @@ body {
     gap: 12px;
 }
 
+.source-mode-tabs {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 4px;
+    padding: 4px;
+    border: 1px solid #d7dde5;
+    border-radius: 8px;
+    background: #f8fafc;
+}
+
+.source-mode-tab {
+    background: transparent;
+    color: #475467;
+}
+
+.source-mode-tab.active {
+    background: #111827;
+    color: #fff;
+}
+
 label {
     display: grid;
     gap: 6px;

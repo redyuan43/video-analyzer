@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import sys
 import tempfile
 import unittest
@@ -41,8 +42,13 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn('id="addUrlButton"', html)
         self.assertIn('id="urlList"', html)
         self.assertIn('id="videoUrls"', html)
+        self.assertIn('id="fileSourceTab"', html)
+        self.assertIn('id="mediaFile"', html)
         self.assertIn('id="focusPrompt"', html)
-        self.assertIn("关注重点", (UI_ROOT / "video_analyzer_ui" / "static" / "js" / "main.js").read_text(encoding="utf-8"))
+        main_js = (UI_ROOT / "video_analyzer_ui" / "static" / "js" / "main.js").read_text(encoding="utf-8")
+        self.assertIn("关注重点", main_js)
+        self.assertIn("/api/video-link/jobs/upload", main_js)
+        self.assertIn("FormData", main_js)
         self.assertIn('<label hidden>', html)
         self.assertIn('id="globalSummary"', html)
         self.assertIn('id="resourceLanes"', html)
@@ -70,6 +76,7 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn('class="qa-source-player source-player-panel"', html)
         self.assertIn('id="sourcePlayerStopButton"', html)
         self.assertIn('id="sourcePlayerPanel"', html)
+        self.assertIn('id="toggleSourcePlayerPanel"', html)
         self.assertIn('data-resize-pane="study"', html)
         self.assertIn('data-resize-pane="doc-list"', html)
         self.assertIn("vendor/markdown-it/markdown-it.min.js", html)
@@ -179,6 +186,30 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertEqual(result["created"], 2)
         self.assertEqual(result["failed"], 1)
         self.assertEqual(list_response.get_json()["total"], 2)
+
+    def test_video_link_api_upload_media_create(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp) / "jobs", video_link_auto_resume=False)
+            ui.video_link.repo_root = Path(tmp) / "repo"
+            ui.video_link.repo_root.mkdir()
+            client = ui.app.test_client()
+
+            create = client.post(
+                "/api/video-link/jobs/upload",
+                data={
+                    "media": (io.BytesIO(b"fake audio"), "sample.mp3"),
+                    "analysis_mode": "fast",
+                    "auto_start": "false",
+                },
+                content_type="multipart/form-data",
+            )
+            result = create.get_json()
+            list_response = client.get("/api/video-link/jobs")
+
+        self.assertEqual(create.status_code, 201)
+        self.assertEqual(result["source_type"], "upload")
+        self.assertEqual(result["source_name"], "sample.mp3")
+        self.assertEqual(list_response.get_json()["total"], 1)
 
     def test_video_link_api_open_run_dir(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -414,6 +445,9 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn("sourcePlayerState.loaded = true", js)
         self.assertIn("sourcePlayerTargets", js)
         self.assertIn("qaSourcePlayerBody", js)
+        self.assertIn("sourcePlayer: true", js)
+        self.assertIn("'sourcePlayer'", js)
+        self.assertIn("toggleSourcePlayerPanel", js)
         self.assertIn("pauseSourcePlayer", js)
         self.assertNotIn("sourceLocalVideoUrl", js)
         self.assertNotIn("syncLocalSourceVideos", js)
@@ -427,6 +461,7 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertNotIn("source-player-click-catcher", js)
         self.assertNotIn("bindSourcePlayerSurfacePause", js)
         self.assertIn("url.searchParams.set('t', String(value))", js)
+        self.assertIn("nodes.sourcePlayerPanel && learningPanelVisibility.sourcePlayer", js)
         self.assertIn("playerVisible && (docListVisible || studyVisible || contentVisible)", js)
         self.assertIn("qaSourceHeight", js)
         self.assertIn("--qa-source-pane-width", css)

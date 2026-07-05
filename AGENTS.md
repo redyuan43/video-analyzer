@@ -75,6 +75,18 @@ A passing local response includes:
 - After a smoke test, unload only the local VibeVoice backend if needed; keep unrelated local services untouched.
 - If `18012` health times out during a request, check GPU processes before declaring failure; model initialization can occupy the backend until the request completes.
 
+## AI Host VNC Operations
+
+- The quick local helper for recreating the current x11vnc setup is `/home/ai/create-vnc-server.sh`. Do not record the VNC password in repo files. Keep the active password in the local password file used by the service.
+- To refresh the VNC password and restart the existing service, run:
+  `/home/ai/create-vnc-server.sh restart`
+  Override only when needed with `VNC_PASSWORD=... /home/ai/create-vnc-server.sh restart`.
+- The persistent service is `x11vnc.service`, defined at `/etc/systemd/system/x11vnc.service`. It serves the logged-in `ai` desktop on `:1` with auth `/run/user/1000/gdm/Xauthority`.
+- If VNC works on the GDM login screen and then fails after login, check whether the graphical session switched from `:0` to `:1` and whether `x11vnc.service` took over port `5900`. In that state, changing a temporary password file such as `/tmp/x11vnc-ai.pass` will not help; update `/home/ai/.vnc/passwd` with `vncpasswd -f` and restart `x11vnc.service`.
+- For TigerVNC password failures, inspect:
+  `journalctl -u x11vnc.service --since '10 minutes ago' --no-pager`
+  and look for `password check failed`, the active `-rfbauth` path, and the active display. Use `vncpasswd -f` to write the password file; do not use `x11vnc -storepasswd - file` as if it read from stdin.
+
 ## Video Link Status Server
 
 - The local status server starts durable `video-link` background runs from the unified UI at `http://127.0.0.1:5000/`, then shows progress for:

@@ -96,6 +96,26 @@ class VideoAnalyzerUI:
             except BridgeError as exc:
                 return jsonify({'error': exc.message}), int(exc.status)
 
+        @self.app.route('/api/video-link/jobs/upload', methods=['POST'])
+        def video_link_create_upload_job():
+            media = request.files.get('media')
+            if not media or not media.filename:
+                return jsonify({'error': 'media file is required'}), int(HTTPStatus.BAD_REQUEST)
+            temp_dir = self.tmp_root / 'video-link-uploads'
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            temp_path = temp_dir / f"{uuid.uuid4().hex}-{secure_filename(media.filename)}"
+            try:
+                media.save(temp_path)
+                payload = dict(request.form.items())
+                return (
+                    jsonify(self.video_link.create_uploaded_media_job(payload, temp_path, media.filename)),
+                    int(HTTPStatus.CREATED),
+                )
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+            finally:
+                temp_path.unlink(missing_ok=True)
+
         @self.app.route('/api/video-link/jobs/batch', methods=['POST'])
         def video_link_create_jobs():
             try:
