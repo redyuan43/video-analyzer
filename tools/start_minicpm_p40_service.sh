@@ -11,6 +11,7 @@ BASE_BACKEND_PORT="${MINICPM_BASE_BACKEND_PORT:-18182}"
 WORKER_COUNT="${MINICPM_WORKER_COUNT:-6}"
 GPU_IDS="${MINICPM_GPU_IDS:-0,1,2,3,4,5}"
 PYTHON_BIN="${MINICPM_PYTHON:-${ROOT_DIR}/.venv/bin/python}"
+STOP_CONFLICTS="${MINICPM_STOP_CONFLICTS:-1}"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   PYTHON_BIN="$(command -v python3)"
@@ -108,7 +109,9 @@ start_minicpm() {
   fi
 
   mkdir -p "${RUNTIME_DIR}" "${LOG_DIR}"
-  stop_conflicting_gpu_services
+  if [[ "${STOP_CONFLICTS}" != "0" ]]; then
+    stop_conflicting_gpu_services
+  fi
   stop_minicpm
 
   cd "${ROOT_DIR}"

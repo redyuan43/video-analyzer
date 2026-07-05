@@ -16,10 +16,14 @@ from tools.prepare_video_doc_export import rewrite_image_paths
 
 
 class VideoDocImageTests(unittest.TestCase):
-    def test_parse_chapters_splits_long_transcript_without_page_chapters(self):
+    def test_parse_chapters_names_fallback_segments_from_transcript(self):
         transcript = {
             "segments": [
-                {"start_time": index * 35.0, "end_time": (index + 1) * 35.0, "text": f"segment {index}"}
+                {
+                    "start_time": index * 35.0,
+                    "end_time": (index + 1) * 35.0,
+                    "text": "设置 Hermes Telegram 代理团队" if index < 8 else f"配置第 {index} 个步骤",
+                }
                 for index in range(49)
             ]
         }
@@ -29,7 +33,8 @@ class VideoDocImageTests(unittest.TestCase):
         self.assertGreaterEqual(len(chapters), 6)
         self.assertLessEqual(len(chapters), 10)
         self.assertNotEqual(chapters[0]["end"], "00:00:00")
-        self.assertTrue(chapters[0]["title"].startswith("自动分段"))
+        self.assertIn("设置 Hermes", chapters[0]["title"])
+        self.assertNotIn("自动分段", chapters[0]["title"])
 
     def test_augment_video_docs_images_inserts_final_and_representative_images(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -127,7 +132,7 @@ class VideoDocImageTests(unittest.TestCase):
             self.assertNotIn("01-image-cards-operation-manual.png", text)
             self.assertNotIn("02-infographic-knowledge-notes.png", text)
 
-    def test_prepare_baoyu_prompts_drops_operation_manual_image_prompt(self):
+    def test_prepare_baoyu_prompts_drops_operation_manual_and_evidence_image_prompts(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
             (run_dir / "docs_analysis").mkdir()
@@ -137,6 +142,7 @@ class VideoDocImageTests(unittest.TestCase):
             prompt_dir = run_dir / "baoyu_images" / "prompts"
             prompt_dir.mkdir(parents=True)
             (prompt_dir / "01-image-cards-operation-manual.md").write_text("stale", encoding="utf-8")
+            (prompt_dir / "04-infographic-manual-evidence.md").write_text("stale", encoding="utf-8")
 
             import sys
 
@@ -148,9 +154,37 @@ class VideoDocImageTests(unittest.TestCase):
                 sys.argv = old_argv
 
             self.assertFalse((prompt_dir / "01-image-cards-operation-manual.md").exists())
+            self.assertFalse((prompt_dir / "04-infographic-manual-evidence.md").exists())
             self.assertTrue((prompt_dir / "02-infographic-knowledge-notes.md").exists())
             self.assertTrue((prompt_dir / "03-infographic-deep-report.md").exists())
-            self.assertTrue((prompt_dir / "04-infographic-manual-evidence.md").exists())
+
+    def test_augment_cleans_manual_evidence_generated_image_reference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "baoyu_images" / "final").mkdir(parents=True)
+            doc = run_dir / "manual_evidence.md"
+            doc.write_text(
+                "# 帧证据索引\n\n"
+                "![证据索引视觉摘要](baoyu_images/final/04-infographic-manual-evidence.png)\n\n"
+                "## 文字证据地图\n\n"
+                "| 时间 | 帧 | OCR 状态 | OCR 摘要 | 视觉摘要 |\n"
+                "| --- | --- | --- | --- | --- |\n"
+                "| 0.00s | Frame 0 | `ok` | 标题 | 画面 |\n",
+                encoding="utf-8",
+            )
+
+            import sys
+
+            old_argv = sys.argv
+            try:
+                sys.argv = ["augment_video_docs_images.py", str(run_dir)]
+                augment_main()
+            finally:
+                sys.argv = old_argv
+
+            text = doc.read_text(encoding="utf-8")
+            self.assertNotIn("04-infographic-manual-evidence.png", text)
+            self.assertIn("## 文字证据地图", text)
 
     def test_export_rewrite_removes_parent_directory_image_paths(self):
         with tempfile.TemporaryDirectory() as tmp:

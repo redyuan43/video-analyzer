@@ -7,6 +7,7 @@ const stageNames = {
     'deep-v2': '章节深度报告',
     'study-guide': '学习证据账本',
     'evidence-review': '证据复核/发布门禁',
+    'qa-index': '问答证据索引',
     'image-prompts': '生成配图提示词',
     'final-publish': '最终定稿/发布'
 };
@@ -15,10 +16,9 @@ const initialParams = new URLSearchParams(window.location.search);
 let selectedJobId = initialParams.get('job') || document.querySelector('.app-shell')?.dataset.initialJob || null;
 let selectedLogStage = null;
 let refreshTimer = null;
-let scanAnimationFrame = null;
 let currentJob = null;
 let latestJobs = [];
-let currentView = ['preview', 'vscode'].includes(initialParams.get('view'))
+let currentView = ['qa', 'vscode'].includes(initialParams.get('view'))
     ? initialParams.get('view')
     : 'console';
 let pendingUrls = [];
@@ -27,14 +27,40 @@ let selectedDocPath = '';
 let renderedDocListKey = '';
 let loadedDocPreviewKey = '';
 let loadedStudyKey = '';
-const videoLoadErrors = {};
+let loadedQaHistoryKey = '';
+const frameTimeMaps = {};
+const sourcePlayerState = {
+    jobId: '',
+    seconds: null,
+    loaded: false
+};
+const imageViewer = {
+    node: null,
+    image: null,
+    playButton: null,
+    scaleLabel: null,
+    scale: 1,
+    jobId: '',
+    seconds: null
+};
+const paneResizeState = {
+    active: null,
+    pointerId: null
+};
+const paneLayoutStorageKey = 'videoAnalyzerPaneLayout';
+const panelVisibilityStorageKey = 'videoAnalyzerLearningPanels';
+const learningPanelVisibility = {
+    docList: true,
+    study: true,
+    docContent: true
+};
 
 const nodes = {
     consoleTab: document.getElementById('consoleTab'),
-    previewTab: document.getElementById('previewTab'),
+    qaTab: document.getElementById('qaTab'),
     vscodeTab: document.getElementById('vscodeTab'),
     consoleView: document.getElementById('consoleView'),
-    previewView: document.getElementById('previewView'),
+    qaView: document.getElementById('qaView'),
     vscodeView: document.getElementById('vscodeView'),
     jobForm: document.getElementById('jobForm'),
     formError: document.getElementById('formError'),
@@ -80,18 +106,48 @@ const nodes = {
     logText: document.getElementById('logText'),
     copyLogButton: document.getElementById('copyLogButton'),
     copyMessage: document.getElementById('copyMessage'),
-    refreshPreviewButton: document.getElementById('refreshPreviewButton'),
-    previewSummary: document.getElementById('previewSummary'),
-    previewGrid: document.getElementById('previewGrid'),
+    qaSummary: document.getElementById('qaSummary'),
+    qaWarnings: document.getElementById('qaWarnings'),
+    qaMessages: document.getElementById('qaMessages'),
+    qaForm: document.getElementById('qaForm'),
+    qaQuestion: document.getElementById('qaQuestion'),
+    qaAskButton: document.getElementById('qaAskButton'),
+    qaSourcePlayerPanel: document.querySelector('.qa-source-player'),
+    qaLayout: document.querySelector('.qa-layout'),
+    qaSidePanel: document.querySelector('.qa-side-panel'),
+    qaSourcePlayerSummary: document.getElementById('qaSourcePlayerSummary'),
+    qaSourcePlayerOpenLink: document.getElementById('qaSourcePlayerOpenLink'),
+    qaSourcePlayerStopButton: document.getElementById('qaSourcePlayerStopButton'),
+    qaSourcePlayerBody: document.getElementById('qaSourcePlayerBody'),
+    qaSourceResizer: document.querySelector('.qa-source-resizer'),
+    qaSourceHeightResizer: document.querySelector('.qa-source-height-resizer'),
+    skillSummary: document.getElementById('skillSummary'),
+    skillWarnings: document.getElementById('skillWarnings'),
+    generateSkillButton: document.getElementById('generateSkillButton'),
+    enableSkillButton: document.getElementById('enableSkillButton'),
     vscodeSummary: document.getElementById('vscodeSummary'),
     startVscodeButton: document.getElementById('startVscodeButton'),
     openVscodeLink: document.getElementById('openVscodeLink'),
     restartVscodeButton: document.getElementById('restartVscodeButton'),
     stopVscodeButton: document.getElementById('stopVscodeButton'),
+    vscodeDocs: document.querySelector('.vscode-docs'),
+    toggleDocListPanel: document.getElementById('toggleDocListPanel'),
+    toggleStudyPanel: document.getElementById('toggleStudyPanel'),
+    toggleDocContentPanel: document.getElementById('toggleDocContentPanel'),
     vscodePlaceholder: document.getElementById('vscodePlaceholder'),
     vscodeFrame: document.getElementById('vscodeFrame'),
     docPreviewSummary: document.getElementById('docPreviewSummary'),
+    docListPanel: document.querySelector('.doc-list-panel'),
     docList: document.getElementById('docList'),
+    docListResizer: document.querySelector('.doc-list-resizer'),
+    studyPanel: document.getElementById('studyPanel'),
+    studyResizer: document.querySelector('[data-resize-pane="study"]'),
+    sourcePlayerPanel: document.getElementById('sourcePlayerPanel'),
+    sourcePlayerResizer: document.querySelector('[data-resize-pane="source-player"]'),
+    sourcePlayerSummary: document.getElementById('sourcePlayerSummary'),
+    sourcePlayerOpenLink: document.getElementById('sourcePlayerOpenLink'),
+    sourcePlayerStopButton: document.getElementById('sourcePlayerStopButton'),
+    sourcePlayerBody: document.getElementById('sourcePlayerBody'),
     docPreviewPanel: document.querySelector('.doc-preview-panel'),
     docPreviewTitle: document.getElementById('docPreviewTitle'),
     docOpenLink: document.getElementById('docOpenLink'),
@@ -317,8 +373,10 @@ async function createJob(event) {
 }
 
 function selectJob(jobId, updateUrl = true) {
+    const changed = selectedJobId !== jobId;
     selectedJobId = jobId;
     selectedLogStage = null;
+    if (changed) resetQaMessages();
     if (updateUrl) {
         const url = new URL(window.location.href);
         url.searchParams.set('job', jobId);
@@ -329,15 +387,15 @@ function selectJob(jobId, updateUrl = true) {
 }
 
 function setView(view, updateUrl = true) {
-    currentView = ['preview', 'vscode'].includes(view) ? view : 'console';
+    currentView = ['qa', 'vscode'].includes(view) ? view : 'console';
     nodes.consoleView.hidden = currentView !== 'console';
-    nodes.previewView.hidden = currentView !== 'preview';
+    nodes.qaView.hidden = currentView !== 'qa';
     nodes.vscodeView.hidden = currentView !== 'vscode';
     nodes.consoleView.classList.toggle('active', currentView === 'console');
-    nodes.previewView.classList.toggle('active', currentView === 'preview');
+    nodes.qaView.classList.toggle('active', currentView === 'qa');
     nodes.vscodeView.classList.toggle('active', currentView === 'vscode');
     nodes.consoleTab.classList.toggle('active', currentView === 'console');
-    nodes.previewTab.classList.toggle('active', currentView === 'preview');
+    nodes.qaTab.classList.toggle('active', currentView === 'qa');
     nodes.vscodeTab.classList.toggle('active', currentView === 'vscode');
     if (updateUrl) {
         const url = new URL(window.location.href);
@@ -348,8 +406,7 @@ function setView(view, updateUrl = true) {
         }
         window.history.replaceState({}, '', url);
     }
-    renderPreviewGrid(latestJobs);
-    if (currentView === 'preview') startScanAnimation();
+    renderQaPanel(currentJob);
     renderVscodePanel(currentJob);
 }
 
@@ -396,15 +453,39 @@ function renderJobList(jobs) {
     bindJobButtons();
 }
 
+function mergeSelectedJobSnapshot(snapshot) {
+    if (!snapshot || currentJob?.job_id !== snapshot.job_id) return snapshot;
+    const merged = { ...currentJob, ...snapshot };
+    [
+        'summary',
+        'core_diagnostics',
+        'preview',
+        'vscode_preview',
+        'warnings',
+        'queue',
+        'core_progress',
+        'stage_progress'
+    ].forEach(key => {
+        if (snapshot[key] === undefined && currentJob[key] !== undefined) {
+            merged[key] = currentJob[key];
+        }
+    });
+    return merged;
+}
+
+function renderSelectedJobSnapshot(jobs) {
+    const snapshot = selectedJobId ? jobs.find(job => job.job_id === selectedJobId) : null;
+    if (!snapshot) return;
+    renderJob(mergeSelectedJobSnapshot(snapshot));
+}
+
 async function refreshJobs() {
     const data = await getJson('/api/video-link/jobs?limit=50');
     renderGlobal(data);
     const jobs = data.jobs || [];
     latestJobs = jobs;
     renderJobList(jobs);
-    const selectedFromList = selectedJobId ? jobs.find(job => job.job_id === selectedJobId) : null;
-    if (selectedFromList) renderJob(selectedFromList);
-    renderPreviewGrid(jobs);
+    renderSelectedJobSnapshot(jobs);
     const first = preferredJob(jobs);
     if (!selectedJobId && first) selectJob(first.job_id, true);
 }
@@ -429,9 +510,7 @@ async function refreshJobsNoSelect() {
     const jobs = data.jobs || [];
     latestJobs = jobs;
     renderJobList(jobs);
-    const selectedFromList = selectedJobId ? jobs.find(job => job.job_id === selectedJobId) : null;
-    if (selectedFromList) renderJob(selectedFromList);
-    renderPreviewGrid(jobs);
+    renderSelectedJobSnapshot(jobs);
 }
 
 function renderGlobal(data) {
@@ -514,20 +593,23 @@ function bindJobButtons() {
 function renderEmpty() {
     currentJob = null;
     nodes.runButton.disabled = true;
-    nodes.runButton.classList.remove('success-action');
+    nodes.runButton.classList.remove('success-action', 'play-action', 'stop-action');
     nodes.runButton.dataset.action = 'run';
     nodes.runButton.title = '';
+    nodes.runButton.textContent = '继续运行';
     nodes.selectedTitle.textContent = '未选择任务';
     nodes.selectedSubtitle.textContent = '创建或选择一个任务后查看进度。';
     nodes.stageDurationSummary.textContent = '原视频长度：- · 阶段总耗时：-';
+    renderQaPanel(null);
 }
 
 function renderServiceOffline(error) {
     currentJob = null;
     nodes.runButton.disabled = true;
-    nodes.runButton.classList.remove('success-action');
+    nodes.runButton.classList.remove('success-action', 'play-action', 'stop-action');
     nodes.runButton.dataset.action = 'run';
     nodes.runButton.title = '';
+    nodes.runButton.textContent = '继续运行';
     nodes.selectedTitle.textContent = '服务未连接';
     nodes.selectedSubtitle.textContent = error.message;
     setText(nodes.statusValue, 'offline');
@@ -537,6 +619,7 @@ function renderServiceOffline(error) {
     nodes.stageDurationSummary.textContent = '原视频长度：- · 阶段总耗时：-';
     nodes.progressText.textContent = '0/0 · 0%';
     nodes.progressBar.style.width = '0%';
+    renderQaPanel(null);
 }
 
 function activeProcess(job) {
@@ -546,14 +629,22 @@ function activeProcess(job) {
 
 function runDisabledReason(job) {
     const process = activeProcess(job);
-    if (process?.alive) return `已有外部进程 PID ${process.pid} 仍在运行`;
-    if (job.runner?.status === 'running') return '阶段仍在运行，等待完成';
-    if (job.runner?.status === 'queued') return `等待资源: ${job.queue?.resource || job.runner?.queued_for || '-'}`;
+    if (process?.alive || job.runner?.status === 'running' || job.runner?.status === 'queued' || job.status === 'running' || job.status === 'queued') return '';
     return '';
+}
+
+function jobIsActive(job) {
+    const process = activeProcess(job);
+    return Boolean(process?.alive || job.runner?.status === 'running' || job.runner?.status === 'queued' || job.status === 'running' || job.status === 'queued');
 }
 
 function renderJob(job) {
     currentJob = job;
+    if (sourcePlayerState.jobId && sourcePlayerState.jobId !== job.job_id) {
+        sourcePlayerState.jobId = job.job_id;
+        sourcePlayerState.seconds = null;
+        sourcePlayerState.loaded = false;
+    }
     const progress = job.progress || {};
     const stageProgress = job.stage_progress || job.core_progress;
     const queue = job.queue || {};
@@ -561,16 +652,19 @@ function renderJob(job) {
     const process = activeProcess(job);
     const runDir = job.summary?.run_dir || job.run_dir;
     const isSucceeded = job.status === 'succeeded';
+    const isActive = jobIsActive(job);
     const missingRunDir = isSucceeded && !runDir;
     nodes.selectedTitle.textContent = jobDisplayTitle(job);
     const subtitleReason = missingRunDir ? '资源目录不可用' : reason;
     const subtitleBase = `任务 ID: ${job.job_id} · ${job.video_url || '-'}`;
     nodes.selectedSubtitle.textContent = subtitleReason ? `${subtitleBase} · ${subtitleReason}` : subtitleBase;
-    nodes.runButton.disabled = Boolean(subtitleReason);
-    nodes.runButton.dataset.action = isSucceeded ? 'open-run-dir' : 'run';
-    nodes.runButton.classList.toggle('success-action', isSucceeded);
-    nodes.runButton.textContent = isSucceeded ? '成功' : (job.status === 'failed' ? '重试失败阶段' : '继续运行');
-    nodes.runButton.title = isSucceeded && runDir ? `打开资源目录：${runDir}` : '';
+    nodes.runButton.disabled = Boolean(missingRunDir);
+    nodes.runButton.dataset.action = isActive ? 'stop' : (isSucceeded ? 'open-run-dir' : 'run');
+    nodes.runButton.classList.toggle('success-action', isSucceeded && !isActive);
+    nodes.runButton.classList.toggle('play-action', !isSucceeded && !isActive);
+    nodes.runButton.classList.toggle('stop-action', isActive);
+    nodes.runButton.textContent = isActive ? '停止' : (isSucceeded ? '成功' : (job.status === 'failed' ? '重试失败阶段' : '继续运行'));
+    nodes.runButton.title = isActive ? '停止当前运行任务' : (isSucceeded && runDir ? `打开资源目录：${runDir}` : '继续运行任务');
     setText(nodes.statusValue, job.status);
     setText(nodes.currentStageValue, stageNames[job.current_stage] || job.current_stage);
     setText(nodes.nextStageValue, stageNames[job.next_stage] || job.next_stage);
@@ -604,6 +698,7 @@ function renderJob(job) {
     renderStageProgress(stageProgress);
     renderCoreDiagnostics(job.core_diagnostics);
     renderArtifacts(job.summary || {});
+    renderQaPanel(job);
     renderVscodePanel(job);
     loadSelectedLog(job);
 }
@@ -756,6 +851,228 @@ function renderArtifacts(summary) {
     ].join('<br>');
 }
 
+function renderQaPanel(job) {
+    if (!nodes.qaView) return;
+    const qa = job?.summary?.qa || {};
+    const available = Boolean(qa.available || qa.answer_index?.exists);
+    const chunkCount = qa.answer_index?.chunk_count || qa.chunk_count || 0;
+    const runDir = job?.summary?.run_dir || job?.run_dir || '';
+    nodes.qaAskButton.disabled = !job || !available;
+    nodes.qaQuestion.disabled = !job || !available;
+    if (!job) {
+        nodes.qaSummary.textContent = '选择一个已生成问答索引的任务';
+        nodes.qaWarnings.textContent = '等待问答索引';
+        resetQaMessages();
+        renderSkillCandidatePanel(null);
+        return;
+    }
+    if (!available) {
+        nodes.qaSummary.textContent = runDir ? '问答索引尚未生成' : '资源目录尚未生成';
+        nodes.qaWarnings.textContent = '等待“问答证据索引”阶段完成';
+        resetQaMessages();
+        renderSkillCandidatePanel(job);
+        return;
+    }
+    nodes.qaSummary.textContent = `已索引 ${chunkCount} 个证据片段 · ${runDir}`;
+    const warnings = qa.answer_index?.quality_warnings || qa.quality_warnings || qa.warnings || [];
+    nodes.qaWarnings.innerHTML = warnings.length
+        ? warnings.map(item => `<div class="qa-warning">${escapeHtml(item.message || item.code || item)}</div>`).join('')
+        : '<div class="qa-ok">未发现明显证据边界警告</div>';
+    loadFrameTimeMap(job.job_id);
+    loadQaHistory(job.job_id);
+    renderSkillCandidatePanel(job);
+}
+
+function resetQaMessages() {
+    if (!nodes.qaMessages) return;
+    loadedQaHistoryKey = '';
+    nodes.qaMessages.innerHTML = '<div class="qa-empty">暂无对话</div>';
+}
+
+function clearQaMessages() {
+    if (!nodes.qaMessages) return;
+    nodes.qaMessages.innerHTML = '<div class="qa-empty">暂无对话</div>';
+}
+
+function renderSkillCandidatePanel(job) {
+    if (!nodes.skillSummary) return;
+    const skill = job?.summary?.skill_candidate || {};
+    const runDir = job?.summary?.run_dir || job?.run_dir || '';
+    const available = Boolean(skill.available);
+    const enabled = Boolean(skill.enabled);
+    nodes.generateSkillButton.disabled = !job || !runDir;
+    nodes.enableSkillButton.disabled = !job || !available || enabled;
+    if (!job) {
+        nodes.skillSummary.textContent = '选择一个任务后生成工具 Skill 草稿';
+        nodes.skillWarnings.innerHTML = '';
+        return;
+    }
+    if (!available) {
+        nodes.skillSummary.textContent = runDir ? '尚未生成草稿' : '资源目录尚未生成';
+        nodes.skillWarnings.innerHTML = '';
+        return;
+    }
+    nodes.skillSummary.textContent = enabled
+        ? `已启用 · ${skill.skill_name || '-'}`
+        : `待审核 · ${skill.skill_name || '-'}`;
+    const warnings = skill.warnings || [];
+    nodes.skillWarnings.innerHTML = warnings.length
+        ? warnings.map(item => `<div class="skill-warning">${escapeHtml(item.message || item.code || item)}</div>`).join('')
+        : '<div class="skill-ok">草稿已生成，启用前请人工复核内容。</div>';
+}
+
+function appendQaMessage(role, html) {
+    const empty = nodes.qaMessages.querySelector('.qa-empty');
+    if (empty) empty.remove();
+    const message = document.createElement('article');
+    message.className = `qa-message ${role}`;
+    message.innerHTML = html;
+    nodes.qaMessages.appendChild(message);
+    nodes.qaMessages.scrollTop = nodes.qaMessages.scrollHeight;
+}
+
+async function loadQaHistory(jobId) {
+    if (!nodes.qaMessages || loadedQaHistoryKey === jobId) return;
+    loadedQaHistoryKey = jobId;
+    try {
+        const history = await getJson(`/api/video-link/jobs/${jobId}/qa/history?limit=50`);
+        if (currentJob?.job_id !== jobId) return;
+        renderQaHistory(history.messages || []);
+    } catch (error) {
+        if (currentJob?.job_id !== jobId) return;
+        clearQaMessages();
+    }
+}
+
+function renderQaHistory(records) {
+    clearQaMessages();
+    if (!records.length) return;
+    for (const record of records) {
+        appendQaMessage('user', `<p>${escapeHtml(record.question || '')}</p>`);
+        appendQaMessage('assistant', renderQaAnswer(record));
+    }
+}
+
+function renderQaAnswer(result) {
+    const warningHtml = (result.warnings || []).length
+        ? `<div class="qa-answer-warnings">${(result.warnings || []).map(item => escapeHtml(item.message || item.code || item)).join('<br>')}</div>`
+        : '';
+    const savedAt = result.created_at ? `<div class="qa-saved-at">已保存 · ${escapeHtml(formatDateTime(result.created_at))}</div>` : '';
+    return `
+        ${warningHtml}
+        <div class="qa-answer">${renderMarkdown(result.answer || '没有生成答案。')}</div>
+        ${renderQaCitations(result.citations || [])}
+        ${savedAt}
+    `;
+}
+
+function renderQaCitations(citations) {
+    if (!citations?.length) return '';
+    return `<div class="qa-citations">
+        ${citations.map(item => {
+            const source = item.source || item.name || item.path || item.label || '-';
+            const score = item.score == null ? '' : ` · ${Number(item.score).toFixed(2)}`;
+            const lowConfidence = item.confidence === 'low' || item.source_type === 'comments';
+            const times = citationTimes(item);
+            return `<div class="${lowConfidence ? 'low-confidence' : ''}">
+                <strong>${escapeHtml(source)}</strong><span>${escapeHtml(score)}</span>
+                ${times.length ? `<div class="qa-citation-times">${times.map(seconds => videoTimeButtonHtml(selectedJobId, seconds)).join('')}</div>` : ''}
+            </div>`;
+        }).join('')}
+    </div>`;
+}
+
+function citationTimes(item) {
+    const values = [];
+    for (const value of item.timestamps || []) {
+        const seconds = typeof value === 'string' ? parseTimestampToSeconds(value) : Number(value);
+        if (Number.isFinite(seconds)) values.push(seconds);
+    }
+    for (const frame of item.frames || []) {
+        const seconds = Number(frame?.timestamp_sec ?? frame?.timestamp);
+        if (Number.isFinite(seconds)) {
+            values.push(seconds);
+            continue;
+        }
+        const mapped = frameTimestampFromMap(selectedJobId, frame?.path || frame?.frame_path || frame);
+        if (mapped != null) values.push(mapped);
+    }
+    return [...new Set(values.map(value => Math.max(0, Math.floor(value))))].slice(0, 4);
+}
+
+function videoTimeButtonHtml(jobId, seconds) {
+    return `<button class="video-time-link" type="button" data-job-id="${escapeHtml(jobId || '')}" data-seconds="${escapeHtml(seconds)}">${escapeHtml(formatTimestampFromSeconds(seconds))}</button>`;
+}
+
+async function askQa(event) {
+    event.preventDefault();
+    if (!selectedJobId || nodes.qaAskButton.disabled) return;
+    const question = nodes.qaQuestion.value.trim();
+    if (!question) return;
+    nodes.qaQuestion.value = '';
+    nodes.qaAskButton.disabled = true;
+    appendQaMessage('user', `<p>${escapeHtml(question)}</p>`);
+    try {
+        const result = await getJson(`/api/video-link/jobs/${selectedJobId}/qa/ask`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ question })
+        });
+        appendQaMessage('assistant', renderQaAnswer(result));
+    } catch (error) {
+        appendQaMessage('assistant error', `<p>${escapeHtml(error.message)}</p>`);
+    } finally {
+        renderQaPanel(currentJob);
+    }
+}
+
+function formatDateTime(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return value;
+    return date.toLocaleString('zh-CN', { hour12: false });
+}
+
+async function generateSkillCandidate() {
+    if (!selectedJobId || nodes.generateSkillButton.disabled) return;
+    nodes.generateSkillButton.disabled = true;
+    nodes.skillSummary.textContent = '正在生成草稿...';
+    try {
+        const result = await getJson(`/api/video-link/jobs/${selectedJobId}/skill-candidate/generate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}'
+        });
+        if (currentJob?.summary) currentJob.summary.skill_candidate = result;
+        renderSkillCandidatePanel(currentJob);
+        await refreshSelectedJob();
+    } catch (error) {
+        nodes.skillSummary.textContent = `生成失败：${error.message}`;
+        renderSkillCandidatePanel(currentJob);
+    }
+}
+
+async function enableSkillCandidate() {
+    if (!selectedJobId || nodes.enableSkillButton.disabled) return;
+    const skill = currentJob?.summary?.skill_candidate || {};
+    const name = skill.skill_name || 'tool skill';
+    if (!window.confirm(`审核并启用这个 Skill？\n\n${name}\n\n启用后会写入项目 .codex/skills，后续 agent 可能自动触发使用。`)) return;
+    nodes.enableSkillButton.disabled = true;
+    nodes.skillSummary.textContent = '正在启用...';
+    try {
+        const result = await getJson(`/api/video-link/jobs/${selectedJobId}/skill-candidate/enable`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}'
+        });
+        if (currentJob?.summary) currentJob.summary.skill_candidate = result;
+        renderSkillCandidatePanel(currentJob);
+        await refreshSelectedJob();
+    } catch (error) {
+        nodes.skillSummary.textContent = `启用失败：${error.message}`;
+        renderSkillCandidatePanel(currentJob);
+    }
+}
+
 function renderVscodePanel(job) {
     if (!nodes.vscodeView) return;
     const runDir = job?.summary?.run_dir || job?.run_dir || job?.vscode_preview?.run_dir || '';
@@ -773,6 +1090,7 @@ function renderVscodePanel(job) {
     if (!job) {
         nodes.vscodeSummary.textContent = '选择一个已生成资源包的任务';
         resetVscodeShell();
+        renderSourcePlayer(job);
         renderStudyPanel(job);
         renderDocPreviewPanel(job);
         return;
@@ -780,6 +1098,7 @@ function renderVscodePanel(job) {
     if (!runDir) {
         nodes.vscodeSummary.textContent = '资源包目录尚未生成';
         resetVscodeShell();
+        renderSourcePlayer(job);
         renderStudyPanel(job);
         renderDocPreviewPanel(job);
         return;
@@ -788,6 +1107,7 @@ function renderVscodePanel(job) {
         ? `WebIDE 已就绪 · PID ${preview.pid} · ${runDir}`
         : `${vscodeStarting ? '正在启动 WebIDE' : '资源包目录'} · ${runDir}`;
     resetVscodeShell();
+    renderSourcePlayer(job);
     renderStudyPanel(job);
     renderDocPreviewPanel(job);
 }
@@ -813,8 +1133,9 @@ function renderStudyPanel(job) {
     if (!nodes.studyBody) return;
     const study = job?.summary?.study || {};
     const decision = study.publish_decision || {};
+    const durationLabel = durationMinutes(job?.preview?.duration_seconds || job?.duration_seconds);
     nodes.studySummary.textContent = study.available
-        ? `${study.chapter_count || 0} 章 · ${study.evidence_count || 0} 条证据`
+        ? `${study.chapter_count || 0} 章${durationLabel === '-' ? '' : ` · 约 ${durationLabel}`}`
         : '等待 study guide';
     const status = decision.status || '-';
     nodes.studyDecision.textContent = status;
@@ -831,12 +1152,13 @@ async function loadStudyGuide(jobId) {
     if (loadedStudyKey === jobId) return;
     nodes.studyBody.innerHTML = '<div class="doc-empty">加载学习视图...</div>';
     try {
-        const guide = await getJson(`/api/video-link/jobs/${jobId}/study-guide`);
+        const [guide] = await Promise.all([
+            getJson(`/api/video-link/jobs/${jobId}/study-guide`),
+            loadFrameTimeMap(jobId)
+        ]);
         if (currentJob?.job_id !== jobId) return;
         nodes.studyBody.innerHTML = renderStudyGuide(guide, jobId);
-        nodes.studyBody.querySelectorAll('.study-jump').forEach(button => {
-            button.addEventListener('click', () => jumpToVideoTime(button.dataset.jobId, Number(button.dataset.seconds || 0)));
-        });
+        wireStudyGuideInteractions(guide, jobId);
         loadedStudyKey = jobId;
     } catch (error) {
         nodes.studyBody.innerHTML = `<div class="doc-empty">学习视图加载失败：${escapeHtml(error.message)}</div>`;
@@ -847,51 +1169,385 @@ async function loadStudyGuide(jobId) {
 function renderStudyGuide(guide, jobId) {
     const chapters = guide.chapters || [];
     const overview = guide.overview || {};
-    const decision = guide.publish_decision || {};
-    const gaps = guide.evidence_gaps?.summary || {};
-    const html = [
-        `<p class="study-overview">${escapeHtml(overview.summary || '暂无学习总览')}</p>`,
-        `<p class="study-overview">发布门禁：${escapeHtml(decision.status || '-')} · 证据缺口：${escapeHtml(gaps.total ?? 0)} 条</p>`
-    ];
-    chapters.slice(0, 30).forEach(chapter => {
-        const evidence = (chapter.evidence || []).filter(item => item.text).slice(0, 3);
-        html.push(`<article class="study-chapter">
-            <h4>${escapeHtml(String(chapter.index || '').padStart(2, '0'))}. ${escapeHtml(chapter.title || '未命名章节')}</h4>
-            <p>${escapeHtml(chapter.start || '')} - ${escapeHtml(chapter.end || '')}</p>
-            <p>${escapeHtml(chapter.summary || '')}</p>
-            <button class="study-jump" type="button" data-job-id="${escapeHtml(jobId)}" data-seconds="${escapeHtml(chapter.start_sec || 0)}">跳到视频</button>
-            <div class="study-evidence-list">
-                ${evidence.map(item => `<div class="study-evidence">
-                    <strong>${escapeHtml(item.timestamp_label || '')} · ${escapeHtml(item.source_type || '')}</strong>
-                    <span>${escapeHtml(item.text || '')}</span>
-                </div>`).join('')}
+    const webEvidenceHtml = renderWebEvidenceSummary(guide.web_evidence);
+    if (!chapters.length) {
+        return `<section class="study-learning-shell">
+            <div class="study-content-summary">
+                <span>内容总结</span>
+                <p>${escapeHtml(overview.summary || '暂无学习总览')}</p>
+                ${webEvidenceHtml}
             </div>
-        </article>`);
-    });
+            <div class="doc-empty">暂无可展示的学习步骤</div>
+        </section>`;
+    }
+    const firstChapter = chapters[0];
+    const html = [
+        `<section class="study-learning-shell">
+            <div class="study-content-summary">
+                <span>内容总结</span>
+                <p>${escapeHtml(overview.summary || '暂无学习总览')}</p>
+                ${webEvidenceHtml}
+                <div class="study-progress-meta">
+                    <strong data-study-progress-text>当前步骤：1 / ${escapeHtml(chapters.length)}</strong>
+                    <div class="bar study-progress-bar"><div data-study-progress-bar style="width:${escapeHtml(progressPercent(1, chapters.length))}%"></div></div>
+                </div>
+            </div>
+            <div class="study-workflow-section">
+                <div class="study-section-title">工作流</div>
+                <div class="study-workflow" role="list" aria-label="视频内容学习工作流">
+                    ${chapters.map((chapter, index) => renderStudyNode(chapter, index === 0, index)).join('')}
+                </div>
+            </div>
+            <div class="study-detail-shell">
+                ${renderStudyDetail(firstChapter, jobId, 0, chapters.length)}
+            </div>
+        </section>`
+    ];
     return html.join('');
+}
+
+function renderWebEvidenceSummary(webEvidence) {
+    const summary = webEvidence?.summary || {};
+    const processed = Number(summary.processed_gaps || 0);
+    if (!processed) return '';
+    const external = Number(summary.resolved_by_external || 0);
+    const partial = Number(summary.partial_external_support || 0);
+    const unresolved = Number(summary.unresolved || 0) + Number(summary.video_only_gap || 0);
+    return `<div class="study-evidence-boundary">
+        <strong>联网补证据</strong>
+        <span>已处理 ${escapeHtml(processed)} 个缺口 · 外部补强 ${escapeHtml(external)} · 部分补强 ${escapeHtml(partial)} · 仍需复核 ${escapeHtml(unresolved)}</span>
+    </div>`;
+}
+
+function renderStudyNode(chapter, selected, index) {
+    return `<button class="study-node${selected ? ' active' : ''}" type="button" role="listitem" data-study-index="${escapeHtml(index)}" aria-pressed="${selected ? 'true' : 'false'}">
+        <span>${escapeHtml(String(chapter.index || index + 1).padStart(2, '0'))}</span>
+        <strong>${escapeHtml(chapter.title || '未命名章节')}</strong>
+        <em>${escapeHtml(studyTimeRange(chapter))}</em>
+    </button>`;
+}
+
+function renderStudyDetail(chapter, jobId, index, total) {
+    const title = `${String(chapter.index || index + 1).padStart(2, '0')}. ${chapter.title || '未命名章节'}`;
+    const points = Array.isArray(chapter.key_points) ? chapter.key_points.filter(Boolean).slice(0, 5) : [];
+    return `<article class="study-detail" data-study-detail-index="${escapeHtml(index)}">
+        <div class="study-frame">
+            ${renderStudyFrame(chapter, jobId)}
+        </div>
+        <div class="study-detail-content">
+            <div class="study-detail-head">
+                <div>
+                    <span>当前学习步骤</span>
+                    <h4>${escapeHtml(title)}</h4>
+                    <p>${escapeHtml(studyTimeRange(chapter))}</p>
+                </div>
+                <button class="study-play" type="button" data-job-id="${escapeHtml(jobId)}" data-seconds="${escapeHtml(chapter.start_sec || 0)}">从这里播放</button>
+            </div>
+            <section>
+                <h5>这一段在讲什么</h5>
+                <p>${escapeHtml(chapter.summary || '暂无章节总结')}</p>
+            </section>
+            <section>
+                <h5>需要理解的要点</h5>
+                ${points.length
+                    ? `<ol class="study-key-points">${points.map(point => `<li>${escapeHtml(point)}</li>`).join('')}</ol>`
+                    : '<div class="study-empty-note">暂无单独提取的理解要点</div>'}
+            </section>
+            <div class="study-step-actions">
+                <button class="secondary study-step-prev" type="button" data-study-target="${escapeHtml(index - 1)}" ${index <= 0 ? 'disabled' : ''}>← 上一步</button>
+                <span>${escapeHtml(index + 1)} / ${escapeHtml(total)}</span>
+                <button class="secondary study-step-next" type="button" data-study-target="${escapeHtml(index + 1)}" ${index >= total - 1 ? 'disabled' : ''}>下一步 →</button>
+            </div>
+        </div>
+    </article>`;
+}
+
+function renderStudyFrame(chapter, jobId) {
+    const frame = chapter.representative_frame || {};
+    const path = frame.path || frame.frame_path || '';
+    if (!path || !jobId) {
+        return '<div class="study-frame-empty">暂无章节截图</div>';
+    }
+    const src = resourceUrl(jobId, path);
+    const alt = chapter.title || '章节代表截图';
+    const frameSeconds = Number(frame.timestamp_sec ?? frame.timestamp ?? frameTimestampFromMap(jobId, path));
+    const secondsAttr = Number.isFinite(frameSeconds) ? ` data-frame-seconds="${escapeHtml(frameSeconds)}"` : '';
+    const playButton = Number.isFinite(frameSeconds)
+        ? `<button class="image-frame-play" type="button" data-job-id="${escapeHtml(jobId)}" data-seconds="${escapeHtml(frameSeconds)}">播放此帧</button>`
+        : '';
+    return `<img src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" loading="lazy" data-image-viewer-src="${escapeHtml(src)}" data-image-viewer-alt="${escapeHtml(alt)}" data-job-id="${escapeHtml(jobId)}" data-source-path="${escapeHtml(path)}"${secondsAttr}>${playButton}`;
+}
+
+function wireStudyGuideInteractions(guide, jobId) {
+    const chapters = guide.chapters || [];
+    if (!chapters.length || !nodes.studyBody) return;
+    const workflow = nodes.studyBody.querySelector('.study-workflow');
+    const detailShell = nodes.studyBody.querySelector('.study-detail-shell');
+    const progressText = nodes.studyBody.querySelector('[data-study-progress-text]');
+    const progressBar = nodes.studyBody.querySelector('[data-study-progress-bar]');
+    const selectChapter = index => {
+        if (!Number.isInteger(index) || index < 0 || index >= chapters.length || !detailShell) return;
+        detailShell.innerHTML = renderStudyDetail(chapters[index], jobId, index, chapters.length);
+        nodes.studyBody.querySelectorAll('.study-node').forEach(node => {
+            const active = Number(node.dataset.studyIndex || -1) === index;
+            node.classList.toggle('active', active);
+            node.setAttribute('aria-pressed', active ? 'true' : 'false');
+            if (active) node.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+        });
+        if (progressText) progressText.textContent = `当前步骤：${index + 1} / ${chapters.length}`;
+        if (progressBar) progressBar.style.width = `${progressPercent(index + 1, chapters.length)}%`;
+        wireStudyDetailActions(selectChapter);
+    };
+    workflow?.querySelectorAll('.study-node').forEach(button => {
+        button.addEventListener('click', () => selectChapter(Number(button.dataset.studyIndex || 0)));
+    });
+    wireStudyDetailActions(selectChapter);
+}
+
+function wireStudyDetailActions(selectChapter) {
+    nodes.studyBody.querySelectorAll('.study-step-prev, .study-step-next').forEach(button => {
+        button.addEventListener('click', () => selectChapter(Number(button.dataset.studyTarget)));
+    });
+    nodes.studyBody.querySelectorAll('.study-play').forEach(button => {
+        button.addEventListener('click', () => jumpToVideoTime(button.dataset.jobId, Number(button.dataset.seconds || 0)));
+    });
+    nodes.studyBody.querySelectorAll('.image-frame-play').forEach(button => {
+        button.addEventListener('click', () => jumpToVideoTime(button.dataset.jobId, Number(button.dataset.seconds || 0)));
+    });
+}
+
+function studyTimeRange(chapter) {
+    const start = chapter.start || formatTimestampFromSeconds(chapter.start_sec);
+    const end = chapter.end || formatTimestampFromSeconds(chapter.end_sec);
+    return [start, end].filter(Boolean).join(' - ') || '-';
+}
+
+function progressPercent(current, total) {
+    const value = Number(total) > 0 ? (Number(current) / Number(total)) * 100 : 0;
+    return Math.max(0, Math.min(100, value)).toFixed(1);
+}
+
+function formatTimestampFromSeconds(value) {
+    const seconds = Number(value);
+    if (!Number.isFinite(seconds) || seconds < 0) return '';
+    const whole = Math.floor(seconds);
+    const hours = Math.floor(whole / 3600);
+    const minutes = Math.floor((whole % 3600) / 60);
+    const rest = whole % 60;
+    return hours > 0
+        ? `${hours}:${String(minutes).padStart(2, '0')}:${String(rest).padStart(2, '0')}`
+        : `${minutes}:${String(rest).padStart(2, '0')}`;
 }
 
 async function jumpToVideoTime(jobId, seconds) {
     if (!jobId || !Number.isFinite(seconds)) return;
-    setView('preview');
-    await refreshJobs();
-    const video = previewVideo(jobId);
-    if (!video) return;
-    const seek = () => {
-        video.currentTime = Math.max(0, seconds);
-        updateVideoControls(video);
-        video.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    };
-    if (Number.isFinite(video.duration) && video.duration > 0) {
-        seek();
-    } else {
-        video.addEventListener('loadedmetadata', seek, { once: true });
-        video.load();
+    if (selectedJobId !== jobId) {
+        selectedJobId = jobId;
+        await refreshSelectedJob();
     }
+    if (!['qa', 'vscode'].includes(currentView)) setView('vscode');
+    sourcePlayerState.jobId = jobId;
+    sourcePlayerState.seconds = Math.max(0, Math.floor(seconds));
+    sourcePlayerState.loaded = true;
+    renderSourcePlayer(currentJob, sourcePlayerState.seconds);
+    const activePanel = currentView === 'qa' ? nodes.qaSourcePlayerPanel : nodes.sourcePlayerPanel;
+    activePanel?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function renderSourcePlayer(job, seconds = sourcePlayerState.seconds) {
+    const targets = sourcePlayerTargets();
+    if (!targets.length) return;
+    const player = job?.source_player || {};
+    const value = Number(seconds);
+    const seekSeconds = Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
+    const label = formatTimestampFromSeconds(seekSeconds);
+    if (!job || !player.source_url) {
+        renderSourcePlayerEmpty(targets, '选择一个任务后播放', '暂无可嵌入播放器');
+        return;
+    }
+
+    const watchUrl = sourceWatchUrl(player, seekSeconds);
+    const summary = player.can_embed
+        ? `${sourceProviderLabel(player.provider)} · ${label || '0:00'}`
+        : '当前来源不支持内嵌播放';
+    renderSourcePlayerHeaders(targets, summary, watchUrl || player.source_url, Boolean(watchUrl));
+
+    if (!sourcePlayerState.loaded) {
+        renderSourcePlayerBody(targets, 'empty', '', `<div class="source-player-empty">
+            选择文档或问答中的时间戳后加载播放器；不会自动播放。
+        </div>`);
+        return;
+    }
+
+    if (!player.can_embed || !player.embed_url) {
+        renderSourcePlayerBody(targets, 'empty', '', `<div class="source-player-empty">
+            当前平台不能稳定内嵌播放，请使用“原站打开”跳到 ${escapeHtml(label || '0:00')}。
+        </div>`);
+        return;
+    }
+
+    const embedUrl = sourceEmbedUrl(player, seekSeconds);
+    if (!embedUrl) {
+        renderSourcePlayerBody(targets, 'empty', '', '<div class="source-player-empty">播放器地址无效，请使用“原站打开”。</div>');
+        return;
+    }
+    const html = `<div class="source-player-frame-wrap">
+        <iframe
+            title="${escapeHtml(jobDisplayTitle(job))}"
+            src="${escapeHtml(embedUrl)}"
+            allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+            allowfullscreen></iframe>
+    </div>`;
+    renderSourcePlayerBody(targets, 'iframe', embedUrl, html);
+}
+
+function sourcePlayerTargets() {
+    return [
+        {
+            summary: nodes.qaSourcePlayerSummary,
+            openLink: nodes.qaSourcePlayerOpenLink,
+            stopButton: nodes.qaSourcePlayerStopButton,
+            body: nodes.qaSourcePlayerBody
+        },
+        {
+            summary: nodes.sourcePlayerSummary,
+            openLink: nodes.sourcePlayerOpenLink,
+            stopButton: nodes.sourcePlayerStopButton,
+            body: nodes.sourcePlayerBody
+        }
+    ].filter(target => target.summary && target.openLink && target.body);
+}
+
+function renderSourcePlayerEmpty(targets, summary, message) {
+    renderSourcePlayerHeaders(targets, summary, '', false);
+    renderSourcePlayerBody(targets, 'empty', '', `<div class="source-player-empty">${escapeHtml(message)}</div>`);
+}
+
+function renderSourcePlayerHeaders(targets, summary, href, showLink) {
+    targets.forEach(target => {
+        target.summary.textContent = summary;
+        target.openLink.href = href || '#';
+        target.openLink.hidden = !showLink;
+        if (target.stopButton) target.stopButton.hidden = !sourcePlayerState.loaded;
+    });
+}
+
+function renderSourcePlayerBody(targets, playerKind, playerUrl, html) {
+    targets.forEach(target => {
+        if (
+            target.body.dataset.playerKind === playerKind
+            && target.body.dataset.playerUrl === playerUrl
+        ) return;
+        target.body.dataset.playerKind = playerKind;
+        target.body.dataset.playerUrl = playerUrl;
+        target.body.innerHTML = html;
+    });
+}
+
+function pauseSourcePlayer() {
+    sourcePlayerState.loaded = false;
+    renderSourcePlayer(currentJob);
+}
+
+function sourceProviderLabel(provider) {
+    return {
+        youtube: 'YouTube',
+        bilibili: 'Bilibili',
+        external: '原站'
+    }[provider] || '原站';
+}
+
+function sourceEmbedUrl(player, seconds = 0) {
+    let url;
+    try {
+        url = new URL(player.embed_url, window.location.href);
+    } catch (_error) {
+        return '';
+    }
+    const value = Math.max(0, Math.floor(Number(seconds) || 0));
+    if (player.provider === 'youtube') {
+        url.searchParams.set('start', String(value));
+        url.searchParams.set('rel', '0');
+    } else if (player.provider === 'bilibili') {
+        url.searchParams.set('t', String(value));
+    }
+    return url.toString();
+}
+
+function sourceWatchUrl(player, seconds = 0) {
+    const raw = player.watch_url || player.source_url || '';
+    if (!raw) return '';
+    const value = Math.max(0, Math.floor(Number(seconds) || 0));
+    let url;
+    try {
+        url = new URL(raw, window.location.href);
+    } catch (_error) {
+        return raw;
+    }
+    if (player.provider === 'youtube') {
+        url.searchParams.set('t', `${value}s`);
+    } else if (player.provider === 'bilibili') {
+        url.searchParams.set('t', String(value));
+    } else if (value > 0) {
+        url.hash = `t=${value}`;
+    }
+    return url.toString();
 }
 
 function resourceUrl(jobId, path) {
     return `/api/video-link/jobs/${jobId}/resource?path=${encodeURIComponent(path)}`;
+}
+
+async function loadFrameTimeMap(jobId) {
+    if (!jobId) return {};
+    if (frameTimeMaps[jobId]) return frameTimeMaps[jobId];
+    try {
+        const payload = await getJson(`/api/video-link/jobs/${jobId}/frame-time-map`);
+        if (payload.available) {
+            frameTimeMaps[jobId] = payload.frames || {};
+            return frameTimeMaps[jobId];
+        }
+    } catch (_error) {
+        return {};
+    }
+    return {};
+}
+
+function frameTimestampFromMap(jobId, sourcePath) {
+    const map = frameTimeMaps[jobId] || {};
+    const keys = framePathKeys(sourcePath);
+    for (const key of keys) {
+        const entry = map[key];
+        const seconds = Number(entry?.timestamp_sec);
+        if (Number.isFinite(seconds)) return seconds;
+    }
+    return null;
+}
+
+function framePathKeys(sourcePath) {
+    const value = String(sourcePath || '').replace(/\\/g, '/');
+    if (!value) return [];
+    const keys = new Set([value]);
+    try {
+        const url = new URL(value, window.location.href);
+        const resourcePath = url.searchParams.get('path');
+        if (resourcePath) keys.add(resourcePath.replace(/\\/g, '/'));
+        keys.add(decodeURIComponent(url.pathname.split('/').pop() || ''));
+    } catch (_error) {
+        keys.add(value.split('/').pop() || value);
+    }
+    const basename = value.split('/').pop();
+    if (basename) keys.add(basename);
+    return [...keys].filter(Boolean);
+}
+
+function parseTimestampToSeconds(value) {
+    const match = String(value || '').trim().match(/^(\d{1,2}):([0-5]\d)(?::([0-5]\d))?$/);
+    if (!match) return null;
+    const first = Number(match[1]);
+    const second = Number(match[2]);
+    const third = match[3] == null ? null : Number(match[3]);
+    return third == null ? first * 60 + second : first * 3600 + second * 60 + third;
 }
 
 function previewableDocs(job) {
@@ -923,6 +1579,91 @@ function previewableDocs(job) {
         if (left.kind !== right.kind) return left.kind === 'pdf' ? -1 : 1;
         return left.path.localeCompare(right.path);
     });
+}
+
+function loadLearningPanelVisibility() {
+    try {
+        const stored = JSON.parse(localStorage.getItem(panelVisibilityStorageKey) || '{}') || {};
+        ['docList', 'study', 'docContent'].forEach(key => {
+            if (typeof stored[key] === 'boolean') learningPanelVisibility[key] = stored[key];
+        });
+    } catch (_error) {
+        // Keep the default all-on layout when localStorage is unavailable or stale.
+    }
+}
+
+function saveLearningPanelVisibility() {
+    localStorage.setItem(panelVisibilityStorageKey, JSON.stringify(learningPanelVisibility));
+}
+
+function syncLearningPanelToggles() {
+    if (nodes.toggleDocListPanel) nodes.toggleDocListPanel.checked = learningPanelVisibility.docList;
+    if (nodes.toggleStudyPanel) nodes.toggleStudyPanel.checked = learningPanelVisibility.study;
+    if (nodes.toggleDocContentPanel) nodes.toggleDocContentPanel.checked = learningPanelVisibility.docContent;
+}
+
+function hasDocContent() {
+    return Boolean(selectedDocPath && learningPanelVisibility.docContent);
+}
+
+function updateLearningDocsLayout() {
+    if (!nodes.vscodeDocs) return;
+    const docListVisible = learningPanelVisibility.docList;
+    const studyVisible = learningPanelVisibility.study;
+    const contentVisible = hasDocContent();
+    const playerVisible = Boolean(nodes.sourcePlayerPanel);
+    const visiblePanelCount = [docListVisible, studyVisible, playerVisible, contentVisible].filter(Boolean).length;
+    const columns = [];
+
+    nodes.docListPanel.hidden = !docListVisible;
+    nodes.studyPanel.hidden = !studyVisible;
+    if (nodes.sourcePlayerPanel) nodes.sourcePlayerPanel.hidden = !playerVisible;
+    nodes.docPreviewPanel.hidden = !contentVisible;
+    nodes.vscodeDocs.classList.toggle('preview-open', contentVisible);
+    nodes.vscodeDocs.classList.toggle('empty-layout', visiblePanelCount === 0);
+
+    if (docListVisible) columns.push('minmax(220px, var(--doc-list-pane-width, 300px))');
+    const docListNeedsHandle = docListVisible && (studyVisible || playerVisible || contentVisible);
+    nodes.docListResizer?.classList.toggle('active', docListNeedsHandle);
+    if (nodes.docListResizer) nodes.docListResizer.hidden = !docListNeedsHandle;
+    if (docListNeedsHandle) columns.push('14px');
+
+    if (studyVisible) columns.push('minmax(280px, var(--study-pane-width, 1fr))');
+    const studyNeedsHandle = studyVisible && (playerVisible || contentVisible);
+    nodes.studyResizer?.classList.toggle('active', studyNeedsHandle);
+    if (nodes.studyResizer) nodes.studyResizer.hidden = !studyNeedsHandle;
+    if (studyNeedsHandle) columns.push('14px');
+
+    if (playerVisible) columns.push('minmax(320px, var(--source-player-pane-width, 560px))');
+    const sourcePlayerNeedsHandle = playerVisible && (docListVisible || studyVisible || contentVisible);
+    nodes.sourcePlayerResizer?.classList.toggle('active', sourcePlayerNeedsHandle);
+    if (nodes.sourcePlayerResizer) nodes.sourcePlayerResizer.hidden = !sourcePlayerNeedsHandle;
+    if (sourcePlayerNeedsHandle) columns.push('14px');
+
+    if (contentVisible) columns.push('minmax(320px, 1fr)');
+    nodes.vscodeDocs.style.gridTemplateColumns = columns.join(' ') || '1fr';
+}
+
+function setLearningPanelVisibility(panel, visible, persist = true) {
+    learningPanelVisibility[panel] = Boolean(visible);
+    syncLearningPanelToggles();
+    updateLearningDocsLayout();
+    if (persist) saveLearningPanelVisibility();
+}
+
+function bindLearningPanelToggles() {
+    loadLearningPanelVisibility();
+    syncLearningPanelToggles();
+    nodes.toggleDocListPanel?.addEventListener('change', event => {
+        setLearningPanelVisibility('docList', event.target.checked);
+    });
+    nodes.toggleStudyPanel?.addEventListener('change', event => {
+        setLearningPanelVisibility('study', event.target.checked);
+    });
+    nodes.toggleDocContentPanel?.addEventListener('change', event => {
+        setLearningPanelVisibility('docContent', event.target.checked);
+    });
+    updateLearningDocsLayout();
 }
 
 function renderDocPreviewPanel(job) {
@@ -976,18 +1717,20 @@ function showDocPreview(title, contentHtml) {
 }
 
 function showDocPreviewPanel() {
-    if (nodes.docPreviewPanel) nodes.docPreviewPanel.hidden = false;
-    nodes.vscodeView?.querySelector('.vscode-docs')?.classList.add('preview-open');
+    if (!learningPanelVisibility.docContent) {
+        setLearningPanelVisibility('docContent', true);
+        return;
+    }
+    updateLearningDocsLayout();
 }
 
 function hideDocPreview() {
-    if (nodes.docPreviewPanel) nodes.docPreviewPanel.hidden = true;
-    nodes.vscodeView?.querySelector('.vscode-docs')?.classList.remove('preview-open');
     nodes.docPreviewTitle.textContent = '选择文档';
     nodes.docOpenLink.hidden = true;
     nodes.docOpenLink.removeAttribute('href');
     nodes.docPreviewBody.className = 'doc-preview-body';
     nodes.docPreviewBody.innerHTML = '';
+    updateLearningDocsLayout();
 }
 
 function closeDocPreview() {
@@ -1021,6 +1764,7 @@ async function loadDocPreview(job, path) {
         nodes.docPreviewBody.className = 'doc-preview-body markdown';
         nodes.docPreviewBody.innerHTML = renderMarkdown(markdown, job.job_id, path);
         renderMarkdownMath(nodes.docPreviewBody);
+        await enhanceTimestampTargets(nodes.docPreviewBody, job.job_id);
         loadedDocPreviewKey = previewKey;
     } catch (error) {
         nodes.docPreviewBody.className = 'doc-preview-body markdown';
@@ -1036,7 +1780,7 @@ function renderMarkdown(markdown, jobId = '', docPath = '') {
     const renderer = createMarkdownRenderer(jobId, docPath);
     return window.DOMPurify.sanitize(renderer.render(normalizeMarkdownForPreview(markdown)), {
         ADD_TAGS: ['figure', 'figcaption'],
-        ADD_ATTR: ['target', 'rel', 'loading']
+        ADD_ATTR: ['target', 'rel', 'loading', 'data-image-viewer-src', 'data-image-viewer-alt', 'data-job-id', 'data-source-path', 'data-frame-seconds']
     });
 }
 
@@ -1092,7 +1836,14 @@ function createMarkdownRenderer(jobId = '', docPath = '') {
         if (srcIndex >= 0) {
             const src = token.attrs[srcIndex][1];
             const assetPath = markdownAssetPath(docPath, src);
-            token.attrs[srcIndex][1] = assetPath && jobId ? resourceUrl(jobId, assetPath) : assetPath;
+            const resolvedSrc = assetPath && jobId ? resourceUrl(jobId, assetPath) : assetPath;
+            token.attrs[srcIndex][1] = resolvedSrc;
+            token.attrSet('data-image-viewer-src', resolvedSrc);
+            token.attrSet('data-image-viewer-alt', token.content || '');
+            if (jobId) token.attrSet('data-job-id', jobId);
+            if (assetPath) token.attrSet('data-source-path', assetPath);
+            const seconds = frameTimestampFromMap(jobId, assetPath);
+            if (seconds != null) token.attrSet('data-frame-seconds', String(seconds));
         }
         token.attrSet('loading', 'lazy');
         token.attrSet('class', 'markdown-image');
@@ -1119,6 +1870,59 @@ function createMarkdownRenderer(jobId = '', docPath = '') {
         return defaultLinkOpen(tokens, idx, options, env, self);
     };
     return md;
+}
+
+async function enhanceTimestampTargets(container, jobId) {
+    if (!container || !jobId) return;
+    await loadFrameTimeMap(jobId);
+    container.querySelectorAll('img[data-image-viewer-src]').forEach(image => {
+        if (!image.dataset.jobId) image.dataset.jobId = jobId;
+        const seconds = Number(image.dataset.frameSeconds);
+        if (Number.isFinite(seconds)) return;
+        const mapped = frameTimestampFromMap(jobId, image.dataset.sourcePath || image.dataset.imageViewerSrc || image.currentSrc || image.src);
+        if (mapped != null) image.dataset.frameSeconds = String(mapped);
+    });
+    linkTimestampTextNodes(container, jobId);
+}
+
+function linkTimestampTextNodes(container, jobId) {
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+        acceptNode(node) {
+            const parent = node.parentElement;
+            if (!parent || parent.closest('button, a, pre, code, script, style, .katex')) {
+                return NodeFilter.FILTER_REJECT;
+            }
+            return /\b\d{1,2}:[0-5]\d(?::[0-5]\d)?\b/.test(node.nodeValue || '')
+                ? NodeFilter.FILTER_ACCEPT
+                : NodeFilter.FILTER_REJECT;
+        }
+    });
+    const nodesToReplace = [];
+    while (walker.nextNode()) nodesToReplace.push(walker.currentNode);
+    for (const node of nodesToReplace) {
+        const fragment = document.createDocumentFragment();
+        const text = node.nodeValue || '';
+        let cursor = 0;
+        text.replace(/\b\d{1,2}:[0-5]\d(?::[0-5]\d)?\b/g, (match, offset) => {
+            if (offset > cursor) fragment.append(document.createTextNode(text.slice(cursor, offset)));
+            const seconds = parseTimestampToSeconds(match);
+            if (seconds == null) {
+                fragment.append(document.createTextNode(match));
+            } else {
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.className = 'video-time-link';
+                button.dataset.jobId = jobId;
+                button.dataset.seconds = String(seconds);
+                button.textContent = match;
+                fragment.append(button);
+            }
+            cursor = offset + match.length;
+            return match;
+        });
+        if (cursor < text.length) fragment.append(document.createTextNode(text.slice(cursor)));
+        node.replaceWith(fragment);
+    }
 }
 
 function renderMarkdownMath(container) {
@@ -1298,8 +2102,10 @@ function inlineMarkdown(text, jobId = '', docPath = '') {
         const alt = match[1] || '';
         const imagePath = markdownAssetPath(docPath, match[2] || '');
         const src = imagePath && jobId ? resourceUrl(jobId, imagePath) : imagePath;
+        const seconds = frameTimestampFromMap(jobId, imagePath);
+        const secondsAttr = seconds != null ? ` data-frame-seconds="${escapeHtml(seconds)}"` : '';
         html += src
-            ? `<figure class="markdown-image"><img src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" loading="lazy"><figcaption>${escapeHtml(alt)}</figcaption></figure>`
+            ? `<figure class="markdown-image"><img src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" loading="lazy" data-image-viewer-src="${escapeHtml(src)}" data-image-viewer-alt="${escapeHtml(alt)}" data-job-id="${escapeHtml(jobId)}" data-source-path="${escapeHtml(imagePath)}"${secondsAttr}><figcaption>${escapeHtml(alt)}</figcaption></figure>`
             : escapeHtml(match[0]);
         lastIndex = (match.index || 0) + match[0].length;
     }
@@ -1334,17 +2140,34 @@ function markdownAssetPath(docPath, rawPath) {
 
 function parseMermaidNode(rawNode) {
     const cleaned = String(rawNode || '').trim().replace(/;$/, '');
-    const match = cleaned.match(/^([A-Za-z][A-Za-z0-9_]*)(?:([\[\{\(])(.*)([\]\}\)]))?$/);
+    const match = cleaned.match(/^([A-Za-z][A-Za-z0-9_-]*)(.*)$/);
     if (!match) return { id: cleaned, label: '', shape: 'box' };
-    let label = match[3] || '';
+    const id = match[1];
+    const rest = (match[2] || '').trim();
+    let label = '';
+    let shape = 'box';
+    if (rest) {
+        const wrappers = [
+            [/^\[\[(.*)\]\]$/, 'box'],
+            [/^\[(.*)\]$/, 'box'],
+            [/^\{\{(.*)\}\}$/, 'decision'],
+            [/^\{(.*)\}$/, 'decision'],
+            [/^\(\((.*)\)\)$/, 'circle'],
+            [/^\((.*)\)$/, 'box'],
+        ];
+        const wrapper = wrappers.find(([pattern]) => pattern.test(rest));
+        if (!wrapper) return { id: cleaned, label: '', shape: 'box' };
+        label = rest.match(wrapper[0])?.[1] || '';
+        shape = wrapper[1];
+    }
     label = label.trim();
     if (label.length >= 2 && label[0] === '"' && label[label.length - 1] === '"') {
         label = label.slice(1, -1);
     }
     return {
-        id: match[1],
+        id,
         label,
-        shape: match[2] === '{' ? 'decision' : 'box'
+        shape
     };
 }
 
@@ -1353,8 +2176,8 @@ function mermaidLabelHtml(label) {
 }
 
 function renderSimpleMermaidFlowchart(diagram) {
-    const lines = String(diagram || '')
-        .split(/\r?\n/)
+    const lines = normalizeMermaidPreviewLines(diagram)
+        .flatMap(line => line.split(';'))
         .map(line => line.trim())
         .filter(line => line && !line.startsWith('%%'));
     if (!lines.length) return '';
@@ -1374,17 +2197,17 @@ function renderSimpleMermaidFlowchart(diagram) {
         return true;
     };
     for (const line of lines.slice(1)) {
-        if (/^(subgraph|end\b|direction\b|style\b|classDef\b|class\b)/i.test(line)) continue;
+        if (/^(subgraph|end\b|direction\b|style\b|classDef\b|class\b|click\b|linkStyle\b)/i.test(line)) continue;
         if (/^[};\s]+$/.test(line)) continue;
-        const edgeMatch = line.match(/^(.+?)\s*-->\s*(?:\|.*?\|\s*)?(.+?)\s*;?$/);
+        const edgeMatch = parseMermaidEdge(line);
         if (!edgeMatch) {
             const node = parseMermaidNode(line);
             if (!rememberNode(node)) return '';
             if (!standaloneNodes.includes(node.id)) standaloneNodes.push(node.id);
             continue;
         }
-        const left = parseMermaidNode(edgeMatch[1]);
-        const right = parseMermaidNode(edgeMatch[2]);
+        const left = parseMermaidNode(edgeMatch.left);
+        const right = parseMermaidNode(edgeMatch.right);
         if (/[{}()[\]]/.test(left.id) || /[{}()[\]]/.test(right.id)) continue;
         rememberNode(left);
         rememberNode(right);
@@ -1443,8 +2266,9 @@ function renderSimpleMermaidFlowchart(diagram) {
         parts.push('<div class="flow-row">');
         row.forEach(node => {
             const shape = shapes.get(node) === 'decision' ? ' decision' : '';
+            const circle = shapes.get(node) === 'circle' ? ' circle' : '';
             const label = mermaidLabelHtml(labels.get(node) || node);
-            parts.push(`<div class="flow-node${shape}"><span class="flow-index">${index}</span>${label}</div>`);
+            parts.push(`<div class="flow-node${shape}${circle}"><span class="flow-index">${index}</span>${label}</div>`);
             index += 1;
         });
         parts.push('</div>');
@@ -1460,6 +2284,28 @@ function renderSimpleMermaidFlowchart(diagram) {
     }
     parts.push('</div>');
     return parts.join('\n');
+}
+
+function normalizeMermaidPreviewLines(diagram) {
+    return String(diagram || '')
+        .split(/\r?\n/)
+        .map(line => line.replace(/\s+%%.*$/, ''));
+}
+
+function parseMermaidEdge(line) {
+    const value = String(line || '').trim().replace(/;$/, '');
+    const patterns = [
+        /^(.+?)\s*--\s*[^-<>|]+?\s*-->\s*(.+?)$/,
+        /^(.+?)\s*-->\s*(?:\|.*?\|\s*)?(.+?)$/,
+        /^(.+?)\s*-.->\s*(?:\|.*?\|\s*)?(.+?)$/,
+        /^(.+?)\s*==>\s*(?:\|.*?\|\s*)?(.+?)$/,
+        /^(.+?)\s*--[ox]\s*(?:\|.*?\|\s*)?(.+?)$/,
+    ];
+    for (const pattern of patterns) {
+        const match = value.match(pattern);
+        if (match) return { left: match[1].trim(), right: match[2].trim() };
+    }
+    return null;
 }
 
 async function ensureVscodeSession(restart = false) {
@@ -1512,219 +2358,6 @@ function scanStartTime(job) {
     const stage = job.current_stage || job.next_stage;
     const stageInfo = job.stages?.[stage] || {};
     return stageInfo.started_at || job.runner?.started_at || job.updated_at || job.created_at || '';
-}
-
-function scanPercent(job, now = Date.now()) {
-    const status = job.status || 'created';
-    const baseProgress = clampPercent(job.progress?.percent || 0);
-    if (videoLoadErrors[job.job_id]) return baseProgress;
-    if (status === 'succeeded') return 100;
-    if (status !== 'running') return baseProgress;
-    const durationSeconds = Number(job.preview?.duration_seconds || 0) || 600;
-    const startedAt = Date.parse(scanStartTime(job));
-    if (Number.isNaN(startedAt)) return Math.min(99, baseProgress);
-    const elapsedSeconds = Math.max(0, (now - startedAt) / 1000);
-    return Math.min(99, Math.max(baseProgress, (elapsedSeconds / durationSeconds) * 100));
-}
-
-function renderPreviewGrid(jobs) {
-    if (!nodes.previewGrid) return;
-    const visibleJobs = jobs || [];
-    nodes.previewSummary.textContent = visibleJobs.length ? `最近 ${visibleJobs.length} 个任务` : '暂无任务';
-    nodes.previewGrid.innerHTML = visibleJobs.length ? visibleJobs.map(job => renderPreviewCard(job)).join('') : '<div class="empty preview-empty">暂无任务</div>';
-    bindPreviewControls();
-    updateScanFrames();
-}
-
-function previewStatusControl(job) {
-    if (job.status === 'succeeded') {
-        return `<button class="status succeeded preview-success-link" type="button" data-job-id="${escapeHtml(job.job_id)}" title="打开资源目录">succeeded</button>`;
-    }
-    return statusBadge(videoLoadErrors[job.job_id] ? 'failed' : job.status);
-}
-
-function renderPreviewCard(job) {
-    const preview = job.preview || {};
-    const ready = Boolean(preview.video_ready && preview.video_url && !videoLoadErrors[job.job_id]);
-    const failed = job.status === 'failed' || Boolean(videoLoadErrors[job.job_id]);
-    const scanning = job.status === 'running' && !failed;
-    const percent = scanPercent(job);
-    const durationSeconds = Number(preview.duration_seconds || 0);
-    const video = ready
-        ? `<video class="preview-video" preload="none" playsinline data-src="${escapeHtml(preview.video_url)}"></video>`
-        : `<div class="preview-placeholder">${failed ? '加载停止' : '等待视频'}</div>`;
-    const buttonLabel = ready ? '播放' : (failed ? '失败' : '等待');
-    const sourceLink = job.video_url
-        ? `<a class="preview-source-link" href="${escapeHtml(job.video_url)}" target="_blank" rel="noreferrer">原站</a>`
-        : '';
-    return `<article class="preview-card ${escapeHtml(job.status || 'created')} ${scanning ? 'scanning' : ''} ${failed ? 'preview-failed' : ''}"
-        data-job-id="${escapeHtml(job.job_id)}"
-        data-status="${escapeHtml(job.status || 'created')}"
-        data-duration="${escapeHtml(durationSeconds || '')}"
-        data-started-at="${escapeHtml(scanStartTime(job))}"
-        data-progress="${escapeHtml(job.progress?.percent || 0)}">
-        <div class="preview-frame">
-            ${video}
-            <div class="scan-line" aria-hidden="true"></div>
-            <div class="preview-status-row">
-                ${previewStatusControl(job)}
-                <span>${escapeHtml(previewStage(job))}</span>
-            </div>
-        </div>
-        <div class="preview-body">
-            <strong title="${escapeHtml(jobDisplayTitle(job))}">${escapeHtml(jobDisplayTitle(job))}</strong>
-            <div class="video-controls">
-                <button class="preview-play" type="button" data-job-id="${escapeHtml(job.job_id)}" ${ready ? '' : 'disabled'}>${buttonLabel}</button>
-                <span class="preview-time" data-job-id="${escapeHtml(job.job_id)}">0:00 / ${escapeHtml(formatClock(durationSeconds))}</span>
-                ${sourceLink}
-            </div>
-            <input class="video-seek" data-job-id="${escapeHtml(job.job_id)}" type="range" min="0" max="1000" value="0" ${ready ? '' : 'disabled'} aria-label="视频进度">
-            <div class="scan-meter">
-                <div class="scan-meter-head">
-                    <span>扫描</span>
-                    <strong class="scan-percent">${Math.round(percent)}%</strong>
-                </div>
-                <div class="bar scan-bar"><div class="preview-scan-progress" style="width:${percent}%"></div></div>
-            </div>
-        </div>
-    </article>`;
-}
-
-function bindPreviewControls() {
-    document.querySelectorAll('.preview-video').forEach(video => {
-        video.addEventListener('loadedmetadata', () => updateVideoControls(video));
-        video.addEventListener('timeupdate', () => updateVideoControls(video));
-        video.addEventListener('play', () => setPreviewButton(video, '暂停'));
-        video.addEventListener('pause', () => setPreviewButton(video, '播放'));
-        video.addEventListener('error', () => markPreviewVideoError(video));
-    });
-    document.querySelectorAll('.preview-play').forEach(button => {
-        button.addEventListener('click', () => togglePreviewPlayback(button.dataset.jobId));
-    });
-    document.querySelectorAll('.preview-success-link').forEach(button => {
-        button.addEventListener('click', () => openPreviewRunDir(button.dataset.jobId));
-    });
-    document.querySelectorAll('.video-seek').forEach(input => {
-        input.addEventListener('input', () => seekPreviewVideo(input));
-    });
-}
-
-function previewCard(jobId) {
-    return document.querySelector(`.preview-card[data-job-id="${CSS.escape(jobId)}"]`);
-}
-
-function previewVideo(jobId) {
-    return previewCard(jobId)?.querySelector('video');
-}
-
-function setPreviewButton(video, label) {
-    const jobId = video.closest('.preview-card')?.dataset.jobId;
-    const button = jobId ? document.querySelector(`.preview-play[data-job-id="${CSS.escape(jobId)}"]`) : null;
-    if (button && !button.disabled) button.textContent = label;
-}
-
-async function togglePreviewPlayback(jobId) {
-    const video = previewVideo(jobId);
-    if (!video) return;
-    ensurePreviewVideoSource(video);
-    if (video.paused) {
-        await video.play().catch(() => markPreviewVideoError(video));
-    } else {
-        video.pause();
-    }
-}
-
-function ensurePreviewVideoSource(video) {
-    if (!video || video.src) return;
-    const source = video.dataset.src || '';
-    if (!source) return;
-    video.src = source;
-    video.load();
-}
-
-async function openPreviewRunDir(jobId) {
-    if (!jobId) return;
-    const button = document.querySelector(`.preview-success-link[data-job-id="${CSS.escape(jobId)}"]`);
-    if (button) button.disabled = true;
-    try {
-        await getJson(`/api/video-link/jobs/${jobId}/open-run-dir`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: '{}'
-        });
-    } catch (error) {
-        if (button) {
-            button.textContent = '打开失败';
-            button.title = error.message;
-        }
-    } finally {
-        if (button) button.disabled = false;
-    }
-}
-
-function seekPreviewVideo(input) {
-    const video = previewVideo(input.dataset.jobId);
-    if (!video || !Number.isFinite(video.duration) || video.duration <= 0) return;
-    video.currentTime = (Number(input.value) / 1000) * video.duration;
-    updateVideoControls(video);
-}
-
-function updateVideoControls(video) {
-    const card = video.closest('.preview-card');
-    const jobId = card?.dataset.jobId;
-    if (!jobId) return;
-    const durationSeconds = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : Number(card.dataset.duration || 0);
-    const input = document.querySelector(`.video-seek[data-job-id="${CSS.escape(jobId)}"]`);
-    const time = document.querySelector(`.preview-time[data-job-id="${CSS.escape(jobId)}"]`);
-    if (input && durationSeconds > 0) input.value = String(Math.round((video.currentTime / durationSeconds) * 1000));
-    if (time) time.textContent = `${formatClock(video.currentTime)} / ${formatClock(durationSeconds)}`;
-}
-
-function markPreviewVideoError(video) {
-    const jobId = video.closest('.preview-card')?.dataset.jobId;
-    if (!jobId) return;
-    videoLoadErrors[jobId] = true;
-    const card = previewCard(jobId);
-    if (card) {
-        card.classList.add('preview-failed');
-        card.classList.remove('scanning');
-        const button = card.querySelector('.preview-play');
-        if (button) {
-            button.disabled = true;
-            button.textContent = '失败';
-        }
-    }
-}
-
-function startScanAnimation() {
-    if (scanAnimationFrame) return;
-    const tick = () => {
-        updateScanFrames();
-        scanAnimationFrame = requestAnimationFrame(tick);
-    };
-    scanAnimationFrame = requestAnimationFrame(tick);
-}
-
-function updateScanFrames(now = Date.now()) {
-    if (!nodes.previewGrid) return;
-    document.querySelectorAll('.preview-card').forEach(card => {
-        const status = card.dataset.status || 'created';
-        const failed = card.classList.contains('preview-failed');
-        const baseProgress = clampPercent(Number(card.dataset.progress || 0));
-        let percent = baseProgress;
-        if (status === 'succeeded') {
-            percent = 100;
-        } else if (status === 'running' && !failed) {
-            const durationSeconds = Number(card.dataset.duration || 0) || 600;
-            const startedAt = Date.parse(card.dataset.startedAt || '');
-            const elapsed = Number.isNaN(startedAt) ? 0 : Math.max(0, (now - startedAt) / 1000);
-            percent = Math.min(99, Math.max(baseProgress, (elapsed / durationSeconds) * 100));
-        }
-        const bar = card.querySelector('.preview-scan-progress');
-        const label = card.querySelector('.scan-percent');
-        if (bar) bar.style.width = `${percent}%`;
-        if (label) label.textContent = `${Math.round(percent)}%`;
-    });
 }
 
 function chooseLogStage(job) {
@@ -1788,17 +2421,385 @@ async function copyText(text) {
     }
 }
 
+function ensureImageViewer() {
+    if (imageViewer.node) return imageViewer.node;
+    const viewer = document.createElement('div');
+    viewer.className = 'image-viewer';
+    viewer.hidden = true;
+    viewer.innerHTML = `
+        <div class="image-viewer-backdrop" data-image-viewer-close></div>
+        <div class="image-viewer-panel" role="dialog" aria-modal="true" aria-label="图片预览">
+            <div class="image-viewer-toolbar">
+                <strong class="image-viewer-title">图片预览</strong>
+                <div class="image-viewer-actions">
+                    <button type="button" data-image-viewer-play hidden>播放此帧</button>
+                    <button type="button" data-image-viewer-zoom="out" aria-label="缩小">−</button>
+                    <span data-image-viewer-scale>100%</span>
+                    <button type="button" data-image-viewer-zoom="in" aria-label="放大">+</button>
+                    <button type="button" data-image-viewer-reset>1:1</button>
+                    <button type="button" data-image-viewer-close aria-label="关闭">×</button>
+                </div>
+            </div>
+            <div class="image-viewer-stage">
+                <img alt="">
+            </div>
+        </div>`;
+    document.body.appendChild(viewer);
+    imageViewer.node = viewer;
+    imageViewer.image = viewer.querySelector('img');
+    imageViewer.playButton = viewer.querySelector('[data-image-viewer-play]');
+    imageViewer.scaleLabel = viewer.querySelector('[data-image-viewer-scale]');
+    viewer.addEventListener('click', event => {
+        if (event.target.closest('[data-image-viewer-close]')) {
+            closeImageViewer();
+            return;
+        }
+        const zoomButton = event.target.closest('[data-image-viewer-zoom]');
+        if (zoomButton) {
+            zoomImageViewer(zoomButton.dataset.imageViewerZoom === 'in' ? 0.2 : -0.2);
+            return;
+        }
+        if (event.target.closest('[data-image-viewer-reset]')) {
+            setImageViewerScale(1);
+            return;
+        }
+        if (event.target.closest('[data-image-viewer-play]')) {
+            if (imageViewer.jobId && Number.isFinite(imageViewer.seconds)) {
+                jumpToVideoTime(imageViewer.jobId, imageViewer.seconds);
+            }
+        }
+    });
+    viewer.querySelector('.image-viewer-stage')?.addEventListener('wheel', event => {
+        event.preventDefault();
+        zoomImageViewer(event.deltaY < 0 ? 0.1 : -0.1);
+    }, { passive: false });
+    return viewer;
+}
+
+function openImageViewer(src, alt = '', jobId = '', seconds = '') {
+    if (!src) return;
+    const viewer = ensureImageViewer();
+    imageViewer.image.src = src;
+    imageViewer.image.alt = alt || '图片预览';
+    imageViewer.jobId = jobId || '';
+    imageViewer.seconds = Number(seconds);
+    const canPlay = imageViewer.jobId && Number.isFinite(imageViewer.seconds);
+    if (imageViewer.playButton) {
+        imageViewer.playButton.hidden = !canPlay;
+        imageViewer.playButton.textContent = canPlay ? `播放此帧 ${formatTimestampFromSeconds(imageViewer.seconds)}` : '播放此帧';
+    }
+    viewer.hidden = false;
+    document.body.classList.add('image-viewer-open');
+    setImageViewerScale(1);
+}
+
+function closeImageViewer() {
+    if (!imageViewer.node) return;
+    imageViewer.node.hidden = true;
+    document.body.classList.remove('image-viewer-open');
+}
+
+function setImageViewerScale(scale) {
+    imageViewer.scale = Math.max(0.25, Math.min(5, scale));
+    if (imageViewer.image) {
+        imageViewer.image.style.transform = `scale(${imageViewer.scale})`;
+    }
+    if (imageViewer.scaleLabel) {
+        imageViewer.scaleLabel.textContent = `${Math.round(imageViewer.scale * 100)}%`;
+    }
+}
+
+function zoomImageViewer(delta) {
+    setImageViewerScale(imageViewer.scale + delta);
+}
+
+function bindImageViewer() {
+    document.addEventListener('dblclick', event => {
+        const image = event.target.closest('img[data-image-viewer-src]');
+        if (!image) return;
+        event.preventDefault();
+        openImageViewer(
+            image.dataset.imageViewerSrc || image.currentSrc || image.src,
+            image.dataset.imageViewerAlt || image.alt || '',
+            image.dataset.jobId || selectedJobId || '',
+            image.dataset.frameSeconds || ''
+        );
+    });
+    document.addEventListener('keydown', event => {
+        if (!imageViewer.node || imageViewer.node.hidden) return;
+        if (event.key === 'Escape') closeImageViewer();
+        if (event.key === '+' || event.key === '=') zoomImageViewer(0.2);
+        if (event.key === '-' || event.key === '_') zoomImageViewer(-0.2);
+        if (event.key === '0') setImageViewerScale(1);
+    });
+}
+
+function bindVideoTimeLinks() {
+    document.addEventListener('click', async event => {
+        const button = event.target.closest('.video-time-link, .image-frame-play, [data-video-time-seconds]');
+        if (!button) return;
+        event.preventDefault();
+        const jobId = button.dataset.jobId || selectedJobId;
+        const seconds = Number(button.dataset.seconds || button.dataset.videoTimeSeconds);
+        if (jobId && Number.isFinite(seconds)) await jumpToVideoTime(jobId, seconds);
+    });
+}
+
+function clamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+}
+
+function loadPaneLayout() {
+    let layout = {};
+    try {
+        layout = JSON.parse(localStorage.getItem(paneLayoutStorageKey) || '{}') || {};
+    } catch (_error) {
+        layout = {};
+    }
+    applyPaneWidth('study', Number(layout.study));
+    applyPaneWidth('doc-list', Number(layout.docList));
+    applyPaneWidth('source-player', Number(layout.sourcePlayer));
+    applyPaneWidth('qa-source', Number(layout.qaSource));
+    applySourcePlayerHeight(Number(layout.qaSourceHeight));
+}
+
+function savePaneLayout() {
+    const vscodeStyle = nodes.vscodeDocs?.style;
+    const qaStyle = nodes.qaLayout?.style;
+    const layout = {
+        study: parsePanePixels(vscodeStyle?.getPropertyValue('--study-pane-width')),
+        docList: parsePanePixels(vscodeStyle?.getPropertyValue('--doc-list-pane-width')),
+        sourcePlayer: parsePanePixels(vscodeStyle?.getPropertyValue('--source-player-pane-width')),
+        qaSource: parsePanePixels(qaStyle?.getPropertyValue('--qa-source-pane-width')),
+        qaSourceHeight: parsePanePixels(nodes.qaSourcePlayerPanel?.style.getPropertyValue('--qa-source-player-height'))
+    };
+    localStorage.setItem(paneLayoutStorageKey, JSON.stringify(layout));
+}
+
+function parsePanePixels(value) {
+    const number = Number.parseFloat(String(value || '').replace('px', ''));
+    return Number.isFinite(number) ? Math.round(number) : null;
+}
+
+function applyPaneWidth(pane, width) {
+    if (!Number.isFinite(width)) return;
+    if (pane === 'qa-source') {
+        nodes.qaLayout?.style.setProperty('--qa-source-pane-width', `${Math.round(width)}px`);
+        return;
+    }
+    if (!nodes.vscodeDocs) return;
+    const property = paneWidthProperty(pane);
+    nodes.vscodeDocs.style.setProperty(property, `${Math.round(width)}px`);
+}
+
+function paneWidth(pane) {
+    if (pane === 'qa-source') {
+        const explicit = parsePanePixels(nodes.qaLayout?.style.getPropertyValue('--qa-source-pane-width'));
+        if (explicit) return explicit;
+        return nodes.qaSidePanel?.getBoundingClientRect().width || 0;
+    }
+    if (!nodes.vscodeDocs) return 0;
+    const property = paneWidthProperty(pane);
+    const explicit = parsePanePixels(nodes.vscodeDocs.style.getPropertyValue(property));
+    if (explicit) return explicit;
+    const selector = paneSelector(pane);
+    return nodes.vscodeDocs.querySelector(selector)?.getBoundingClientRect().width || 0;
+}
+
+function paneWidthProperty(pane) {
+    if (pane === 'doc-list') return '--doc-list-pane-width';
+    if (pane === 'source-player') return '--source-player-pane-width';
+    return '--study-pane-width';
+}
+
+function paneSelector(pane) {
+    if (pane === 'doc-list') return '.doc-list-panel';
+    if (pane === 'source-player') return '.source-player-panel';
+    return '.study-panel';
+}
+
+function sourcePlayerVisible() {
+    return Boolean(nodes.sourcePlayerPanel && !nodes.sourcePlayerPanel.hidden);
+}
+
+function resizeStudyPane(clientX) {
+    const docs = nodes.vscodeDocs;
+    if (!docs || !learningPanelVisibility.study) return;
+    const rect = docs.getBoundingClientRect();
+    const docListOffset = learningPanelVisibility.docList ? (paneWidth('doc-list') || 300) + 14 : 0;
+    const sourceReserve = sourcePlayerVisible() ? 14 + (paneWidth('source-player') || 560) : 0;
+    const contentReserve = hasDocContent() ? 14 + 320 : 0;
+    const leftEdge = rect.left + docListOffset;
+    const max = Math.max(280, rect.right - leftEdge - sourceReserve - contentReserve);
+    applyPaneWidth('study', clamp(clientX - leftEdge, 280, max));
+}
+
+function resizeDocListPane(clientX) {
+    const docs = nodes.vscodeDocs;
+    if (!docs || !learningPanelVisibility.docList) return;
+    const rect = docs.getBoundingClientRect();
+    const studyReserve = learningPanelVisibility.study ? 14 + 280 : 0;
+    const sourceReserve = sourcePlayerVisible() ? 14 + (paneWidth('source-player') || 560) : 0;
+    const contentReserve = hasDocContent() ? 14 + 320 : 0;
+    const max = Math.max(220, rect.width - studyReserve - sourceReserve - contentReserve);
+    applyPaneWidth('doc-list', clamp(clientX - rect.left, 220, max));
+}
+
+function resizeSourcePlayerPane(clientX) {
+    const docs = nodes.vscodeDocs;
+    if (!docs || !sourcePlayerVisible()) return;
+    const rect = docs.getBoundingClientRect();
+    const docListOffset = learningPanelVisibility.docList ? (paneWidth('doc-list') || 300) + 14 : 0;
+    const studyOffset = learningPanelVisibility.study ? (paneWidth('study') || 420) + 14 : 0;
+    const leftEdge = rect.left + docListOffset + studyOffset;
+    const contentReserve = hasDocContent() ? 14 + 320 : 0;
+    const max = Math.max(320, rect.right - leftEdge - contentReserve);
+    applyPaneWidth('source-player', clamp(clientX - leftEdge, 320, max));
+}
+
+function resizePaneFromPointer(pane, clientX) {
+    if (pane === 'qa-source') {
+        resizeQaSourcePane(clientX);
+        return;
+    }
+    if (pane === 'doc-list') {
+        resizeDocListPane(clientX);
+    } else if (pane === 'source-player') {
+        resizeSourcePlayerPane(clientX);
+    } else {
+        resizeStudyPane(clientX);
+    }
+}
+
+function adjustPaneWidth(pane, delta) {
+    if (pane === 'qa-source') {
+        const rect = nodes.qaLayout?.getBoundingClientRect();
+        if (!rect) return;
+        const max = Math.max(320, rect.width - 360);
+        applyPaneWidth('qa-source', clamp(paneWidth('qa-source') + delta, 320, max));
+        return;
+    }
+    if (!nodes.vscodeDocs) return;
+    const rect = nodes.vscodeDocs.getBoundingClientRect();
+    if (pane === 'doc-list') {
+        const studyReserve = learningPanelVisibility.study ? 14 + 280 : 0;
+        const sourceReserve = sourcePlayerVisible() ? 14 + (paneWidth('source-player') || 560) : 0;
+        const contentReserve = hasDocContent() ? 14 + 320 : 0;
+        const max = Math.max(220, rect.width - studyReserve - sourceReserve - contentReserve);
+        applyPaneWidth('doc-list', clamp(paneWidth('doc-list') + delta, 220, max));
+        return;
+    }
+    if (pane === 'source-player') {
+        const docListReserve = learningPanelVisibility.docList ? (paneWidth('doc-list') || 300) + 14 : 0;
+        const studyReserve = learningPanelVisibility.study ? (paneWidth('study') || 420) + 14 : 0;
+        const contentReserve = hasDocContent() ? 14 + 320 : 0;
+        const max = Math.max(320, rect.width - docListReserve - studyReserve - contentReserve);
+        applyPaneWidth('source-player', clamp(paneWidth('source-player') + delta, 320, max));
+        return;
+    }
+    const docListReserve = learningPanelVisibility.docList ? (paneWidth('doc-list') || 300) + 14 : 0;
+    const sourceReserve = sourcePlayerVisible() ? 14 + (paneWidth('source-player') || 560) : 0;
+    const contentReserve = hasDocContent() ? 14 + 320 : 0;
+    const max = Math.max(280, rect.width - docListReserve - sourceReserve - contentReserve);
+    applyPaneWidth('study', clamp(paneWidth('study') + delta, 280, max));
+}
+
+function resizeQaSourcePane(clientX) {
+    const layout = nodes.qaLayout;
+    if (!layout) return;
+    const rect = layout.getBoundingClientRect();
+    const max = Math.max(320, rect.width - 360);
+    applyPaneWidth('qa-source', clamp(rect.right - clientX, 320, max));
+}
+
+function sourcePlayerHeight() {
+    const explicit = parsePanePixels(nodes.qaSourcePlayerPanel?.style.getPropertyValue('--qa-source-player-height'));
+    if (explicit) return explicit;
+    return nodes.qaSourcePlayerBody?.getBoundingClientRect().height || 260;
+}
+
+function applySourcePlayerHeight(height) {
+    if (!nodes.qaSourcePlayerPanel || !Number.isFinite(height)) return;
+    nodes.qaSourcePlayerPanel.style.setProperty('--qa-source-player-height', `${Math.round(height)}px`);
+}
+
+function resizeSourcePlayerHeight(clientY) {
+    const panel = nodes.qaSourcePlayerPanel;
+    const header = panel?.querySelector('.source-player-header');
+    if (!panel || !header) return;
+    const rect = panel.getBoundingClientRect();
+    const headerHeight = header.getBoundingClientRect().height;
+    const max = Math.max(220, window.innerHeight - rect.top - 180);
+    applySourcePlayerHeight(clamp(clientY - rect.top - headerHeight, 180, max));
+}
+
+function adjustSourcePlayerHeight(delta) {
+    const max = Math.max(220, window.innerHeight - (nodes.qaSourcePlayerPanel?.getBoundingClientRect().top || 0) - 180);
+    applySourcePlayerHeight(clamp(sourcePlayerHeight() + delta, 180, max));
+}
+
+function bindPaneResizers() {
+    loadPaneLayout();
+    document.querySelectorAll('.pane-resizer').forEach(handle => {
+        handle.addEventListener('pointerdown', event => {
+            paneResizeState.active = handle.dataset.resizePane || 'study';
+            paneResizeState.pointerId = event.pointerId;
+            handle.setPointerCapture?.(event.pointerId);
+            resizerContainer(paneResizeState.active)?.classList.add('resizing');
+            if (paneResizeState.active === 'qa-source-height') {
+                resizeSourcePlayerHeight(event.clientY);
+            } else {
+                resizePaneFromPointer(paneResizeState.active, event.clientX);
+            }
+            event.preventDefault();
+        });
+        handle.addEventListener('keydown', event => {
+            const pane = handle.dataset.resizePane || 'study';
+            if (pane === 'qa-source-height') {
+                if (!['ArrowUp', 'ArrowDown'].includes(event.key)) return;
+                adjustSourcePlayerHeight(event.key === 'ArrowDown' ? 24 : -24);
+            } else {
+                if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+                const delta = event.key === 'ArrowRight' ? 24 : -24;
+                adjustPaneWidth(pane, delta);
+            }
+            savePaneLayout();
+            event.preventDefault();
+        });
+    });
+    document.addEventListener('pointermove', event => {
+        if (!paneResizeState.active) return;
+        if (paneResizeState.active === 'qa-source-height') {
+            resizeSourcePlayerHeight(event.clientY);
+        } else {
+            resizePaneFromPointer(paneResizeState.active, event.clientX);
+        }
+    });
+    document.addEventListener('pointerup', event => {
+        if (!paneResizeState.active) return;
+        if (paneResizeState.pointerId !== null && event.pointerId !== paneResizeState.pointerId) return;
+        resizerContainer(paneResizeState.active)?.classList.remove('resizing');
+        paneResizeState.active = null;
+        paneResizeState.pointerId = null;
+        savePaneLayout();
+    });
+}
+
+function resizerContainer(pane) {
+    return pane?.startsWith('qa-source') ? nodes.qaLayout : nodes.vscodeDocs;
+}
+
 async function runSelectedJob() {
     if (!selectedJobId) return;
     nodes.runButton.disabled = true;
     try {
-        const action = currentJob?.status === 'succeeded' ? 'open-run-dir' : 'run';
+        const action = nodes.runButton.dataset.action || (currentJob?.status === 'succeeded' ? 'open-run-dir' : 'run');
         await getJson(`/api/video-link/jobs/${selectedJobId}/${action}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: '{}'
         });
-        if (action === 'run') {
+        if (action === 'run' || action === 'stop') {
             await refreshSelectedJob();
         } else {
             nodes.runButton.disabled = false;
@@ -1811,7 +2812,7 @@ async function runSelectedJob() {
 
 async function boot() {
     nodes.consoleTab.addEventListener('click', () => setView('console'));
-    nodes.previewTab.addEventListener('click', () => setView('preview'));
+    nodes.qaTab.addEventListener('click', () => setView('qa'));
     nodes.vscodeTab.addEventListener('click', () => setView('vscode'));
     nodes.jobForm.addEventListener('submit', createJob);
     nodes.addUrlButton.addEventListener('click', addPendingUrls);
@@ -1823,18 +2824,25 @@ async function boot() {
     });
     renderUrlList();
     nodes.refreshJobsButton.addEventListener('click', refreshJobs);
-    nodes.refreshPreviewButton.addEventListener('click', refreshJobs);
+    nodes.qaForm.addEventListener('submit', askQa);
+    nodes.generateSkillButton.addEventListener('click', generateSkillCandidate);
+    nodes.enableSkillButton.addEventListener('click', enableSkillCandidate);
     nodes.startVscodeButton.addEventListener('click', () => ensureVscodeSession(false));
     nodes.restartVscodeButton.addEventListener('click', () => ensureVscodeSession(true));
     nodes.stopVscodeButton.addEventListener('click', stopVscodeSession);
     nodes.docPreviewClose.addEventListener('click', closeDocPreview);
+    nodes.qaSourcePlayerStopButton?.addEventListener('click', pauseSourcePlayer);
+    nodes.sourcePlayerStopButton?.addEventListener('click', pauseSourcePlayer);
     nodes.runButton.addEventListener('click', runSelectedJob);
     nodes.copyLogButton.addEventListener('click', copySelectedLog);
+    bindImageViewer();
+    bindVideoTimeLinks();
+    bindLearningPanelToggles();
+    bindPaneResizers();
     await loadOptions();
-    setView(currentView, false);
+    setView(currentView, true);
     await refreshJobs();
     if (selectedJobId) await refreshSelectedJob();
-    startScanAnimation();
     refreshTimer = setInterval(() => {
         if (selectedJobId) {
             refreshSelectedJob();

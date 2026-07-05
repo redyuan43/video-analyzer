@@ -378,6 +378,9 @@ def main() -> int:
                 fallback_model=config.get("operation_manual", {}).get("vision_model"),
                 fallback_api_key="0",
                 request_timeout_seconds=ocr_config.get("timeout_seconds", 120),
+                max_tokens=ocr_config.get("max_tokens", 1024),
+                max_image_long_side=ocr_config.get("max_image_long_side", 1280),
+                retry_endpoints=bool(ocr_config.get("retry_endpoints", True)),
                 cache_mode=ocr_config.get("cache", "on"),
                 cache_dir=ocr_config.get("cache_dir", ".cache/video-analyzer/ocr"),
             )

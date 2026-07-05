@@ -28,6 +28,8 @@
 - When starting VibeVoice workers, choose only P40 GPU indices from current `nvidia-smi` output. As of 2026-06-01, the expected P40 indices are `0,1,2,4,5`; GPU `3` is `Tesla V100-SXM2-16GB` and should not be included in VibeVoice worker mapping.
 - If VibeVoice startup fails with an apparent CUDA OOM on a 15-16 GiB device, first suspect that the V100 was selected accidentally. Check `nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total --format=csv,noheader` and fix the GPU mapping before changing model length, memory utilization, or ASR provider.
 - MiniCPM VL may use the V100 together with the five P40 cards. Its normal local worker set is six GPUs, `0,1,2,3,4,5`, with `CUDA_DEVICE_ORDER=PCI_BUS_ID` so script GPU IDs match `nvidia-smi`.
+- MiniCPM VL keeps the OpenAI-compatible proxy on `http://127.0.0.1:18082/v1` alive while worker `llama-server` processes are lazy and unloadable. `tools/minicpm_p40_proxy.py` starts workers only on `POST /v1/...`; `/api/health` and `/v1/models` must not load the model. Workers unload after `MINICPM_IDLE_UNLOAD_SECONDS` seconds of no inflight work, default `600`, while the proxy API remains available for the next call.
+- MiniCPM proxy autostart is installed as the user service `minicpm-p40-proxy.service`. It starts only the proxy after reboot; it sets `MINICPM_STOP_CONFLICTS=0`, so boot-time proxy recovery does not stop VibeVoice or DotsMOCR. Check it with `systemctl --user status minicpm-p40-proxy.service --no-pager`.
 - DotsMOCR OCR must remain P40-only for now: use `0,1,2,4,5`. A 2026-06-01 V100 smoke failed in the current vLLM/Pascal runtime with `CUDA error: no kernel image is available for execution on the device`, so do not include GPU `3` in OCR until the OCR runtime is rebuilt or otherwise validated for sm_70.
 - The project-wide text/VL endpoint is configured by the active runtime profile. Current local overrides may intentionally use loopback services such as MiniCPM or DotsMOCR; keep those on the current machine unless the user asks otherwise. Historical AMD Fast settings are reference-only, not a reason to move work off `ai`.
 - Historical AMD Fast reference:
@@ -80,6 +82,7 @@ A passing local response includes:
 - The reusable job engine is `tools/video_link_status_server.py`; the human entrypoint is the Flask UI under `video-analyzer-ui/video_analyzer_ui`, managed by `tools/run_video_link_status_server.sh`. It exposes `POST /api/video-link/jobs`, `GET /api/video-link/jobs`, `POST /api/video-link/jobs/<job_id>/run`, manual stage endpoints under `/stages/<stage>`, and stores job state/logs under `tmp/video-link-status/jobs/`.
 - Keep runtime progress and service failures visible on the home page, including failed stage, queue/resource state, error message, log path, selected log tail, full-log copy, core-analysis substeps, and artifact counts.
 - The background runner skips stages already marked `succeeded` or `skipped`, then resumes from the first incomplete stage. If a resource is busy, the stage should become `queued` instead of failing with a lock conflict.
+- Treat transient video-link failures as retry-first conditions before reporting a final failure. This includes YouTube/yt-dlp incomplete data, subtitle/comment fetch errors, HTTP 429/rate limits, temporary network errors, local model cold-start races, and queued/resource-lock contention. Retry the failed stage or resume the job from the first incomplete stage at least once when the operation is idempotent or already uses `keep_existing`; only escalate after the retry also fails, and keep the first error plus retry result in the report. Do not auto-retry destructive or high-risk operations without explicit user confirmation.
 - The home page should expose only common and collection options: URL, analysis mode, profile, run name, browser cookie source, skip images, keep existing, subtitles, subtitle transcript preference, comments, max comments, subtitle languages, and refresh context.
 - If a job has `keep_existing=true` and `refresh_context=true`, the core stage may intentionally rerun the URL context/download path instead of only reusing the successful prepare artifacts. With `download_device=mi` and subtitles enabled, a repeated remote `yt-dlp` attempt can fail on YouTube subtitle fetch with `HTTP Error 429: Too Many Requests`; treat that as a network/rate-limit retry condition, not an ASR/OCR/VL/LLM failure.
 - Model endpoint/model overrides should stay in runtime profiles, not page fields. The default page profile should prefer `deepseek_v4_pro` when available.
@@ -104,6 +107,15 @@ A passing local response includes:
   `~/.codex/skills/video-link/scripts/run_video_link_analysis_publisher.sh URL --profile deepseek_v4_pro --run-dir "$RUN_DIR" --skip-operation`
 - Current final publish is mobile-first PDF-only by default. Do not require `.long.png` unless the user explicitly asks for long-image delivery.
 - The default PDF backend is `tools/md_to_mobile_pdf.py` through `tools/export_video_docs.sh`. It renders prepared Markdown to narrow mobile-readable PDF with WeasyPrint. Simple acyclic `flowchart TB/TD` and `graph TB/TD/LR/RL` Mermaid blocks should render as native mobile HTML flowcharts, including branch/merge flows and `<br/>` label breaks; more complex Mermaid blocks rely on `@mermaid-js/mermaid-cli` plus Chrome/Chromium PNG rendering. If a PDF shows raw Mermaid source, first check whether the diagram is outside the built-in simple-flow renderer and whether the Mermaid CLI/Puppeteer/Chrome path is failing.
+- If final publish appears stuck during PDF export, first identify the exact document being rendered. Check the stage log, live process, and export directory before suspecting OCR/GPU/model work:
+  `tail -n 160 tmp/video-link-status/jobs/<job_id>/logs/final-publish.log`,
+  `pgrep -af 'run_video_doc_final_publish|export_video_docs|md_to_mobile_pdf'`,
+  and `ls -lh <run_dir>/exports`.
+  A common failure mode is `md_to_mobile_pdf.py ... manual_evidence.pdf` consuming 100% CPU with no output PDF. This is usually WeasyPrint/Pango struggling with `manual_evidence.md` evidence tables on the narrow mobile page, not a DeepSeek/OCR/VL/GPU issue.
+- For `manual_evidence.pdf`, keep the source Markdown/JSON evidence complete, but make the export-prepared Markdown PDF-friendly. `tools/prepare_video_doc_export.py` should summarize or card-ify pathological evidence tables and avoid passing huge OCR/VL cells, inline HTML tables, and dense frame evidence maps directly to WeasyPrint. Validate with a focused smoke before rerunning final publish:
+  `.venv/bin/python tools/prepare_video_doc_export.py RUN_DIR RUN_DIR/manual_evidence.md /tmp/manual_evidence_test.md`
+  then `timeout 60 .venv/bin/python tools/md_to_mobile_pdf.py /tmp/manual_evidence_test.md /tmp/manual_evidence_test.pdf --title manual_evidence`.
+- If `final-publish` was interrupted while stuck, verify whether the stage was recorded as `skipped`/soft-failed with incomplete exports. In that case the manual stage endpoint must be able to rerun `final-publish`; a skipped final publish is only safe to treat as complete when all expected exports exist and are non-empty. After a manual stage rerun, ensure both the stage and top-level runner settle to `succeeded` with `current_stage=null`, otherwise the Web UI can keep showing a stale queued/running state even though `pdf=4` was verified.
 - Optional long-image delivery uses `tools/export_video_docs.sh --long-png` or `tools/run_video_doc_final_publish.sh --long-png`. It converts each verified PDF page to PNG, trims page whitespace, and stitches pages into `<name>.long.png`.
 - Final publish should generate the four Baoyu final images when `skip_images` is false, run `tools/augment_video_docs_images.py`, then generate PDFs from the image-augmented Markdown.
 - Before reporting video-link completion, verify the four default PDF outputs exist and are non-empty, and verify four final image PNGs exist unless `skip_images` is true:
@@ -134,13 +146,14 @@ A passing local response includes:
 
 ## Jetson LAN Sync
 
-- Use Tailscale/MagicDNS as the control plane to reach devices and repair SSH state, but use `192.168.31.x` LAN addresses as the data plane for large video transfers between Jetson workers.
-- Current LAN identities:
+- Use Tailscale/MagicDNS as the control plane to reach devices and repair SSH state. Use dynamically discovered private LAN addresses as the data plane for large video transfers between Jetson workers; do not hard-code transient DHCP IPs in default startup paths.
+- Historical LAN identities for diagnostics only:
   - `nx1`: `nx@192.168.31.40`, Tailscale `100.119.5.57`
   - `nx2`: `nx@192.168.31.68`, Tailscale `100.123.222.45`
   - `nx3`: `nx@192.168.31.35`, Tailscale `100.127.71.86`
   - `nx4`: `nx@192.168.31.10`, Tailscale `100.82.227.71`
   - `agx`: `agx@192.168.31.201`, Tailscale `100.103.199.121`
+- For AGX Ray startup, default to the `agx` control host and let `tools/start_jetson_frame_ray.sh` resolve the current private LAN IP from AGX before starting Ray. The video-link status launcher probes LAN device names (`agx-lan,agx.local,ubuntu.local` by default) and exports `JETSON_AGX_LAN_HOST` only when the name resolves and `ssh agx@<name>` works. Set `JETSON_AGX_LAN_HOST=agx-lan` only when a stable LAN DNS/DHCP hostname exists; customize probe names with `VIDEO_LINK_AGX_LAN_HOST_CANDIDATES`; set `JETSON_RAY_HEAD_IP` only as an explicit temporary override.
 - All `nx*` device passwords are `nx`; AGX password is `agx`. Prefer using those only to bootstrap public-key auth, then keep automated runs passwordless.
 - Before large syncs, validate LAN mesh with direct device-to-device SSH, for example:
   `ssh nx1 "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new nx@192.168.31.10 hostname"`

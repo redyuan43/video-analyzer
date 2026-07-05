@@ -23,16 +23,9 @@ DOCS = [
         "生成一张中文深度分析信息图，呈现核心论点、因果链、风险点和结论。",
         "高密度模块化布局；适合长文配图；包含时间线、风险矩阵或因果箭头；中文清晰可读。",
     ),
-    (
-        "04-infographic-manual-evidence.md",
-        "baoyu-infographic",
-        "manual_evidence.md",
-        "生成一张证据地图/审稿仪表盘，展示视频证据来源、帧画面、OCR/VL/ASR支撑和复核路径。",
-        "技术仪表盘风格；分区展示输入来源、证据强度、时间线覆盖、风险提醒；不要堆满小字。",
-    ),
 ]
 
-DEPRECATED_PROMPTS = ("01-image-cards-operation-manual.md",)
+DEPRECATED_PROMPTS = ("01-image-cards-operation-manual.md", "04-infographic-manual-evidence.md")
 
 
 def parse_args() -> argparse.Namespace:

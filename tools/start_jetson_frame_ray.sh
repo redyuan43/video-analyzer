@@ -27,8 +27,12 @@ case "$NETWORK" in
     WORKERS=()
     ;;
   lan)
-    DEFAULT_HEAD_SSH="agx@192.168.2.110"
-    HEAD_IP="${JETSON_RAY_HEAD_IP:-192.168.2.110}"
+    if [[ -n "${JETSON_AGX_LAN_HOST:-}" ]]; then
+      DEFAULT_HEAD_SSH="agx@${JETSON_AGX_LAN_HOST}"
+    else
+      DEFAULT_HEAD_SSH="$HEAD_HOST"
+    fi
+    HEAD_IP="${JETSON_RAY_HEAD_IP:-}"
     WORKERS=()
     ;;
   *)
@@ -39,7 +43,7 @@ esac
 
 HEAD_SSH_TARGET="${JETSON_RAY_HEAD_SSH:-$DEFAULT_HEAD_SSH}"
 HEAD_SSH_OPTIONS=(-o BatchMode=yes -o ConnectTimeout="$SSH_TIMEOUT" -o ConnectionAttempts=1)
-if [[ "$NETWORK" == "lan" ]]; then
+if [[ "$NETWORK" == "lan" && "$HEAD_SSH_TARGET" == agx@* ]]; then
   HEAD_SSH_OPTIONS+=(-o HostKeyAlias=agx-lan)
 fi
 
@@ -47,7 +51,6 @@ if [[ -n "${JETSON_RAY_WORKERS:-}" ]]; then
   IFS=, read -r -a WORKERS <<<"$JETSON_RAY_WORKERS"
 fi
 
-ADDRESS="${HEAD_IP}:${RAY_PORT}"
 ACTIVE_WORKERS=()
 
 required_resources=(
@@ -86,6 +89,44 @@ build_required_resources() {
 host_reachable() {
   local host="$1"
   ssh -o BatchMode=yes -o ConnectTimeout="$SSH_TIMEOUT" "$host" true >/dev/null 2>&1
+}
+
+resolve_head_ip() {
+  if [[ -n "$HEAD_IP" ]]; then
+    return
+  fi
+  if [[ "$NETWORK" != "lan" ]]; then
+    echo "JETSON_RAY_HEAD_IP is required when JETSON_RAY_NETWORK=$NETWORK" >&2
+    exit 2
+  fi
+  local remote_script
+  remote_script='python3 - <<'"'"'PY'"'"'
+import ipaddress
+import subprocess
+
+rows = subprocess.check_output(["ip", "-4", "-o", "addr", "show", "scope", "global"], text=True)
+candidates = []
+for row in rows.splitlines():
+    cidr = row.split()[3]
+    interface = ipaddress.ip_interface(cidr)
+    ip = interface.ip
+    text = str(ip)
+    if ip.is_loopback or ip.is_link_local:
+        continue
+    if text.startswith("100.") or text.startswith("172.17."):
+        continue
+    if ip.is_private:
+        candidates.append(text)
+if candidates:
+    candidates.sort(key=lambda value: (not value.startswith("192.168."), value))
+    print(candidates[0])
+PY'
+  HEAD_IP="$(ssh "${HEAD_SSH_OPTIONS[@]}" "$HEAD_SSH_TARGET" "$remote_script" 2>/dev/null | tail -n 1)"
+  if [[ -z "$HEAD_IP" ]]; then
+    echo "[jetson-ray] failed to resolve LAN IP for Ray head via $HEAD_SSH_TARGET" >&2
+    echo "[jetson-ray] set JETSON_RAY_HEAD_IP explicitly, or set JETSON_AGX_LAN_HOST to a reachable LAN DNS name/IP" >&2
+    exit 1
+  fi
 }
 
 select_active_workers() {
@@ -175,9 +216,12 @@ stop_all() {
 
 if ! ssh "${HEAD_SSH_OPTIONS[@]}" "$HEAD_SSH_TARGET" true >/dev/null 2>&1; then
   echo "[jetson-ray] Ray head is offline: $HEAD_SSH_TARGET" >&2
+  echo "[jetson-ray] tried network=$NETWORK; set JETSON_RAY_HEAD_SSH or JETSON_AGX_LAN_HOST if the head moved" >&2
   exit 1
 fi
 
+resolve_head_ip
+ADDRESS="${HEAD_IP}:${RAY_PORT}"
 select_active_workers
 status="$(ray_status)"
 if cluster_ready "$status"; then

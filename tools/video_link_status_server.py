@@ -16,7 +16,7 @@ import subprocess
 import sys
 import threading
 import time
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 import uuid
 from datetime import datetime
 from http import HTTPStatus
@@ -25,6 +25,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient
+from video_analyzer.config import Config, build_openai_extra_body, resolve_api_key, resolve_temperature
+from video_analyzer.doc_chat import ask_video_docs_result
+from video_analyzer.qa_index import ANSWER_INDEX_NAME, CHUNKS_NAME, QA_DIR_NAME
+from video_analyzer.skill_candidate import (
+    build_tool_skill_candidate,
+    candidate_summary,
+    enable_tool_skill_candidate,
+)
 from video_analyzer.resource_locks import DEFAULT_LOCK_DIR
 from video_analyzer.url_context import FALLBACK_OUTPUT_ROOT, infer_video_id_from_url, safe_slug
 
@@ -32,7 +41,7 @@ from video_analyzer.url_context import FALLBACK_OUTPUT_ROOT, infer_video_id_from
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_JOBS_DIR = REPO_ROOT / "tmp" / "video-link-status" / "jobs"
 BAOYU_PROMPT_SCRIPT = REPO_ROOT / "tools" / "prepare_baoyu_image_prompts.py"
-ALLOWED_ANALYSIS_MODES = ("auto", "fast", "balanced", "deep", "long-talk-fast")
+ALLOWED_ANALYSIS_MODES = ("auto", "fast", "balanced", "deep", "operation-fast", "long-talk-fast")
 ALLOWED_COOKIE_BROWSERS = ("", "chrome", "none", "edge", "firefox", "chromium", "brave")
 ALLOWED_DOWNLOAD_DEVICES = ("local", "mi")
 DEFAULT_COOKIE_BROWSER = ""
@@ -63,7 +72,7 @@ CORE_DIAGNOSTIC_NOT_READY_PATTERNS = (
 CORE_DIAGNOSTIC_STALE_SECONDS = 600
 CORE_DIAGNOSTIC_QUEUE_WARN_SECONDS = 300
 CORE_DIAGNOSTIC_EXPECTED_MINICPM_CONCURRENCY = 6
-CORE_DIAGNOSTIC_GPU_TTL_SECONDS = 5
+CORE_DIAGNOSTIC_GPU_TTL_SECONDS = 120
 CORE_DIAGNOSTIC_GPU_TIMEOUT_SECONDS = 0.8
 AUTO_MODE_LONG_SECONDS = 2700
 AUTO_MODE_FAST_KEYWORDS = (
@@ -132,6 +141,26 @@ AUTO_MODE_LONG_TALK_KEYWORDS = (
     "subtitle",
     "chapter",
 )
+AUTO_MODE_OPERATION_KEYWORDS = (
+    "操作",
+    "教程",
+    "演示",
+    "屏幕",
+    "界面",
+    "配置",
+    "步骤",
+    "命令",
+    "安装",
+    "部署",
+    "debug",
+    "setup",
+    "install",
+    "configure",
+    "tutorial",
+    "screen",
+    "ui",
+    "cli",
+)
 DEFAULT_RUN_NAME = "operation-manual"
 DEFAULT_SUBTITLE_LANGS = "zh-CN,zh-Hans,zh,en"
 MODULE_ORDER = [
@@ -143,6 +172,8 @@ MODULE_ORDER = [
     "multidoc",
     "deep-v2",
     "evidence-review",
+    "web-evidence",
+    "qa-index",
     "image-prompts",
     "final-publish",
 ]
@@ -155,6 +186,8 @@ MODULE_LABELS = {
     "multidoc": "多文档分析",
     "deep-v2": "章节深度报告",
     "evidence-review": "证据复核/发布门禁",
+    "web-evidence": "联网补证据",
+    "qa-index": "问答证据索引",
     "image-prompts": "生成配图提示词",
     "final-publish": "最终定稿/发布",
 }
@@ -176,6 +209,8 @@ MODULE_SPECS = {
         "requires": ["run_dir", "verified_core", "study_guide"],
         "produces": ["evidence_review", "publish_decision"],
     },
+    "web-evidence": {"requires": ["run_dir", "verified_core", "evidence_review"], "produces": ["web_evidence"]},
+    "qa-index": {"requires": ["run_dir", "verified_core"], "produces": ["qa_index"]},
     "image-prompts": {"requires": ["run_dir"], "produces": ["image_prompts"]},
     "final-publish": {"requires": ["run_dir", "verified_core"], "produces": ["exports"]},
 }
@@ -189,6 +224,10 @@ STAGE_ALIASES = {
     "study_guide": "study-guide",
     "review": "evidence-review",
     "evidence_review": "evidence-review",
+    "web": "web-evidence",
+    "web_evidence": "web-evidence",
+    "qa": "qa-index",
+    "qa_index": "qa-index",
     "export": "final-publish",
     "export_docs": "final-publish",
     "image_prompts": "image-prompts",
@@ -203,6 +242,8 @@ STAGE_RESOURCES = {
     "multidoc": "multidoc",
     "deep-v2": "deep-v2",
     "evidence-review": "study-guide",
+    "web-evidence": "qa-index",
+    "qa-index": "qa-index",
     "image-prompts": "image-prompts",
     "final-publish": "final-publish",
 }
@@ -216,6 +257,7 @@ RESOURCE_LIMITS = {
     "study-guide": 3,
     "multidoc": 3,
     "deep-v2": 3,
+    "qa-index": 2,
     "image-prompts": 3,
     "final-publish": 3,
 }
@@ -225,7 +267,7 @@ EXPECTED_FINAL_EXPORTS = (
     "deep_report_v2.pdf",
     "manual_evidence.pdf",
 )
-SOFT_FAILURE_STAGES = {"multidoc", "deep-v2", "image-prompts", "final-publish"}
+SOFT_FAILURE_STAGES = {"multidoc", "deep-v2", "web-evidence", "qa-index", "image-prompts", "final-publish"}
 VIDEO_PREVIEW_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 VSCODE_PORT_RANGE = tuple(
     int(part)
@@ -312,6 +354,16 @@ STAGE_PROGRESS_STEPS = {
         ("review", "模型复核缺口影响", (r"evidence_review", r"review", r"publish_decision")),
         ("gate", "写出发布门禁", (r"publish_decision", r"publishable", r"blocked")),
     ],
+    "web-evidence": [
+        ("load", "读取证据缺口", (r"evidence_gaps", r"study_guide", r"web_evidence")),
+        ("search", "联网搜索外部证据", (r"search", r"external", r"web")),
+        ("write", "写出联网证据账本", (r"web_evidence\.json", r"web_evidence\.md", r"processed_gaps")),
+    ],
+    "qa-index": [
+        ("load", "读取最终文档与证据", (r"operation_manual", r"manual_evidence", r"transcript")),
+        ("chunk", "生成问答证据切片", (r"source_chunks\.jsonl", r"chunk_count")),
+        ("write", "写出问答索引", (r"answer_index\.json", r"QA index")),
+    ],
     "image-prompts": [
         ("load", "读取文档内容", (r"operation_manual", r"knowledge_notes", r"deep_report", r"manual_evidence")),
         ("prompt", "生成配图提示词", (r"prompt", r"baoyu", r"cover", r"image")),
@@ -364,7 +416,7 @@ class VideoLinkStatusServer:
                 "run_name": DEFAULT_RUN_NAME,
                 "cookies_from_browser": "none",
                 "download_device": "local",
-                "skip_images": False,
+                "skip_images": True,
                 "keep_existing": True,
                 "include_subtitles": True,
                 "prefer_subtitle_transcript": True,
@@ -407,7 +459,7 @@ class VideoLinkStatusServer:
         profiles = runtime_profile_names()
         if profiles and profile not in profiles:
             raise BridgeError(HTTPStatus.BAD_REQUEST, f"profile must be one of {profiles}")
-        skip_images = parse_bool(normalize_optional_template(payload.get("skip_images") if "skip_images" in payload else payload.get("skipImages", False)))
+        skip_images = parse_bool_option(payload, "skip_images", "skipImages", defaults["skip_images"])
         auto_start = parse_bool(normalize_optional_template(payload.get("auto_start") if "auto_start" in payload else payload.get("autoStart", False)))
         keep_existing = parse_bool_option(payload, "keep_existing", "keepExisting", defaults["keep_existing"])
         include_subtitles = parse_bool_option(payload, "include_subtitles", "includeSubtitles", defaults["include_subtitles"])
@@ -510,7 +562,7 @@ class VideoLinkStatusServer:
         jobs = []
         for path in self.jobs_dir.glob("*/job.json"):
             try:
-                jobs.append(self.public_job(self.load_job(path.parent.name)))
+                jobs.append(self.public_job_summary(self.load_job(path.parent.name)))
             except Exception:
                 continue
         jobs.sort(key=lambda item: item.get("created_at") or "", reverse=True)
@@ -670,6 +722,48 @@ class VideoLinkStatusServer:
             self.active_runners[job_id] = thread
         thread.start()
         return self.public_job(self.load_job(job_id))
+
+    def stop_job(self, job_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        stage = normalize_stage_name((job.get("runner") or {}).get("current_stage") or self.current_stage(job) or self.next_stage(job) or "")
+        stage_info = dict((job.get("stages") or {}).get(stage) or {})
+        process_info = dict(stage_info.get("process") or job.get("process") or {})
+        pid = process_info.get("pid")
+        stopped_pids: list[int] = []
+        if pid and process_alive(pid):
+            stopped_pids = terminate_process_tree(pid)
+        now = iso_now()
+        if stage:
+            stage_info.update(
+                {
+                    "status": "failed",
+                    "finished_at": now,
+                    "exit_code": -15 if stopped_pids else None,
+                    "error": "stopped by user",
+                }
+            )
+            if process_info:
+                process_info["alive"] = False
+                process_info["stopped_at"] = now
+                process_info["stopped_pids"] = stopped_pids
+                stage_info["process"] = process_info
+            job.setdefault("stages", {})[stage] = stage_info
+        job["status"] = "failed"
+        job["updated_at"] = now
+        runner = dict(job.get("runner") or {})
+        runner.update(
+            {
+                "status": "failed",
+                "current_stage": stage or runner.get("current_stage"),
+                "error": "stopped by user",
+                "finished_at": now,
+                "updated_at": now,
+                "server_pid": os.getpid(),
+            }
+        )
+        job["runner"] = runner
+        self.save_job(job)
+        return {"stopped": True, "job_id": job_id, "stage": stage, "pid": pid, "stopped_pids": stopped_pids}
 
     def recover_interrupted_jobs(self, auto_start: bool = False) -> None:
         recovered_jobs: list[dict[str, Any]] = []
@@ -869,6 +963,8 @@ class VideoLinkStatusServer:
             job["updated_at"] = now
             self.save_job(job)
             return self.public_job(job)
+        if stage == "final-publish" and current_status == "skipped" and not self.export_outputs_complete(job):
+            current_status = None
         if current_status in {"succeeded", "skipped"}:
             return self.public_job(job)
         if stage == "image-prompts" and job["options"].get("skip_images"):
@@ -887,6 +983,10 @@ class VideoLinkStatusServer:
     def wait_for_resource_slot(self, resource: str, job_id: str) -> None:
         limit = max(1, int(RESOURCE_LIMITS.get(resource, 1)))
         while True:
+            job = self.load_job(job_id)
+            runner = job.get("runner") or {}
+            if job.get("status") == "failed" or runner.get("status") == "failed":
+                raise BridgeError(HTTPStatus.CONFLICT, runner.get("error") or "job stopped")
             blockers = self.live_resource_users(resource, exclude_job_id=job_id)
             if len(blockers) < limit:
                 return
@@ -954,6 +1054,10 @@ class VideoLinkStatusServer:
                 result = self.run_command_stage(job, stage, self.study_guide_command(job), stage_info["log_path"], stage_info)
             elif stage == "evidence-review":
                 result = self.run_command_stage(job, stage, self.evidence_review_command(job), stage_info["log_path"], stage_info)
+            elif stage == "web-evidence":
+                result = self.run_command_stage(job, stage, self.web_evidence_command(job), stage_info["log_path"], stage_info)
+            elif stage == "qa-index":
+                result = self.run_command_stage(job, stage, self.qa_index_command(job), stage_info["log_path"], stage_info)
             elif stage == "image-prompts":
                 result = self.run_command_stage(job, stage, self.image_prompts_command(job), stage_info["log_path"], stage_info)
             else:
@@ -965,7 +1069,7 @@ class VideoLinkStatusServer:
             stage_info["exit_code"] = 0
             stage_info["duration_seconds"] = round(time.time() - start, 3)
             stage_info["finished_at"] = iso_now()
-            job["status"] = "succeeded" if stage == STAGE_ORDER[-1] else "running"
+            job["status"] = "succeeded" if self.next_stage(job) is None else "running"
         except Exception as exc:
             stage_info["status"] = "failed"
             stage_info["exit_code"] = getattr(exc, "returncode", 1)
@@ -984,6 +1088,27 @@ class VideoLinkStatusServer:
         job["updated_at"] = iso_now()
         job["stages"][stage] = stage_info
         job["summary"] = self.collect_summary(job)
+        next_stage = self.next_stage(job)
+        runner = dict(job.get("runner") or {})
+        runner["updated_at"] = job["updated_at"]
+        runner["server_pid"] = os.getpid()
+        runner["error"] = None if job["status"] != "failed" else stage_info.get("error")
+        if job["status"] == "succeeded":
+            runner["status"] = "succeeded"
+            runner["current_stage"] = None
+            runner["queued_for"] = None
+            runner["finished_at"] = job["updated_at"]
+        elif job["status"] == "failed":
+            runner["status"] = "failed"
+            runner["current_stage"] = stage
+            runner["queued_for"] = stage_resource(stage)
+            runner["finished_at"] = job["updated_at"]
+        else:
+            runner["status"] = "running"
+            runner["current_stage"] = next_stage
+            runner["queued_for"] = stage_resource(next_stage) if next_stage else None
+            runner.pop("finished_at", None)
+        job["runner"] = runner
         self.save_job(job)
         if stage_info["status"] == "failed":
             raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, f"{stage} failed: {stage_info.get('error')}")
@@ -1201,6 +1326,8 @@ class VideoLinkStatusServer:
                 pipeline_mode_for(resolved_mode),
             ]
             self.append_default_frame_extractor_options(command)
+            if resolved_mode == "operation-fast":
+                command.extend(["--vl-frame-policy", "auto", "--min-vl-frames", "8", "--max-vl-frames", "16"])
         command.append("--resume-existing-core")
         self.append_url_options(command, opts)
         return command
@@ -1291,6 +1418,27 @@ class VideoLinkStatusServer:
             job["options"].get("profile") or DEFAULT_PROFILE,
         ]
 
+    def web_evidence_command(self, job: dict[str, Any]) -> list[str]:
+        return [
+            sys.executable,
+            "-m",
+            "video_analyzer.web_evidence",
+            str(self.require_run_dir(job)),
+            "--profile",
+            job["options"].get("profile") or DEFAULT_PROFILE,
+        ]
+
+    def qa_index_command(self, job: dict[str, Any]) -> list[str]:
+        return [
+            sys.executable,
+            "-m",
+            "video_analyzer.doc_chat",
+            str(self.require_run_dir(job)),
+            "--profile",
+            job["options"].get("profile") or DEFAULT_PROFILE,
+            "--build-index",
+        ]
+
     def export_command(self, job: dict[str, Any]) -> list[str]:
         return ["tools/export_video_docs.sh", str(self.require_run_dir(job)), "--final-only", "--jobs", "3"]
 
@@ -1340,7 +1488,7 @@ class VideoLinkStatusServer:
             "log_path": None,
             "artifacts": self.collect_summary(job),
         }
-        job["status"] = "succeeded" if stage == STAGE_ORDER[-1] else "running"
+        job["status"] = "succeeded" if self.next_stage(job) is None else "running"
         job["updated_at"] = iso_now()
         job["summary"] = self.collect_summary(job)
         self.save_job(job)
@@ -1388,6 +1536,7 @@ class VideoLinkStatusServer:
             "study_guide": run_dir / "study_guide.json",
             "evidence_gaps": run_dir / "evidence_gaps.json",
             "evidence_review": run_dir / "evidence_review.json",
+            "web_evidence": run_dir / "web_evidence.json",
             "publish_decision": run_dir / "publish_decision.json",
         }
         for name, path in study_candidates.items():
@@ -1569,22 +1718,25 @@ class VideoLinkStatusServer:
         job.setdefault("stages", {})["analyze-core"] = stage_info
         self.update_job_artifacts(job, "analyze-core", artifacts)
 
+        job["summary"] = self.collect_summary(job)
+        job["updated_at"] = now
         next_stage = self.next_stage(job)
+        if next_stage:
+            self.mark_stage_queued(job, next_stage, stage_resource(next_stage))
+            job["summary"] = self.collect_summary(job)
+            self.save_job(job)
+            return job
+
         runner = dict(job.get("runner") or {})
-        runner["status"] = "queued" if next_stage else "succeeded"
-        runner["current_stage"] = next_stage
-        runner["queued_for"] = stage_resource(next_stage) if next_stage else None
+        runner["status"] = "succeeded"
+        runner["current_stage"] = None
+        runner["queued_for"] = None
         runner["error"] = None
         runner["updated_at"] = now
         runner["server_pid"] = os.getpid()
-        if not next_stage:
-            runner["finished_at"] = now
-        else:
-            runner.pop("finished_at", None)
+        runner["finished_at"] = now
         job["runner"] = runner
-        job["status"] = "queued" if next_stage else "succeeded"
-        job["summary"] = self.collect_summary(job)
-        job["updated_at"] = now
+        job["status"] = "succeeded"
         self.save_job(job)
         return job
 
@@ -1602,6 +1754,8 @@ class VideoLinkStatusServer:
         for previous in STAGE_ORDER[:stage_index]:
             previous_status = job["stages"].get(previous, {}).get("status")
             if previous_status not in {"succeeded", "skipped"}:
+                if previous in SOFT_FAILURE_STAGES and self.core_markdown_available_for_job(job):
+                    continue
                 raise BridgeError(HTTPStatus.CONFLICT, f"stage {previous} must succeed before {stage}")
 
     def require_run_dir(self, job: dict[str, Any]) -> Path:
@@ -1777,10 +1931,14 @@ class VideoLinkStatusServer:
                 }
             except Exception:
                 core_counts = {}
+        qa_summary = self.qa_summary(run_dir)
         return {
             "run_dir": str(run_dir),
             "core_counts": core_counts,
             "study": self.study_summary(run_dir),
+            "qa": qa_summary,
+            "qa_index": qa_summary.get("answer_index"),
+            "skill_candidate": self.skill_candidate_summary(run_dir),
             "markdown_files": sorted(str(path.relative_to(run_dir)) for path in run_dir.glob("**/*.md") if path.is_file()),
             "export_files": sorted(str(path.relative_to(run_dir)) for path in (run_dir / "exports").glob("*") if path.is_file())
             if (run_dir / "exports").is_dir()
@@ -1792,6 +1950,32 @@ class VideoLinkStatusServer:
             if (run_dir / "baoyu_images" / "final").is_dir()
             else [],
         }
+
+    def qa_summary(self, run_dir: Path) -> dict[str, Any]:
+        qa_dir = run_dir / QA_DIR_NAME
+        index_path = qa_dir / ANSWER_INDEX_NAME
+        chunks_path = qa_dir / CHUNKS_NAME
+        if not index_path.is_file():
+            return {"available": False, "answer_index": None, "source_chunks": None, "warnings": []}
+        try:
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {"available": False, "error": "qa index is invalid", "answer_index": str(index_path.relative_to(run_dir))}
+        return {
+            "available": chunks_path.is_file(),
+            "answer_index": str(index_path.relative_to(run_dir)),
+            "source_chunks": str(chunks_path.relative_to(run_dir)) if chunks_path.is_file() else None,
+            "source_count": index.get("source_count"),
+            "chunk_count": index.get("chunk_count"),
+            "generated_at": index.get("generated_at"),
+            "warnings": index.get("warnings") or [],
+        }
+
+    def skill_candidate_summary(self, run_dir: Path) -> dict[str, Any]:
+        try:
+            return candidate_summary(run_dir)
+        except Exception as exc:
+            return {"available": False, "error": str(exc), "warnings": []}
 
     def study_summary(self, run_dir: Path) -> dict[str, Any]:
         guide_path = run_dir / "study_guide.json"
@@ -1816,6 +2000,13 @@ class VideoLinkStatusServer:
                 summary["gaps"] = gaps.get("summary") or {}
             except Exception:
                 summary["gaps_error"] = "evidence_gaps.json is invalid"
+        web_path = run_dir / "web_evidence.json"
+        if web_path.is_file():
+            try:
+                web_evidence = json.loads(web_path.read_text(encoding="utf-8"))
+                summary["web_evidence"] = web_evidence.get("summary") or {}
+            except Exception:
+                summary["web_evidence_error"] = "web_evidence.json is invalid"
         if decision_path.is_file():
             try:
                 decision = json.loads(decision_path.read_text(encoding="utf-8"))
@@ -1878,6 +2069,89 @@ class VideoLinkStatusServer:
             "duration_seconds": self.preview_duration_seconds(job),
         }
 
+    def source_player_metadata(self, job: dict[str, Any]) -> dict[str, Any]:
+        source_url = str(job.get("video_url") or "").strip()
+        duration_seconds = self.preview_duration_seconds(job)
+        base = {
+            "source_url": source_url,
+            "provider": "external",
+            "can_embed": False,
+            "supports_timestamp": bool(source_url),
+            "embed_url": None,
+            "watch_url": source_url or None,
+            "duration_seconds": duration_seconds,
+        }
+        if not source_url:
+            return base
+
+        parsed = urlparse(source_url)
+        host = parsed.netloc.lower()
+        video_id = infer_video_id_from_url(source_url)
+        if video_id and ("youtube.com" in host or "youtu.be" in host):
+            base.update(
+                {
+                    "provider": "youtube",
+                    "can_embed": True,
+                    "supports_timestamp": True,
+                    "embed_url": f"https://www.youtube.com/embed/{quote(video_id)}",
+                    "watch_url": f"https://www.youtube.com/watch?v={quote(video_id)}",
+                }
+            )
+            return base
+        if video_id and ("bilibili.com" in host or "b23.tv" in host):
+            base.update(
+                {
+                    "provider": "bilibili",
+                    "can_embed": True,
+                    "supports_timestamp": True,
+                    "embed_url": f"https://player.bilibili.com/player.html?bvid={quote(video_id)}",
+                    "watch_url": f"https://www.bilibili.com/video/{quote(video_id)}",
+                }
+            )
+        return base
+
+    def frame_time_map(self, job_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        manifest_path = run_dir / "frames_manifest.json"
+        if not manifest_path.is_file():
+            return {"available": False, "frames": {}, "count": 0}
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, "frame manifest is invalid") from exc
+
+        frames: dict[str, dict[str, Any]] = {}
+        for item in payload.get("frames") or []:
+            if not isinstance(item, dict):
+                continue
+            frame_number = item.get("frame_number", item.get("number"))
+            timestamp = item.get("timestamp", item.get("timestamp_sec"))
+            frame_path = item.get("path") or item.get("frame_path")
+            if frame_number is None or timestamp is None:
+                continue
+            try:
+                number = int(frame_number)
+                seconds = float(timestamp)
+            except (TypeError, ValueError):
+                continue
+            entry = {
+                "frame_number": number,
+                "timestamp_sec": seconds,
+                "timestamp_label": format_seconds_label(seconds),
+            }
+            keys = set()
+            for extension in ("jpg", "jpeg", "png", "webp"):
+                keys.add(f"manual_assets/frame_{number:03d}.{extension}")
+                keys.add(f"manual_assets/frame_{number}.{extension}")
+            if frame_path:
+                path_value = str(frame_path).replace("\\", "/")
+                keys.update({path_value, Path(path_value).name})
+            for key in keys:
+                if key:
+                    frames[key] = entry
+        return {"available": True, "frames": frames, "count": len(frames)}
+
     def preview_video_file(self, job_id: str) -> tuple[Path, str | None]:
         job = self.load_job(job_id)
         video_path = self.preview_video_candidate(job)
@@ -1917,7 +2191,7 @@ class VideoLinkStatusServer:
             guide = json.loads(path.read_text(encoding="utf-8"))
         except Exception as exc:
             raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, "study guide is invalid") from exc
-        for name in ("evidence_gaps", "evidence_review", "publish_decision"):
+        for name in ("evidence_gaps", "evidence_review", "web_evidence", "publish_decision"):
             sidecar = run_dir / f"{name}.json"
             if sidecar.is_file():
                 try:
@@ -1925,6 +2199,123 @@ class VideoLinkStatusServer:
                 except Exception:
                     guide[name] = {"status": "invalid"}
         return guide
+
+    def qa_index(self, job_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        summary = self.qa_summary(run_dir)
+        if not summary.get("available"):
+            raise BridgeError(HTTPStatus.NOT_FOUND, summary.get("error") or "QA index is not available")
+        return summary
+
+    def qa_history(self, job_id: str, limit: int = 50) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        history_dir = run_dir / QA_DIR_NAME / "chat_history"
+        records: list[dict[str, Any]] = []
+        if history_dir.is_dir():
+            for path in sorted(history_dir.glob("*.jsonl")):
+                try:
+                    for line in path.read_text(encoding="utf-8").splitlines():
+                        if line.strip():
+                            record = json.loads(line)
+                            record["history_file"] = str(path.relative_to(run_dir))
+                            records.append(record)
+                except Exception:
+                    continue
+        records.sort(key=lambda item: str(item.get("created_at") or ""))
+        if limit > 0:
+            records = records[-limit:]
+        return {
+            "available": bool(records),
+            "history_dir": str(history_dir.relative_to(run_dir)),
+            "messages": records,
+            "count": len(records),
+        }
+
+    def web_evidence(self, job_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        path = run_dir / "web_evidence.json"
+        if not path.is_file():
+            raise BridgeError(HTTPStatus.NOT_FOUND, "web evidence is not available")
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, "web evidence is invalid") from exc
+
+    def skill_candidate(self, job_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        return self.skill_candidate_summary(run_dir)
+
+    def generate_skill_candidate(self, job_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        try:
+            summary = build_tool_skill_candidate(run_dir)
+        except FileNotFoundError as exc:
+            raise BridgeError(HTTPStatus.CONFLICT, str(exc)) from exc
+        job["summary"] = self.collect_summary(job)
+        job["updated_at"] = iso_now()
+        self.save_job(job)
+        return summary
+
+    def enable_skill_candidate(self, job_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        try:
+            summary = enable_tool_skill_candidate(run_dir, self.repo_root)
+        except FileNotFoundError as exc:
+            raise BridgeError(HTTPStatus.NOT_FOUND, str(exc)) from exc
+        except (FileExistsError, ValueError) as exc:
+            raise BridgeError(HTTPStatus.CONFLICT, str(exc)) from exc
+        job["summary"] = self.collect_summary(job)
+        job["updated_at"] = iso_now()
+        self.save_job(job)
+        return summary
+
+    def ask_qa(self, job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        question = str(payload.get("question") or "").strip()
+        if not question:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "question is required")
+        profile_name = (job.get("options") or {}).get("profile") or DEFAULT_PROFILE
+        config = Config("config")
+        profile = config.get_runtime_profile(profile_name)
+        base_url = profile.get("llm_base_url") or (config.get("endpoints") or {}).get("services", {}).get("amd_fast_base_url")
+        model = profile.get("text_model")
+        if not base_url or not model:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, f"profile {profile_name} must provide llm_base_url and text_model")
+        client = GenericOpenAIAPIClient(
+            resolve_api_key(
+                api_key_env=profile.get("text_api_key_env") or profile.get("api_key_env"),
+                api_url=base_url,
+            ),
+            base_url,
+            extra_body=build_openai_extra_body(profile, base_url),
+        )
+        try:
+            result = ask_video_docs_result(
+                run_dir,
+                question,
+                client,
+                model,
+                resolve_temperature(profile, 0.2),
+                int(payload.get("max_context_chars") or 60000),
+            )
+        except FileNotFoundError as exc:
+            raise BridgeError(HTTPStatus.NOT_FOUND, str(exc)) from exc
+        history_dir = run_dir / QA_DIR_NAME / "chat_history"
+        history_dir.mkdir(parents=True, exist_ok=True)
+        record = {"question": question, **result, "created_at": iso_now()}
+        history_path = history_dir / f"{datetime.now().strftime('%Y%m%d')}.jsonl"
+        with history_path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        result["history_path"] = str(history_path.relative_to(run_dir))
+        result["created_at"] = record["created_at"]
+        return result
 
     def public_job(self, job: dict[str, Any], public_host: str | None = None) -> dict[str, Any]:
         public = dict(job)
@@ -1944,6 +2335,7 @@ class VideoLinkStatusServer:
         public["stage_progress"] = self.stage_progress(public)
         public["core_diagnostics"] = self.core_diagnostics(public)
         public["preview"] = self.preview_metadata(public)
+        public["source_player"] = self.source_player_metadata(public)
         public["vscode_preview"] = self.vscode_preview_metadata(public, public_host)
         public["warnings"] = self.active_warnings(public)
         queued_stage = public["queue"].get("stage")
@@ -1952,6 +2344,36 @@ class VideoLinkStatusServer:
             public["stages"][queued_stage]["queue_position"] = public["queue"].get("position")
         current_stage = public.get("current_stage")
         current_info = public["stages"].get(current_stage or "", {})
+        public["process"] = self.public_process_info(current_info.get("process"))
+        return public
+
+    def public_job_summary(self, job: dict[str, Any]) -> dict[str, Any]:
+        public = {
+            "job_id": job["job_id"],
+            "video_url": job.get("video_url"),
+            "status": job.get("status"),
+            "created_at": job.get("created_at"),
+            "updated_at": job.get("updated_at"),
+            "options": job.get("options") or {},
+            "runner": job.get("runner") or {},
+            "stages": dict(job.get("stages") or {}),
+            "resolved_mode": job.get("resolved_mode") or ((job.get("artifacts") or {}).get("resolved_mode") or {}).get("value"),
+            "resolved_mode_reason": job.get("resolved_mode_reason")
+            or ((job.get("artifacts") or {}).get("resolved_mode_reason") or {}).get("value"),
+            "run_dir": job.get("run_dir"),
+            "video_path": job.get("video_path"),
+        }
+        title = self.resolve_job_title(public)
+        public["title"] = title
+        public["display_title"] = title or job.get("video_url") or job.get("job_id")
+        public["stage_order"] = STAGE_ORDER
+        public["progress"] = self.progress(job)
+        public["current_stage"] = self.current_stage(job)
+        public["next_stage"] = self.next_stage(job)
+        public["error_summary"] = self.error_summary(job)
+        public["dashboard_url"] = self.dashboard_url(job["job_id"])
+        public["source_player"] = self.source_player_metadata(public)
+        current_info = public["stages"].get(public.get("current_stage") or "", {})
         public["process"] = self.public_process_info(current_info.get("process"))
         return public
 
@@ -2507,6 +2929,65 @@ def process_alive(pid: Any) -> bool:
     except OSError:
         return False
     return True
+
+
+def child_process_map() -> dict[int, list[int]]:
+    try:
+        result = subprocess.run(["ps", "-eo", "pid=,ppid="], capture_output=True, text=True, check=True)
+    except Exception:
+        return {}
+    children: dict[int, list[int]] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        children.setdefault(ppid, []).append(pid)
+    return children
+
+
+def process_tree_pids(root_pid: Any) -> list[int]:
+    try:
+        root = int(root_pid)
+    except (TypeError, ValueError):
+        return []
+    children = child_process_map()
+    ordered: list[int] = []
+    stack = [root]
+    seen = set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        ordered.append(pid)
+        stack.extend(children.get(pid, []))
+    return ordered
+
+
+def terminate_process_tree(root_pid: Any, grace_seconds: float = 3.0) -> list[int]:
+    pids = [pid for pid in process_tree_pids(root_pid) if pid != os.getpid()]
+    if not pids:
+        return []
+    for pid in reversed(pids):
+        if process_alive(pid):
+            try:
+                os.kill(pid, 15)
+            except OSError:
+                pass
+    deadline = time.time() + grace_seconds
+    while time.time() < deadline and any(process_alive(pid) for pid in pids):
+        time.sleep(0.1)
+    for pid in reversed(pids):
+        if process_alive(pid):
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+    return pids
 
 
 def parse_core_progress(text: str, stage_status: str) -> dict[str, Any]:
@@ -3240,7 +3721,7 @@ def format_epoch(value: float) -> str:
 
 
 def pipeline_mode_for(analysis_mode: str) -> str:
-    return "fast" if analysis_mode == "long-talk-fast" else analysis_mode
+    return "fast" if analysis_mode in {"long-talk-fast", "operation-fast"} else analysis_mode
 
 
 def resolve_auto_analysis_mode(requested_mode: str, duration_seconds: int | float | None, focus_prompt: str) -> tuple[str, str]:
@@ -3257,16 +3738,21 @@ def resolve_auto_analysis_mode(requested_mode: str, duration_seconds: int | floa
     fast_score = keyword_score(prompt, AUTO_MODE_FAST_KEYWORDS)
     deep_score = keyword_score(prompt, AUTO_MODE_DEEP_KEYWORDS)
     long_talk_score = keyword_score(prompt, AUTO_MODE_LONG_TALK_KEYWORDS)
+    operation_score = keyword_score(prompt, AUTO_MODE_OPERATION_KEYWORDS)
 
     if is_long:
         if deep_score > max(fast_score, long_talk_score):
             return "deep", "focus prompt asks for deep/high-detail analysis"
+        if operation_score > long_talk_score and fast_score:
+            return "operation-fast", "long video with fast operation/tutorial intent"
         if fast_score or long_talk_score:
             return "long-talk-fast", "long video with speed/subtitle/talk intent"
         return "long-talk-fast", f"duration >= {AUTO_MODE_LONG_SECONDS}s"
 
     if deep_score > fast_score:
         return "deep", "focus prompt asks for deep/high-detail analysis"
+    if fast_score > 0 and operation_score > 0:
+        return "operation-fast", "focus prompt asks for quick operation/tutorial analysis"
     if fast_score > 0:
         return "fast", "focus prompt asks for quick/summary analysis"
     return "balanced", "focus prompt has no strong mode hint"
@@ -3716,6 +4202,16 @@ def iso_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
+def format_seconds_label(value: float) -> str:
+    seconds = max(0, int(value))
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    remaining = seconds % 60
+    if hours:
+        return f"{hours}:{minutes:02d}:{remaining:02d}"
+    return f"{minutes}:{remaining:02d}"
+
+
 def parse_iso_timestamp(value: Any) -> float | None:
     if not isinstance(value, str) or not value:
         return None
@@ -3911,6 +4407,11 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
 	    button.secondary {{ background: #eef2f7; color: #202124; }}
 	    button.success-action {{ display: inline-flex; align-items: center; justify-content: center; gap: 6px; background: #16a34a; color: #fff; }}
 	    button.success-action::before {{ content: "\\2713"; display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 999px; background: rgba(255,255,255,.22); font-size: 12px; font-weight: 700; line-height: 1; }}
+	    button.play-action, button.stop-action {{ display: inline-flex; align-items: center; justify-content: center; gap: 6px; }}
+	    button.play-action {{ background: #16a34a; color: #fff; }}
+	    button.play-action::before {{ content: ""; width: 0; height: 0; border-top: 6px solid transparent; border-bottom: 6px solid transparent; border-left: 10px solid currentColor; }}
+	    button.stop-action {{ background: #dc2626; color: #fff; }}
+	    button.stop-action::before {{ content: ""; width: 11px; height: 11px; border-radius: 2px; background: currentColor; }}
 	    button:disabled {{ opacity: .55; cursor: default; }}
     .logLink {{ border: 0; background: transparent; color: #0969da; padding: 0; cursor: pointer; font: inherit; }}
     pre {{ margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.5; max-height: 420px; overflow: auto; }}
@@ -3930,7 +4431,7 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
       </div>
       <div class="bar"><div id="progressBar"></div></div>
       <div class="actions">
-        <button id="runButton" type="button">继续运行</button>
+        <button id="runButton" class="play-action" type="button">继续运行</button>
         <span class="hint" id="runMessage"></span>
       </div>
     </section>
@@ -3979,6 +4480,7 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
   <script>
 	    const apiUrl = {json.dumps(api_url)};
 	    const runActionUrl = `${{apiUrl}}/run`;
+	    const stopActionUrl = `${{apiUrl}}/stop`;
 	    const openRunDirActionUrl = `${{apiUrl}}/open-run-dir`;
 	    let logUrl = {json.dumps(log_url)};
 	    let selectedLogStage = null;
@@ -4029,10 +4531,15 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
 	      const runButton = document.getElementById("runButton");
 	      const runDir = job.summary?.run_dir || job.run_dir;
 	      const isSucceeded = job.status === "succeeded";
-	      runButton.disabled = isSucceeded ? !runDir : (job.status === "running" || job.runner?.status === "running");
-	      runButton.classList.toggle("success-action", isSucceeded);
-	      runButton.textContent = isSucceeded ? "成功" : (job.status === "failed" ? "重试失败阶段" : "继续运行");
-	      runButton.title = isSucceeded && runDir ? `打开资源目录：${{runDir}}` : "";
+	      const process = job.process || job.stages?.[job.current_stage || job.next_stage || ""]?.process;
+	      const isActive = Boolean(process?.alive || job.status === "running" || job.status === "queued" || job.runner?.status === "running" || job.runner?.status === "queued");
+	      runButton.disabled = isSucceeded ? !runDir : false;
+	      runButton.dataset.action = isActive ? "stop" : (isSucceeded ? "open-run-dir" : "run");
+	      runButton.classList.toggle("success-action", isSucceeded && !isActive);
+	      runButton.classList.toggle("play-action", !isSucceeded && !isActive);
+	      runButton.classList.toggle("stop-action", isActive);
+	      runButton.textContent = isActive ? "停止" : (isSucceeded ? "成功" : (job.status === "failed" ? "重试失败阶段" : "继续运行"));
+	      runButton.title = isActive ? "停止当前运行任务" : (isSucceeded && runDir ? `打开资源目录：${{runDir}}` : "继续运行任务");
       text("current", stageNames[job.current_stage] || job.current_stage);
       text("next", stageNames[job.next_stage] || job.next_stage);
       text("progressText", `${{progress.completed || 0}}/${{progress.total || 0}} · ${{progress.percent || 0}}%`);
@@ -4137,14 +4644,14 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
 	      button.disabled = true;
 	      message.textContent = "已发送";
 	      try {{
-	        const action = currentJob?.status === "succeeded" ? "open-run-dir" : "run";
-	        const actionUrl = action === "open-run-dir" ? openRunDirActionUrl : runActionUrl;
+	        const action = button.dataset.action || (currentJob?.status === "succeeded" ? "open-run-dir" : "run");
+	        const actionUrl = action === "open-run-dir" ? openRunDirActionUrl : (action === "stop" ? stopActionUrl : runActionUrl);
 	        await fetch(actionUrl, {{ method: "POST", headers: {{ "Content-Type": "application/json" }}, body: "{{}}" }}).then(async r => {{
 	          if (!r.ok) throw new Error((await r.json()).error || `HTTP ${{r.status}}`);
 	          return r.json();
 	        }});
-	        message.textContent = action === "open-run-dir" ? "已打开资源目录" : "运行中";
-	        if (action === "run") {{
+	        message.textContent = action === "open-run-dir" ? "已打开资源目录" : (action === "stop" ? "已停止" : "运行中");
+	        if (action === "run" || action === "stop") {{
 	          await refresh();
 	        }} else {{
 	          button.disabled = false;
@@ -4198,6 +4705,23 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
                 full = parse_bool(query.get("full", ["false"])[0])
                 self.write_json(self.server_app.stage_log(match.group(1), match.group(2), limit, full))
                 return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/qa-index", path)
+            if match:
+                self.write_json(self.server_app.qa_index(match.group(1)))
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/qa/history", path)
+            if match:
+                limit = int(query.get("limit", ["50"])[0])
+                self.write_json(self.server_app.qa_history(match.group(1), limit=limit))
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/web-evidence", path)
+            if match:
+                self.write_json(self.server_app.web_evidence(match.group(1)))
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/skill-candidate", path)
+            if match:
+                self.write_json(self.server_app.skill_candidate(match.group(1)))
+                return
             match = re.fullmatch(r"/video-link/jobs/([a-f0-9]{32})", path)
             if match:
                 self.write_redirect(f"/?job={match.group(1)}")
@@ -4227,6 +4751,10 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             if match:
                 self.write_json(self.server_app.start_run(match.group(1)), HTTPStatus.ACCEPTED)
                 return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/stop", path)
+            if match:
+                self.write_json(self.server_app.stop_job(match.group(1)), HTTPStatus.ACCEPTED)
+                return
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/open-run-dir", path)
             if match:
                 self.write_json(self.server_app.open_run_dir(match.group(1)))
@@ -4236,6 +4764,18 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
                 restart = parse_bool(payload.get("restart", False))
                 host = self.headers.get("Host", "").split(":", 1)[0] or None
                 self.write_json(self.server_app.start_vscode_session(match.group(1), public_host=host, restart=restart))
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/qa/ask", path)
+            if match:
+                self.write_json(self.server_app.ask_qa(match.group(1), payload))
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/skill-candidate/generate", path)
+            if match:
+                self.write_json(self.server_app.generate_skill_candidate(match.group(1)))
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/skill-candidate/enable", path)
+            if match:
+                self.write_json(self.server_app.enable_skill_candidate(match.group(1)))
                 return
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/stages/([a-z0-9-]+)", path)
             if match:

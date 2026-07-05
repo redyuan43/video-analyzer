@@ -20,7 +20,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlunparse
 
 from video_analyzer.config import Config
 from video_analyzer.douyin_browser import (
@@ -55,6 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-frames", type=int, help="Explicit upper limit for the operation-manual candidate frame pool")
     parser.add_argument("--pipeline-mode", choices=["fast", "balanced", "deep"])
     parser.add_argument("--candidate-frames", help="auto or explicit candidate frame pool size")
+    parser.add_argument("--candidate-frame-strategy", choices=["auto", "legacy", "generic", "lecture", "operation"])
     parser.add_argument("--min-vl-frames", help="auto or minimum frames sent to VL")
     parser.add_argument("--max-vl-frames", help="auto or maximum frames sent to VL")
     parser.add_argument("--vl-frame-policy", choices=["auto", "all", "none"])
@@ -70,6 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ocr-concurrency", help="OCR concurrency per endpoint, or auto")
     parser.add_argument("--ocr-cache", choices=["on", "off", "refresh"], help="OCR cache mode")
     parser.add_argument("--ocr-cache-dir", help="OCR cache directory")
+    parser.add_argument("--ocr-timeout-seconds", type=float, help="Per-frame OCR request timeout")
     parser.add_argument("--ocr-keyframe-strategy", choices=["auto", "scan-text", "legacy"])
     parser.add_argument("--ocr-keyframe-budget", help="auto or explicit OCR keyframe count")
     parser.add_argument("--ocr-scan-sample-fps", help="auto or low-cost preview scan FPS for OCR keyframe discovery")
@@ -149,6 +151,7 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
         "run_name": profile.get("run_name", FALLBACK_RUN_NAME),
         "pipeline_mode": profile.get("pipeline_mode", "balanced"),
         "candidate_frames": profile.get("candidate_frames", "auto"),
+        "candidate_frame_strategy": profile.get("candidate_frame_strategy", "auto"),
         "min_vl_frames": profile.get("min_vl_frames", "auto"),
         "max_vl_frames": profile.get("max_vl_frames", "auto"),
         "vl_frame_policy": profile.get("vl_frame_policy", "auto"),
@@ -163,6 +166,7 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
         "ocr_concurrency": profile.get("ocr_concurrency", "auto"),
         "ocr_cache": profile.get("ocr_cache", "on"),
         "ocr_cache_dir": profile.get("ocr_cache_dir", ".cache/video-analyzer/ocr"),
+        "ocr_timeout_seconds": profile.get("ocr_timeout_seconds"),
         "ocr_keyframe_strategy": profile.get("ocr_keyframe_strategy", "scan-text"),
         "ocr_keyframe_budget": profile.get("ocr_keyframe_budget", "auto"),
         "ocr_scan_sample_fps": profile.get("ocr_scan_sample_fps", "auto"),
@@ -377,6 +381,7 @@ def remote_download_command(args: argparse.Namespace, remote_run_dir: str) -> st
     if args.include_comments:
         command.append("--write-comments")
     append_remote_ytdlp_runtime_args(command, args)
+    append_remote_ytdlp_site_args(command, args.url)
     if getattr(args, "ytdlp_proxy", None):
         command.extend(["--proxy", shell_quote(args.ytdlp_proxy)])
     if getattr(args, "cookies", None):
@@ -401,11 +406,18 @@ def append_remote_ytdlp_runtime_args(command: list[str], args: argparse.Namespac
         command.extend(["--extractor-args", shell_quote(extractor_args)])
 
 
+def append_remote_ytdlp_site_args(command: list[str], url: str) -> None:
+    for header in ytdlp_site_headers(url):
+        command.extend(["--add-header", shell_quote(header)])
+
+
 def fetch_metadata(url: str, args: argparse.Namespace) -> dict[str, Any]:
-    command = ["yt-dlp", "--dump-single-json", "--no-warnings", "--skip-download", url]
+    command = ["yt-dlp", "--dump-single-json", "--no-warnings", "--skip-download"]
     add_ytdlp_runtime_args(command, args)
+    add_ytdlp_site_args(command, url)
     add_ytdlp_network_args(command, args)
     add_cookie_args(command, args)
+    command.append(url)
     raw = subprocess.check_output(command, text=True)
     return json.loads(raw)
 
@@ -422,15 +434,16 @@ def download_video(url: str, video_dir: Path, args: argparse.Namespace) -> None:
         "bv*[vcodec^=avc1]+ba/b[vcodec^=avc1]/bv*+ba/b",
         "-o",
         str(video_dir / "download.%(ext)s"),
-        url,
     ]
     if args.include_subtitles:
         command.extend(["--write-subs", "--write-auto-subs", "--sub-langs", subtitle_langs_for_ytdlp(args.subtitle_langs)])
     if args.include_comments:
         command.append("--write-comments")
     add_ytdlp_runtime_args(command, args)
+    add_ytdlp_site_args(command, url)
     add_ytdlp_network_args(command, args)
     add_cookie_args(command, args)
+    command.append(url)
     subprocess.run(command, check=True)
 
 
@@ -443,15 +456,16 @@ def download_context_assets(url: str, video_dir: Path, args: argparse.Namespace)
         "--write-description",
         "-o",
         str(video_dir / "download.%(ext)s"),
-        url,
     ]
     if args.include_subtitles:
         command.extend(["--write-subs", "--write-auto-subs", "--sub-langs", subtitle_langs_for_ytdlp(args.subtitle_langs)])
     if args.include_comments:
         command.append("--write-comments")
     add_ytdlp_runtime_args(command, args)
+    add_ytdlp_site_args(command, url)
     add_ytdlp_network_args(command, args)
     add_cookie_args(command, args)
+    command.append(url)
     subprocess.run(command, check=True)
 
 
@@ -482,7 +496,7 @@ def existing_video_dir_for_url(output_root: Path, url: str) -> Path | None:
 def infer_video_id_from_url(url: str) -> str:
     parsed = urlparse(url)
     host = parsed.netloc.lower()
-    if "youtube.com" in host:
+    if is_youtube_url(url):
         query_id = parse_qs(parsed.query).get("v")
         if query_id:
             return query_id[0]
@@ -491,7 +505,40 @@ def infer_video_id_from_url(url: str) -> str:
             return parts[1]
     if "youtu.be" in host:
         return parsed.path.strip("/").split("/")[0]
+    if is_bilibili_url(url):
+        parts = [part for part in parsed.path.split("/") if part]
+        for part in parts:
+            if part.startswith("BV") or part.startswith("av"):
+                return part
     return ""
+
+
+def is_youtube_url(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    return "youtube.com" in host or "youtu.be" in host
+
+
+def is_bilibili_url(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    return "bilibili.com" in host or "b23.tv" in host
+
+
+def ytdlp_site_headers(url: str) -> list[str]:
+    if not is_bilibili_url(url):
+        return []
+    referer = bilibili_referer(url)
+    return [
+        f"Referer: {referer}",
+        "Origin: https://www.bilibili.com",
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    ]
+
+
+def bilibili_referer(url: str) -> str:
+    parsed = urlparse(url)
+    if "bilibili.com" not in parsed.netloc.lower() or not parsed.path:
+        return "https://www.bilibili.com/"
+    return urlunparse((parsed.scheme or "https", parsed.netloc, parsed.path, "", "", ""))
 
 
 def add_cookie_args(command: list[str], args: argparse.Namespace) -> None:
@@ -504,6 +551,11 @@ def add_cookie_args(command: list[str], args: argparse.Namespace) -> None:
 def add_ytdlp_network_args(command: list[str], args: argparse.Namespace) -> None:
     if getattr(args, "ytdlp_proxy", None):
         command.extend(["--proxy", args.ytdlp_proxy])
+
+
+def add_ytdlp_site_args(command: list[str], url: str) -> None:
+    for header in ytdlp_site_headers(url):
+        command.extend(["--add-header", header])
 
 
 def add_ytdlp_runtime_args(command: list[str], args: argparse.Namespace) -> None:
@@ -979,6 +1031,8 @@ def build_analyzer_command(args: argparse.Namespace, video_path: Path, context_p
         args.pipeline_mode,
         "--candidate-frames",
         str(args.candidate_frames),
+        "--candidate-frame-strategy",
+        str(getattr(args, "candidate_frame_strategy", "auto")),
         "--min-vl-frames",
         str(args.min_vl_frames),
         "--max-vl-frames",
@@ -1032,6 +1086,8 @@ def build_analyzer_command(args: argparse.Namespace, video_path: Path, context_p
             getattr(args, "ocr_cache", "on"),
             "--ocr-cache-dir",
             getattr(args, "ocr_cache_dir", ".cache/video-analyzer/ocr"),
+            "--ocr-timeout-seconds",
+            str(getattr(args, "ocr_timeout_seconds", 120)),
             "--ocr-keyframe-strategy",
             getattr(args, "ocr_keyframe_strategy", "auto"),
             "--ocr-keyframe-budget",

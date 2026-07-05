@@ -36,7 +36,7 @@ stop_matching() {
 stop_ocr() {
   systemctl --user stop dots-mocr-p40.service >/dev/null 2>&1 || true
   ps -eo pid=,comm=,args= \
-    | awk '/python/ && /\/home\/ai\/ocr-deploy\/scripts\/dots_mocr_p40_proxy.py|\/home\/ai\/ocr-deploy\/dots\.mocr\/weights\/DotsMOCR/ {print $1}' \
+    | awk '/python/ && /\/home\/ai\/ocr-deploy\/scripts\/dots_mocr_p40_proxy.py|\/home\/ai\/ocr-deploy\/dots\.mocr\/weights\/DotsMOCR|\/home\/ai\/ocr-deploy\/scripts\/unlimited_ocr_p40_proxy.py|\/home\/ai\/ocr-deploy\/scripts\/unlimited_ocr_transformers_worker.py/ {print $1}' \
     | {
         pids="$(cat)"
         stop_pids "${pids}"
@@ -63,9 +63,25 @@ start_vibevoice() {
 }
 
 start_ocr() {
-  local workers="${DOTS_MOCR_WORKER_COUNT:-5}"
-  DOTS_MOCR_PROXY_PORT="${DOTS_MOCR_PROXY_PORT:-18088}" \
-    "/home/ai/ocr-deploy/start_dots_mocr_p40_service.sh" "${workers}"
+  local engine="${OCR_ENGINE:-unlimited}"
+  case "${engine}" in
+    unlimited|unlimited-ocr)
+      local workers="${UNLIMITED_OCR_WORKER_COUNT:-5}"
+      local model="${UNLIMITED_OCR_MODEL:-/home/ai/.cache/huggingface/hub/models--baidu--Unlimited-OCR/snapshots/f799a9cb8404eda2deeefee81ac79a46f6a6f447}"
+      UNLIMITED_OCR_MODEL="${model}" \
+      UNLIMITED_OCR_PROXY_PORT="${UNLIMITED_OCR_PROXY_PORT:-18088}" \
+        "/home/ai/ocr-deploy/start_unlimited_ocr_p40_service.sh" "${workers}"
+      ;;
+    dots|dotsmocr|dots-mocr)
+      local workers="${DOTS_MOCR_WORKER_COUNT:-5}"
+      DOTS_MOCR_PROXY_PORT="${DOTS_MOCR_PROXY_PORT:-18088}" \
+        "/home/ai/ocr-deploy/start_dots_mocr_p40_service.sh" "${workers}"
+      ;;
+    *)
+      echo "Unknown OCR_ENGINE=${engine}; expected unlimited or dots" >&2
+      return 2
+      ;;
+  esac
 }
 
 start_minicpm() {

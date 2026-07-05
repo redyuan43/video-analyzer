@@ -88,21 +88,21 @@ mkdir -p "$FINAL_DIR" "$IMAGE_LOG_DIR" "$EXPORT_DIR"
 declare -a FINAL_IMAGES=(
   "02-infographic-knowledge-notes.png"
   "03-infographic-deep-report.png"
-  "04-infographic-manual-evidence.png"
 )
 
 declare -a PROMPTS=(
   "02-infographic-knowledge-notes.md"
   "03-infographic-deep-report.md"
-  "04-infographic-manual-evidence.md"
 )
 
 declare -a DEPRECATED_FINAL_IMAGES=(
   "01-image-cards-operation-manual.png"
+  "04-infographic-manual-evidence.png"
 )
 
 declare -a DEPRECATED_PROMPTS=(
   "01-image-cards-operation-manual.md"
+  "04-infographic-manual-evidence.md"
 )
 
 declare -a DOCS=(
