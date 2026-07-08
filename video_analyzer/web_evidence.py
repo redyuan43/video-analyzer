@@ -102,6 +102,8 @@ def build_web_evidence(
 ) -> dict[str, Any]:
     run_dir = run_dir.expanduser().resolve()
     gaps = read_json(run_dir / "evidence_gaps.json") or {"items": []}
+    triage = read_json(run_dir / "evidence_triage.json") or {"items": []}
+    triage_by_gap_id = {item.get("gap_id"): item for item in triage.get("items") or [] if isinstance(item, dict)}
     context = load_context(run_dir)
     items = []
     diagnostics: list[str] = []
@@ -111,6 +113,7 @@ def build_web_evidence(
     for gap in (gaps.get("items") or [])[: max(0, max_gaps)]:
         item = collect_gap_evidence(
             gap,
+            triage_item=triage_by_gap_id.get(gap.get("id")),
             context=context,
             client=client,
             text_model=text_model,
@@ -140,6 +143,7 @@ def build_web_evidence(
 def collect_gap_evidence(
     gap: dict[str, Any],
     *,
+    triage_item: dict[str, Any] | None = None,
     context: dict[str, str],
     client: Any | None,
     text_model: str,
@@ -166,6 +170,15 @@ def collect_gap_evidence(
     if category in VIDEO_ONLY_CATEGORIES:
         item["status"] = "video_only_gap"
         item["uncertainty_note"] = "该缺口属于视频内证据缺失，外部网页不能替代 OCR/VL/截图/Transcript。"
+        return item
+    if triage_item and triage_item.get("resolution_route") != "web_search":
+        item["status"] = "not_applicable"
+        item["uncertainty_note"] = triage_item.get("recommendation") or "证据分诊认为该缺口不应通过联网补证据解决。"
+        item["triage"] = {
+            "resolution_route": triage_item.get("resolution_route"),
+            "evidence_class": triage_item.get("evidence_class"),
+            "publish_impact": triage_item.get("publish_impact"),
+        }
         return item
     if no_network:
         item["diagnostics"].append("network disabled")
@@ -364,6 +377,7 @@ def summarize_items(items: list[dict[str, Any]], *, total_gaps: int) -> dict[str
         "partial_external_support": 0,
         "unresolved": 0,
         "video_only_gap": 0,
+        "not_applicable": 0,
         "source_count": 0,
     }
     for item in items:
@@ -384,6 +398,7 @@ def render_web_evidence_markdown(payload: dict[str, Any]) -> str:
         f"- 部分补强：{summary.get('partial_external_support', 0)}",
         f"- 仍未解决：{summary.get('unresolved', 0)}",
         f"- 视频内证据缺口：{summary.get('video_only_gap', 0)}",
+        f"- 无需联网处理：{summary.get('not_applicable', 0)}",
         "",
     ]
     for item in payload.get("items") or []:

@@ -44,6 +44,7 @@ DOC_SOURCES = [
     ("deep_report_v2_review", "docs_analysis_chapters/deep_report_v2.review.md", "chapter-based deep report review", "medium"),
     ("study_guide", "study_guide.json", "structured study guide and chapters", "medium"),
     ("evidence_gaps", "evidence_gaps.json", "structured evidence gaps", "high"),
+    ("evidence_triage", "evidence_triage.json", "structured evidence triage routes and publish impact", "high"),
     ("web_evidence", "web_evidence.md", "external web evidence supplements; cannot replace video evidence", "medium"),
     ("web_evidence_json", "web_evidence.json", "structured external web evidence supplements", "medium"),
     ("publish_decision", "publish_decision.json", "publish gate and risk decision", "high"),

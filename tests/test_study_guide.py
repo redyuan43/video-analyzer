@@ -28,6 +28,35 @@ class FakeStudyCardClient:
         return {"response": response}
 
 
+def write_minimal_run(run_dir: Path, review_text: str | None = None) -> None:
+    (run_dir / "orin").mkdir()
+    (run_dir / "frames").mkdir()
+    (run_dir / "frames" / "frame_0.jpg").write_bytes(b"jpg")
+    (run_dir / "analysis.json").write_text(
+        json.dumps(
+            {
+                "transcript": {
+                    "segments": [{"Start": 0.0, "End": 10.0, "Content": "这里是完整讲解内容"}],
+                },
+                "ocr_events": [{"frame_number": 0, "timestamp": 0.0, "status": "ok", "text": "画面文字"}],
+                "frame_analyses": [{"frame_number": 0, "timestamp": 0.0, "response": "画面显示演示步骤"}],
+                "metadata": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "manual_evidence.md").write_text("# Evidence\n", encoding="utf-8")
+    (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
+    (run_dir / "frames_manifest.json").write_text(
+        json.dumps({"frames": [{"frame_number": 0, "path": "frames/frame_0.jpg", "timestamp": 0.0}]}),
+        encoding="utf-8",
+    )
+    if review_text is not None:
+        review_dir = run_dir / "docs_analysis" / "orin"
+        review_dir.mkdir(parents=True)
+        review_dir.joinpath("round_04_review.md").write_text(review_text, encoding="utf-8")
+
+
 class StudyGuideTests(unittest.TestCase):
     def test_detects_hard_evidence_gaps_and_blocks_publish(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -397,6 +426,57 @@ class StudyGuideTests(unittest.TestCase):
             self.assertNotIn("ocr_empty", categories)
             self.assertNotIn("vl_empty", categories)
             self.assertEqual(result["publish_decision"]["status"], "publishable")
+
+    def test_prior_review_conditional_publish_is_warning_not_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            write_minimal_run(
+                run_dir,
+                """# Review
+
+第二章“不能发布空中更新”在操作手册中已正确补充限定说明。
+
+## 最终发布建议
+
+**准予发布，附条件**：
+1. 在知识笔记中补充 OTA 限定说明。
+2. 对证据局限性标注需复核。
+
+以上修正完成后可合并发布，风险等级：低。
+""",
+            )
+
+            result = build_study_artifacts(run_dir, skip_review=True)
+
+            categories = {item["category"] for item in result["evidence_gaps"]["items"]}
+            self.assertNotIn("prior_review_blocks_publish", categories)
+            self.assertIn("prior_review_conditional_publish", categories)
+            self.assertEqual(result["publish_decision"]["status"], "publish_with_warnings")
+            triage_item = result["evidence_triage"]["items"][0]
+            self.assertEqual(triage_item["resolution_route"], "review_parse")
+            self.assertEqual(triage_item["publish_impact"], "warning")
+
+    def test_prior_review_final_block_still_blocks_publish(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            write_minimal_run(
+                run_dir,
+                """# Review
+
+正文里可以讨论各种条件。
+
+### 最终发布建议
+
+**不能发布。** 缺少第三、四章关键视频帧和 ASR，当前结论无法验证。
+""",
+            )
+
+            result = build_study_artifacts(run_dir, skip_review=True)
+
+            categories = {item["category"] for item in result["evidence_gaps"]["items"]}
+            self.assertIn("prior_review_blocks_publish", categories)
+            self.assertEqual(result["publish_decision"]["status"], "blocked")
+            self.assertEqual(result["publish_decision"]["blocked_by"], ["gap_0001"])
 
 
 if __name__ == "__main__":

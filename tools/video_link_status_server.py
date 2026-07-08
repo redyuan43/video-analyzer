@@ -212,7 +212,7 @@ MODULE_SPECS = {
     "verify-core": {"requires": ["run_dir"], "produces": ["verified_core"]},
     "study-guide": {
         "requires": ["run_dir", "verified_core"],
-        "produces": ["study_guide", "evidence_gaps"],
+        "produces": ["study_guide", "evidence_gaps", "evidence_triage"],
     },
     "multidoc": {"requires": ["run_dir", "verified_core", "study_guide"], "produces": ["docs_analysis"]},
     "deep-v2": {"requires": ["run_dir", "verified_core", "study_guide"], "produces": ["chapter_deep_report"]},
@@ -1675,6 +1675,7 @@ class VideoLinkStatusServer:
         study_candidates = {
             "study_guide": run_dir / "study_guide.json",
             "evidence_gaps": run_dir / "evidence_gaps.json",
+            "evidence_triage": run_dir / "evidence_triage.json",
             "evidence_review": run_dir / "evidence_review.json",
             "web_evidence": run_dir / "web_evidence.json",
             "publish_decision": run_dir / "publish_decision.json",
@@ -2341,7 +2342,7 @@ class VideoLinkStatusServer:
             guide = json.loads(path.read_text(encoding="utf-8"))
         except Exception as exc:
             raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, "study guide is invalid") from exc
-        for name in ("evidence_gaps", "evidence_review", "web_evidence", "publish_decision"):
+        for name in ("evidence_gaps", "evidence_triage", "evidence_review", "web_evidence", "publish_decision"):
             sidecar = run_dir / f"{name}.json"
             if sidecar.is_file():
                 try:

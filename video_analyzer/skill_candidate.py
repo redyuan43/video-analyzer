@@ -124,6 +124,7 @@ def load_artifacts(run_dir: Path) -> dict[str, Any]:
         "study_guide": read_json(run_dir / "study_guide.json"),
         "qa_index": read_json(run_dir / "qa" / "answer_index.json"),
         "evidence_gaps": read_json(run_dir / "evidence_gaps.json"),
+        "evidence_triage": read_json(run_dir / "evidence_triage.json"),
         "web_evidence": read_json(run_dir / "web_evidence.json"),
         "publish_decision": read_json(run_dir / "publish_decision.json"),
     }
@@ -379,6 +380,7 @@ def available_sources(artifacts: dict[str, Any]) -> list[str]:
         ("study_guide", "study_guide.json"),
         ("qa_index", "qa/answer_index.json"),
         ("evidence_gaps", "evidence_gaps.json"),
+        ("evidence_triage", "evidence_triage.json"),
         ("web_evidence", "web_evidence.json"),
         ("publish_decision", "publish_decision.json"),
         ("page_context", "orin/page_context.md"),

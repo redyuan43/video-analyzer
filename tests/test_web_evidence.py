@@ -105,6 +105,50 @@ class WebEvidenceTests(unittest.TestCase):
             self.assertEqual(item["sources"][0]["source_confidence"], "high")
             self.assertEqual(result["summary"]["partial_external_support"], 1)
 
+    def test_triage_non_web_route_skips_network(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "evidence_gaps.json").write_text(
+                json.dumps(
+                    {
+                        "items": [
+                            {
+                                "id": "gap_0001",
+                                "category": "prior_review_conditional_publish",
+                                "severity": "warning",
+                                "message": "既有复核文档建议附条件发布",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "evidence_triage.json").write_text(
+                json.dumps(
+                    {
+                        "items": [
+                            {
+                                "gap_id": "gap_0001",
+                                "evidence_class": "review_decision",
+                                "resolution_route": "review_parse",
+                                "publish_impact": "warning",
+                                "recommendation": "解析最终发布建议，不需要联网。",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            def search_fn(**kwargs):
+                raise AssertionError("search should not be called")
+
+            result = build_web_evidence(run_dir, no_network=False, search_fn=search_fn, fetch_fn=lambda **_: "")
+
+            item = result["web_evidence"]["items"][0]
+            self.assertEqual(item["status"], "not_applicable")
+            self.assertEqual(result["summary"]["not_applicable"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

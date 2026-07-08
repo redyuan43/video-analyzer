@@ -19,6 +19,7 @@ CORE_SOURCE_TYPES = {"asr", "subtitle", "ocr", "vl", "manual"}
 LEARNING_SOURCE_TYPES = {"asr", "subtitle", "ocr", "vl"}
 DEFAULT_TEXT_MODEL = "redhatai_qwen3.6-35b-a3b-nvfp4"
 DEFAULT_STUDY_CARD_TEMPERATURE = 0.1
+DEFAULT_TRIAGE_TEMPERATURE = 0.0
 STUDY_CARD_MAX_TRANSCRIPT_CHARS = 7000
 STUDY_CARD_MAX_CONTEXT_CHARS = 1800
 
@@ -33,6 +34,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text-model")
     parser.add_argument("--study-card-llm-base-url")
     parser.add_argument("--study-card-model")
+    parser.add_argument("--triage-llm-base-url")
+    parser.add_argument("--triage-model")
+    parser.add_argument("--triage-temperature", type=float)
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--study-only", action="store_true", help="Only rebuild study guide/card artifacts; leave review and publish decision untouched")
     parser.add_argument("--skip-review", action="store_true")
@@ -58,6 +62,19 @@ def main() -> int:
             study_cards_config.get("temperature", DEFAULT_STUDY_CARD_TEMPERATURE),
         )
     )
+    triage_config = config.get("evidence_triage") or {}
+    triage_llm_base_url = (
+        args.triage_llm_base_url
+        or profile.get("triage_llm_base_url")
+        or triage_config.get("llm_base_url")
+        or study_card_llm_base_url
+    )
+    triage_model = args.triage_model or profile.get("triage_model") or triage_config.get("model") or study_card_model
+    triage_temperature = float(
+        args.triage_temperature
+        if args.triage_temperature is not None
+        else profile.get("triage_temperature", triage_config.get("temperature", DEFAULT_TRIAGE_TEMPERATURE))
+    )
     result = build_study_artifacts(
         run_dir=Path(args.run_dir),
         language=args.language,
@@ -76,6 +93,19 @@ def main() -> int:
         ),
         study_card_extra_body=build_openai_extra_body(profile, study_card_llm_base_url, prefix="study_card_")
         if study_card_llm_base_url
+        else None,
+        triage_llm_base_url=triage_llm_base_url,
+        triage_model=triage_model,
+        triage_temperature=triage_temperature,
+        triage_api_key_env=(
+            profile.get("triage_api_key_env")
+            or triage_config.get("api_key_env")
+            or profile.get("study_card_api_key_env")
+            or study_cards_config.get("api_key_env")
+            or profile.get("api_key_env")
+        ),
+        triage_extra_body=build_openai_extra_body(profile, triage_llm_base_url, prefix="triage_")
+        if triage_llm_base_url
         else None,
         study_only=args.study_only,
         skip_review=args.skip_review,
@@ -99,6 +129,12 @@ def build_study_artifacts(
     study_card_extra_body: dict[str, Any] | None = None,
     study_card_client: Any | None = None,
     study_card_fallback_client: Any | None = None,
+    triage_llm_base_url: str | None = None,
+    triage_model: str | None = None,
+    triage_temperature: float = DEFAULT_TRIAGE_TEMPERATURE,
+    triage_api_key_env: str | None = None,
+    triage_extra_body: dict[str, Any] | None = None,
+    triage_client: Any | None = None,
     study_only: bool = False,
     skip_review: bool = False,
     client: Any | None = None,
@@ -130,10 +166,23 @@ def build_study_artifacts(
         fallback_client=study_card_fallback_client,
     )
     gaps = detect_evidence_gaps(run_dir, analysis, transcript, frames, evidence, chapter_packets)
+    triage = build_evidence_triage(
+        run_dir=run_dir,
+        gaps=gaps,
+        guide_context={"title": extract_title(read_text_if_exists(run_dir.parent / "page_context.md") or read_text_if_exists(run_dir / "input_page_context.md"))},
+        chapter_packets=chapter_packets,
+        triage_llm_base_url=triage_llm_base_url,
+        triage_model=triage_model,
+        triage_temperature=triage_temperature,
+        triage_api_key_env=triage_api_key_env,
+        triage_extra_body=triage_extra_body,
+        triage_client=triage_client,
+    )
     guide = build_study_guide(run_dir, analysis, evidence, chapter_packets, gaps, language)
 
     write_json(run_dir / "study_guide.json", guide)
     write_json(run_dir / "evidence_gaps.json", gaps)
+    write_json(run_dir / "evidence_triage.json", triage)
     write_chapter_packets(run_dir, chapter_packets)
     write_study_markdown(run_dir, guide, chapter_packets, gaps)
     if study_only:
@@ -143,6 +192,7 @@ def build_study_artifacts(
             "summary": summary,
             "study_guide": guide,
             "evidence_gaps": gaps,
+            "evidence_triage": triage,
             "evidence_review": read_json_if_exists(run_dir / "evidence_review.json") or {},
             "publish_decision": decision,
         }
@@ -164,11 +214,18 @@ def build_study_artifacts(
     write_json(run_dir / "evidence_review.json", review)
     (run_dir / "review_notes.md").write_text(render_review_notes(review, gaps), encoding="utf-8")
 
-    decision = build_publish_decision(gaps, review)
+    decision = build_publish_decision(gaps, review, triage)
     write_json(run_dir / "publish_decision.json", decision)
 
     summary = build_study_summary(run_dir, chapter_packets, evidence, gaps, decision)
-    return {"summary": summary, "study_guide": guide, "evidence_gaps": gaps, "evidence_review": review, "publish_decision": decision}
+    return {
+        "summary": summary,
+        "study_guide": guide,
+        "evidence_gaps": gaps,
+        "evidence_triage": triage,
+        "evidence_review": review,
+        "publish_decision": decision,
+    }
 
 
 def build_study_summary(
@@ -182,6 +239,7 @@ def build_study_summary(
         "run_dir": str(run_dir),
         "study_guide": str(run_dir / "study_guide.json"),
         "evidence_gaps": str(run_dir / "evidence_gaps.json"),
+        "evidence_triage": str(run_dir / "evidence_triage.json"),
         "evidence_review": str(run_dir / "evidence_review.json"),
         "publish_decision": str(run_dir / "publish_decision.json"),
         "study_overview": str(run_dir / "study_overview.md"),
@@ -741,12 +799,24 @@ def detect_evidence_gaps(
         run_dir / "docs_analysis" / "operation_manual_review.md",
     ):
         review_text = read_text_if_exists(review_path)
-        if re.search(r"(不能发布|不建议直接发布|不建议发布|停止发布|阻止发布)", review_text):
+        if not review_text:
+            continue
+        review_decision = classify_prior_review_publish_status(review_text)
+        if review_decision["status"] == "blocked":
             add_gap(
                 items,
                 "prior_review_blocks_publish",
                 "error",
                 f"既有复核文档建议阻止发布：{review_path.relative_to(run_dir)}",
+                None,
+            )
+            break
+        if review_decision["status"] == "conditional":
+            add_gap(
+                items,
+                "prior_review_conditional_publish",
+                "warning",
+                f"既有复核文档建议附条件发布：{review_path.relative_to(run_dir)}",
                 None,
             )
             break
@@ -787,6 +857,288 @@ def add_gap(
     if chapter_id:
         gap["chapter_id"] = chapter_id
     items.append(gap)
+
+
+def classify_prior_review_publish_status(review_text: str) -> dict[str, Any]:
+    section = extract_final_publish_section(review_text)
+    if not section:
+        return {"status": "unknown", "section": "", "source_spans": []}
+    conclusion = first_meaningful_review_line(section)
+    normalized = clean_text(conclusion or section)
+    if re.search(r"(准予发布|可以发布|可合并发布)", normalized) and re.search(r"(附条件|条件|修正完成后|修正后)", normalized):
+        return {"status": "conditional", "section": section, "source_spans": [conclusion or trim(section, 160)]}
+    if re.search(r"(不能发布|不建议直接发布|不建议发布|停止发布|阻止发布|\bblocked\b)", normalized, flags=re.I):
+        return {"status": "blocked", "section": section, "source_spans": [conclusion or trim(section, 160)]}
+    if re.search(r"(准予发布|可以发布|可发布|可合并发布)", normalized):
+        return {"status": "publishable", "section": section, "source_spans": [conclusion or trim(section, 160)]}
+    return {"status": "unknown", "section": section, "source_spans": [trim(section, 160)]}
+
+
+def extract_final_publish_section(review_text: str, max_chars: int = 1800) -> str:
+    text = str(review_text or "")
+    match = re.search(r"(?im)^#{1,6}\s*[*\s#]*最终发布建议[*\s#：:]*$", text)
+    if not match:
+        match = re.search(r"最终发布建议", text)
+    if not match:
+        return ""
+    section = text[match.start() : match.start() + max_chars]
+    next_heading = re.search(r"(?m)\n#{1,6}\s+\S+", section[1:])
+    if next_heading:
+        section = section[: next_heading.start() + 1]
+    return section.strip()
+
+
+def first_meaningful_review_line(section: str) -> str:
+    for raw_line in section.splitlines()[1:]:
+        line = clean_text(raw_line).strip("*-# ：:")
+        if line:
+            return line
+    return clean_text(section)
+
+
+def build_evidence_triage(
+    run_dir: Path,
+    gaps: dict[str, Any],
+    guide_context: dict[str, Any],
+    chapter_packets: list[dict[str, Any]],
+    triage_llm_base_url: str | None,
+    triage_model: str | None,
+    triage_temperature: float,
+    triage_api_key_env: str | None,
+    triage_extra_body: dict[str, Any] | None,
+    triage_client: Any | None = None,
+) -> dict[str, Any]:
+    client = triage_client
+    diagnostics: list[str] = []
+    if not client and triage_llm_base_url and triage_model:
+        try:
+            client = build_llm_client(triage_llm_base_url, triage_api_key_env, triage_extra_body)
+        except Exception as exc:
+            diagnostics.append(f"triage client unavailable: {exc}")
+    items = []
+    for gap in gaps.get("items") or []:
+        item = deterministic_triage_item(gap)
+        if should_llm_triage(gap) and client and triage_model:
+            try:
+                prompt = build_triage_prompt(run_dir, gap, guide_context, chapter_packets)
+                response = client.generate(prompt=prompt, model=triage_model, temperature=triage_temperature, num_predict=1000)
+                parsed = parse_json_object(clean_text(response.get("response")))
+                if parsed:
+                    item = merge_llm_triage(item, parsed)
+                    item["triage_model"] = triage_model
+                else:
+                    item["diagnostics"] = ["triage model did not return a JSON object"]
+            except Exception as exc:
+                item["diagnostics"] = [f"triage model failed: {exc}"]
+        items.append(item)
+    summary = summarize_triage(items, total_gaps=len(gaps.get("items") or []))
+    return {
+        "version": 1,
+        "run_dir": str(run_dir),
+        "summary": summary,
+        "items": items,
+        "diagnostics": diagnostics[:20],
+    }
+
+
+def should_llm_triage(gap: dict[str, Any]) -> bool:
+    category = str(gap.get("category") or "")
+    return category.startswith("prior_review") or category not in KNOWN_DETERMINISTIC_TRIAGE_CATEGORIES
+
+
+KNOWN_DETERMINISTIC_TRIAGE_CATEGORIES = {
+    "frames_manifest_missing",
+    "frame_missing",
+    "asr_empty",
+    "ocr_empty",
+    "ocr_failed",
+    "ocr_text_empty",
+    "vl_empty",
+    "vl_failed",
+    "vl_response_empty",
+    "chapter_core_evidence_missing",
+    "prior_review_blocks_publish",
+    "prior_review_conditional_publish",
+}
+
+
+def deterministic_triage_item(gap: dict[str, Any]) -> dict[str, Any]:
+    category = str(gap.get("category") or "")
+    severity = str(gap.get("severity") or "warning")
+    if category in {"asr_empty"}:
+        return triage_item(gap, "video_evidence_failure", "rerun_asr", False, "blocked", "ASR 是视频内容的核心证据，不能为空。", 0.98)
+    if category in {"frames_manifest_missing", "frame_missing"}:
+        return triage_item(gap, "video_evidence_failure", "rerun_frames", False, "blocked", "缺少视频帧证据，外部网页不能替代画面。", 0.98)
+    if category in {"vl_failed", "chapter_core_evidence_missing"}:
+        return triage_item(gap, "video_evidence_failure", "rerun_vl", False, "blocked", "核心视觉/章节证据缺失，需要重跑视频证据阶段。", 0.95)
+    if category in {"ocr_empty", "ocr_failed", "ocr_text_empty"}:
+        impact = "warning" if severity != "error" else "blocked"
+        route = "rerun_ocr" if category == "ocr_failed" else "manual_review"
+        reason = "OCR 证据问题只能通过重跑 OCR 或人工确认画面是否含文字解决，不能靠联网补齐。"
+        if category == "ocr_text_empty":
+            reason = "OCR 空文本可能只是空白/转场帧；需结合画面判断是否影响关键结论。"
+        return triage_item(gap, "video_evidence_gap", route, False, impact, reason, 0.9)
+    if category in {"vl_empty", "vl_response_empty"}:
+        return triage_item(gap, "video_evidence_gap", "rerun_vl", False, "warning", "VL 证据为空时应重跑视觉分析或人工复核画面。", 0.9)
+    if category == "prior_review_blocks_publish":
+        return triage_item(gap, "review_decision", "review_parse", False, "blocked", "既有复核最终建议明确阻断发布。", 0.9)
+    if category == "prior_review_conditional_publish":
+        return triage_item(gap, "review_decision", "review_parse", False, "warning", "既有复核最终建议为附条件发布，应作为待修项而非硬阻断。", 0.9)
+    return triage_item(gap, "external_fact", "manual_review", False, "warning", "未知证据缺口类型，需人工或大模型复核后决定是否联网。", 0.5)
+
+
+def triage_item(
+    gap: dict[str, Any],
+    evidence_class: str,
+    resolution_route: str,
+    can_external_resolve: bool,
+    publish_impact: str,
+    reason: str,
+    confidence: float,
+) -> dict[str, Any]:
+    return {
+        "gap_id": gap.get("id"),
+        "category": gap.get("category"),
+        "severity": gap.get("severity"),
+        "message": gap.get("message"),
+        "evidence_class": evidence_class,
+        "resolution_route": resolution_route,
+        "can_external_resolve": can_external_resolve,
+        "publish_impact": publish_impact,
+        "recommendation": reason,
+        "confidence": confidence,
+        "source_spans": [],
+    }
+
+
+def build_triage_prompt(
+    run_dir: Path,
+    gap: dict[str, Any],
+    guide_context: dict[str, Any],
+    chapter_packets: list[dict[str, Any]],
+) -> str:
+    review_excerpt = related_review_excerpt(run_dir, gap)
+    compact_chapters = [
+        {
+            "chapter_id": packet.get("chapter_id"),
+            "title": packet.get("title"),
+            "summary": packet.get("summary"),
+        }
+        for packet in chapter_packets[:12]
+    ]
+    return f"""/no_think
+你是视频学习资料的证据分诊员。请判断这个证据缺口应该走哪条修复路线。
+
+第一性原则：
+- 只有合适的证据才能支撑结论。
+- 视频里的 ASR/OCR/VL/截图缺失，不能靠外部网页替代。
+- 外部网页只能补官方说明、版本、背景、项目链接、公开事实。
+- 旧 review 的发布门禁只看“最终发布建议”，不要把正文里的领域表述误判成文档不能发布。
+
+只输出 JSON 对象，字段固定：
+{{
+  "evidence_class": "video_evidence_failure|video_evidence_gap|review_decision|external_fact|context_conflict|no_action",
+  "resolution_route": "rerun_asr|rerun_ocr|rerun_vl|rerun_frames|web_search|review_parse|manual_review|no_action",
+  "can_external_resolve": true,
+  "publish_impact": "none|warning|blocked",
+  "confidence": 0.0,
+  "recommendation": "一句话说明下一步",
+  "source_spans": ["引用输入中支持判断的短句"]
+}}
+
+视频上下文：
+{json.dumps(guide_context, ensure_ascii=False)}
+
+章节摘要：
+{json.dumps(compact_chapters, ensure_ascii=False)[:5000]}
+
+证据缺口：
+{json.dumps(gap, ensure_ascii=False, indent=2)}
+
+相关 review 摘录：
+{review_excerpt}
+""".strip()
+
+
+def related_review_excerpt(run_dir: Path, gap: dict[str, Any]) -> str:
+    message = str(gap.get("message") or "")
+    match = re.search(r"：(.+?\.md)", message)
+    candidates: list[Path] = []
+    if match:
+        candidates.append(run_dir / match.group(1))
+    candidates.extend(
+        [
+            run_dir / "docs_analysis_chapters" / "deep_report_v2.review.md",
+            run_dir / "docs_analysis" / "orin" / "round_04_review.md",
+            run_dir / "docs_analysis" / "operation_manual_review.md",
+        ]
+    )
+    seen: set[Path] = set()
+    for path in candidates:
+        if path in seen:
+            continue
+        seen.add(path)
+        text = read_text_if_exists(path)
+        if not text:
+            continue
+        final_section = extract_final_publish_section(text)
+        if final_section:
+            return trim(final_section, 1800)
+        return trim(text, 1800)
+    return ""
+
+
+def merge_llm_triage(base: dict[str, Any], parsed: dict[str, Any]) -> dict[str, Any]:
+    evidence_classes = {"video_evidence_failure", "video_evidence_gap", "review_decision", "external_fact", "context_conflict", "no_action"}
+    routes = {"rerun_asr", "rerun_ocr", "rerun_vl", "rerun_frames", "web_search", "review_parse", "manual_review", "no_action"}
+    impacts = {"none", "warning", "blocked"}
+    merged = dict(base)
+    if parsed.get("evidence_class") in evidence_classes:
+        merged["evidence_class"] = parsed["evidence_class"]
+    if parsed.get("resolution_route") in routes:
+        merged["resolution_route"] = parsed["resolution_route"]
+    if isinstance(parsed.get("can_external_resolve"), bool):
+        merged["can_external_resolve"] = parsed["can_external_resolve"]
+    if parsed.get("publish_impact") in impacts:
+        merged["publish_impact"] = parsed["publish_impact"]
+    try:
+        confidence = float(parsed.get("confidence"))
+        if 0 <= confidence <= 1:
+            merged["confidence"] = confidence
+    except Exception:
+        pass
+    recommendation = clean_text(parsed.get("recommendation"))
+    if recommendation:
+        merged["recommendation"] = sentence_safe_trim(recommendation, 240)
+    spans = parsed.get("source_spans")
+    if isinstance(spans, list):
+        merged["source_spans"] = [sentence_safe_trim(clean_text(span), 180) for span in spans if clean_text(span)][:5]
+    if not merged.get("source_spans") and merged.get("publish_impact") == "blocked" and merged.get("confidence", 0) < 0.8:
+        merged["resolution_route"] = "manual_review"
+        merged["recommendation"] = "模型未给出足够原文依据，需人工复核后才能阻断发布。"
+    if merged["resolution_route"] != "web_search":
+        merged["can_external_resolve"] = False
+    return merged
+
+
+def summarize_triage(items: list[dict[str, Any]], total_gaps: int) -> dict[str, Any]:
+    routes: dict[str, int] = {}
+    impacts: dict[str, int] = {}
+    external_resolvable = 0
+    for item in items:
+        route = item.get("resolution_route") or "manual_review"
+        impact = item.get("publish_impact") or "warning"
+        routes[route] = routes.get(route, 0) + 1
+        impacts[impact] = impacts.get(impact, 0) + 1
+        if item.get("can_external_resolve"):
+            external_resolvable += 1
+    return {
+        "total_gaps": total_gaps,
+        "triaged_gaps": len(items),
+        "routes": routes,
+        "publish_impacts": impacts,
+        "external_resolvable": external_resolvable,
+    }
 
 
 def build_study_guide(
@@ -906,15 +1258,24 @@ def build_review_prompt(
 """.strip()
 
 
-def build_publish_decision(gaps: dict[str, Any], review: dict[str, Any]) -> dict[str, Any]:
+def build_publish_decision(gaps: dict[str, Any], review: dict[str, Any], triage: dict[str, Any] | None = None) -> dict[str, Any]:
     errors = [item for item in gaps.get("items") or [] if item.get("severity") == "error"]
     warnings = [item for item in gaps.get("items") or [] if item.get("severity") == "warning"]
     hard_block_categories = {"asr_empty", "frame_missing", "vl_failed", "chapter_core_evidence_missing", "prior_review_blocks_publish"}
-    hard_block = any(item.get("category") in hard_block_categories for item in errors)
+    hard_block_gap_ids = [item["id"] for item in errors if item.get("category") in hard_block_categories]
+    triage_items = (triage or {}).get("items") or []
+    triage_blocked_ids = [
+        item.get("gap_id")
+        for item in triage_items
+        if item.get("publish_impact") == "blocked"
+        and float_or_zero(item.get("confidence")) >= 0.7
+        and item.get("gap_id")
+    ]
+    hard_block = bool(hard_block_gap_ids or triage_blocked_ids)
     model_recommendation = review.get("publish_recommendation")
     if hard_block:
         status = "blocked"
-        reason = "硬规则发现关键证据缺口"
+        reason = "证据分诊发现关键证据缺口"
     elif model_recommendation in {"blocked", "publish_with_warnings", "publishable"}:
         status = model_recommendation
         reason = "模型复核建议"
@@ -933,9 +1294,10 @@ def build_publish_decision(gaps: dict[str, Any], review: dict[str, Any]) -> dict
         "reason": reason,
         "hard_rule_priority": True,
         "gap_summary": gaps.get("summary") or {},
+        "triage_summary": (triage or {}).get("summary") or {},
         "review_status": review.get("status"),
         "risk_level": review.get("risk_level") or deterministic_risk(gaps),
-        "blocked_by": [item["id"] for item in errors if item.get("category") in hard_block_categories],
+        "blocked_by": sorted(set(hard_block_gap_ids + triage_blocked_ids)),
     }
 
 
