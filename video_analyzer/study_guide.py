@@ -18,6 +18,9 @@ from video_analyzer.multidoc import parse_chapters, timestamp_to_seconds
 CORE_SOURCE_TYPES = {"asr", "subtitle", "ocr", "vl", "manual"}
 LEARNING_SOURCE_TYPES = {"asr", "subtitle", "ocr", "vl"}
 DEFAULT_TEXT_MODEL = "redhatai_qwen3.6-35b-a3b-nvfp4"
+DEFAULT_STUDY_CARD_TEMPERATURE = 0.1
+STUDY_CARD_MAX_TRANSCRIPT_CHARS = 7000
+STUDY_CARD_MAX_CONTEXT_CHARS = 1800
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,7 +31,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--language", default="zh-CN")
     parser.add_argument("--llm-base-url")
     parser.add_argument("--text-model")
+    parser.add_argument("--study-card-llm-base-url")
+    parser.add_argument("--study-card-model")
     parser.add_argument("--temperature", type=float)
+    parser.add_argument("--study-only", action="store_true", help="Only rebuild study guide/card artifacts; leave review and publish decision untouched")
     parser.add_argument("--skip-review", action="store_true")
     return parser.parse_args()
 
@@ -37,8 +43,21 @@ def main() -> int:
     args = parse_args()
     config = Config(args.config)
     profile = config.get_runtime_profile(args.profile)
+    study_cards_config = config.get("study_cards") or {}
     default_base_url = (config.get("endpoints") or {}).get("services", {}).get("amd_fast_base_url")
     llm_base_url = args.llm_base_url or profile.get("llm_base_url") or default_base_url
+    study_card_llm_base_url = (
+        args.study_card_llm_base_url
+        or profile.get("study_card_llm_base_url")
+        or study_cards_config.get("llm_base_url")
+    )
+    study_card_model = args.study_card_model or profile.get("study_card_model") or study_cards_config.get("model")
+    study_card_temperature = float(
+        profile.get(
+            "study_card_temperature",
+            study_cards_config.get("temperature", DEFAULT_STUDY_CARD_TEMPERATURE),
+        )
+    )
     result = build_study_artifacts(
         run_dir=Path(args.run_dir),
         language=args.language,
@@ -47,6 +66,18 @@ def main() -> int:
         temperature=args.temperature if args.temperature is not None else resolve_temperature(profile, 0.2),
         api_key_env=profile.get("text_api_key_env") or profile.get("api_key_env"),
         extra_body=build_openai_extra_body(profile, llm_base_url),
+        study_card_llm_base_url=study_card_llm_base_url,
+        study_card_model=study_card_model,
+        study_card_temperature=study_card_temperature,
+        study_card_api_key_env=(
+            profile.get("study_card_api_key_env")
+            or study_cards_config.get("api_key_env")
+            or profile.get("api_key_env")
+        ),
+        study_card_extra_body=build_openai_extra_body(profile, study_card_llm_base_url, prefix="study_card_")
+        if study_card_llm_base_url
+        else None,
+        study_only=args.study_only,
         skip_review=args.skip_review,
     )
     print(json.dumps(result["summary"], ensure_ascii=False, indent=2))
@@ -61,6 +92,14 @@ def build_study_artifacts(
     temperature: float = 0.2,
     api_key_env: str | None = None,
     extra_body: dict[str, Any] | None = None,
+    study_card_llm_base_url: str | None = None,
+    study_card_model: str | None = None,
+    study_card_temperature: float = DEFAULT_STUDY_CARD_TEMPERATURE,
+    study_card_api_key_env: str | None = None,
+    study_card_extra_body: dict[str, Any] | None = None,
+    study_card_client: Any | None = None,
+    study_card_fallback_client: Any | None = None,
+    study_only: bool = False,
     skip_review: bool = False,
     client: Any | None = None,
 ) -> dict[str, Any]:
@@ -74,6 +113,22 @@ def build_study_artifacts(
     chapters = build_chapters(run_dir, transcript)
     evidence = build_evidence(run_dir, analysis, transcript, frames)
     chapter_packets = build_chapter_packets(run_dir, chapters, evidence, frames)
+    synthesize_study_cards(
+        chapter_packets,
+        language=language,
+        study_card_llm_base_url=study_card_llm_base_url,
+        study_card_model=study_card_model,
+        study_card_temperature=study_card_temperature,
+        study_card_api_key_env=study_card_api_key_env,
+        study_card_extra_body=study_card_extra_body,
+        study_card_client=study_card_client,
+        fallback_llm_base_url=llm_base_url,
+        fallback_model=text_model,
+        fallback_temperature=temperature,
+        fallback_api_key_env=api_key_env,
+        fallback_extra_body=extra_body,
+        fallback_client=study_card_fallback_client,
+    )
     gaps = detect_evidence_gaps(run_dir, analysis, transcript, frames, evidence, chapter_packets)
     guide = build_study_guide(run_dir, analysis, evidence, chapter_packets, gaps, language)
 
@@ -81,6 +136,16 @@ def build_study_artifacts(
     write_json(run_dir / "evidence_gaps.json", gaps)
     write_chapter_packets(run_dir, chapter_packets)
     write_study_markdown(run_dir, guide, chapter_packets, gaps)
+    if study_only:
+        decision = read_json_if_exists(run_dir / "publish_decision.json") or {"status": "not_run", "reason": "study-only requested"}
+        summary = build_study_summary(run_dir, chapter_packets, evidence, gaps, decision)
+        return {
+            "summary": summary,
+            "study_guide": guide,
+            "evidence_gaps": gaps,
+            "evidence_review": read_json_if_exists(run_dir / "evidence_review.json") or {},
+            "publish_decision": decision,
+        }
 
     review = build_evidence_review(
         run_dir=run_dir,
@@ -102,7 +167,18 @@ def build_study_artifacts(
     decision = build_publish_decision(gaps, review)
     write_json(run_dir / "publish_decision.json", decision)
 
-    summary = {
+    summary = build_study_summary(run_dir, chapter_packets, evidence, gaps, decision)
+    return {"summary": summary, "study_guide": guide, "evidence_gaps": gaps, "evidence_review": review, "publish_decision": decision}
+
+
+def build_study_summary(
+    run_dir: Path,
+    chapter_packets: list[dict[str, Any]],
+    evidence: list[dict[str, Any]],
+    gaps: dict[str, Any],
+    decision: dict[str, Any],
+) -> dict[str, Any]:
+    return {
         "run_dir": str(run_dir),
         "study_guide": str(run_dir / "study_guide.json"),
         "evidence_gaps": str(run_dir / "evidence_gaps.json"),
@@ -114,9 +190,8 @@ def build_study_artifacts(
         "chapters": len(chapter_packets),
         "evidence": len(evidence),
         "gaps": len(gaps.get("items") or []),
-        "decision": decision["status"],
+        "decision": decision.get("status"),
     }
-    return {"summary": summary, "study_guide": guide, "evidence_gaps": gaps, "evidence_review": review, "publish_decision": decision}
 
 
 def load_transcript(run_dir: Path, analysis: dict[str, Any]) -> dict[str, Any]:
@@ -327,10 +402,277 @@ def build_chapter_packets(
             "representative_frame": representative,
             "evidence_ids": [item["id"] for item in chapter_evidence[:30]],
             "evidence": chapter_evidence[:30],
+            "_synthesis_evidence": chapter_evidence,
             "review_flags": [],
         }
         packets.append(packet)
     return packets
+
+
+def synthesize_study_cards(
+    packets: list[dict[str, Any]],
+    language: str,
+    study_card_llm_base_url: str | None = None,
+    study_card_model: str | None = None,
+    study_card_temperature: float = DEFAULT_STUDY_CARD_TEMPERATURE,
+    study_card_api_key_env: str | None = None,
+    study_card_extra_body: dict[str, Any] | None = None,
+    study_card_client: Any | None = None,
+    fallback_llm_base_url: str | None = None,
+    fallback_model: str | None = None,
+    fallback_temperature: float = 0.2,
+    fallback_api_key_env: str | None = None,
+    fallback_extra_body: dict[str, Any] | None = None,
+    fallback_client: Any | None = None,
+) -> None:
+    primary_error = ""
+    primary_client = None
+    fallback_llm_client = None
+    use_primary = bool(study_card_model and (study_card_client or study_card_llm_base_url))
+    use_fallback = bool(
+        fallback_model
+        and (fallback_client or fallback_llm_base_url)
+        and not same_model_endpoint(study_card_model, study_card_llm_base_url, fallback_model, fallback_llm_base_url)
+    )
+
+    if use_primary and not study_card_client:
+        try:
+            primary_client = build_llm_client(
+                study_card_llm_base_url,
+                api_key_env=study_card_api_key_env,
+                extra_body=study_card_extra_body,
+            )
+        except Exception as exc:
+            primary_error = str(exc)
+            use_primary = False
+    else:
+        primary_client = study_card_client
+
+    if use_fallback and not fallback_client:
+        try:
+            fallback_llm_client = build_llm_client(
+                fallback_llm_base_url,
+                api_key_env=fallback_api_key_env,
+                extra_body=fallback_extra_body,
+            )
+        except Exception:
+            fallback_llm_client = None
+            use_fallback = False
+    else:
+        fallback_llm_client = fallback_client
+
+    for packet in packets:
+        packet["source_title"] = packet.get("source_title") or packet.get("title") or ""
+        generated = None
+        errors: list[str] = []
+        if use_primary and primary_client and study_card_model:
+            try:
+                generated = synthesize_one_study_card(
+                    packet,
+                    client=primary_client,
+                    model=study_card_model,
+                    temperature=study_card_temperature,
+                    language=language,
+                )
+                apply_generated_study_card(packet, generated, status="generated", model=study_card_model)
+                continue
+            except Exception as exc:
+                errors.append(f"primary {study_card_model}: {exc}")
+        elif primary_error:
+            errors.append(f"primary unavailable: {primary_error}")
+
+        if errors and use_fallback and fallback_llm_client and fallback_model:
+            try:
+                generated = synthesize_one_study_card(
+                    packet,
+                    client=fallback_llm_client,
+                    model=fallback_model,
+                    temperature=fallback_temperature,
+                    language=language,
+                )
+                apply_generated_study_card(
+                    packet,
+                    generated,
+                    status="fallback_model",
+                    model=fallback_model,
+                    reason="; ".join(errors),
+                )
+                continue
+            except Exception as exc:
+                errors.append(f"fallback {fallback_model}: {exc}")
+
+        packet["card_synthesis"] = {
+            "status": "deterministic",
+            "model": None,
+            "reason": "; ".join(errors) if errors else "study card model not configured",
+        }
+
+
+def build_llm_client(
+    llm_base_url: str | None,
+    api_key_env: str | None = None,
+    extra_body: dict[str, Any] | None = None,
+) -> GenericOpenAIAPIClient:
+    if not llm_base_url:
+        raise ValueError("llm base url unavailable")
+    return GenericOpenAIAPIClient(
+        resolve_api_key(api_key_env=api_key_env, api_url=llm_base_url),
+        llm_base_url,
+        max_retries=1,
+        timeout_seconds=180,
+        extra_body=extra_body,
+    )
+
+
+def same_model_endpoint(
+    left_model: str | None,
+    left_base_url: str | None,
+    right_model: str | None,
+    right_base_url: str | None,
+) -> bool:
+    return bool(left_model and right_model and left_base_url and right_base_url and left_model == right_model and left_base_url == right_base_url)
+
+
+def synthesize_one_study_card(
+    packet: dict[str, Any],
+    client: Any,
+    model: str,
+    temperature: float,
+    language: str,
+) -> dict[str, Any]:
+    prompt = build_study_card_prompt(packet, language)
+    response = client.generate(prompt=prompt, model=model, temperature=temperature, num_predict=900)
+    text = clean_text(response.get("response"))
+    parsed = parse_json_object(text)
+    if not parsed:
+        raise ValueError("model did not return a JSON object")
+    return normalize_generated_study_card(parsed, packet)
+
+
+def build_study_card_prompt(packet: dict[str, Any], language: str) -> str:
+    synthesis_evidence = packet.get("_synthesis_evidence") or packet.get("evidence") or []
+    transcript_items = [
+        item
+        for item in synthesis_evidence
+        if item.get("source_type") in {"asr", "subtitle"} and clean_text(item.get("text"))
+    ]
+    context_items = [
+        item
+        for item in synthesis_evidence
+        if item.get("source_type") in {"ocr", "vl"} and clean_text(item.get("text"))
+    ]
+    transcript_text = "\n".join(
+        f"[{item.get('timestamp_label')}] {clean_text(item.get('text'))}" for item in transcript_items
+    )
+    context_text = "\n".join(
+        f"[{item.get('timestamp_label')}] {item.get('source_type')}: {clean_text(item.get('text'))}"
+        for item in context_items
+    )
+    payload = {
+        "chapter_id": packet.get("chapter_id"),
+        "time": f"{packet.get('start', '')} - {packet.get('end', '')}",
+        "source_title": packet.get("source_title") or packet.get("title"),
+        "deterministic_summary": packet.get("summary"),
+        "transcript": trim(transcript_text, STUDY_CARD_MAX_TRANSCRIPT_CHARS),
+        "visual_context": trim(context_text, STUDY_CARD_MAX_CONTEXT_CHARS),
+    }
+    return f"""/no_think
+你是视频访谈学习卡编辑。请用 {language} 基于整章转写生成一个章节学习卡。
+
+只输出 JSON 对象，字段固定：
+- title: string，整章主题短标题，8-22 个中文字符左右；不要复制开头句、语气词、时间残片或问句残片。
+- summary: string，2-3 句自然摘要，概括整章讨论脉络和结论。
+- key_points: string[]，3-5 条归纳后的学习要点，不要连续摘抄原文。
+
+硬规则：
+- 必须综合整章 ASR/字幕，不得只看第一句话。
+- 标题不能是“他说”“呃”“过去九个月”“我会先写”这类低信息片段。
+- 如果是访谈内容，优先概括讨论主题、观点变化和可复用启发。
+- OCR/VL 只是补充上下文；没有时不要编造画面信息。
+
+章节材料：
+{json.dumps(payload, ensure_ascii=False)}
+""".strip()
+
+
+def normalize_generated_study_card(parsed: dict[str, Any], packet: dict[str, Any]) -> dict[str, Any]:
+    title = normalize_card_text(parsed.get("title"), max_chars=40)
+    summary = normalize_card_text(parsed.get("summary"), max_chars=420)
+    key_points = normalize_key_points(parsed.get("key_points"))
+    if is_low_information_title(title, packet):
+        raise ValueError(f"low-information title: {title}")
+    if len(summary) < 16:
+        raise ValueError("summary is too short")
+    if len(key_points) < 2:
+        raise ValueError("key_points must contain at least two useful items")
+    return {
+        "title": title,
+        "summary": summary,
+        "key_points": key_points[:5],
+    }
+
+
+def normalize_card_text(value: Any, max_chars: int) -> str:
+    if isinstance(value, list):
+        value = "；".join(str(item) for item in value if clean_text(item))
+    text = clean_text(value).strip("`#* \t\r\n")
+    text = re.sub(r"^\d{1,2}[.、]\s*", "", text).strip()
+    return sentence_safe_trim(text, max_chars)
+
+
+def normalize_key_points(value: Any) -> list[str]:
+    if isinstance(value, list):
+        raw_items = value
+    else:
+        raw_items = re.split(r"\n+|[；;]", str(value or ""))
+    points: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        text = normalize_card_text(item, max_chars=180)
+        text = re.sub(r"^[-*•]\s*", "", text).strip()
+        normalized = re.sub(r"\W+", "", text).lower()
+        if len(text) < 6 or not normalized or normalized in seen:
+            continue
+        points.append(text)
+        seen.add(normalized)
+    return points
+
+
+def is_low_information_title(title: str, packet: dict[str, Any]) -> bool:
+    title = clean_text(title).strip(" ，,；;。.!！?？")
+    if not title:
+        return True
+    compact = re.sub(r"\W+", "", title).lower()
+    cjk_count = len(re.findall(r"[\u4e00-\u9fff]", title))
+    if cjk_count <= 2 and len(compact) <= 6:
+        return True
+    if compact in {"嗯", "呃", "啊", "哦", "他说", "我说", "你说", "就是", "然后", "没有"}:
+        return True
+    vague_prefixes = ("过去", "现在", "明年", "本来", "那你", "那个", "这个", "就是", "然后", "我会先", "没有去")
+    if len(title) <= 10 and title.startswith(vague_prefixes):
+        return True
+    source_title = clean_text(packet.get("source_title"))
+    if source_title and title == source_title and len(title) <= 12 and title.startswith(vague_prefixes):
+        return True
+    return False
+
+
+def apply_generated_study_card(
+    packet: dict[str, Any],
+    generated: dict[str, Any],
+    status: str,
+    model: str,
+    reason: str | None = None,
+) -> None:
+    packet["title"] = generated["title"]
+    packet["summary"] = generated["summary"]
+    packet["key_points"] = generated["key_points"]
+    packet["card_synthesis"] = {
+        "status": status,
+        "model": model,
+    }
+    if reason:
+        packet["card_synthesis"]["reason"] = reason
 
 
 def choose_representative_frame(start: float, end: float, frames: dict[int, dict[str, Any]]) -> dict[str, Any] | None:
@@ -469,7 +811,7 @@ def build_study_guide(
             "evidence_count": len(evidence),
             "gap_count": gaps.get("summary", {}).get("total", 0),
         },
-        "chapters": chapter_packets,
+        "chapters": public_chapter_packets(chapter_packets),
         "evidence": evidence,
         "evidence_gaps": gaps,
     }
@@ -601,13 +943,21 @@ def write_chapter_packets(run_dir: Path, packets: list[dict[str, Any]]) -> None:
     chapter_dir = run_dir / "study_chapters"
     chapter_dir.mkdir(exist_ok=True)
     for packet in packets:
-        write_json(chapter_dir / f"{packet['chapter_id']}.json", packet)
+        write_json(chapter_dir / f"{packet['chapter_id']}.json", public_chapter_packet(packet))
 
 
 def write_study_markdown(run_dir: Path, guide: dict[str, Any], packets: list[dict[str, Any]], gaps: dict[str, Any]) -> None:
     (run_dir / "study_overview.md").write_text(render_study_overview(guide, packets, gaps), encoding="utf-8")
     (run_dir / "study_cards.md").write_text(render_study_cards(packets), encoding="utf-8")
     (run_dir / "evidence_index.md").write_text(render_evidence_index(guide.get("evidence") or []), encoding="utf-8")
+
+
+def public_chapter_packets(packets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [public_chapter_packet(packet) for packet in packets]
+
+
+def public_chapter_packet(packet: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in packet.items() if not key.startswith("_")}
 
 
 def render_study_overview(guide: dict[str, Any], packets: list[dict[str, Any]], gaps: dict[str, Any]) -> str:
@@ -632,7 +982,7 @@ def render_study_overview(guide: dict[str, Any], packets: list[dict[str, Any]], 
                 f"### {packet['index']:02d}. {packet['title']}",
                 "",
                 f"- 时间：{packet['start']} - {packet['end']}",
-                f"- 主旨：{packet['summary']}",
+                f"- 摘要：{packet['summary']}",
                 f"- 可跳转时间：{packet['start']}",
                 "",
             ]
@@ -654,8 +1004,8 @@ def render_study_cards(packets: list[dict[str, Any]]) -> str:
                 f"## {packet['index']:02d}. {packet['title']}",
                 "",
                 f"- 时间：{packet['start']} - {packet['end']}",
-                f"- 主旨：{packet['summary']}",
-                "- 重点：",
+                f"- 摘要：{packet['summary']}",
+                "- 要点：",
             ]
         )
         for point in packet.get("key_points") or []:
