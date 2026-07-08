@@ -1151,7 +1151,8 @@ def main():
             },
             "transcript": {
                 "text": transcript.text if transcript else None,
-                "segments": transcript.segments if transcript else None
+                "segments": transcript.segments if transcript else None,
+                "metadata": transcript.metadata if transcript else None,
             } if transcript else None,
             "asr": asr_result.to_metadata() if asr_result else None,
             "ocr_events": [event.to_dict() for event in ocr_events],

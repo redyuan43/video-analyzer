@@ -158,6 +158,7 @@ def transcribe_with_http_asr(
                 text=payload.get("text", ""),
                 segments=payload.get("segments") or [],
                 language=payload.get("language") or "unknown",
+                metadata=_asr_payload_metadata(payload),
             )
         except requests.HTTPError as exc:
             status_code = exc.response.status_code if exc.response is not None else None
@@ -484,6 +485,11 @@ def merge_asr_transcripts(
         text=deep_transcript.text.strip() or fast_transcript.text,
         segments=merged_segments,
         language=deep_transcript.language if deep_transcript.language != "unknown" else fast_transcript.language,
+        metadata={
+            "source": "merged_remote_http_vibevoice",
+            "fast_transcript_metadata": fast_transcript.metadata,
+            "deep_transcript_metadata": deep_transcript.metadata,
+        },
     )
 
 
@@ -599,7 +605,10 @@ def _transcribe_vibevoice_worker(
         shifted_segments.append(shifted)
     if not shifted_segments:
         shifted_segments = [{"provider_url": url, "chunk_offset_seconds": start_seconds, "text": transcript.text}]
-    return AudioTranscript(text=transcript.text, segments=shifted_segments, language=transcript.language)
+    metadata = dict(transcript.metadata or {})
+    metadata["distributed_chunk_offset_seconds"] = start_seconds
+    metadata["provider_url"] = url
+    return AudioTranscript(text=transcript.text, segments=shifted_segments, language=transcript.language, metadata=metadata)
 
 
 def _merge_distributed_vibevoice_results(
@@ -627,7 +636,21 @@ def _merge_distributed_vibevoice_results(
         }
     )
     language = next((transcript.language for _index, _start, transcript, _url in successful if transcript and transcript.language), "unknown")
-    return AudioTranscript(text=text, segments=segments, language=language)
+    metadata = {
+        "provider": "vibevoice_remote_distributed",
+        "provider_urls": [url for _index, _start, _transcript, url in successful],
+        "chunk_count": len(successful),
+        "worker_metadata": [
+            {
+                "chunk_index": index,
+                "chunk_offset_seconds": start,
+                "provider_url": url,
+                "metadata": transcript.metadata if transcript else {},
+            }
+            for index, start, transcript, url in successful
+        ],
+    }
+    return AudioTranscript(text=text, segments=segments, language=language, metadata=metadata)
 
 
 def _shift_segment_time(segment: Dict[str, object], key: str, offset: float) -> None:
@@ -667,6 +690,11 @@ def _vibevoice_request_options(options: Dict[str, object]) -> Dict[str, object]:
 def _set_default_when_empty(options: Dict[str, object], key: str, default: object) -> None:
     if options.get(key) is None or options.get(key) == "":
         options[key] = default
+
+
+def _asr_payload_metadata(payload: Dict[str, object]) -> Dict[str, object]:
+    omitted = {"success", "text", "segments", "language"}
+    return {key: value for key, value in payload.items() if key not in omitted}
 
 
 def _http_timeout_for_audio(duration_seconds: float, options: Optional[Dict[str, object]] = None) -> Tuple[float, float]:
@@ -743,12 +771,21 @@ def _transcript_summary(transcript: Optional[AudioTranscript]) -> Optional[Dict[
     if not transcript:
         return None
     text = transcript.text or ""
-    return {
+    summary: Dict[str, object] = {
         "language": transcript.language,
         "text_preview": text[:500],
         "text_length": len(text),
         "segment_count": len(transcript.segments or []),
     }
+    if transcript.metadata:
+        summary["metadata_keys"] = sorted(transcript.metadata.keys())
+        if "quality_report" in transcript.metadata:
+            summary["quality_report"] = transcript.metadata.get("quality_report")
+        if "mode" in transcript.metadata:
+            summary["mode"] = transcript.metadata.get("mode")
+        if "provider" in transcript.metadata:
+            summary["provider"] = transcript.metadata.get("provider")
+    return summary
 
 
 def _has_transcript_text(transcript: Optional[AudioTranscript]) -> bool:
