@@ -11,6 +11,7 @@ The default runtime policy matches the current tested setup:
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 import re
 import shutil
@@ -20,7 +21,8 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse, urlunparse
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.request import Request, urlopen
 
 from video_analyzer.config import Config
 from video_analyzer.douyin_browser import (
@@ -43,6 +45,11 @@ DOWNLOAD_DEVICE_REMOTE_ROOTS = {
 VIDEO_MEDIA_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".flv", ".avi", ".m4v"}
 AUDIO_MEDIA_EXTENSIONS = {".m4a", ".mp3", ".wav", ".aac", ".opus", ".ogg", ".flac"}
 MEDIA_EXTENSIONS = VIDEO_MEDIA_EXTENSIONS | AUDIO_MEDIA_EXTENSIONS
+APPLE_PODCASTS_HOST = "podcasts.apple.com"
+APPLE_LOOKUP_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -263,9 +270,11 @@ def main() -> int:
         elif args.keep_existing and video_path.exists():
             download_context_assets(args.url, video_dir, args)
         else:
-            download_video(args.url, video_dir, args)
+            download_video(args.url, video_dir, args, info)
             video_path = materialize_download(video_dir, video_dir / "video.mp4")
-        info = load_downloaded_info(video_dir) or info
+        downloaded_info = load_downloaded_info(video_dir)
+        if not apple_lookup_info(info):
+            info = downloaded_info or info
         info_path.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
         description_text = build_context_markdown(info, args.url)
         description_path.write_text(description_text, encoding="utf-8")
@@ -418,11 +427,18 @@ def fetch_metadata(url: str, args: argparse.Namespace) -> dict[str, Any]:
     add_ytdlp_network_args(command, args)
     add_cookie_args(command, args)
     command.append(url)
-    raw = subprocess.check_output(command, text=True)
-    return json.loads(raw)
+    try:
+        raw = subprocess.check_output(command, text=True)
+        return json.loads(raw)
+    except subprocess.CalledProcessError:
+        fallback = apple_podcasts_lookup_metadata(url)
+        if fallback:
+            return fallback
+        raise
 
 
-def download_video(url: str, video_dir: Path, args: argparse.Namespace) -> None:
+def download_video(url: str, video_dir: Path, args: argparse.Namespace, info: dict[str, Any] | None = None) -> None:
+    download_url = media_download_url(url, info or {})
     command = [
         "yt-dlp",
         "--no-playlist",
@@ -443,7 +459,7 @@ def download_video(url: str, video_dir: Path, args: argparse.Namespace) -> None:
     add_ytdlp_site_args(command, url)
     add_ytdlp_network_args(command, args)
     add_cookie_args(command, args)
-    command.append(url)
+    command.append(download_url)
     subprocess.run(command, check=True)
 
 
@@ -484,6 +500,98 @@ def load_downloaded_info(video_dir: Path) -> dict[str, Any] | None:
     return None
 
 
+def apple_podcasts_episode_parts(url: str) -> tuple[str, str, str] | None:
+    parsed = urlparse(url)
+    if parsed.netloc.lower() != APPLE_PODCASTS_HOST:
+        return None
+    episode_ids = parse_qs(parsed.query).get("i") or []
+    if not episode_ids:
+        return None
+    show_match = re.search(r"/id(\d+)(?:/|$)", parsed.path)
+    if not show_match:
+        return None
+    path_parts = [part for part in parsed.path.split("/") if part]
+    country = path_parts[0].lower() if path_parts and path_parts[0].lower() != "podcast" else "us"
+    return show_match.group(1), episode_ids[0], country
+
+
+def apple_podcasts_lookup_metadata(url: str) -> dict[str, Any] | None:
+    parts = apple_podcasts_episode_parts(url)
+    if not parts:
+        return None
+    show_id, episode_id, country = parts
+    query = urlencode({"id": show_id, "entity": "podcastEpisode", "limit": 200, "country": country})
+    request = Request(
+        f"https://itunes.apple.com/lookup?{query}",
+        headers={"User-Agent": APPLE_LOOKUP_USER_AGENT},
+    )
+    try:
+        with urlopen(request, timeout=20) as response:
+            payload = json.load(response)
+    except Exception:
+        return None
+
+    for item in payload.get("results") or []:
+        if item.get("kind") == "podcast-episode" and str(item.get("trackId") or "") == episode_id:
+            episode_url = str(item.get("episodeUrl") or "").strip()
+            if episode_url.startswith(("http://", "https://")):
+                return apple_podcast_lookup_info(item, url, episode_url)
+    return None
+
+
+def apple_podcast_lookup_info(item: dict[str, Any], source_url: str, episode_url: str) -> dict[str, Any]:
+    duration_ms = item.get("trackTimeMillis")
+    duration = int(duration_ms / 1000) if isinstance(duration_ms, (int, float)) and duration_ms > 0 else None
+    upload_date = apple_release_date(item.get("releaseDate"))
+    suffix = Path(urlparse(episode_url).path).suffix.lower().lstrip(".") or "mp3"
+    info = {
+        "id": str(item.get("trackId") or ""),
+        "display_id": str(item.get("trackId") or ""),
+        "title": item.get("trackName") or item.get("collectionName") or "Apple Podcasts Episode",
+        "episode": item.get("trackName") or "",
+        "description": item.get("description") or item.get("shortDescription") or "",
+        "url": episode_url,
+        "webpage_url": source_url,
+        "original_url": source_url,
+        "uploader": item.get("artistName") or "",
+        "channel": item.get("artistName") or "",
+        "series": item.get("collectionName") or "",
+        "duration": duration,
+        "thumbnail": item.get("artworkUrl600") or item.get("artworkUrl100") or "",
+        "extractor": "ApplePodcastsLookup",
+        "extractor_key": "ApplePodcastsLookup",
+        "vcodec": "none",
+        "ext": suffix,
+        "_type": "video",
+        "_video_analyzer_download_url": episode_url,
+    }
+    if upload_date:
+        info["upload_date"] = upload_date
+    return info
+
+
+def apple_release_date(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        return ""
+    normalized = value.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(normalized).strftime("%Y%m%d")
+    except ValueError:
+        return ""
+
+
+def apple_lookup_info(info: dict[str, Any]) -> bool:
+    return str(info.get("extractor") or "") == "ApplePodcastsLookup"
+
+
+def media_download_url(url: str, info: dict[str, Any]) -> str:
+    if apple_lookup_info(info):
+        direct_url = str(info.get("_video_analyzer_download_url") or "").strip()
+        if direct_url.startswith(("http://", "https://")):
+            return direct_url
+    return url
+
+
 def existing_video_dir_for_url(output_root: Path, url: str) -> Path | None:
     video_id = infer_video_id_from_url(url)
     candidates = [output_root / safe_slug(video_id)] if video_id else []
@@ -510,6 +618,9 @@ def infer_video_id_from_url(url: str) -> str:
         for part in parts:
             if part.startswith("BV") or part.startswith("av"):
                 return part
+    apple_parts = apple_podcasts_episode_parts(url)
+    if apple_parts:
+        return apple_parts[1]
     return ""
 
 

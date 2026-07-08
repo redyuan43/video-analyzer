@@ -67,11 +67,11 @@ def media_has_video_stream(media_path: Path) -> bool:
                 "-v",
                 "error",
                 "-select_streams",
-                "v:0",
+                "v",
                 "-show_entries",
-                "stream=codec_type",
+                "stream=codec_type:stream_disposition=attached_pic",
                 "-of",
-                "csv=p=0",
+                "json",
                 str(media_path),
             ],
             check=True,
@@ -81,7 +81,15 @@ def media_has_video_stream(media_path: Path) -> bool:
     except Exception as exc:
         logger.warning("Could not probe video stream for %s; assuming video input: %s", media_path, exc)
         return True
-    return bool(result.stdout.strip())
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return bool(result.stdout.strip())
+    for stream in payload.get("streams") or []:
+        disposition = stream.get("disposition") or {}
+        if stream.get("codec_type") == "video" and not disposition.get("attached_pic"):
+            return True
+    return False
 
 def get_log_level(level_str: str) -> int:
     """Convert string log level to logging constant."""
