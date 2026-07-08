@@ -1,7 +1,7 @@
 import logging
 from pathlib import Path
 from typing import Optional, Dict, List, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import subprocess
 
 try:
@@ -18,6 +18,7 @@ class AudioTranscript:
     text: str
     segments: List[Dict[str, Any]]
     language: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 class AudioProcessor:
     def __init__(self, 

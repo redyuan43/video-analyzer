@@ -87,6 +87,7 @@ def write_orin_artifacts(output_dir: Path, results: dict, page_context: str) -> 
                 text=transcript.get("text") or "",
                 segments=transcript.get("segments") or [],
                 language=metadata.get("audio_language") or "",
+                metadata=transcript.get("metadata") or {},
             ),
             orin_dir / "transcript.md",
         )

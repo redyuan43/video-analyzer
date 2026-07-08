@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 import unittest
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -132,6 +133,122 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertIn("Origin: https://www.bilibili.com", remote_command)
         self.assertIn("User-Agent: Mozilla/5.0", remote_command)
 
+    def test_infer_video_id_from_apple_podcast_episode_url(self):
+        url = "https://podcasts.apple.com/au/podcast/huberman-lab/id1545953110?i=1000775612409"
+
+        self.assertEqual(url_context_mod.infer_video_id_from_url(url), "1000775612409")
+        self.assertEqual(
+            url_context_mod.apple_podcasts_episode_parts(url),
+            ("1545953110", "1000775612409", "au"),
+        )
+
+    def test_fetch_metadata_falls_back_to_apple_lookup(self):
+        url = "https://podcasts.apple.com/au/podcast/huberman-lab/id1545953110?i=1000775612409"
+        args = type(
+            "Args",
+            (),
+            {
+                "ytdlp_js_runtimes": "node",
+                "ytdlp_remote_components": "ejs:github",
+                "ytdlp_extractor_args": "",
+                "ytdlp_proxy": None,
+                "cookies": None,
+                "cookies_from_browser": "",
+            },
+        )()
+        payload = {
+            "resultCount": 2,
+            "results": [
+                {"kind": "podcast", "trackId": 1545953110, "collectionName": "Huberman Lab"},
+                {
+                    "kind": "podcast-episode",
+                    "trackId": 1000775612409,
+                    "trackName": "Raising a Dog & Mastering Calm Assertive Energy | Cesar Millan",
+                    "description": "Episode description",
+                    "episodeUrl": "https://traffic.megaphone.fm/SCIM6380580289.mp3",
+                    "trackTimeMillis": 9503000,
+                    "releaseDate": "2026-07-06T07:00:00Z",
+                    "collectionName": "Huberman Lab",
+                    "artistName": "Scicomm Media",
+                    "artworkUrl600": "https://example.com/art.jpg",
+                },
+            ],
+        }
+
+        def fake_urlopen(request, timeout=0):
+            self.assertIn("id=1545953110", request.full_url)
+            self.assertIn("entity=podcastEpisode", request.full_url)
+            self.assertEqual(timeout, 20)
+            return BytesIO(json.dumps(payload).encode("utf-8"))
+
+        with patch.object(
+            url_context_mod.subprocess,
+            "check_output",
+            side_effect=subprocess.CalledProcessError(1, ["yt-dlp"]),
+        ), patch.object(url_context_mod, "urlopen", side_effect=fake_urlopen):
+            info = url_context_mod.fetch_metadata(url, args)
+
+        self.assertEqual(info["extractor"], "ApplePodcastsLookup")
+        self.assertEqual(info["id"], "1000775612409")
+        self.assertEqual(info["title"], "Raising a Dog & Mastering Calm Assertive Energy | Cesar Millan")
+        self.assertEqual(info["duration"], 9503)
+        self.assertEqual(info["upload_date"], "20260706")
+        self.assertEqual(info["_video_analyzer_download_url"], "https://traffic.megaphone.fm/SCIM6380580289.mp3")
+
+    def test_fetch_metadata_non_apple_error_stays_ytdlp_error(self):
+        args = type(
+            "Args",
+            (),
+            {
+                "ytdlp_js_runtimes": "node",
+                "ytdlp_remote_components": "ejs:github",
+                "ytdlp_extractor_args": "",
+                "ytdlp_proxy": None,
+                "cookies": None,
+                "cookies_from_browser": "",
+            },
+        )()
+
+        with patch.object(
+            url_context_mod.subprocess,
+            "check_output",
+            side_effect=subprocess.CalledProcessError(1, ["yt-dlp"]),
+        ), self.assertRaises(subprocess.CalledProcessError):
+            url_context_mod.fetch_metadata("https://example.com/video", args)
+
+    def test_download_video_uses_apple_lookup_direct_media_url(self):
+        args = type(
+            "Args",
+            (),
+            {
+                "include_subtitles": False,
+                "include_comments": False,
+                "subtitle_langs": "zh-CN,zh,en",
+                "ytdlp_js_runtimes": "none",
+                "ytdlp_remote_components": "",
+                "ytdlp_extractor_args": "",
+                "ytdlp_proxy": None,
+                "cookies": None,
+                "cookies_from_browser": "",
+            },
+        )()
+        info = {
+            "extractor": "ApplePodcastsLookup",
+            "_video_analyzer_download_url": "https://traffic.megaphone.fm/SCIM6380580289.mp3",
+        }
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(url_context_mod.subprocess, "run") as run:
+            url_context_mod.download_video(
+                "https://podcasts.apple.com/au/podcast/huberman-lab/id1545953110?i=1000775612409",
+                Path(tmp),
+                args,
+                info,
+            )
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[-1], "https://traffic.megaphone.fm/SCIM6380580289.mp3")
+        self.assertIn("-f", command)
+
     def test_douyin_browser_helpers_recognize_url_and_profile(self):
         self.assertTrue(douyin_browser_mod.is_douyin_url("https://v.douyin.com/sdYOxlCtlrY/"))
         self.assertTrue(douyin_browser_mod.is_douyin_url("https://www.douyin.com/video/7656377961499250097"))
@@ -210,17 +327,39 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         completed = subprocess.CompletedProcess(
             args=["ffprobe"],
             returncode=0,
-            stdout="",
+            stdout=json.dumps({"streams": []}),
             stderr="",
         )
         with patch.object(cli_mod.subprocess, "run", return_value=completed):
             self.assertFalse(cli_mod.media_has_video_stream(Path("/tmp/audio.m4a")))
 
+    def test_media_has_video_stream_ignores_attached_picture(self):
+        completed = subprocess.CompletedProcess(
+            args=["ffprobe"],
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "streams": [
+                        {"codec_type": "video", "disposition": {"attached_pic": 1}},
+                    ]
+                }
+            ),
+            stderr="",
+        )
+        with patch.object(cli_mod.subprocess, "run", return_value=completed):
+            self.assertFalse(cli_mod.media_has_video_stream(Path("/tmp/audio-with-cover.mp3")))
+
     def test_media_has_video_stream_detects_video_input(self):
         completed = subprocess.CompletedProcess(
             args=["ffprobe"],
             returncode=0,
-            stdout="video\n",
+            stdout=json.dumps(
+                {
+                    "streams": [
+                        {"codec_type": "video", "disposition": {"attached_pic": 0}},
+                    ]
+                }
+            ),
             stderr="",
         )
         with patch.object(cli_mod.subprocess, "run", return_value=completed):
