@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from video_analyzer.artifacts import first_present, format_speaker_label
+
 from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient
 from video_analyzer.config import Config, build_openai_extra_body, resolve_api_key, resolve_temperature
 from video_analyzer.multidoc import parse_chapters, timestamp_to_seconds
@@ -271,7 +273,8 @@ def normalize_transcript(transcript: dict[str, Any]) -> dict[str, Any]:
         start = segment.get("start", segment.get("start_time", segment.get("Start")))
         end = segment.get("end", segment.get("end_time", segment.get("End")))
         text = segment.get("text", segment.get("Content", segment.get("content")))
-        segments.append({**segment, "start": start, "end": end, "text": text})
+        speaker = format_speaker_label(first_present(segment, ("speaker", "Speaker")))
+        segments.append({**segment, "start": start, "end": end, "text": text, "speaker_label": speaker})
     normalized["segments"] = segments
     return normalized
 
@@ -337,14 +340,16 @@ def build_evidence(
         text = clean_text(segment.get("text"))
         if not text:
             continue
+        speaker = clean_text(segment.get("speaker_label"))
+        display_text = f"{speaker}: {text}" if speaker else text
         evidence.append(
             evidence_item(
                 source_type="asr",
                 index=index,
                 timestamp_sec=start,
-                text=text,
+                text=display_text,
                 confidence=0.75,
-                extra={"end_sec": float_or_zero(segment.get("end", segment.get("end_time")))},
+                extra={"end_sec": float_or_zero(segment.get("end", segment.get("end_time"))), "speaker": speaker or None},
             )
         )
 

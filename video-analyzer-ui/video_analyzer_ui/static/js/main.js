@@ -23,6 +23,9 @@ let currentView = ['qa', 'vscode'].includes(initialParams.get('view'))
     : 'console';
 let pendingUrls = [];
 let sourceMode = 'url';
+let activeIntent = 'smart';
+let promptTemplates = [];
+let selectedTemplate = null;
 let vscodeStarting = false;
 let selectedDocPath = '';
 let renderedDocListKey = '';
@@ -77,6 +80,15 @@ const nodes = {
     addUrlButton: document.getElementById('addUrlButton'),
     videoUrls: document.getElementById('videoUrls'),
     urlList: document.getElementById('urlList'),
+    intentCards: Array.from(document.querySelectorAll('.intent-card')),
+    templatePanel: document.getElementById('templatePanel'),
+    templateSearch: document.getElementById('templateSearch'),
+    templateCategory: document.getElementById('templateCategory'),
+    templateStatus: document.getElementById('templateStatus'),
+    templateList: document.getElementById('templateList'),
+    selectedTemplatePanel: document.getElementById('selectedTemplatePanel'),
+    selectedTemplateName: document.getElementById('selectedTemplateName'),
+    clearTemplateButton: document.getElementById('clearTemplateButton'),
     focusPrompt: document.getElementById('focusPrompt'),
     globalSummary: document.getElementById('globalSummary'),
     resourceLanes: document.getElementById('resourceLanes'),
@@ -236,11 +248,198 @@ function escapeHtml(value) {
     }[char]));
 }
 
+const templateCategoryLabels = {
+    all: '全部模板',
+    building: '建筑工程',
+    call: '通话',
+    education: '教育',
+    finance: '金融',
+    functionality: '功能工具',
+    genera: '通用',
+    interview: '访谈',
+    it: 'IT',
+    law: '法律',
+    medical: '医疗',
+    meeting: '会议',
+    sales: '销售',
+    speech: '演讲'
+};
+
+const intentDefaults = {
+    smart: {
+        analysisMode: 'auto',
+        prompt: '请自动判断内容类型，优先生成结构清晰、可直接阅读的总结。保留关键结论、行动项、风险点和后续问题；如果内容更像会议、讲座、访谈、通话或演讲，请自动采用最合适的结构。'
+    },
+    transcribe: {
+        analysisMode: 'fast',
+        prompt: '请优先保证转写内容完整和可读，只做轻量整理。输出重点包括：完整转写、关键段落、明显的专有名词修正，以及非常简短的摘要。'
+    }
+};
+
+const templateBlockRe = /【模板指令开始】[\s\S]*?【模板指令结束】\n*/;
+const userSupplementMarker = '【用户补充】';
+const maxFocusPromptChars = 3900;
+
 async function getJson(url, options = {}) {
     const response = await fetch(url, options);
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
     return data;
+}
+
+function setSelectValue(id, value) {
+    const node = document.getElementById(id);
+    if (node && Array.from(node.options).some(option => option.value === value)) {
+        node.value = value;
+    }
+}
+
+function stripTemplateBlock(value) {
+    return String(value || '').replace(templateBlockRe, '').replace(userSupplementMarker, '').trim();
+}
+
+function compactTemplatePrompt(template, userSupplement = '') {
+    const source = String(template.prompt_original || '').trim();
+    const header = [
+        '【模板指令开始】',
+        `模板：${template.title_zh || template.title}`,
+        `分类：${template.first_category_zh || template.first_category} / ${template.second_category_zh || template.second_category}`,
+        '',
+        '请按以下模板分析输入的音频、视频、字幕或转写文本：',
+        source,
+        '【模板指令结束】'
+    ].join('\n');
+    const suffix = userSupplement ? `\n\n${userSupplementMarker}\n${userSupplement.trim()}` : '';
+    const budget = maxFocusPromptChars - suffix.length;
+    const body = header.length > budget
+        ? `${header.slice(0, Math.max(0, budget - 80)).trim()}\n\n[模板内容已压缩到长度限制内]\n【模板指令结束】`
+        : header;
+    return `${body}${suffix}`.slice(0, maxFocusPromptChars).trim();
+}
+
+function applyFocusPromptTemplate(template) {
+    selectedTemplate = template;
+    const supplement = stripTemplateBlock(nodes.focusPrompt.value);
+    nodes.focusPrompt.value = compactTemplatePrompt(template, supplement);
+    renderSelectedTemplate();
+}
+
+function renderSelectedTemplate() {
+    const name = selectedTemplate?.title_zh || selectedTemplate?.title || '';
+    if (nodes.selectedTemplatePanel) nodes.selectedTemplatePanel.hidden = !name;
+    if (nodes.selectedTemplateName) nodes.selectedTemplateName.textContent = name || '-';
+}
+
+function clearTemplateSelection() {
+    selectedTemplate = null;
+    nodes.focusPrompt.value = stripTemplateBlock(nodes.focusPrompt.value);
+    renderSelectedTemplate();
+    renderTemplateList();
+}
+
+function applyIntent(intent) {
+    activeIntent = intent;
+    nodes.intentCards.forEach(button => button.classList.toggle('active', button.dataset.intent === intent));
+    if (nodes.templatePanel) nodes.templatePanel.hidden = !['scene', 'tools'].includes(intent);
+    if (intent === 'smart' || intent === 'transcribe') {
+        selectedTemplate = null;
+        const config = intentDefaults[intent];
+        if (config) {
+            setSelectValue('analysisMode', config.analysisMode);
+            const supplement = stripTemplateBlock(nodes.focusPrompt.value);
+            nodes.focusPrompt.value = supplement || config.prompt;
+        }
+        renderSelectedTemplate();
+    }
+    if (intent === 'scene') {
+        setSelectValue('analysisMode', 'auto');
+        if (nodes.templateCategory && nodes.templateCategory.value === 'functionality') {
+            nodes.templateCategory.value = 'all';
+        }
+    }
+    if (intent === 'tools') {
+        setSelectValue('analysisMode', 'auto');
+        if (nodes.templateCategory) nodes.templateCategory.value = 'functionality';
+    }
+    renderTemplateList();
+}
+
+function templateMatchesIntent(template) {
+    if (activeIntent === 'tools') return template.first_category === 'functionality';
+    if (activeIntent === 'scene') return template.first_category !== 'functionality';
+    return true;
+}
+
+function renderTemplateCategories() {
+    if (!nodes.templateCategory) return;
+    const categories = Array.from(new Set(promptTemplates.map(item => item.first_category).filter(Boolean))).sort();
+    nodes.templateCategory.innerHTML = [
+        '<option value="all">全部模板</option>',
+        ...categories.map(category => `<option value="${escapeHtml(category)}">${escapeHtml(templateCategoryLabels[category] || category)}</option>`)
+    ].join('');
+}
+
+function templateSearchText(template) {
+    return [
+        template.title,
+        template.title_zh,
+        template.first_category,
+        template.first_category_zh,
+        template.second_category,
+        template.second_category_zh,
+        ...(template.tags || [])
+    ].join(' ').toLowerCase();
+}
+
+function renderTemplateList() {
+    if (!nodes.templateList || !nodes.templateStatus) return;
+    if (!['scene', 'tools'].includes(activeIntent)) return;
+    const query = String(nodes.templateSearch?.value || '').trim().toLowerCase();
+    const category = nodes.templateCategory?.value || 'all';
+    const filtered = promptTemplates
+        .filter(templateMatchesIntent)
+        .filter(template => category === 'all' || template.first_category === category)
+        .filter(template => !query || templateSearchText(template).includes(query))
+        .slice(0, 80);
+    nodes.templateStatus.textContent = promptTemplates.length
+        ? `显示 ${filtered.length} 个模板 / 共 ${promptTemplates.length} 个`
+        : '模板暂不可用，可手动填写关注重点';
+    nodes.templateList.innerHTML = filtered.map(template => {
+        const active = selectedTemplate?.id === template.id ? ' active' : '';
+        const categoryText = `${template.first_category_zh || template.first_category} / ${template.second_category_zh || template.second_category}`;
+        return `
+            <button class="template-item${active}" type="button" data-template-id="${escapeHtml(template.id)}">
+                <strong>${escapeHtml(template.title_zh || template.title)}</strong>
+                <span>${escapeHtml(categoryText)}</span>
+            </button>
+        `;
+    }).join('') || '<div class="muted">没有匹配的模板</div>';
+    nodes.templateList.querySelectorAll('.template-item').forEach(button => {
+        button.addEventListener('click', () => {
+            const template = promptTemplates.find(item => item.id === button.dataset.templateId);
+            if (template) {
+                applyFocusPromptTemplate(template);
+                renderTemplateList();
+            }
+        });
+    });
+}
+
+async function loadPromptTemplates() {
+    if (!nodes.templateList) return;
+    try {
+        const response = await fetch('/static/data/audio_prompt_templates.json');
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        promptTemplates = Array.isArray(data)
+            ? data.filter(item => item?.id && item?.prompt_original)
+            : [];
+        renderTemplateCategories();
+        renderTemplateList();
+    } catch (error) {
+        promptTemplates = [];
+        nodes.templateStatus.textContent = `模板加载失败：${error.message}`;
+    }
 }
 
 function fillSelect(id, values, selected) {
@@ -341,6 +540,8 @@ async function loadOptions() {
     document.getElementById('includeComments').checked = Boolean(defaults.include_comments);
     document.getElementById('refreshContext').checked = Boolean(defaults.refresh_context);
     nodes.focusPrompt.value = defaults.focus_prompt || '';
+    selectedTemplate = null;
+    renderSelectedTemplate();
     document.getElementById('maxComments').value = defaults.max_comments ?? 3000;
     document.getElementById('subtitleLangs').value = defaults.subtitle_langs || '';
 }
@@ -404,6 +605,7 @@ async function createJob(event) {
             pendingUrls = [];
             renderUrlList();
             await loadOptions();
+            applyIntent(activeIntent);
             setSourceMode('file');
             await refreshJobs();
             return;
@@ -424,6 +626,7 @@ async function createJob(event) {
         pendingUrls = [];
         renderUrlList();
         await loadOptions();
+        applyIntent(activeIntent);
         await refreshJobs();
     } catch (error) {
         nodes.formError.textContent = error.message;
@@ -2885,6 +3088,10 @@ async function boot() {
     nodes.jobForm.addEventListener('submit', createJob);
     nodes.urlSourceTab?.addEventListener('click', () => setSourceMode('url'));
     nodes.fileSourceTab?.addEventListener('click', () => setSourceMode('file'));
+    nodes.intentCards.forEach(button => button.addEventListener('click', () => applyIntent(button.dataset.intent || 'smart')));
+    nodes.templateSearch?.addEventListener('input', renderTemplateList);
+    nodes.templateCategory?.addEventListener('change', renderTemplateList);
+    nodes.clearTemplateButton?.addEventListener('click', clearTemplateSelection);
     nodes.addUrlButton.addEventListener('click', addPendingUrls);
     nodes.videoUrlInput.addEventListener('keydown', event => {
         if (event.key === 'Enter') {
@@ -2910,6 +3117,8 @@ async function boot() {
     bindLearningPanelToggles();
     bindPaneResizers();
     await loadOptions();
+    await loadPromptTemplates();
+    applyIntent(activeIntent);
     setSourceMode(sourceMode);
     setView(currentView, true);
     await refreshJobs();

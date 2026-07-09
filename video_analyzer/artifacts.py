@@ -34,7 +34,7 @@ def write_transcript_markdown(transcript: Optional[AudioTranscript], path: Path)
             ).strip()
             if not text:
                 continue
-            speaker = str(first_present(segment, ("speaker", "Speaker")) or "").strip()
+            speaker = format_speaker_label(first_present(segment, ("speaker", "Speaker")))
             if speaker:
                 text = f"{speaker}: {text}"
             start = first_present(segment, ("start_time", "start", "Start"))
@@ -48,6 +48,19 @@ def write_transcript_markdown(transcript: Optional[AudioTranscript], path: Path)
         lines.extend(["## Full Text", "", transcript.text])
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     return path
+
+
+def format_speaker_label(value: object) -> str:
+    if value is None or value == "":
+        return ""
+    raw = str(value).strip()
+    if not raw:
+        return ""
+    try:
+        number = int(raw)
+    except ValueError:
+        return raw
+    return f"说话人 {number + 1}"
 
 
 def first_present(values: dict, keys: tuple[str, ...]) -> object:

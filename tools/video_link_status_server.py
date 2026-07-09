@@ -51,6 +51,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_JOBS_DIR = REPO_ROOT / "tmp" / "video-link-status" / "jobs"
 BAOYU_PROMPT_SCRIPT = REPO_ROOT / "tools" / "prepare_baoyu_image_prompts.py"
 ALLOWED_ANALYSIS_MODES = ("auto", "fast", "balanced", "deep", "operation-fast", "long-talk-fast")
+ALLOWED_ANALYSIS_DEPTHS = ("light", "full")
 ALLOWED_COOKIE_BROWSERS = ("", "chrome", "none", "edge", "firefox", "chromium", "brave")
 ALLOWED_DOWNLOAD_DEVICES = ("local", "mi")
 DEFAULT_COOKIE_BROWSER = ""
@@ -423,6 +424,7 @@ class VideoLinkStatusServer:
         return {
             "defaults": {
                 "analysis_mode": "auto",
+                "analysis_depth": "full",
                 "profile": default_profile,
                 "run_name": DEFAULT_RUN_NAME,
                 "cookies_from_browser": "none",
@@ -439,6 +441,7 @@ class VideoLinkStatusServer:
             },
             "choices": {
                 "analysis_modes": list(ALLOWED_ANALYSIS_MODES),
+                "analysis_depths": list(ALLOWED_ANALYSIS_DEPTHS),
                 "profiles": profiles,
                 "cookie_browsers": [item for item in ALLOWED_COOKIE_BROWSERS if item],
                 "download_devices": list(ALLOWED_DOWNLOAD_DEVICES),
@@ -520,6 +523,10 @@ class VideoLinkStatusServer:
         analysis_mode = str(payload.get("analysis_mode") or payload.get("analysisMode") or "auto").strip() or "auto"
         if analysis_mode not in ALLOWED_ANALYSIS_MODES:
             raise BridgeError(HTTPStatus.BAD_REQUEST, f"analysis_mode must be one of {sorted(ALLOWED_ANALYSIS_MODES)}")
+        default_depth = "light" if source_type == UPLOAD_SOURCE_TYPE else "full"
+        analysis_depth = str(payload.get("analysis_depth") or payload.get("analysisDepth") or default_depth).strip() or default_depth
+        if analysis_depth not in ALLOWED_ANALYSIS_DEPTHS:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, f"analysis_depth must be one of {sorted(ALLOWED_ANALYSIS_DEPTHS)}")
 
         cookie_browser = "" if source_type == UPLOAD_SOURCE_TYPE else normalize_cookie_browser(payload.get("cookies_from_browser") or payload.get("cookiesFromBrowser"))
         if cookie_browser not in ALLOWED_COOKIE_BROWSERS:
@@ -552,6 +559,10 @@ class VideoLinkStatusServer:
         max_comments = parse_int_option(payload.get("max_comments") if "max_comments" in payload else payload.get("maxComments"), defaults["max_comments"])
         subtitle_langs = str(payload.get("subtitle_langs") or payload.get("subtitleLangs") or defaults["subtitle_langs"]).strip()
         focus_prompt = normalize_focus_prompt(payload.get("focus_prompt") if "focus_prompt" in payload else payload.get("focusPrompt", ""))
+        template_id = normalize_optional_template(payload.get("template_id") if "template_id" in payload else payload.get("templateId", ""))
+        template_title = normalize_optional_template(payload.get("template_title") if "template_title" in payload else payload.get("templateTitle", ""))
+        template_title_zh = normalize_optional_template(payload.get("template_title_zh") if "template_title_zh" in payload else payload.get("templateTitleZh", ""))
+        template_category = normalize_optional_template(payload.get("template_category") if "template_category" in payload else payload.get("templateCategory", ""))
 
         job_id = uuid.uuid4().hex
         job_dir = self.job_dir(job_id)
@@ -567,6 +578,7 @@ class VideoLinkStatusServer:
             "upload_suffix": upload_suffix,
             "options": {
                 "analysis_mode": analysis_mode,
+                "analysis_depth": analysis_depth,
                 "profile": profile,
                 "run_name": run_name,
                 "cookies_from_browser": cookie_browser,
@@ -580,6 +592,10 @@ class VideoLinkStatusServer:
                 "subtitle_langs": subtitle_langs,
                 "refresh_context": refresh_context,
                 "focus_prompt": focus_prompt,
+                "template_id": template_id,
+                "template_title": template_title,
+                "template_title_zh": template_title_zh,
+                "template_category": template_category,
             },
             "resolved_mode": None,
             "run_dir": None,
@@ -1017,9 +1033,9 @@ class VideoLinkStatusServer:
 
     def run_stage(self, job_id: str, stage: str) -> dict[str, Any]:
         stage = normalize_stage_name(stage)
-        if stage not in STAGE_ORDER:
-            raise BridgeError(HTTPStatus.NOT_FOUND, f"unknown stage: {stage}")
         job = self.load_job(job_id)
+        if stage not in self.stage_order_for_job(job):
+            raise BridgeError(HTTPStatus.NOT_FOUND, f"unknown stage: {stage}")
         self.ensure_dependencies(job, stage)
         current_status = job.get("stages", {}).get(stage, {}).get("status")
         if stage == "final-publish" and current_status == "skipped" and self.export_outputs_complete(job):
@@ -1297,8 +1313,12 @@ class VideoLinkStatusServer:
         if not run_dir:
             raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, "operation stage did not print a run directory")
         job["run_dir"] = str(self.resolve_output_path(run_dir))
-        artifacts = {"run_dir": job["run_dir"], "command": command, **self.collect_core_artifacts(Path(job["run_dir"]))}
-        warning = self.core_quality_warning(Path(job["run_dir"]))
+        run_dir_path = Path(job["run_dir"])
+        artifacts = {"run_dir": job["run_dir"], "command": command, **self.collect_core_artifacts(run_dir_path)}
+        actual_template = self.audio_prompt_template_actual(run_dir_path)
+        if actual_template:
+            job["prompt_template_actual"] = actual_template
+        warning = self.core_quality_warning(run_dir_path)
         if warning:
             self.add_warning(job, "analyze-core", warning)
         return {"artifacts": artifacts, "stdout_tail": result["stdout_tail"]}
@@ -1431,22 +1451,24 @@ class VideoLinkStatusServer:
             raise BridgeError(HTTPStatus.BAD_REQUEST, f"uploaded media context does not exist: {context_path}")
         if not run_dir:
             raise BridgeError(HTTPStatus.BAD_REQUEST, "uploaded media job is missing run_dir")
-
-        args = argparse.Namespace(
-            config="config",
-            profile=opts["profile"],
-            python=os.environ.get("PYTHON") or sys.executable,
-            pipeline_mode=pipeline_mode_for(job.get("resolved_mode") or opts["analysis_mode"]),
-            run_name=opts["run_name"],
-            log_level="INFO",
-            resume_existing_core=True,
-            no_keep_frames=False,
-            max_frames=None,
-            duration=None,
-        )
-        apply_runtime_profile(args)
-        context_for_analysis = materialize_analysis_context(context_path, run_dir, opts.get("focus_prompt") or "")
-        return build_analyzer_command(args, media_path, context_for_analysis, run_dir)
+        command = [
+            os.environ.get("PYTHON") or sys.executable,
+            "tools/run_audio_template_analysis.py",
+            str(media_path),
+            "--output",
+            str(run_dir),
+            "--config",
+            "config",
+            "--profile",
+            opts["profile"],
+            "--source-name",
+            str(job.get("source_name") or media_path.name),
+        ]
+        if opts.get("template_id"):
+            command.extend(["--template-id", opts["template_id"]])
+        if opts.get("focus_prompt"):
+            command.extend(["--focus-prompt", opts["focus_prompt"]])
+        return command
 
     def prepare_command(self, job: dict[str, Any]) -> list[str]:
         opts = job["options"]
@@ -1840,6 +1862,9 @@ class VideoLinkStatusServer:
         job["run_dir"] = str(run_dir)
         stage_info = dict(stage_info or (job.get("stages") or {}).get("analyze-core") or {})
         artifacts = {"run_dir": str(run_dir), **self.collect_core_artifacts(run_dir)}
+        actual_template = self.audio_prompt_template_actual(run_dir)
+        if actual_template:
+            job["prompt_template_actual"] = actual_template
         warning = self.core_quality_warning(run_dir)
         if warning:
             self.add_warning(job, "analyze-core", warning)
@@ -1891,8 +1916,9 @@ class VideoLinkStatusServer:
         stage = normalize_stage_name(stage)
         if stage == "probe":
             return
-        stage_index = STAGE_ORDER.index(stage)
-        for previous in STAGE_ORDER[:stage_index]:
+        stage_order = self.stage_order_for_job(job)
+        stage_index = stage_order.index(stage)
+        for previous in stage_order[:stage_index]:
             previous_status = job["stages"].get(previous, {}).get("status")
             if previous_status not in {"succeeded", "skipped"}:
                 if previous in SOFT_FAILURE_STAGES and self.core_markdown_available_for_job(job):
@@ -2475,7 +2501,7 @@ class VideoLinkStatusServer:
         title = self.resolve_job_title(public)
         public["title"] = title
         public["display_title"] = title or job.get("source_name") or job.get("video_url") or job.get("job_id")
-        public["stage_order"] = STAGE_ORDER
+        public["stage_order"] = self.stage_order_for_job(job)
         public["progress"] = self.progress(job)
         public["current_stage"] = self.current_stage(job)
         public["next_stage"] = self.next_stage(job)
@@ -2489,6 +2515,8 @@ class VideoLinkStatusServer:
         public["source_player"] = self.source_player_metadata(public)
         public["vscode_preview"] = self.vscode_preview_metadata(public, public_host)
         public["warnings"] = self.active_warnings(public)
+        public["prompt_template"] = self.prompt_template_metadata(public)
+        public["result_resources"] = self.result_resources(public)
         queued_stage = public["queue"].get("stage")
         if queued_stage and queued_stage in public["stages"]:
             public["stages"][queued_stage] = dict(public["stages"][queued_stage])
@@ -2497,6 +2525,92 @@ class VideoLinkStatusServer:
         current_info = public["stages"].get(current_stage or "", {})
         public["process"] = self.public_process_info(current_info.get("process"))
         return public
+
+    def audio_prompt_template_actual(self, run_dir: Path) -> dict[str, Any] | None:
+        for path in (run_dir / "audio_template_analysis.json", run_dir / "analysis.json"):
+            if not path.is_file():
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            analysis = payload.get("audio_template_analysis") if path.name == "analysis.json" else payload
+            selected = (analysis or {}).get("selected_template") or {}
+            classification = (analysis or {}).get("classification") or {}
+            if selected:
+                return {
+                    "id": selected.get("id"),
+                    "title": selected.get("title"),
+                    "title_zh": selected.get("title_zh") or selected.get("title"),
+                    "category": "/".join(
+                        item
+                        for item in [selected.get("first_category_zh"), selected.get("second_category_zh")]
+                        if item
+                    ),
+                    "classification": classification,
+                    "prompt": selected.get("prompt_original"),
+                }
+        return None
+
+    def prompt_template_metadata(self, job: dict[str, Any]) -> dict[str, Any]:
+        opts = job.get("options") or {}
+        requested = {
+            "id": opts.get("template_id") or None,
+            "title": opts.get("template_title") or None,
+            "title_zh": opts.get("template_title_zh") or None,
+            "category": opts.get("template_category") or None,
+            "focus_prompt": opts.get("focus_prompt") or None,
+        }
+        actual = job.get("prompt_template_actual") if isinstance(job.get("prompt_template_actual"), dict) else None
+        run_dir_value = job.get("run_dir") or (((job.get("artifacts") or {}).get("run_dir") or {}).get("value"))
+        if actual is None and run_dir_value:
+            actual = self.audio_prompt_template_actual(Path(str(run_dir_value)))
+        return {"requested": requested, "actual": actual}
+
+    def result_resources(self, job: dict[str, Any]) -> dict[str, str]:
+        run_dir_value = job.get("run_dir") or (((job.get("artifacts") or {}).get("run_dir") or {}).get("value"))
+        if not run_dir_value:
+            return {}
+        run_dir = Path(str(run_dir_value)).expanduser().resolve()
+        artifacts = job.get("artifacts") or {}
+        artifact_candidates: dict[str, Any] = {
+            "summary_markdown": ((artifacts.get("operation_manual") or {}).get("value")),
+            "transcript_markdown": ((artifacts.get("transcript") or {}).get("value")),
+            "analysis_json": ((artifacts.get("analysis_json") or {}).get("value")),
+        }
+        file_candidates: dict[str, Any] = {
+            "transcript_json": run_dir / "orin" / "transcript.json",
+            "study_guide": run_dir / "study_guide.json",
+            "mindmap_markdown": run_dir / "study_overview.md",
+            "study_cards_markdown": run_dir / "study_cards.md",
+            "audio_template_analysis": run_dir / "audio_template_analysis.json",
+        }
+        resources: dict[str, str] = {}
+        for name, value in artifact_candidates.items():
+            path = self.resource_relative_path(run_dir, value, allow_missing=True)
+            if path:
+                resources[name] = path
+        for name, value in file_candidates.items():
+            path = self.resource_relative_path(run_dir, value)
+            if path:
+                resources[name] = path
+        return resources
+
+    def resource_relative_path(self, run_dir: Path, value: Any, allow_missing: bool = False) -> str | None:
+        if not value:
+            return None
+        path = Path(str(value))
+        if not path.is_absolute():
+            candidate = (run_dir / path).resolve()
+        else:
+            candidate = path.expanduser().resolve()
+        try:
+            relative = candidate.relative_to(run_dir)
+        except ValueError:
+            return None
+        if not allow_missing and not candidate.is_file():
+            return None
+        return str(relative)
 
     def public_job_summary(self, job: dict[str, Any]) -> dict[str, Any]:
         public = {
@@ -2519,7 +2633,7 @@ class VideoLinkStatusServer:
         title = self.resolve_job_title(public)
         public["title"] = title
         public["display_title"] = title or job.get("source_name") or job.get("video_url") or job.get("job_id")
-        public["stage_order"] = STAGE_ORDER
+        public["stage_order"] = self.stage_order_for_job(job)
         public["progress"] = self.progress(job)
         public["current_stage"] = self.current_stage(job)
         public["next_stage"] = self.next_stage(job)
@@ -2757,7 +2871,7 @@ class VideoLinkStatusServer:
         runner = job.get("runner") or {}
         failed_stage = None
         failed_info: dict[str, Any] = {}
-        for stage in STAGE_ORDER:
+        for stage in self.stage_order_for_job(job):
             info = job.get("stages", {}).get(stage, {})
             if info.get("status") == "failed":
                 failed_stage = stage
@@ -2826,32 +2940,43 @@ class VideoLinkStatusServer:
         self.gpu_snapshot_cache_time = now
         return snapshot
 
+    def stage_order_for_job(self, job: dict[str, Any]) -> tuple[str, ...]:
+        options = job.get("options") or {}
+        if options.get("analysis_depth") == "light":
+            return ("probe", "prepare", "analyze-core")
+        return tuple(STAGE_ORDER)
+
     def progress(self, job: dict[str, Any]) -> dict[str, Any]:
-        statuses = [job.get("stages", {}).get(stage, {}).get("status") for stage in STAGE_ORDER]
+        stage_order = self.stage_order_for_job(job)
+        statuses = [job.get("stages", {}).get(stage, {}).get("status") for stage in stage_order]
         completed = sum(1 for status in statuses if status in {"succeeded", "skipped"})
         failed = sum(1 for status in statuses if status == "failed")
         running = sum(1 for status in statuses if status == "running")
         queued = sum(1 for status in statuses if status == "queued")
+        total = len(stage_order)
         return {
-            "total": len(STAGE_ORDER),
+            "total": total,
             "completed": completed,
             "running": running,
             "queued": queued,
             "failed": failed,
-            "percent": int(round((completed / len(STAGE_ORDER)) * 100)),
+            "percent": int(round((completed / total) * 100)) if total else 100,
         }
 
     def current_stage(self, job: dict[str, Any]) -> str | None:
         runner = job.get("runner") or {}
+        stage_order = self.stage_order_for_job(job)
         if runner.get("status") in {"running", "queued"} and runner.get("current_stage"):
-            return normalize_stage_name(runner["current_stage"])
-        for stage in STAGE_ORDER:
+            stage = normalize_stage_name(runner["current_stage"])
+            if stage in stage_order:
+                return stage
+        for stage in stage_order:
             if job.get("stages", {}).get(stage, {}).get("status") in {"running", "queued"}:
                 return stage
         return None
 
     def next_stage(self, job: dict[str, Any]) -> str | None:
-        for stage in STAGE_ORDER:
+        for stage in self.stage_order_for_job(job):
             if job.get("stages", {}).get(stage, {}).get("status") not in {"succeeded", "skipped"}:
                 return stage
         return None
@@ -2861,9 +2986,9 @@ class VideoLinkStatusServer:
 
     def stage_log(self, job_id: str, stage: str, limit: int = 80, full: bool = False) -> dict[str, Any]:
         stage = normalize_stage_name(stage)
-        if stage not in STAGE_ORDER:
+        job = self.load_job(job_id)
+        if stage not in self.stage_order_for_job(job):
             raise BridgeError(HTTPStatus.NOT_FOUND, f"unknown stage: {stage}")
-        self.load_job(job_id)
         limit = max(1, min(limit, 500))
         log_path = self.stage_log_path(job_id, stage)
         if not log_path.exists():
@@ -2969,7 +3094,7 @@ class VideoLinkStatusServer:
         if runner.get("status") != "failed" or ORPHANED_PROCESS_GONE_MESSAGE not in str(runner.get("error") or ""):
             return False
         stage = normalize_stage_name(runner.get("current_stage") or self.next_stage(job) or "")
-        return stage in STAGE_ORDER
+        return stage in self.stage_order_for_job(job)
 
     def requeue_interrupted_job(
         self,
@@ -2980,7 +3105,7 @@ class VideoLinkStatusServer:
         now = iso_now()
         raw_stage = stage or (job.get("runner") or {}).get("current_stage") or self.current_stage(job) or self.next_stage(job)
         stage = normalize_stage_name(raw_stage or "") if raw_stage else None
-        if not stage or stage not in STAGE_ORDER:
+        if not stage or stage not in self.stage_order_for_job(job):
             return job
         stage_info = dict(stage_info or (job.get("stages") or {}).get(stage) or {})
         if stage == "analyze-core":

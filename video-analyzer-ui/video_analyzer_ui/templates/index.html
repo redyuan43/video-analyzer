@@ -26,6 +26,39 @@
                 <section class="panel">
 	                    <h2>新建任务</h2>
 	                    <form id="jobForm" class="job-form">
+                        <section class="intent-entry" aria-label="任务入口">
+                            <button class="intent-card active" type="button" data-intent="smart">
+                                <strong>智能总结</strong>
+                                <span>Auto Pilot</span>
+                            </button>
+                            <button class="intent-card" type="button" data-intent="transcribe">
+                                <strong>快速转写</strong>
+                                <span>转写优先</span>
+                            </button>
+                            <button class="intent-card" type="button" data-intent="scene">
+                                <strong>按场景分析</strong>
+                                <span>模板库</span>
+                            </button>
+                            <button class="intent-card" type="button" data-intent="tools">
+                                <strong>高级工具</strong>
+                                <span>清洗/改写</span>
+                            </button>
+                        </section>
+                        <section id="templatePanel" class="template-panel" hidden>
+                            <div class="template-toolbar">
+                                <input id="templateSearch" type="search" placeholder="搜索模板、场景或关键词">
+                                <select id="templateCategory" aria-label="模板分类"></select>
+                            </div>
+                            <div id="templateStatus" class="template-status">正在加载模板...</div>
+                            <div id="templateList" class="template-list" aria-live="polite"></div>
+                        </section>
+                        <section id="selectedTemplatePanel" class="selected-template-panel" hidden>
+                            <div>
+                                <span>当前模板</span>
+                                <strong id="selectedTemplateName">-</strong>
+                            </div>
+                            <button id="clearTemplateButton" class="secondary tiny" type="button">清除</button>
+                        </section>
 	                        <div class="source-mode-tabs" role="tablist" aria-label="任务来源">
 	                            <button id="urlSourceTab" class="source-mode-tab active" type="button" data-source-mode="url">链接</button>
 	                            <button id="fileSourceTab" class="source-mode-tab" type="button" data-source-mode="file">文件</button>

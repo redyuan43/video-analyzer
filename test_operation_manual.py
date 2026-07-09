@@ -325,6 +325,36 @@ class OperationManualTests(unittest.TestCase):
             self.assertEqual(args.output_root, "downloads/url-videos")
             self.assertEqual(args.ytdlp_js_runtimes, "auto")
 
+    def test_operation_profile_updates_asr_deep_remote_urls(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_dir = Path(temp_dir)
+            (config_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "active_runtime_profile": "lab",
+                        "runtime_profiles": {
+                            "lab": {
+                                "llm_base_url": "http://lab.local/v1",
+                                "text_model": "lab-text",
+                                "vibevoice_urls": ["http://127.0.0.1:18012/api/asr/transcribe"],
+                                "ocr_base_url": "http://lab.local/ocr",
+                            }
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(task="operation_manual", profile=None, client=None, asr_provider=None)
+
+            config = Config(str(config_dir))
+            config.update_from_args(args)
+
+            self.assertEqual(
+                config.get("asr")["vibevoice"]["deep_remote_urls"],
+                ["http://127.0.0.1:18012/api/asr/transcribe"],
+            )
+
     def test_endpoint_host_override_updates_runtime_services(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_dir = Path(temp_dir)

@@ -46,6 +46,21 @@ class TranscriptArtifactTests(unittest.TestCase):
         self.assertIn("## Full Text", content)
         self.assertIn("完整正文", content)
 
+    def test_writes_numeric_zero_speaker_label(self):
+        transcript = AudioTranscript(
+            text="完整正文",
+            segments=[{"Start": 0, "End": 1, "Speaker": 0, "Content": "你好"}],
+            language="zh",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "transcript.md"
+            write_transcript_markdown(transcript, path)
+
+            content = path.read_text(encoding="utf-8")
+
+        self.assertIn("说话人 1: 你好", content)
+
 
 if __name__ == "__main__":
     unittest.main()

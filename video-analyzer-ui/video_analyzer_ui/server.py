@@ -57,6 +57,7 @@ class VideoAnalyzerUI:
                 assets = [
                     static_root / 'js' / 'main.js',
                     static_root / 'css' / 'styles.css',
+                    static_root / 'data' / 'audio_prompt_templates.json',
                     static_root / 'vendor' / 'markdown-it' / 'markdown-it.min.js',
                     static_root / 'vendor' / 'dompurify' / 'purify.min.js',
                     static_root / 'vendor' / 'katex' / 'katex.min.css',

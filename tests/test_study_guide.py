@@ -478,6 +478,31 @@ class StudyGuideTests(unittest.TestCase):
             self.assertEqual(result["publish_decision"]["status"], "blocked")
             self.assertEqual(result["publish_decision"]["blocked_by"], ["gap_0001"])
 
+    def test_asr_evidence_preserves_numeric_speaker_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "orin").mkdir()
+            (run_dir / "analysis.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": {"source_type": "audio_upload"},
+                        "transcript": {"segments": [{"Start": 0.0, "End": 1.0, "Speaker": 0, "Content": "你好"}]},
+                        "ocr_events": [],
+                        "frame_analyses": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "manual_evidence.md").write_text("# Evidence\n", encoding="utf-8")
+            (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
+            (run_dir / "frames_manifest.json").write_text(json.dumps({"version": 1, "source": "audio_only", "frames": []}), encoding="utf-8")
+
+            result = build_study_artifacts(run_dir, skip_review=True)
+
+        evidence = result["study_guide"]["chapters"][0]["evidence"]
+        self.assertTrue(any(item.get("speaker") == "说话人 1" for item in evidence))
+        self.assertTrue(any("说话人 1: 你好" in item.get("text", "") for item in evidence))
+
 
 if __name__ == "__main__":
     unittest.main()

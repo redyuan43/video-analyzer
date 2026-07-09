@@ -205,6 +205,9 @@ class Config:
                 self.config.setdefault("asr", {})["provider"] = "auto"
             services = (self.config.get("endpoints") or {}).get("services") or {}
             vibevoice = self.config.setdefault("asr", {}).setdefault("vibevoice", {})
+            profile_vibevoice_urls = normalize_string_list(profile.get("vibevoice_urls") or profile.get("vibevoice_url"))
+            if profile_vibevoice_urls and not getattr(args, "vibevoice_url", None):
+                vibevoice["deep_remote_urls"] = profile_vibevoice_urls
             if services.get("capswriter_url"):
                 vibevoice.setdefault("capswriter_url", services["capswriter_url"])
 

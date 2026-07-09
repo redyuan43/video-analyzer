@@ -438,6 +438,10 @@ class VideoLinkStatusServerTests(unittest.TestCase):
                     "include_subtitles": True,
                     "include_comments": True,
                     "download_device": "mi",
+                    "template_id": "tmpl-001",
+                    "template_title": "Default Summary",
+                    "template_title_zh": "默认总结",
+                    "template_category": "通用 / 摘要",
                 },
                 source,
                 "../demo.mp3",
@@ -448,6 +452,8 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             self.assertEqual(loaded["options"]["download_device"], "local")
             self.assertFalse(loaded["options"]["include_subtitles"])
             self.assertFalse(loaded["options"]["include_comments"])
+            self.assertEqual(loaded["options"]["template_id"], "tmpl-001")
+            self.assertEqual(loaded["options"]["template_title_zh"], "默认总结")
             self.assertTrue(Path(loaded["media_path"]).is_file())
             self.assertIn("本地上传媒体文件", Path(loaded["page_context_path"]).read_text(encoding="utf-8"))
 
@@ -468,6 +474,36 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(result["artifacts"]["duration_seconds"], 3600)
         self.assertEqual(loaded["resolved_mode"], "fast")
         self.assertEqual(run.call_args.args[0][0], "ffprobe")
+
+    def test_uploaded_media_operation_uses_audio_template_flow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            source = Path(tmp) / "demo.mp3"
+            source.write_bytes(b"fake audio")
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", repo_root)
+            job = server.create_uploaded_media_job(
+                {
+                    "analysis_mode": "auto",
+                    "profile": "deepseek_v4_pro",
+                    "focus_prompt": "会议纪要",
+                    "template_id": "tmpl-meeting",
+                },
+                source,
+                "demo.mp3",
+            )
+            loaded = server.load_job(job["job_id"])
+
+            command = server.operation_command(loaded)
+
+        self.assertIn("tools/run_audio_template_analysis.py", command)
+        self.assertIn("--template-id", command)
+        self.assertEqual(command[command.index("--template-id") + 1], "tmpl-meeting")
+        self.assertIn("--focus-prompt", command)
+        self.assertIn("会议纪要", command)
+        self.assertIn("--output", command)
+        self.assertEqual(command[command.index("--profile") + 1], "deepseek_v4_pro")
+        self.assertNotIn("video_analyzer.cli", " ".join(command))
 
     def test_command_mapping_for_collection_options(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -826,6 +862,11 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
             (run_dir / "manual_evidence.md").write_text("# Evidence\n", encoding="utf-8")
             (run_dir / "transcript.md").write_text("# Transcript\n", encoding="utf-8")
+            (run_dir / "study_guide.json").write_text("{}", encoding="utf-8")
+            (run_dir / "audio_template_analysis.json").write_text(
+                json.dumps({"selected_template": {"id": "actual", "title_zh": "实际模板"}, "classification": {"method": "explicit"}}),
+                encoding="utf-8",
+            )
             loaded["video_dir"] = str(video_dir)
             loaded["stages"]["probe"] = {"status": "succeeded"}
             loaded["stages"]["prepare"] = {"status": "succeeded"}
@@ -852,6 +893,10 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(recovered["stages"]["verify-core"]["status"], "queued")
         self.assertEqual(recovered["stages"]["verify-core"]["queued_for"], "verify")
         self.assertEqual(recovered["artifacts"]["operation_manual"]["value"], str(run_dir.resolve() / "operation_manual.md"))
+        public = server.public_job(recovered)
+        self.assertEqual(public["result_resources"]["summary_markdown"], "operation_manual.md")
+        self.assertEqual(public["result_resources"]["transcript_markdown"], "transcript.md")
+        self.assertEqual(public["prompt_template"]["actual"]["id"], "actual")
 
     def test_verify_core_accepts_quality_failed_manual_with_warning(self):
         with tempfile.TemporaryDirectory() as tmp:
