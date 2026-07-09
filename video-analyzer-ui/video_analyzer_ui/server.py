@@ -90,6 +90,18 @@ class VideoAnalyzerUI:
             limit = request.args.get('limit', default=50, type=int)
             return jsonify(self.video_link.list_jobs(limit))
 
+        @self.app.route('/api/mobile/audio-jobs')
+        def mobile_audio_jobs():
+            limit = request.args.get('limit', default=50, type=int)
+            return jsonify(self.video_link.list_mobile_audio_jobs(limit))
+
+        @self.app.route('/api/mobile/audio-jobs/<job_id>')
+        def mobile_audio_job(job_id):
+            try:
+                return jsonify(self.video_link.get_mobile_audio_job(job_id))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
         @self.app.route('/api/video-link/jobs', methods=['POST'])
         def video_link_create_job():
             try:

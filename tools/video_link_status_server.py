@@ -670,6 +670,67 @@ class VideoLinkStatusServer:
             "resources": self.resource_summary(jobs),
         }
 
+    def list_mobile_audio_jobs(self, limit: int = 50) -> dict[str, Any]:
+        jobs = []
+        for path in self.jobs_dir.glob("*/job.json"):
+            try:
+                job = self.load_job(path.parent.name)
+            except Exception:
+                continue
+            if self.is_mobile_audio_job(job):
+                jobs.append(self.mobile_audio_job(job))
+        jobs.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+        return {"jobs": jobs[: max(1, min(limit, 100))], "total": len(jobs)}
+
+    def get_mobile_audio_job(self, job_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        if not self.is_mobile_audio_job(job):
+            raise BridgeError(HTTPStatus.NOT_FOUND, "audio job not found")
+        return self.mobile_audio_job(job, include_resources=True)
+
+    def is_mobile_audio_job(self, job: dict[str, Any]) -> bool:
+        opts = job.get("options") or {}
+        source_name = str(job.get("source_name") or "")
+        return bool(
+            job.get("source_type") == UPLOAD_SOURCE_TYPE
+            and (
+                opts.get("run_name") == "audio-summary"
+                or re.fullmatch(r"\d{14}\.mp3", source_name)
+                or str(job.get("upload_suffix") or "").lower() in AUDIO_MEDIA_EXTENSIONS
+            )
+        )
+
+    def mobile_audio_job(self, job: dict[str, Any], include_resources: bool = False) -> dict[str, Any]:
+        public = self.public_job(job)
+        prompt = public.get("prompt_template") or {}
+        requested = self.mobile_prompt_template((prompt.get("requested") or {}))
+        actual = self.mobile_prompt_template((prompt.get("actual") or {}))
+        item = {
+            "job_id": public["job_id"],
+            "status": public.get("status"),
+            "title": public.get("title"),
+            "source_name": public.get("source_name"),
+            "created_at": public.get("created_at"),
+            "updated_at": public.get("updated_at"),
+            "current_stage": public.get("current_stage"),
+            "summary": {"study": (public.get("summary") or {}).get("study") or {}},
+            "prompt_template": {
+                "requested": requested,
+                "actual": actual,
+            },
+        }
+        if include_resources:
+            item["result_resources"] = public.get("result_resources") or {}
+        return item
+
+    def mobile_prompt_template(self, value: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": value.get("id"),
+            "title": value.get("title"),
+            "title_zh": value.get("title_zh"),
+            "category": value.get("category"),
+        }
+
     def delete_job(self, job_id: str) -> dict[str, Any]:
         job = self.load_job(job_id)
         active = self.active_runners.get(job_id)
@@ -5021,6 +5082,15 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
                 query = parse_qs(parsed.query)
                 limit = int(query.get("limit", ["50"])[0])
                 self.write_json(self.server_app.list_jobs(limit))
+                return
+            if path == "/api/mobile/audio-jobs":
+                query = parse_qs(parsed.query)
+                limit = int(query.get("limit", ["50"])[0])
+                self.write_json(self.server_app.list_mobile_audio_jobs(limit))
+                return
+            match = re.fullmatch(r"/api/mobile/audio-jobs/([a-f0-9]{32})", path)
+            if match:
+                self.write_json(self.server_app.get_mobile_audio_job(match.group(1)))
                 return
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})", path)
             if match:
