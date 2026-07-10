@@ -16,7 +16,7 @@ import subprocess
 import sys
 import threading
 import time
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, unquote, urlencode
 import uuid
 from datetime import datetime
 from http import HTTPStatus
@@ -60,6 +60,7 @@ DEFAULT_FRAME_EXTRACTOR = "jetson"
 DEFAULT_JETSON_FRAME_HOSTS = "agx,agx"
 DEFAULT_JETSON_FRAME_BACKEND = "ray"
 DEFAULT_JETSON_SAMPLE_FPS = "0.5"
+BAOYU_IMAGE_GENERATION_ENABLED = os.environ.get("VIDEO_LINK_ENABLE_BAOYU_IMAGES", "").strip().lower() in {"1", "true", "yes", "on"}
 CORE_ANALYSIS_ERROR_PATTERNS = (
     "Error analyzing frame",
     "model-resource-busy",
@@ -279,6 +280,42 @@ EXPECTED_FINAL_EXPORTS = (
     "deep_report_v2.pdf",
     "manual_evidence.pdf",
 )
+DOCUMENT_PREVIEW_PRIMARY = (
+    ("operation_manual.md", "操作手册", "优先阅读：核心结论、流程步骤和关键截图。"),
+    ("docs_analysis_chapters/knowledge_notes_v2.md", "逐章知识笔记", "第二阅读：按章节整理概念、背景和要点。"),
+    ("docs_analysis_chapters/deep_report_v2.md", "深度报告", "第三阅读：综合分析、风险点和深入判断。"),
+)
+DOCUMENT_PREVIEW_EVIDENCE = (
+    ("manual_evidence.md", "证据审计表", "核查 OCR/VL/帧证据时使用，内容较重。"),
+    ("evidence_index.md", "证据索引", "按结论和证据位置整理的索引。"),
+    ("visual_review.html", "视觉复核页", "快速检查抽帧、截图和视觉证据覆盖。"),
+    ("evidence_review.json", "证据复核结果", "发布门禁和证据质量复核数据。"),
+    ("publish_decision.json", "发布决策", "是否可发布及阻断原因。"),
+    ("web_evidence.md", "联网补证据摘要", "需要外部资料时的补证据结果。"),
+    ("web_evidence.json", "联网补证据数据", "联网补证据的结构化原始数据。"),
+)
+DOCUMENT_PREVIEW_PROCESS = (
+    ("transcript.md", "转写文本", "ASR 生成的全文转写。"),
+    ("analysis.json", "核心分析 JSON", "核心分析的结构化总产物。"),
+    ("study_guide.json", "学习证据账本", "学习卡片和证据分诊的结构化输入。"),
+    ("study_overview.md", "学习概览", "轻量脑图/概要式学习入口。"),
+    ("study_cards.md", "学习卡片", "拆分后的学习卡片。"),
+    ("evidence_gaps.json", "证据缺口", "模型发现的证据不足点。"),
+    ("evidence_triage.json", "证据分诊", "证据缺口的处理路由。"),
+    ("docs_analysis/knowledge_notes.md", "知识笔记草稿", "旧版多文档分析中间产物。"),
+    ("docs_analysis/deep_report.md", "深度报告草稿", "旧版深度报告中间产物。"),
+    ("docs_analysis/operation_manual_review.md", "操作手册复核", "多文档分析对操作手册的复核。"),
+    ("docs_analysis_chapters/deep_report_v2.review.md", "深度报告复核", "新版深度报告质量复核。"),
+    ("docs_analysis_chapters/deep_report_v2.review.json", "深度报告复核数据", "新版深度报告复核结构化数据。"),
+    ("RUN_MANIFEST.md", "运行清单", "本次运行的关键命令和环境记录。"),
+    ("frame_dedup_audit.json", "抽帧去重审计", "候选帧去重和覆盖情况。"),
+)
+DOCUMENT_PREVIEW_ASSETS = (
+    ("frames", "原始抽帧", "Jetson/Ray 抽出的候选帧目录。"),
+    ("manual_assets", "手册截图", "写入 Markdown 的真实截图资源。"),
+    ("orin", "OCR/VL 原始结果", "ASR、OCR、VL 的结构化中间结果。"),
+    ("visual_review", "视觉复核素材", "视觉复核页面使用的素材目录。"),
+)
 SOFT_FAILURE_STAGES = {"multidoc", "deep-v2", "web-evidence", "qa-index", "image-prompts", "final-publish"}
 VIDEO_PREVIEW_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 VSCODE_PORT_RANGE = tuple(
@@ -291,6 +328,14 @@ ORPHANED_PROCESS_GONE_MESSAGE = (
 )
 ORPHANED_PROCESS_REQUEUE_MESSAGE = (
     "server stopped while this stage was running; process is gone and artifacts are incomplete; queued for retry"
+)
+TRANSIENT_RESOURCE_REQUEUE_MESSAGE = "remote/system resource is temporarily busy; queued for retry"
+AUTO_RETRY_REASONS = {ORPHANED_PROCESS_REQUEUE_MESSAGE, TRANSIENT_RESOURCE_REQUEUE_MESSAGE}
+TRANSIENT_RESOURCE_BUSY_PATTERNS = (
+    "ray.exceptions.OutOfMemoryError",
+    "Task was killed due to the node running low on memory",
+    "exceeds the memory usage threshold",
+    "Ray killed this worker",
 )
 RESOURCE_WAIT_SECONDS = 5.0
 AUTO_RETRY_DELAY_SECONDS = float(os.environ.get("VIDEO_LINK_AUTO_RETRY_DELAY_SECONDS", "60"))
@@ -385,7 +430,7 @@ STAGE_PROGRESS_STEPS = {
         ("images", "生成/复用最终图片", (r"\[images\]", r"augment_video_docs_images")),
         ("docs", "补齐最终文档", (r"\[docs\]", r"multidoc", r"deep-v2")),
         ("augment", "插入配图", (r"augment", r"image-augmented", r"baoyu_images")),
-        ("export", "导出 PDF/长图", (r"\[pdf\]", r"export_video_docs", r"\[long-png\]")),
+        ("export", "导出发布文件", (r"\[pdf\]", r"\[export\]", r"export_video_docs", r"\[long-png\]")),
         ("verify", "校验发布产物", (r"\[verify\]", r"pdf=", r"long_png=")),
         ("summary", "写出发布摘要", (r"\[summary\]", r"final_publish_summary\.json")),
         ("send", "发送/跳过发送", (r"\[send\]", r"skipped")),
@@ -544,7 +589,9 @@ class VideoLinkStatusServer:
         profiles = runtime_profile_names()
         if profiles and profile not in profiles:
             raise BridgeError(HTTPStatus.BAD_REQUEST, f"profile must be one of {profiles}")
-        skip_images = parse_bool_option(payload, "skip_images", "skipImages", defaults["skip_images"])
+        skip_images = True
+        if BAOYU_IMAGE_GENERATION_ENABLED:
+            skip_images = parse_bool_option(payload, "skip_images", "skipImages", defaults["skip_images"])
         auto_start = parse_bool(normalize_optional_template(payload.get("auto_start") if "auto_start" in payload else payload.get("autoStart", False)))
         keep_existing = parse_bool_option(payload, "keep_existing", "keepExisting", defaults["keep_existing"])
         include_subtitles = False if source_type == UPLOAD_SOURCE_TYPE else parse_bool_option(payload, "include_subtitles", "includeSubtitles", defaults["include_subtitles"])
@@ -1005,7 +1052,8 @@ class VideoLinkStatusServer:
         if job.get("status") != "queued" or runner.get("status") != "queued" or not stage:
             return {}
         stage_info = (job.get("stages") or {}).get(stage) or {}
-        if runner.get("error") != ORPHANED_PROCESS_REQUEUE_MESSAGE and stage_info.get("retry_reason") != ORPHANED_PROCESS_REQUEUE_MESSAGE:
+        retry_reason = stage_info.get("retry_reason") or runner.get("error")
+        if retry_reason not in AUTO_RETRY_REASONS:
             return {}
         queued_at = stage_info.get("queued_at") or runner.get("updated_at") or job.get("updated_at")
         queued_at_ts = parse_iso_timestamp(queued_at)
@@ -1040,7 +1088,10 @@ class VideoLinkStatusServer:
                     self.update_runner(job, "succeeded", current_stage=None, finished=True)
                     return
                 self.update_runner(job, "running", current_stage=stage)
-                self.run_stage(job_id, stage)
+                result = self.run_stage(job_id, stage, continue_runner=True)
+                result_runner = result.get("runner") or {}
+                if result.get("status") == "queued" or result_runner.get("status") == "queued":
+                    return
         except BridgeError as exc:
             job = self.load_job(job_id)
             if self.runner_failure_can_finish_with_warning(job):
@@ -1092,7 +1143,7 @@ class VideoLinkStatusServer:
             job["status"] = "failed"
         self.save_job(job)
 
-    def run_stage(self, job_id: str, stage: str) -> dict[str, Any]:
+    def run_stage(self, job_id: str, stage: str, continue_runner: bool = False) -> dict[str, Any]:
         stage = normalize_stage_name(stage)
         job = self.load_job(job_id)
         if stage not in self.stage_order_for_job(job):
@@ -1125,8 +1176,8 @@ class VideoLinkStatusServer:
             current_status = None
         if current_status in {"succeeded", "skipped"}:
             return self.public_job(job)
-        if stage == "image-prompts" and job["options"].get("skip_images"):
-            return self.mark_stage_skipped(job, stage, "skip_images is true")
+        if stage == "image-prompts" and (job["options"].get("skip_images") or not BAOYU_IMAGE_GENERATION_ENABLED):
+            return self.mark_stage_skipped(job, stage, "baoyu image generation is disabled", continue_runner=continue_runner)
 
         resource = stage_resource(stage)
         self.mark_stage_queued(job, stage, resource)
@@ -1134,7 +1185,7 @@ class VideoLinkStatusServer:
         lock = self.resource_locks[resource]
         lock.acquire()
         try:
-            return self._run_stage_locked(job_id, stage)
+            return self._run_stage_locked(job_id, stage, continue_runner=continue_runner)
         finally:
             lock.release()
 
@@ -1173,7 +1224,7 @@ class VideoLinkStatusServer:
                 users.append(job)
         return users
 
-    def _run_stage_locked(self, job_id: str, stage: str) -> dict[str, Any]:
+    def _run_stage_locked(self, job_id: str, stage: str, continue_runner: bool = False) -> dict[str, Any]:
         stage = normalize_stage_name(stage)
         job = self.load_job(job_id)
         current_status = job.get("stages", {}).get(stage, {}).get("status")
@@ -1229,48 +1280,63 @@ class VideoLinkStatusServer:
             stage_info["finished_at"] = iso_now()
             job["status"] = "succeeded" if self.next_stage(job) is None else "running"
         except Exception as exc:
-            stage_info["status"] = "failed"
+            retry_reason = self.retryable_stage_failure_reason(stage, exc, stage_info["log_path"])
+            stage_info["status"] = "queued" if retry_reason else "failed"
             stage_info["exit_code"] = getattr(exc, "returncode", 1)
             stage_info["duration_seconds"] = round(time.time() - start, 3)
             stage_info["finished_at"] = iso_now()
-            stage_info["error"] = str(exc)
             stage_info.pop("process", None)
-            if self.stage_can_soft_fail(job, stage):
+            if retry_reason:
+                stage_info["queued_at"] = stage_info["finished_at"]
+                stage_info["queued_for"] = stage_resource(stage)
+                stage_info["retry_reason"] = retry_reason
+                stage_info["last_error"] = self.exception_text(exc) or str(exc)
+                stage_info.pop("error", None)
+                job["status"] = "queued"
+            elif self.stage_can_soft_fail(job, stage):
+                stage_info["error"] = str(exc)
                 warning = self.add_warning(job, stage, str(exc))
                 stage_info["status"] = "skipped"
                 stage_info["warning"] = warning["message"]
                 stage_info["soft_failed"] = True
                 job["status"] = "running"
             else:
+                stage_info["error"] = str(exc)
                 job["status"] = "failed"
         job["updated_at"] = iso_now()
         job["stages"][stage] = stage_info
         job["summary"] = self.collect_summary(job)
-        next_stage = self.next_stage(job)
-        runner = dict(job.get("runner") or {})
-        runner["updated_at"] = job["updated_at"]
-        runner["server_pid"] = os.getpid()
-        runner["error"] = None if job["status"] != "failed" else stage_info.get("error")
-        if job["status"] == "succeeded":
-            runner["status"] = "succeeded"
-            runner["current_stage"] = None
-            runner["queued_for"] = None
-            runner["finished_at"] = job["updated_at"]
-        elif job["status"] == "failed":
-            runner["status"] = "failed"
-            runner["current_stage"] = stage
-            runner["queued_for"] = stage_resource(stage)
-            runner["finished_at"] = job["updated_at"]
-        else:
-            runner["status"] = "running"
-            runner["current_stage"] = next_stage
-            runner["queued_for"] = stage_resource(next_stage) if next_stage else None
-            runner.pop("finished_at", None)
-        job["runner"] = runner
+        self.finalize_stage_runner(job, stage, stage_info, continue_runner=continue_runner)
         self.save_job(job)
         if stage_info["status"] == "failed":
             raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, f"{stage} failed: {stage_info.get('error')}")
         return self.public_job(job)
+
+    def retryable_stage_failure_reason(self, stage: str, exc: Exception, log_path: str) -> str | None:
+        if normalize_stage_name(stage) != "analyze-core":
+            return None
+        text = self.exception_text(exc)
+        output = getattr(exc, "output", None)
+        if not output:
+            try:
+                text += "\n" + Path(log_path).read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+        return self.retryable_stage_failure_text(stage, text)
+
+    def retryable_stage_failure_text(self, stage: str, text: str) -> str | None:
+        if "Ray frame driver failed" not in text and "run_frame_worker" not in text and "Jetson" not in text:
+            return None
+        if any(pattern in text for pattern in TRANSIENT_RESOURCE_BUSY_PATTERNS):
+            return TRANSIENT_RESOURCE_REQUEUE_MESSAGE
+        return None
+
+    def exception_text(self, exc: Exception) -> str:
+        text = str(exc)
+        output = getattr(exc, "output", None)
+        if output:
+            text += "\n" + str(output)
+        return text
 
     def touch_queued_runner(self, job_id: str, resource: str, blocker_count: int, limit: int) -> None:
         try:
@@ -1675,9 +1741,10 @@ class VideoLinkStatusServer:
             "--jobs",
             "3",
             "--finalize-only",
+            "--skip-pdf",
             "--skip-send",
         ]
-        if job["options"].get("skip_images"):
+        if job["options"].get("skip_images") or not BAOYU_IMAGE_GENERATION_ENABLED:
             command.append("--skip-images")
         return command
 
@@ -1700,7 +1767,7 @@ class VideoLinkStatusServer:
             reason = decision.get("reason") or "evidence review blocked publishing"
             raise BridgeError(HTTPStatus.CONFLICT, f"publish blocked by evidence gate: {reason}")
 
-    def mark_stage_skipped(self, job: dict[str, Any], stage: str, reason: str) -> dict[str, Any]:
+    def mark_stage_skipped(self, job: dict[str, Any], stage: str, reason: str, continue_runner: bool = False) -> dict[str, Any]:
         stage = normalize_stage_name(stage)
         job["stages"][stage] = {
             "status": "skipped",
@@ -1714,8 +1781,66 @@ class VideoLinkStatusServer:
         job["status"] = "succeeded" if self.next_stage(job) is None else "running"
         job["updated_at"] = iso_now()
         job["summary"] = self.collect_summary(job)
+        self.finalize_stage_runner(job, stage, job["stages"][stage], continue_runner=continue_runner)
         self.save_job(job)
         return self.public_job(job)
+
+    def finalize_stage_runner(
+        self,
+        job: dict[str, Any],
+        stage: str,
+        stage_info: dict[str, Any],
+        continue_runner: bool = False,
+    ) -> None:
+        next_stage = self.next_stage(job)
+        now = job.get("updated_at") or iso_now()
+        runner = dict(job.get("runner") or {})
+        runner["updated_at"] = now
+        runner["server_pid"] = os.getpid()
+        if job["status"] == "failed":
+            runner["status"] = "failed"
+            runner["current_stage"] = stage
+            runner["queued_for"] = stage_resource(stage)
+            runner["error"] = stage_info.get("error")
+            runner["finished_at"] = now
+        elif job["status"] == "queued":
+            runner["status"] = "queued"
+            runner["current_stage"] = stage
+            runner["queued_for"] = stage_resource(stage)
+            runner["error"] = stage_info.get("retry_reason")
+            runner.pop("finished_at", None)
+        elif next_stage is None:
+            job["status"] = "succeeded"
+            runner["status"] = "succeeded"
+            runner["current_stage"] = None
+            runner["queued_for"] = None
+            runner["error"] = None
+            runner["finished_at"] = now
+        elif continue_runner:
+            job["status"] = "running"
+            runner["status"] = "running"
+            runner["current_stage"] = next_stage
+            runner["queued_for"] = stage_resource(next_stage)
+            runner["error"] = None
+            runner.pop("finished_at", None)
+        else:
+            resource = stage_resource(next_stage)
+            next_info = dict((job.get("stages") or {}).get(next_stage) or {})
+            next_info.setdefault("log_path", str(self.stage_log_path(job["job_id"], next_stage)))
+            next_info["status"] = "queued"
+            next_info["queued_at"] = now
+            next_info["queued_for"] = resource
+            next_info.pop("finished_at", None)
+            next_info.pop("exit_code", None)
+            next_info.pop("process", None)
+            job.setdefault("stages", {})[next_stage] = next_info
+            job["status"] = "queued"
+            runner["status"] = "queued"
+            runner["current_stage"] = next_stage
+            runner["queued_for"] = resource
+            runner["error"] = None
+            runner.pop("finished_at", None)
+        job["runner"] = runner
 
     def update_job_artifacts(self, job: dict[str, Any], stage: str, artifacts: dict[str, Any]) -> None:
         artifact_store = dict(job.get("artifacts") or {})
@@ -1750,6 +1875,9 @@ class VideoLinkStatusServer:
             "ocr_events": [orin_dir / "ocr_events.json"],
             "frame_analyses": [orin_dir / "frame_analyses.json"],
             "frames": [run_dir / "frames"],
+            "frame_dedup_audit": [run_dir / "frame_dedup_audit.json"],
+            "visual_review": [run_dir / "visual_review.html"],
+            "run_manifest": [run_dir / "RUN_MANIFEST.md"],
         }
         for name, paths in candidate_paths.items():
             path = next((candidate for candidate in paths if candidate.exists()), None)
@@ -1781,6 +1909,9 @@ class VideoLinkStatusServer:
                     "ocr_text_events": ocr_keyframes.get("ocr_text_events_count"),
                     "ocr_events": len(payload.get("ocr_events") or []),
                     "frame_analyses": len(payload.get("frame_analyses") or []),
+                    "frame_dedup_audit": (metadata.get("frame_dedup_audit") or {}).get("summary", {}),
+                    "visual_review": metadata.get("visual_review") or {},
+                    "run_manifest": metadata.get("run_manifest") or {},
                     "timings": metadata.get("timings") or {},
                 }
             except Exception:
@@ -2578,6 +2709,7 @@ class VideoLinkStatusServer:
         public["warnings"] = self.active_warnings(public)
         public["prompt_template"] = self.prompt_template_metadata(public)
         public["result_resources"] = self.result_resources(public)
+        public["document_preview"] = self.document_preview(public)
         queued_stage = public["queue"].get("stage")
         if queued_stage and queued_stage in public["stages"]:
             public["stages"][queued_stage] = dict(public["stages"][queued_stage])
@@ -2656,6 +2788,125 @@ class VideoLinkStatusServer:
             if path:
                 resources[name] = path
         return resources
+
+    def document_preview(self, job: dict[str, Any]) -> dict[str, Any]:
+        run_dir_value = job.get("run_dir") or (((job.get("artifacts") or {}).get("run_dir") or {}).get("value"))
+        if not run_dir_value:
+            return {
+                "primary": [],
+                "evidence": [],
+                "process": [],
+                "assets": [],
+                "derivation": self.document_derivation([], [], [], []),
+            }
+        run_dir = Path(str(run_dir_value)).expanduser().resolve()
+        job_id = str(job.get("job_id") or "")
+        primary = self.document_preview_files(job_id, run_dir, DOCUMENT_PREVIEW_PRIMARY)
+        evidence = self.document_preview_files(job_id, run_dir, DOCUMENT_PREVIEW_EVIDENCE)
+        process = self.document_preview_files(job_id, run_dir, DOCUMENT_PREVIEW_PROCESS)
+        assets = self.document_preview_dirs(run_dir, DOCUMENT_PREVIEW_ASSETS)
+        return {
+            "primary": primary,
+            "evidence": evidence,
+            "process": process,
+            "assets": assets,
+            "derivation": self.document_derivation(primary, evidence, process, assets),
+        }
+
+    def document_preview_files(self, job_id: str, run_dir: Path, specs: tuple[tuple[str, str, str], ...]) -> list[dict[str, Any]]:
+        items = []
+        for relative, title, description in specs:
+            path = run_dir / relative
+            if not path.is_file():
+                continue
+            items.append(
+                {
+                    "type": "file",
+                    "path": relative,
+                    "title": title,
+                    "description": description,
+                    "size_bytes": path.stat().st_size,
+                    "updated_at": iso_from_timestamp(path.stat().st_mtime),
+                    "mime_type": mimetypes.guess_type(str(path))[0],
+                    "url": self.resource_url(job_id, relative),
+                }
+            )
+        return items
+
+    def document_preview_dirs(self, run_dir: Path, specs: tuple[tuple[str, str, str], ...]) -> list[dict[str, Any]]:
+        items = []
+        for relative, title, description in specs:
+            path = run_dir / relative
+            if not path.is_dir():
+                continue
+            files = [candidate for candidate in path.rglob("*") if candidate.is_file()]
+            items.append(
+                {
+                    "type": "directory",
+                    "path": relative,
+                    "title": title,
+                    "description": description,
+                    "file_count": len(files),
+                    "size_bytes": sum(candidate.stat().st_size for candidate in files),
+                    "updated_at": iso_from_timestamp(max((candidate.stat().st_mtime for candidate in files), default=path.stat().st_mtime)),
+                }
+            )
+        return items
+
+    def resource_url(self, job_id: str, relative_path: str) -> str:
+        return f"/api/video-link/jobs/{job_id}/resources/{quote(relative_path, safe='/')}"
+
+    def document_derivation(
+        self,
+        primary: list[dict[str, Any]],
+        evidence: list[dict[str, Any]],
+        process: list[dict[str, Any]],
+        assets: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        available = {item["path"] for item in [*primary, *evidence, *process, *assets]}
+        specs = (
+            ("input", "输入素材", "视频 / 页面上下文 / 评论", 0, None),
+            ("transcript", "ASR 转写", "transcript.md", 1, "transcript.md"),
+            ("frames", "抽帧与截图", "frames / manual_assets", 1, "manual_assets"),
+            ("visual", "OCR/VL 视觉理解", "orin / manual_evidence.md", 2, "manual_evidence.md"),
+            ("manual", "操作手册", "operation_manual.md", 3, "operation_manual.md"),
+            ("study", "学习账本与证据分诊", "study_guide / evidence_triage", 4, "study_guide.json"),
+            ("notes", "逐章知识笔记", "knowledge_notes_v2.md", 5, "docs_analysis_chapters/knowledge_notes_v2.md"),
+            ("report", "深度报告", "deep_report_v2.md", 5, "docs_analysis_chapters/deep_report_v2.md"),
+            ("audit", "证据审计与发布判断", "evidence_review / publish_decision", 6, "evidence_review.json"),
+        )
+        nodes = [
+            {"id": node_id, "title": title, "description": description, "tier": tier, "available": required is None or required in available}
+            for node_id, title, description, tier, required in specs
+        ]
+        edges = [
+            ("input", "transcript", "音频提取"),
+            ("input", "frames", "视频抽帧"),
+            ("transcript", "manual", "文本上下文"),
+            ("frames", "visual", "视觉证据"),
+            ("visual", "manual", "截图/证据"),
+            ("manual", "study", "核心文档"),
+            ("visual", "study", "证据缺口"),
+            ("study", "notes", "章节整理"),
+            ("study", "report", "深度分析"),
+            ("notes", "audit", "发布材料"),
+            ("report", "audit", "发布材料"),
+            ("visual", "audit", "证据复核"),
+        ]
+        return {
+            "nodes": nodes,
+            "edges": [{"from": left, "to": right, "label": label} for left, right, label in edges],
+            "mermaid": self.document_derivation_mermaid(nodes, edges),
+        }
+
+    def document_derivation_mermaid(self, nodes: list[dict[str, Any]], edges: list[tuple[str, str, str]]) -> str:
+        labels = {node["id"]: f"{node['title']}<br/>{node['description']}" for node in nodes}
+        lines = ["flowchart LR"]
+        for node_id, label in labels.items():
+            lines.append(f"  {node_id}[\"{label}\"]")
+        for left, right, label in edges:
+            lines.append(f"  {left} -->|{label}| {right}")
+        return "\n".join(lines)
 
     def resource_relative_path(self, run_dir: Path, value: Any, allow_missing: bool = False) -> str | None:
         if not value:
@@ -2800,8 +3051,15 @@ class VideoLinkStatusServer:
         run_dir_value = job.get("run_dir")
         if not run_dir_value:
             return False
-        export_dir = Path(run_dir_value) / "exports"
-        return all((export_dir / name).is_file() and (export_dir / name).stat().st_size > 0 for name in EXPECTED_FINAL_EXPORTS)
+        run_dir = Path(run_dir_value)
+        summary_path = run_dir / "final_publish_summary.json"
+        if not summary_path.is_file() or summary_path.stat().st_size <= 0:
+            return False
+        if job.get("options", {}).get("skip_images") or not BAOYU_IMAGE_GENERATION_ENABLED:
+            return True
+        final_dir = run_dir / "baoyu_images" / "final"
+        expected_images = ("02-infographic-knowledge-notes.png", "03-infographic-deep-report.png")
+        return all((final_dir / name).is_file() and (final_dir / name).stat().st_size > 0 for name in expected_images)
 
     def queue_info(self, job: dict[str, Any]) -> dict[str, Any]:
         runner = job.get("runner") or {}
@@ -3083,6 +3341,8 @@ class VideoLinkStatusServer:
             if recovered:
                 return recovered
             return self.requeue_interrupted_job(job)
+        if self.should_requeue_legacy_transient_failure(job):
+            return self.requeue_interrupted_job(job, reason=TRANSIENT_RESOURCE_REQUEUE_MESSAGE)
         if runner.get("status") not in {"running", "queued"}:
             return job
         active = self.active_runners.get(job["job_id"])
@@ -3157,11 +3417,36 @@ class VideoLinkStatusServer:
         stage = normalize_stage_name(runner.get("current_stage") or self.next_stage(job) or "")
         return stage in self.stage_order_for_job(job)
 
+    def should_requeue_legacy_transient_failure(self, job: dict[str, Any]) -> bool:
+        runner = job.get("runner") or {}
+        if job.get("status") != "failed" or runner.get("status") != "failed":
+            return False
+        stage = normalize_stage_name(runner.get("current_stage") or self.current_stage(job) or self.next_stage(job) or "")
+        if stage not in self.stage_order_for_job(job):
+            return False
+        stage_info = (job.get("stages") or {}).get(stage) or {}
+        text = "\n".join(
+            str(value or "")
+            for value in (
+                runner.get("error"),
+                stage_info.get("error"),
+                stage_info.get("last_error"),
+            )
+        )
+        log_path = stage_info.get("log_path")
+        if log_path and Path(str(log_path)).is_file():
+            try:
+                text += "\n" + Path(str(log_path)).read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+        return self.retryable_stage_failure_text(stage, text) is not None
+
     def requeue_interrupted_job(
         self,
         job: dict[str, Any],
         stage: str | None = None,
         stage_info: dict[str, Any] | None = None,
+        reason: str = ORPHANED_PROCESS_REQUEUE_MESSAGE,
     ) -> dict[str, Any]:
         now = iso_now()
         raw_stage = stage or (job.get("runner") or {}).get("current_stage") or self.current_stage(job) or self.next_stage(job)
@@ -3177,8 +3462,11 @@ class VideoLinkStatusServer:
         stage_info["status"] = "queued"
         stage_info["queued_at"] = now
         stage_info["queued_for"] = resource
-        stage_info["retry_reason"] = ORPHANED_PROCESS_REQUEUE_MESSAGE
+        stage_info["retry_reason"] = reason
         stage_info["log_path"] = stage_info.get("log_path") or str(self.stage_log_path(job["job_id"], stage))
+        previous_error = stage_info.get("error")
+        if previous_error and not stage_info.get("last_error"):
+            stage_info["last_error"] = previous_error
         stage_info.pop("process", None)
         stage_info.pop("finished_at", None)
         stage_info.pop("exit_code", None)
@@ -3186,7 +3474,7 @@ class VideoLinkStatusServer:
         job.setdefault("stages", {})[stage] = stage_info
         runner = dict(job.get("runner") or {})
         runner["status"] = "queued"
-        runner["error"] = ORPHANED_PROCESS_REQUEUE_MESSAGE
+        runner["error"] = reason
         runner["updated_at"] = now
         runner["current_stage"] = stage
         runner["queued_for"] = resource
@@ -4592,6 +4880,10 @@ def iso_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
+def iso_from_timestamp(value: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(value))
+
+
 def format_seconds_label(value: float) -> str:
     seconds = max(0, int(value))
     hours = seconds // 3600
@@ -4668,7 +4960,7 @@ def render_create_page(options: dict[str, Any]) -> str:
           <label for="download_device">下载设备</label>
           <select id="download_device" name="download_device"></select>
         </div>
-        <label class="check"><input id="skip_images" name="skip_images" type="checkbox">跳过配图/提示词</label>
+        <label class="check"><input id="skip_images" name="skip_images" type="checkbox" checked disabled>跳过配图/提示词</label>
       </div>
       <details class="panel">
         <summary>采集选项</summary>
@@ -4792,6 +5084,28 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
     .errorBox {{ display: none; border-color: #f5c2c7; background: #fff5f5; color: #842029; }}
     .errorBox strong {{ display: block; margin-bottom: 8px; }}
     .hint {{ margin-top: 8px; color: #5f6368; font-size: 13px; }}
+    .docSection {{ margin-top: 14px; }}
+    .docSection h3 {{ margin: 0 0 8px; font-size: 15px; }}
+    .docGrid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }}
+    .docCard {{ border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; background: #fff; min-height: 96px; }}
+    .docCard.primary {{ border-color: #b6d4fe; background: #f8fbff; }}
+    .docTitle {{ display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; font-weight: 650; }}
+    .docBadge {{ flex: 0 0 auto; border-radius: 999px; padding: 2px 8px; font-size: 12px; background: #e8f0fe; color: #174ea6; }}
+    .docDescription {{ margin-top: 8px; color: #3c4043; font-size: 13px; line-height: 1.5; }}
+    .docMeta {{ margin-top: 8px; color: #5f6368; font-size: 12px; }}
+    .docList {{ display: grid; gap: 8px; }}
+    .docListItem {{ display: grid; grid-template-columns: minmax(160px, 1fr) minmax(120px, auto); gap: 10px; border-bottom: 1px solid #edf0f2; padding: 8px 0; }}
+    .docListItem:last-child {{ border-bottom: 0; }}
+    .docEmpty {{ color: #5f6368; font-size: 13px; }}
+    .mindmap {{ display: grid; gap: 8px; }}
+    .mindmapTier {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }}
+    .mindmapTier + .mindmapTier::before {{ content: "\\2193"; color: #5f6368; margin-right: 4px; }}
+    .mindNode {{ border: 1px solid #dadce0; border-radius: 8px; padding: 8px 10px; background: #fff; min-width: 150px; }}
+    .mindNode.missing {{ opacity: .58; background: #f8f9fa; }}
+    .mindNode strong {{ display: block; font-size: 13px; }}
+    .mindNode span {{ display: block; color: #5f6368; font-size: 12px; margin-top: 3px; }}
+    details.docDetails {{ margin-top: 12px; border-top: 1px solid #edf0f2; padding-top: 10px; }}
+    details.docDetails summary {{ cursor: pointer; font-weight: 650; }}
 	    .actions {{ margin-top: 14px; display: flex; gap: 10px; align-items: center; }}
 	    button {{ border: 0; border-radius: 6px; padding: 9px 14px; background: #202124; color: #fff; font-size: 14px; cursor: pointer; }}
 	    button.secondary {{ background: #eef2f7; color: #202124; }}
@@ -4854,7 +5168,7 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
       </table>
     </section>
     <section class="panel">
-      <h2>产物</h2>
+      <h2>文档预览</h2>
       <div id="artifacts" class="value">-</div>
     </section>
     <section class="panel">
@@ -4907,6 +5221,88 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
         if (char === '"') return "&quot;";
         return "&#39;";
       }});
+    }}
+    function formatBytes(value) {{
+      const bytes = Number(value);
+      if (!Number.isFinite(bytes) || bytes <= 0) return "-";
+      if (bytes < 1024) return `${{bytes}} B`;
+      if (bytes < 1024 * 1024) return `${{(bytes / 1024).toFixed(1)}} KB`;
+      return `${{(bytes / 1024 / 1024).toFixed(1)}} MB`;
+    }}
+    function docLink(item) {{
+      if (!item?.url) return escapeHtml(item?.path || "");
+      return `<a href="${{escapeHtml(item.url)}}" target="_blank" rel="noopener noreferrer">${{escapeHtml(item.title || item.path)}}</a>`;
+    }}
+    function docMeta(item) {{
+      const parts = [];
+      if (item?.path) parts.push(escapeHtml(item.path));
+      if (item?.type === "directory") parts.push(`${{Number(item.file_count || 0)}} 个文件`);
+      if (item?.size_bytes) parts.push(formatBytes(item.size_bytes));
+      return parts.join(" · ");
+    }}
+    function renderDocCards(items, badge) {{
+      if (!items?.length) return `<div class="docEmpty">暂无可用文档</div>`;
+      return `<div class="docGrid">${{items.map(item => `
+        <article class="docCard primary">
+          <div class="docTitle"><span>${{docLink(item)}}</span><span class="docBadge">${{escapeHtml(badge)}}</span></div>
+          <div class="docDescription">${{escapeHtml(item.description || "")}}</div>
+          <div class="docMeta">${{docMeta(item)}}</div>
+        </article>
+      `).join("")}}</div>`;
+    }}
+    function renderDocList(items) {{
+      if (!items?.length) return `<div class="docEmpty">暂无可用文件</div>`;
+      return `<div class="docList">${{items.map(item => `
+        <div class="docListItem">
+          <div>
+            <div>${{item.type === "file" ? docLink(item) : escapeHtml(item.title || item.path)}}</div>
+            <div class="hint">${{escapeHtml(item.description || "")}}</div>
+          </div>
+          <div class="docMeta">${{docMeta(item)}}</div>
+        </div>
+      `).join("")}}</div>`;
+    }}
+    function renderMindmap(derivation) {{
+      const nodes = derivation?.nodes || [];
+      if (!nodes.length) return `<div class="docEmpty">暂无推导关系</div>`;
+      const tiers = [...new Set(nodes.map(node => node.tier))].sort((a, b) => a - b);
+      const html = tiers.map(tier => `
+        <div class="mindmapTier">
+          ${{nodes.filter(node => node.tier === tier).map(node => `
+            <div class="mindNode ${{node.available ? "" : "missing"}}">
+              <strong>${{escapeHtml(node.title)}}</strong>
+              <span>${{escapeHtml(node.description)}}</span>
+            </div>
+          `).join("")}}
+        </div>
+      `).join("");
+      const source = derivation?.mermaid ? `<details class="docDetails"><summary>Mermaid 源码</summary><pre>${{escapeHtml(derivation.mermaid)}}</pre></details>` : "";
+      return `<div class="mindmap">${{html}}</div>${{source}}`;
+    }}
+    function renderDocumentPreview(preview) {{
+      if (!preview) return `<div class="docEmpty">暂无文档预览</div>`;
+      return `
+        <div class="docSection">
+          <h3>重点阅读</h3>
+          ${{renderDocCards(preview.primary || [], "重点")}}
+        </div>
+        <div class="docSection">
+          <h3>推导脑图</h3>
+          ${{renderMindmap(preview.derivation)}}
+        </div>
+        <div class="docSection">
+          <h3>证据审计</h3>
+          ${{renderDocList(preview.evidence || [])}}
+        </div>
+        <details class="docDetails">
+          <summary>过程文件</summary>
+          ${{renderDocList(preview.process || [])}}
+        </details>
+        <details class="docDetails">
+          <summary>素材与中间目录</summary>
+          ${{renderDocList(preview.assets || [])}}
+        </details>
+      `;
     }}
     function chooseLogStage(job) {{
       if (selectedLogStage) return selectedLogStage;
@@ -4961,13 +5357,7 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
         }});
       }});
       renderCoreProgress(job.core_progress);
-      const summary = job.summary || {{}};
-      document.getElementById("artifacts").innerHTML = [
-        `Markdown: ${{(summary.markdown_files || []).length}}`,
-        `导出文件: ${{(summary.export_files || []).length}}`,
-        `配图提示词: ${{(summary.prompt_files || []).length}}`,
-        `最终图片: ${{(summary.final_images || []).length}}`
-      ].join("<br>");
+      document.getElementById("artifacts").innerHTML = renderDocumentPreview(job.document_preview);
       const stageForLog = chooseLogStage(job);
       await loadLog(job, stageForLog);
     }}
@@ -5104,6 +5494,12 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
                 full = parse_bool(query.get("full", ["false"])[0])
                 self.write_json(self.server_app.stage_log(match.group(1), match.group(2), limit, full))
                 return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/resources/(.+)", path)
+            if match:
+                resource_path = unquote(match.group(2))
+                file_path, content_type = self.server_app.resource_file(match.group(1), resource_path)
+                self.write_file(file_path, content_type)
+                return
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/qa-index", path)
             if match:
                 self.write_json(self.server_app.qa_index(match.group(1)))
@@ -5225,6 +5621,15 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
         self.send_response(int(status))
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def write_file(self, path: Path, content_type: str | None = None) -> None:
+        body = path.read_bytes()
+        self.send_response(int(HTTPStatus.OK))
+        self.send_header("Content-Type", content_type or "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Disposition", f"inline; filename={quote(path.name)}")
         self.end_headers()
         self.wfile.write(body)
 

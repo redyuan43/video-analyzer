@@ -1765,6 +1765,15 @@ function resourceUrl(jobId, path) {
     return `/api/video-link/jobs/${jobId}/resource?path=${encodeURIComponent(path)}`;
 }
 
+function resourcePathUrl(jobId, path) {
+    const encodedPath = String(path || '')
+        .split('/')
+        .filter(Boolean)
+        .map(part => encodeURIComponent(part))
+        .join('/');
+    return `/api/video-link/jobs/${jobId}/resources/${encodedPath}`;
+}
+
 async function loadFrameTimeMap(jobId) {
     if (!jobId) return {};
     if (frameTimeMaps[jobId]) return frameTimeMaps[jobId];
@@ -1817,25 +1826,71 @@ function parseTimestampToSeconds(value) {
     return third == null ? first * 60 + second : first * 3600 + second * 60 + third;
 }
 
-function previewableDocs(job) {
+const DOCUMENT_DERIVATION_PATH = '__document_derivation__';
+
+function formatBytes(value) {
+    const bytes = Number(value || 0);
+    if (!bytes) return '';
+    if (bytes < 1024) return `${bytes} B`;
+    const units = ['KB', 'MB', 'GB'];
+    let amount = bytes / 1024;
+    let unit = units.shift();
+    while (amount >= 1024 && units.length) {
+        amount /= 1024;
+        unit = units.shift();
+    }
+    return `${amount.toFixed(amount >= 10 ? 0 : 1)} ${unit}`;
+}
+
+function docKindFromPath(path) {
+    const value = String(path || '').toLowerCase();
+    if (value.endsWith('.pdf')) return 'pdf';
+    if (value.endsWith('.html') || value.endsWith('.htm')) return 'html';
+    if (value.endsWith('.json')) return 'json';
+    return 'markdown';
+}
+
+function normalizePreviewItems(items, group) {
+    return (items || []).map(item => ({
+        ...item,
+        group,
+        kind: item.type === 'directory' ? 'directory' : docKindFromPath(item.path),
+        previewable: item.type !== 'directory'
+    }));
+}
+
+function fallbackPreviewableDocs(job) {
     const summary = job?.summary || {};
-    const markdownFiles = (summary.markdown_files || []).map(path => ({ path, kind: 'markdown' }));
+    const markdownFiles = (summary.markdown_files || []).map(path => ({
+        path,
+        title: path,
+        description: '历史 Markdown 产物',
+        group: 'process',
+        kind: 'markdown',
+        previewable: true
+    }));
     const pdfFiles = (summary.export_files || [])
         .filter(path => path.toLowerCase().endsWith('.pdf'))
-        .map(path => ({ path, kind: 'pdf' }));
+        .map(path => ({
+            path,
+            title: path,
+            description: '历史 PDF 导出',
+            group: 'process',
+            kind: 'pdf',
+            previewable: true
+        }));
     const preferred = [
+        'operation_manual.md',
+        'docs_analysis_chapters/knowledge_notes_v2.md',
+        'docs_analysis_chapters/deep_report_v2.md',
+        'manual_evidence.md',
+        'evidence_index.md',
         'study_overview.md',
         'study_cards.md',
-        'evidence_index.md',
-        'review_notes.md',
         'exports/operation_manual.pdf',
-        'operation_manual.md',
         'exports/knowledge_notes_v2.pdf',
-        'docs_analysis_chapters/knowledge_notes_v2.md',
         'exports/deep_report_v2.pdf',
-        'docs_analysis_chapters/deep_report_v2.md',
-        'exports/manual_evidence.pdf',
-        'manual_evidence.md'
+        'exports/manual_evidence.pdf'
     ];
     return [...markdownFiles, ...pdfFiles].sort((left, right) => {
         const leftIndex = preferred.indexOf(left.path);
@@ -1843,9 +1898,103 @@ function previewableDocs(job) {
         const leftRank = leftIndex === -1 ? 1000 : leftIndex;
         const rightRank = rightIndex === -1 ? 1000 : rightIndex;
         if (leftRank !== rightRank) return leftRank - rightRank;
-        if (left.kind !== right.kind) return left.kind === 'pdf' ? -1 : 1;
+        if (left.kind !== right.kind) return left.kind === 'markdown' ? -1 : 1;
         return left.path.localeCompare(right.path);
     });
+}
+
+function previewableDocs(job) {
+    const preview = job?.document_preview || {};
+    const primary = normalizePreviewItems(preview.primary, 'primary');
+    const evidence = normalizePreviewItems(preview.evidence, 'evidence');
+    const process = normalizePreviewItems(preview.process, 'process');
+    const assets = normalizePreviewItems(preview.assets, 'assets');
+    const derivation = preview.derivation ? [{
+        type: 'mindmap',
+        path: DOCUMENT_DERIVATION_PATH,
+        title: '文档推导脑图',
+        description: '理解重点文档、证据文件和过程文件之间的递进关系',
+        group: 'mindmap',
+        kind: 'mindmap',
+        previewable: true
+    }] : [];
+    const grouped = [...primary, ...derivation, ...evidence, ...process, ...assets];
+    return grouped.length ? grouped : fallbackPreviewableDocs(job);
+}
+
+function docGroupDefinitions(docs) {
+    const groups = [
+        ['primary', '重点阅读', '最终用户最应该先看的结论文档'],
+        ['mindmap', '文档推导', '这些文件如何一步步生成'],
+        ['evidence', '证据审计', '抽帧、OCR/VL、发布判断等可追溯证据'],
+        ['process', '过程文件', '中间分析、QA、调试与结构化产物'],
+        ['assets', '素材目录', '帧图、截图和报告素材目录']
+    ];
+    return groups
+        .map(([key, title, description]) => ({
+            key,
+            title,
+            description,
+            docs: docs.filter(doc => doc.group === key)
+        }))
+        .filter(group => group.docs.length);
+}
+
+function docTypeLabel(doc) {
+    if (doc.kind === 'mindmap') return '图';
+    if (doc.kind === 'directory') return '目录';
+    if (doc.kind === 'pdf') return 'PDF';
+    if (doc.kind === 'html') return 'HTML';
+    if (doc.kind === 'json') return 'JSON';
+    return 'MD';
+}
+
+function docMetaText(doc) {
+    const parts = [];
+    if (doc.file_count != null) parts.push(`${doc.file_count} 个文件`);
+    const size = formatBytes(doc.size_bytes);
+    if (size) parts.push(size);
+    if (doc.updated_at) parts.push(String(doc.updated_at).replace('T', ' ').replace(/\+00:00$/, 'Z'));
+    return parts.join(' · ');
+}
+
+function findPreviewDoc(job, path) {
+    return previewableDocs(job).find(doc => doc.path === path);
+}
+
+function docPreviewUrl(job, doc) {
+    if (!job?.job_id || !doc?.path) return '';
+    return doc.url || resourcePathUrl(job.job_id, doc.path);
+}
+
+function renderDocMindmap(derivation) {
+    const nodes = derivation?.nodes || [];
+    const edges = derivation?.edges || [];
+    const mermaid = derivation?.mermaid || 'flowchart LR';
+    const mermaidPreview = renderSimpleMermaidFlowchart(mermaid);
+    const tiers = [...new Set(nodes.map(node => Number(node.tier || 0)))].sort((left, right) => left - right);
+    const tierHtml = tiers.map(tier => {
+        const tierNodes = nodes.filter(node => Number(node.tier || 0) === tier);
+        return `<div class="mindmap-tier">
+            ${tierNodes.map(node => `<div class="mindmap-node${node.available ? '' : ' missing'}">
+                <strong>${escapeHtml(node.label || node.id || '')}</strong>
+                <span>${escapeHtml(node.description || '')}</span>
+            </div>`).join('')}
+        </div>`;
+    }).join('');
+    const edgeHtml = edges.map(edge => `<li>${escapeHtml(edge.from_label || edge.from)} -> ${escapeHtml(edge.to_label || edge.to)}</li>`).join('');
+    return `<section class="mindmap-preview">
+        <h2>文档推导脑图</h2>
+        <p>重点文档来自前面的转写、抽帧、OCR/VL 与证据审计；过程文件默认折叠，只在排查或追溯时打开。</p>
+        <h3>Mermaid 预览</h3>
+        <div class="mindmap-mermaid">${mermaidPreview || '<div class="mindmap-empty">当前 Mermaid 图超出内置预览能力，请查看源码。</div>'}</div>
+        <h3>生成层级</h3>
+        <div class="mindmap-canvas">${tierHtml}</div>
+        <h3>递进关系</h3>
+        <ol>${edgeHtml}</ol>
+        <h3>Mermaid 源码</h3>
+        <pre class="mindmap-source">${escapeHtml(mermaid)}</pre>
+    </section>`;
 }
 
 function loadLearningPanelVisibility() {
@@ -1940,7 +2089,12 @@ function bindLearningPanelToggles() {
 function renderDocPreviewPanel(job) {
     if (!nodes.docList) return;
     const docs = previewableDocs(job);
-    nodes.docPreviewSummary.textContent = docs.length ? `${docs.length} 个文档` : '无文档';
+    const primaryCount = docs.filter(doc => doc.group === 'primary').length;
+    const evidenceCount = docs.filter(doc => doc.group === 'evidence').length;
+    const processCount = docs.filter(doc => doc.group === 'process').length;
+    nodes.docPreviewSummary.textContent = docs.length
+        ? `${primaryCount} 个重点 · ${evidenceCount} 个证据 · ${processCount} 个过程`
+        : '无文档';
     if (!job || !docs.length) {
         selectedDocPath = '';
         renderedDocListKey = '';
@@ -1950,19 +2104,44 @@ function renderDocPreviewPanel(job) {
         return;
     }
     if (selectedDocPath && !docs.some(doc => doc.path === selectedDocPath)) selectedDocPath = '';
-    const listKey = `${job.job_id}|${selectedDocPath}|${docs.map(doc => `${doc.kind}:${doc.path}`).join('|')}`;
+    const listKey = `${job.job_id}|${selectedDocPath}|${docs.map(doc => `${doc.group}:${doc.kind}:${doc.path}`).join('|')}`;
     if (renderedDocListKey !== listKey) {
         renderedDocListKey = listKey;
-        nodes.docList.innerHTML = docs.map(doc => {
-            const active = doc.path === selectedDocPath ? ' active' : '';
-            const label = doc.kind === 'pdf' ? 'PDF' : 'MD';
-            return `<button class="doc-item${active}" type="button" data-doc-path="${escapeHtml(doc.path)}">
-                <span>${escapeHtml(label)}</span>
-                <strong>${escapeHtml(doc.path)}</strong>
-            </button>`;
+        nodes.docList.innerHTML = docGroupDefinitions(docs).map(group => {
+            const body = group.docs.map(doc => {
+                const active = doc.path === selectedDocPath ? ' active' : '';
+                const disabled = doc.previewable ? '' : ' disabled';
+                const meta = docMetaText(doc);
+                return `<button class="doc-item ${escapeHtml(doc.group)}${active}" type="button" data-doc-path="${escapeHtml(doc.path)}"${disabled}>
+                    <span class="doc-kind">${escapeHtml(docTypeLabel(doc))}</span>
+                    <strong>${escapeHtml(doc.title || doc.path)}</strong>
+                    <small>${escapeHtml(doc.description || doc.path)}</small>
+                    <em>${escapeHtml(meta || doc.path)}</em>
+                </button>`;
+            }).join('');
+            const content = `<div class="doc-group-body">${body}</div>`;
+            if (group.key === 'process' || group.key === 'assets') {
+                return `<details class="doc-group" ${group.key === 'process' ? '' : ''}>
+                    <summary>
+                        <strong>${escapeHtml(group.title)}</strong>
+                        <span>${group.docs.length} 项</span>
+                    </summary>
+                    <p>${escapeHtml(group.description)}</p>
+                    ${content}
+                </details>`;
+            }
+            return `<section class="doc-group">
+                <header>
+                    <strong>${escapeHtml(group.title)}</strong>
+                    <span>${group.docs.length} 项</span>
+                </header>
+                <p>${escapeHtml(group.description)}</p>
+                ${content}
+            </section>`;
         }).join('');
         nodes.docList.querySelectorAll('.doc-item').forEach(button => {
             button.addEventListener('click', () => {
+                if (button.disabled) return;
                 selectedDocPath = button.dataset.docPath || '';
                 loadedDocPreviewKey = '';
                 renderedDocListKey = '';
@@ -2015,11 +2194,27 @@ async function loadDocPreview(job, path) {
     if (!job?.job_id || !path) return;
     const previewKey = `${job.job_id}|${path}`;
     if (loadedDocPreviewKey === previewKey) return;
-    const url = resourceUrl(job.job_id, path);
-    nodes.docPreviewTitle.textContent = path;
+    const doc = findPreviewDoc(job, path) || { path, kind: docKindFromPath(path), title: path, previewable: true };
+    if (doc.kind === 'mindmap') {
+        nodes.docPreviewTitle.textContent = doc.title || '文档推导脑图';
+        nodes.docOpenLink.hidden = true;
+        nodes.docOpenLink.removeAttribute('href');
+        nodes.docPreviewBody.className = 'doc-preview-body mindmap';
+        nodes.docPreviewBody.innerHTML = renderDocMindmap(job.document_preview?.derivation || {});
+        loadedDocPreviewKey = previewKey;
+        return;
+    }
+    const url = docPreviewUrl(job, doc);
+    nodes.docPreviewTitle.textContent = doc.title || path;
     nodes.docOpenLink.href = url;
     nodes.docOpenLink.hidden = false;
     if (path.toLowerCase().endsWith('.pdf')) {
+        nodes.docPreviewBody.className = 'doc-preview-body pdf';
+        nodes.docPreviewBody.innerHTML = `<iframe title="${escapeHtml(path)}" src="${escapeHtml(url)}"></iframe>`;
+        loadedDocPreviewKey = previewKey;
+        return;
+    }
+    if (path.toLowerCase().endsWith('.html') || path.toLowerCase().endsWith('.htm')) {
         nodes.docPreviewBody.className = 'doc-preview-body pdf';
         nodes.docPreviewBody.innerHTML = `<iframe title="${escapeHtml(path)}" src="${escapeHtml(url)}"></iframe>`;
         loadedDocPreviewKey = previewKey;
@@ -2030,10 +2225,14 @@ async function loadDocPreview(job, path) {
     try {
         const response = await fetch(url);
         if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-        const markdown = await response.text();
+        const text = await response.text();
         if (selectedDocPath !== path) return;
         nodes.docPreviewBody.className = 'doc-preview-body markdown';
-        nodes.docPreviewBody.innerHTML = renderMarkdown(markdown, job.job_id, path);
+        if (path.toLowerCase().endsWith('.json')) {
+            nodes.docPreviewBody.innerHTML = `<pre>${escapeHtml(text)}</pre>`;
+        } else {
+            nodes.docPreviewBody.innerHTML = renderMarkdown(text, job.job_id, path);
+        }
         renderMarkdownMath(nodes.docPreviewBody);
         await enhanceTimestampTargets(nodes.docPreviewBody, job.job_id);
         loadedDocPreviewKey = previewKey;

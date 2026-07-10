@@ -386,6 +386,43 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertIn("deepseek_v4_pro", options["choices"]["profiles"])
         self.assertIn("mi", options["choices"]["download_devices"])
 
+    def test_collect_core_artifacts_includes_review_and_ab_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
+            (run_dir / "manual_evidence.md").write_text("# Evidence\n", encoding="utf-8")
+            (run_dir / "frame_dedup_audit.json").write_text("{}", encoding="utf-8")
+            (run_dir / "visual_review.html").write_text("<html></html>", encoding="utf-8")
+            (run_dir / "RUN_MANIFEST.md").write_text("# RUN_MANIFEST\n", encoding="utf-8")
+            (run_dir / "analysis.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": {
+                            "frames_extracted": 3,
+                            "frame_dedup_audit": {"summary": {"treatment_drop_count": 1}},
+                            "visual_review": {"contact_sheet_count": 1},
+                            "run_manifest": {"chars": 120},
+                            "ocr_keyframes": {"ocr_text_events_count": 2},
+                        },
+                        "ocr_events": [{}, {}],
+                        "frame_analyses": [{}],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+
+            artifacts = server.collect_core_artifacts(run_dir)
+
+        self.assertEqual(artifacts["frame_dedup_audit"], str(run_dir / "frame_dedup_audit.json"))
+        self.assertEqual(artifacts["visual_review"], str(run_dir / "visual_review.html"))
+        self.assertEqual(artifacts["run_manifest"], str(run_dir / "RUN_MANIFEST.md"))
+        self.assertEqual(artifacts["core_counts"]["frame_dedup_audit"]["treatment_drop_count"], 1)
+        self.assertEqual(artifacts["core_counts"]["visual_review"]["contact_sheet_count"], 1)
+        self.assertEqual(artifacts["core_counts"]["run_manifest"]["chars"], 120)
+
     def test_create_job_saves_common_and_collection_options(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
@@ -784,6 +821,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(command[0], "tools/run_video_doc_final_publish.sh")
         self.assertIn("--finalize-only", command)
         self.assertIn("--skip-send", command)
+        self.assertIn("--skip-pdf", command)
         self.assertIn("--jobs", command)
         self.assertEqual(command[command.index("--jobs") + 1], "3")
         self.assertIn("--profile", command)
@@ -803,8 +841,21 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
         self.assertIn("--skip-images", command)
 
-    def test_final_publish_stage_can_enable_images_explicitly(self):
+    def test_final_publish_stage_keeps_images_disabled_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "skip_images": False})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            loaded["run_dir"] = str(run_dir)
+
+            command = server.final_publish_command(loaded)
+
+        self.assertIn("--skip-images", command)
+
+    def test_final_publish_stage_can_enable_images_with_runtime_flag(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(server_mod, "BAOYU_IMAGE_GENERATION_ENABLED", True):
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
             job = server.create_job({"video_url": "https://example.com/video", "skip_images": False})
             loaded = server.load_job(job["job_id"])
@@ -897,6 +948,63 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(public["result_resources"]["summary_markdown"], "operation_manual.md")
         self.assertEqual(public["result_resources"]["transcript_markdown"], "transcript.md")
         self.assertEqual(public["prompt_template"]["actual"]["id"], "actual")
+
+    def test_document_preview_groups_primary_evidence_process_and_assets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "run"
+            (run_dir / "docs_analysis_chapters").mkdir(parents=True)
+            (run_dir / "manual_assets").mkdir()
+            (run_dir / "orin").mkdir()
+            (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
+            (run_dir / "docs_analysis_chapters" / "knowledge_notes_v2.md").write_text("# Notes\n", encoding="utf-8")
+            (run_dir / "docs_analysis_chapters" / "deep_report_v2.md").write_text("# Report\n", encoding="utf-8")
+            (run_dir / "manual_evidence.md").write_text("# Evidence\n", encoding="utf-8")
+            (run_dir / "evidence_index.md").write_text("# Index\n", encoding="utf-8")
+            (run_dir / "transcript.md").write_text("# Transcript\n", encoding="utf-8")
+            (run_dir / "analysis.json").write_text("{}", encoding="utf-8")
+            (run_dir / "study_guide.json").write_text("{}", encoding="utf-8")
+            (run_dir / "manual_assets" / "frame_000.jpg").write_bytes(b"jpg")
+            loaded["run_dir"] = str(run_dir)
+            server.save_job(loaded)
+
+            public = server.public_job(server.load_job(job["job_id"]))
+            preview = public["document_preview"]
+
+        self.assertEqual([item["path"] for item in preview["primary"]], [
+            "operation_manual.md",
+            "docs_analysis_chapters/knowledge_notes_v2.md",
+            "docs_analysis_chapters/deep_report_v2.md",
+        ])
+        self.assertIn("manual_evidence.md", [item["path"] for item in preview["evidence"]])
+        self.assertNotIn("manual_evidence.md", [item["path"] for item in preview["primary"]])
+        self.assertIn("transcript.md", [item["path"] for item in preview["process"]])
+        self.assertIn("manual_assets", [item["path"] for item in preview["assets"]])
+        self.assertIn("flowchart LR", preview["derivation"]["mermaid"])
+        self.assertIn("操作手册", [node["title"] for node in preview["derivation"]["nodes"]])
+        self.assertTrue(preview["primary"][0]["url"].endswith("/resources/operation_manual.md"))
+
+    def test_resource_file_serves_only_run_dir_relative_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
+            loaded["run_dir"] = str(run_dir)
+            server.save_job(loaded)
+
+            path, mime_type = server.resource_file(job["job_id"], "operation_manual.md")
+
+            with self.assertRaises(server_mod.BridgeError) as escaped:
+                server.resource_file(job["job_id"], "../operation_manual.md")
+
+        self.assertEqual(path, run_dir / "operation_manual.md")
+        self.assertTrue(mime_type is None or "markdown" in mime_type or mime_type.startswith("text/"))
+        self.assertEqual(escaped.exception.status, server_mod.HTTPStatus.FORBIDDEN)
 
     def test_verify_core_accepts_quality_failed_manual_with_warning(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1328,7 +1436,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             server.save_job(loaded)
             server.resource_locks["core"].acquire()
 
-            def fake_locked(job_id, stage):
+            def fake_locked(job_id, stage, continue_runner=False):
                 current = server.load_job(job_id)
                 current["stages"][stage] = {"status": "succeeded"}
                 server.save_job(current)
@@ -1390,7 +1498,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
                     released["stages"]["analyze-core"] = {"status": "succeeded"}
                     server.save_job(released)
 
-            def fake_locked(job_id, stage):
+            def fake_locked(job_id, stage, continue_runner=False):
                 current = server.load_job(job_id)
                 current["stages"][stage] = {"status": "succeeded"}
                 server.save_job(current)
@@ -1535,6 +1643,69 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(started, [])
         start_run.assert_not_called()
 
+    def test_ray_frame_oom_requeues_core_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
+            loaded = server.load_job(job["job_id"])
+            loaded["resolved_mode"] = "fast"
+            loaded["stages"]["probe"] = {"status": "succeeded"}
+            loaded["stages"]["prepare"] = {"status": "succeeded"}
+            server.save_job(loaded)
+            error = subprocess.CalledProcessError(1, ["frame-worker"])
+            error.output = (
+                "RuntimeError: Ray frame driver failed on agx with code 1\n"
+                "ray.exceptions.OutOfMemoryError: Task was killed due to the node running low on memory.\n"
+                "Memory on the node was 60.81GB / 61.36GB, which exceeds the memory usage threshold of 0.99.\n"
+            )
+
+            with patch.object(server, "stage_analyze_core", side_effect=error):
+                result = server.run_stage(job["job_id"], "analyze-core")
+
+            reloaded = server.load_job(job["job_id"])
+
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(result["runner"]["status"], "queued")
+        self.assertEqual(result["runner"]["queued_for"], "core")
+        self.assertEqual(result["stages"]["analyze-core"]["status"], "queued")
+        self.assertEqual(result["stages"]["analyze-core"]["retry_reason"], server_mod.TRANSIENT_RESOURCE_REQUEUE_MESSAGE)
+        self.assertIn("Ray frame driver failed", result["stages"]["analyze-core"]["last_error"])
+        self.assertTrue(server.auto_retry_info(reloaded).get("auto_retry"))
+
+    def test_load_job_requeues_legacy_ray_frame_oom_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
+            loaded = server.load_job(job["job_id"])
+            loaded["status"] = "failed"
+            loaded["resolved_mode"] = "fast"
+            loaded["runner"] = {
+                "status": "failed",
+                "current_stage": "analyze-core",
+                "error": "analyze-core failed: Ray frame driver failed on agx with code 1",
+            }
+            loaded["stages"]["probe"] = {"status": "succeeded"}
+            loaded["stages"]["prepare"] = {"status": "succeeded"}
+            loaded["stages"]["analyze-core"] = {
+                "status": "failed",
+                "error": (
+                    "Ray frame driver failed on agx with code 1\n"
+                    "ray.exceptions.OutOfMemoryError: Task was killed due to the node running low on memory.\n"
+                    "which exceeds the memory usage threshold of 0.99.\n"
+                ),
+            }
+            server.save_job(loaded)
+
+            recovered = server.load_job(job["job_id"])
+
+        self.assertEqual(recovered["status"], "queued")
+        self.assertEqual(recovered["runner"]["status"], "queued")
+        self.assertEqual(recovered["runner"]["queued_for"], "core")
+        self.assertEqual(recovered["runner"]["error"], server_mod.TRANSIENT_RESOURCE_REQUEUE_MESSAGE)
+        self.assertEqual(recovered["stages"]["analyze-core"]["status"], "queued")
+        self.assertEqual(recovered["stages"]["analyze-core"]["retry_reason"], server_mod.TRANSIENT_RESOURCE_REQUEUE_MESSAGE)
+        self.assertIn("Ray frame driver failed", recovered["stages"]["analyze-core"]["last_error"])
+
     def test_load_job_keeps_orphaned_stage_running_when_process_is_alive(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
@@ -1604,10 +1775,8 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
             run_dir = Path(tmp) / "run"
-            export_dir = run_dir / "exports"
-            export_dir.mkdir(parents=True)
-            for name in server_mod.EXPECTED_FINAL_EXPORTS:
-                (export_dir / name).write_text("ok", encoding="utf-8")
+            run_dir.mkdir(parents=True)
+            (run_dir / "final_publish_summary.json").write_text("{}", encoding="utf-8")
             job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
             loaded = server.load_job(job["job_id"])
             loaded["run_dir"] = str(run_dir)
@@ -1678,6 +1847,22 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
         self.assertEqual(result["resolved_mode"], "long-talk-fast")
         self.assertEqual(result["stages"]["probe"]["status"], "succeeded")
+
+    def test_manual_stage_completion_queues_next_stage_without_fake_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+
+            with patch.object(server_mod, "probe_duration_seconds", return_value=600):
+                result = server.run_stage(job["job_id"], "probe")
+
+        self.assertEqual(result["stages"]["probe"]["status"], "succeeded")
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(result["current_stage"], "prepare")
+        self.assertEqual(result["runner"]["status"], "queued")
+        self.assertEqual(result["runner"]["current_stage"], "prepare")
+        self.assertEqual(result["stages"]["prepare"]["status"], "queued")
+        self.assertNotEqual(result["runner"]["status"], "running")
 
     def test_probe_auto_uses_focus_prompt_for_fast_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1767,7 +1952,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
             calls = []
 
-            def fake_run_stage(job_id, stage):
+            def fake_run_stage(job_id, stage, continue_runner=False):
                 calls.append(stage)
                 loaded = server.load_job(job_id)
                 loaded["stages"][stage] = {"status": "succeeded", "duration_seconds": 0.001}
@@ -2257,8 +2442,8 @@ class VideoLinkStatusServerTests(unittest.TestCase):
                 "[images] exists: baoyu_images/final/operation_manual_cover.png",
                 "[docs] multidoc",
                 "[docs] deep-v2",
-                "[pdf] operation_manual.md",
-                "[verify] pdf=4",
+                "[export] skipped pdf",
+                "[verify] pdf=skipped",
                 "[summary] /tmp/run/final_publish_summary.json",
                 "[send] skipped",
             ]
@@ -2323,6 +2508,9 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
         self.assertIn('id="copyLogButton"', html)
         self.assertIn('id="corePanel"', html)
+        self.assertIn("文档预览", html)
+        self.assertIn("renderDocumentPreview", html)
+        self.assertIn("Mermaid 源码", html)
         self.assertIn("?full=1", html)
         self.assertIn("copyText", html)
         self.assertIn('document.execCommand("copy")', html)

@@ -221,6 +221,14 @@ class VideoAnalyzerUI:
             except BridgeError as exc:
                 return jsonify({'error': exc.message}), int(exc.status)
 
+        @self.app.route('/api/video-link/jobs/<job_id>/resources/<path:relative_path>')
+        def video_link_resource_path(job_id, relative_path):
+            try:
+                file_path, mimetype = self.video_link.resource_file(job_id, relative_path)
+                return send_file(file_path, mimetype=mimetype, conditional=True)
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
         @self.app.route('/api/video-link/jobs/<job_id>/study-guide')
         def video_link_study_guide(job_id):
             try:
