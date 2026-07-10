@@ -326,6 +326,7 @@ def transcribe_with_vibevoice(audio_path: Path, config: Optional[Dict[str, objec
         "remote_retry_delay_seconds": config.get("remote_retry_delay_seconds"),
         "distributed_min_seconds": config.get("distributed_min_seconds", VIBEVOICE_DISTRIBUTED_MIN_SECONDS),
         "distributed_workers": config.get("distributed_workers"),
+        "speaker_upper_bound": config.get("speaker_upper_bound"),
     }
     return transcribe_with_vibevoice_remote(audio_path, remote_urls, options=options)
 
