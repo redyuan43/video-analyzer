@@ -1,7 +1,10 @@
 import importlib.util
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from video_analyzer.asr_providers import ASRStrategyResult
+from video_analyzer.audio_processor import AudioTranscript
 from video_analyzer.config import Config
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,6 +40,34 @@ class AudioTemplateAnalysisModelTests(unittest.TestCase):
             run_audio_template_analysis.recording_time_from_source('20260709113245.mp3'),
             '2026年7月9日 11:32:45',
         )
+
+    def test_auto_asr_uses_deep_strategy_when_speaker_diarization_is_enabled(self):
+        config = Config('config')
+        config.config.setdefault('asr', {})['provider'] = 'auto'
+        config.config.setdefault('asr', {})['strategy'] = 'balanced'
+        config.config.setdefault('speaker_diarization', {})['enabled'] = True
+        transcript = AudioTranscript(text='hello', segments=[], language='zh', metadata={})
+        result = ASRStrategyResult(strategy='deep', transcript=transcript)
+
+        with patch.object(run_audio_template_analysis, 'analyzer_resource_lock') as lock_factory:
+            lock_factory.return_value.__enter__.return_value = None
+            lock_factory.return_value.__exit__.return_value = None
+            with patch.object(run_audio_template_analysis, 'local_model_runtime_session') as runtime_factory:
+                runtime_factory.return_value.__enter__.return_value = None
+                runtime_factory.return_value.__exit__.return_value = None
+                with patch.object(run_audio_template_analysis, 'local_model_stage') as stage_factory:
+                    stage_factory.return_value.__enter__.return_value = None
+                    stage_factory.return_value.__exit__.return_value = None
+                    with patch.object(run_audio_template_analysis, 'transcribe_with_strategy', return_value=result) as strategy_mock:
+                        got_transcript, got_result = run_audio_template_analysis.transcribe_audio(
+                            Path('/tmp/fake.wav'),
+                            Path('/tmp/out'),
+                            config,
+                        )
+
+        self.assertIs(got_transcript, transcript)
+        self.assertIs(got_result, result)
+        self.assertEqual(strategy_mock.call_args.kwargs['strategy'], 'deep')
 
 
 if __name__ == '__main__':

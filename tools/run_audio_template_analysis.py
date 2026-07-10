@@ -29,6 +29,7 @@ from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient  # 
 from video_analyzer.config import Config, build_openai_extra_body, resolve_api_key, resolve_temperature  # noqa: E402
 from video_analyzer.local_model_runtime import local_model_runtime_session, local_model_stage  # noqa: E402
 from video_analyzer.resource_locks import analyzer_resource_lock  # noqa: E402
+from video_analyzer.speaker_diarization import refine_transcript_speakers  # noqa: E402
 
 
 DEFAULT_TEMPLATE_CATALOG = REPO_ROOT / "video-analyzer-ui" / "video_analyzer_ui" / "static" / "data" / "audio_prompt_templates.json"
@@ -74,6 +75,9 @@ def main() -> int:
     transcript, asr_result = transcribe_audio(audio_path, output_dir, config)
     if transcript is None or not transcript.text.strip():
         raise RuntimeError("Required ASR transcript was not produced for uploaded audio")
+    transcript, speaker_report = refine_audio_speakers(audio_path, transcript, output_dir, config)
+    if asr_result:
+        asr_result.transcript = transcript
     transcript_path = write_transcript_markdown(transcript, output_dir / "transcript.md")
 
     selector_client, selector_model, selector_base_url, _selector_temperature = build_template_selector_client(config)
@@ -106,6 +110,7 @@ def main() -> int:
         media_path=media_path,
         transcript=transcript,
         asr_result=asr_result,
+        speaker_report=speaker_report,
         selected_template=selected,
         classification=classification,
         summary=summary,
@@ -167,8 +172,16 @@ def transcribe_audio(audio_path: Path, output_dir: Path, config: Config) -> tupl
         with asr_lock:
             with local_model_stage("asr", config.config, logger, str(output_dir)):
                 if provider == "auto":
+                    strategy = asr_config.get("strategy", "balanced")
+                    speaker_config = config.get("speaker_diarization") or {}
+                    if (
+                        strategy == "balanced"
+                        and truthy_config_value(speaker_config.get("enabled"), default=True)
+                        and truthy_config_value(speaker_config.get("force_deep_asr"), default=True)
+                    ):
+                        strategy = "deep"
                     asr_result = transcribe_with_strategy(
-                        strategy=asr_config.get("strategy", "balanced"),
+                        strategy=strategy,
                         audio_path=audio_path,
                         language=config.get("audio", {}).get("language", ""),
                         whisper_model=config.get("audio", {}).get("whisper_model", "medium"),
@@ -201,6 +214,37 @@ def transcribe_audio(audio_path: Path, output_dir: Path, config: Config) -> tupl
             providers_run=[] if provider == "none" else [provider],
         )
     return transcript, asr_result
+
+
+def refine_audio_speakers(
+    audio_path: Path,
+    transcript: AudioTranscript,
+    output_dir: Path,
+    config: Config,
+) -> tuple[AudioTranscript, dict[str, Any]]:
+    speaker_config = config.get("speaker_diarization") or {}
+    try:
+        refined, report = refine_transcript_speakers(audio_path, transcript, speaker_config)
+    except Exception as exc:
+        logger.warning("speaker diarization refinement failed: %s", exc)
+        report = {"enabled": True, "error": str(exc)}
+        refined = transcript
+    qa_dir = output_dir / "qa"
+    qa_dir.mkdir(parents=True, exist_ok=True)
+    write_json(qa_dir / "speaker_diarization_report.json", report)
+    return refined, report
+
+
+def truthy_config_value(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "no", "off"}
+    return bool(value)
 
 
 def build_template_selector_client(config: Config) -> tuple[GenericOpenAIAPIClient, str, str, float]:
@@ -641,6 +685,7 @@ def write_analysis_json(
     media_path: Path,
     transcript: AudioTranscript,
     asr_result: ASRStrategyResult | None,
+    speaker_report: dict[str, Any],
     selected_template: dict[str, Any],
     classification: dict[str, Any],
     summary: str,
@@ -681,6 +726,7 @@ def write_analysis_json(
             "transcript_markdown": str(output_dir / "transcript.md"),
             "transcription_successful": True,
             "audio_language": transcript.language,
+            "speaker_diarization": speaker_report,
             "frames_extracted": 0,
             "frames_processed": 0,
             "timings": {"total_seconds": elapsed_seconds},
@@ -691,6 +737,7 @@ def write_analysis_json(
             "metadata": transcript.metadata,
         },
         "asr": asr_result.to_metadata() if asr_result else None,
+        "speaker_diarization": speaker_report,
         "audio_template_analysis": {
             "selected_template": selected_template,
             "classification": classification,

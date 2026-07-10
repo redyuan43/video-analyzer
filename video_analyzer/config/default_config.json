@@ -422,6 +422,16 @@
             "remote_urls": []
         }
     },
+    "speaker_diarization": {
+        "enabled": true,
+        "enable_3dspeaker": true,
+        "enable_ecapa": true,
+        "sample_seconds": 90,
+        "max_windows": 2,
+        "force_deep_asr": true,
+        "timeout_seconds": 240,
+        "merge_min_score": 0.78
+    },
     "resource_locks": {
         "enabled": true,
         "dir": "tmp/video-link-status/resource-locks",
