@@ -17,6 +17,28 @@ DEFAULT_MAX_TRANSCRIPT_TEXT_CHARS = 90_000
 DEFAULT_MAX_TRANSCRIPT_SEGMENTS_CHARS = 50_000
 DEFAULT_MAX_PAGE_CONTEXT_CHARS = 30_000
 
+KEY_VISUAL_TERMS = (
+    "workflow",
+    "flowchart",
+    "diagram",
+    "architecture",
+    "structure",
+    "framework",
+    "brainstorming",
+    "goal:",
+    "agent",
+    "流程",
+    "流程图",
+    "架构",
+    "结构",
+    "框架",
+    "工作流",
+    "技术架构",
+    "人工验证",
+    "任务完成",
+    "目标",
+)
+
 
 def _truncate_evidence_text(value: str, max_chars: int) -> str:
     if max_chars <= 0:
@@ -132,6 +154,12 @@ def build_operation_manual_prompt(
             )
         )
     frame_evidence = _truncate_evidence_text("\n\n".join(frame_notes), max_frame_evidence_chars)
+    key_visual_anchors = render_key_visual_anchors(
+        frames=frames,
+        frame_analyses=frame_analyses,
+        ocr_by_frame=ocr_by_frame,
+        frame_assets=frame_assets,
+    )
 
     transcript_text = _truncate_balanced_text(
         transcript.text if transcript else "",
@@ -156,6 +184,7 @@ Rules:
 - Use a user-facing "总-分-总" structure: first explain the video's overall structure, then present illustrated steps, then end with checks and caveats.
 - Put screenshots directly inside the relevant steps. Do not append a large screenshot gallery at the end.
 - For each major step, choose 1 to 4 representative frame images from the provided Markdown image paths. Use adjacent images when they clarify before/after or multiple UI states.
+- If key visual anchors include workflow, structure, or architecture diagrams, show those screenshots near the overview or "视频结构与流程图" section.
 - Screenshots must be real Markdown images, for example `![12s screenshot](manual_assets/frame_003.jpg)`.
 - Never write screenshot paths as plain text, code spans, or table text such as `manual_assets/frame_003.jpg`.
 - If several screenshots belong together, use a compact Markdown table with images side by side.
@@ -183,6 +212,9 @@ ASR strategy evidence:
 
 Frame evidence:
 {frame_evidence}
+
+Key visual anchors:
+{key_visual_anchors}
 
 Return Markdown with these sections:
 1. 概览
@@ -299,11 +331,11 @@ def write_frame_evidence_index(
                 "",
                 "### OCR 文本",
                 "",
-                (ocr.text if ocr and ocr.text else "_无_"),
+                render_raw_evidence_text(ocr.text if ocr else ""),
                 "",
                 "### 视觉分析",
                 "",
-                analysis.get("response", "_无_"),
+                render_raw_evidence_text(analysis.get("response", "")),
                 "",
             ]
         )
@@ -350,6 +382,9 @@ def render_text_evidence_map(frames: List[Frame], frame_analyses: List[Dict[str,
 
 def clean_evidence_cell(value: str) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = strip_generated_markdown_images(text)
+    text = re.sub(r"<img\b[^>]*>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
     if not text:
         return "_无_"
     text = text.replace("|", "\\|")
@@ -358,21 +393,127 @@ def clean_evidence_cell(value: str) -> str:
     return text[:87].rstrip() + "..."
 
 
-def embed_step_images(manual_text: str, frames: List[Frame], frame_assets: Dict[int, str]) -> str:
+def render_raw_evidence_text(value: str) -> str:
+    text = strip_generated_markdown_images(str(value or "")).strip()
+    if not text:
+        return "_无_"
+    fence = "```"
+    while fence in text:
+        fence += "`"
+    return f"{fence}\n{text}\n{fence}"
+
+
+def strip_generated_markdown_images(value: str) -> str:
+    return re.sub(r"!\[[^\]]*\]\(\s*images/[^)]+\)", " ", str(value or ""))
+
+
+def render_key_visual_anchors(
+    frames: List[Frame],
+    frame_analyses: List[Dict[str, Any]],
+    ocr_by_frame: Dict[int, OCREvent],
+    frame_assets: Dict[int, str],
+    max_count: int = 6,
+) -> str:
+    selected = select_key_visual_frames(frames, frame_analyses, ocr_by_frame, frame_assets, max_count=max_count)
+    if not selected:
+        return "_无_"
+    lines = []
+    for frame, score, reason in selected:
+        lines.append(
+            f"- Frame {frame.number} at {frame.timestamp:.2f}s, score={score:.1f}, "
+            f"path={frame_assets.get(frame.number, '')}, reason={reason}"
+        )
+    return "\n".join(lines)
+
+
+def select_key_visual_frames(
+    frames: List[Frame],
+    frame_analyses: List[Dict[str, Any]],
+    ocr_by_frame: Dict[int, OCREvent],
+    frame_assets: Dict[int, str],
+    max_count: int = 4,
+) -> List[tuple[Frame, float, str]]:
+    analyses_by_number = {
+        frame.number: frame_analyses[index] if index < len(frame_analyses) else {}
+        for index, frame in enumerate(frames)
+    }
+    candidates: List[tuple[Frame, float, str]] = []
+    for frame in frames:
+        if frame.number not in frame_assets:
+            continue
+        analysis_text = str((analyses_by_number.get(frame.number) or {}).get("response") or "")
+        ocr_text = (ocr_by_frame.get(frame.number).text if ocr_by_frame.get(frame.number) else "") or ""
+        score, reason = score_key_visual_text(f"{analysis_text}\n{ocr_text}")
+        if score >= 2.5:
+            candidates.append((frame, score, reason))
+
+    candidates.sort(key=lambda item: (-item[1], item[0].timestamp))
+    selected: List[tuple[Frame, float, str]] = []
+    for candidate in candidates:
+        frame = candidate[0]
+        if any(abs(frame.timestamp - existing[0].timestamp) < 8 for existing in selected):
+            continue
+        selected.append(candidate)
+        if len(selected) >= max_count:
+            break
+    return sorted(selected, key=lambda item: item[0].timestamp)
+
+
+def score_key_visual_text(value: str) -> tuple[float, str]:
+    text = strip_generated_markdown_images(value).lower()
+    score = 0.0
+    matched: List[str] = []
+    for term in KEY_VISUAL_TERMS:
+        if term.lower() in text:
+            score += 1.0
+            matched.append(term)
+    if "flowchart" in text or "流程图" in text:
+        score += 2.0
+    if "diagram" in text or "图" in text:
+        score += 1.0
+    if "goal:" in text and ("人工验证" in text or "任务完成" in text):
+        score += 2.0
+    if "architecture" in text or "技术架构" in text:
+        score += 1.5
+    reason = ", ".join(dict.fromkeys(matched[:6])) or "visual/ocr diagram signal"
+    return score, reason
+
+
+def _is_step_heading(line: str) -> bool:
+    match = re.match(r"^#{3,5}\s+(.+)$", line.strip())
+    if not match:
+        return False
+    title = match.group(1).strip()
+    if "图文操作步骤" in title:
+        return False
+    return bool(re.search(r"步骤\s*(?:\d+|[一二三四五六七八九十]+)", title))
+
+
+def _is_section_boundary(line: str) -> bool:
+    return bool(re.match(r"^#{2,5}\s+", line))
+
+
+def embed_step_images(
+    manual_text: str,
+    frames: List[Frame],
+    frame_assets: Dict[int, str],
+    frame_analyses: Optional[List[Dict[str, Any]]] = None,
+    ocr_events: Optional[List[OCREvent]] = None,
+) -> str:
     """Insert compact screenshot strips into step sections based on nearby timestamps."""
     if not frames or not frame_assets:
         return _render_asset_references(manual_text)
 
     lines = manual_text.splitlines()
-    step_count = sum(1 for line in lines if line.startswith("### ") and "步骤" in line)
+    step_count = sum(1 for line in lines if _is_step_heading(line))
     result = []
     i = 0
     while i < len(lines):
         line = lines[i]
-        if line.startswith("### ") and "步骤" in line:
+        if _is_step_heading(line):
             section_lines = []
             j = i + 1
-            while j < len(lines) and not lines[j].startswith("### ") and not lines[j].startswith("## "):
+            while j < len(lines) and not _is_section_boundary(lines[j]):
                 section_lines.append(lines[j])
                 j += 1
             result.extend(_remap_step_section_images([line, *section_lines], frames, frame_assets, step_count))
@@ -380,7 +521,16 @@ def embed_step_images(manual_text: str, frames: List[Frame], frame_assets: Dict[
             continue
         result.append(line)
         i += 1
-    return _render_asset_references("\n".join(result)).rstrip() + "\n"
+    rendered = _render_asset_references("\n".join(result))
+    rendered = _remove_broad_step_heading_image_strips(rendered)
+    rendered = _insert_key_visual_overview_images(
+        rendered,
+        frames,
+        frame_assets,
+        frame_analyses or [],
+        ocr_events or [],
+    )
+    return rendered.rstrip() + "\n"
 
 
 def review_operation_manual_markdown(manual_text: str) -> List[Dict[str, str]]:
@@ -447,8 +597,64 @@ def review_operation_manual_markdown(manual_text: str) -> List[Dict[str, str]]:
     return issues
 
 
+def _insert_key_visual_overview_images(
+    manual_text: str,
+    frames: List[Frame],
+    frame_assets: Dict[int, str],
+    frame_analyses: List[Dict[str, Any]],
+    ocr_events: List[OCREvent],
+) -> str:
+    ocr_by_frame = {event.frame_number: event for event in ocr_events}
+    selected = select_key_visual_frames(frames, frame_analyses, ocr_by_frame, frame_assets, max_count=4)
+    selected_frames = [frame for frame, _score, _reason in selected if frame_assets.get(frame.number) not in manual_text]
+    if not selected_frames:
+        return manual_text
+
+    strip = _build_step_image_strip_from_frames(selected_frames, frame_assets)
+    if not strip:
+        return manual_text
+    block = "\n".join(["", "**关键画面：**", "", *strip, ""])
+
+    lines = manual_text.splitlines()
+    for index, line in enumerate(lines):
+        if re.match(r"^#{2,4}\s+.*(?:视频结构|流程图|整体流程)", line):
+            return "\n".join(lines[: index + 1] + block.splitlines() + lines[index + 1 :])
+    for index, line in enumerate(lines):
+        if re.match(r"^#{2,4}\s+.*概览", line):
+            return "\n".join(lines[: index + 1] + block.splitlines() + lines[index + 1 :])
+    for index, line in enumerate(lines):
+        if re.match(r"^#{2,4}\s+", line):
+            return "\n".join(lines[: index + 1] + block.splitlines() + lines[index + 1 :])
+    return manual_text.rstrip() + block
+
+
 def _has_rendered_asset_image(text: str) -> bool:
     return bool(re.search(r"(^|[^`])!\[[^\]]*\]\(manual_assets/[^)]+\)", text))
+
+
+def _remove_broad_step_heading_image_strips(manual_text: str) -> str:
+    lines = manual_text.splitlines()
+    output: List[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        output.append(line)
+        index += 1
+        if not re.match(r"^#{2,4}\s+.*图文操作步骤", line):
+            continue
+
+        while index < len(lines) and lines[index] == "":
+            output.append(lines[index])
+            index += 1
+
+        if index < len(lines) and lines[index].startswith("|"):
+            table_start = index
+            while index < len(lines) and lines[index].startswith("|"):
+                index += 1
+            table = lines[table_start:index]
+            if "manual_assets/" not in "\n".join(table):
+                output.extend(table)
+    return "\n".join(output)
 
 
 def _remap_step_section_images(
@@ -500,6 +706,9 @@ def _remove_step_image_blocks(lines: List[str]) -> List[str]:
                     cleaned.extend(cleaned_table)
                 i = j
                 continue
+            if _is_empty_placeholder_table(table_lines):
+                i = j
+                continue
         if "manual_assets/" in line:
             i += 1
             continue
@@ -529,6 +738,16 @@ def _clean_asset_images_from_table(lines: List[str]) -> List[str]:
     if not meaningful:
         return []
     return cleaned
+
+
+def _is_empty_placeholder_table(lines: List[str]) -> bool:
+    if len(lines) < 2:
+        return False
+    body = "\n".join(lines[2:] if re.search(r":?-{3,}:?", lines[1]) else lines)
+    if "manual_assets/" in body:
+        return False
+    without_pipes = re.sub(r"[|\s:：\-—>→=]", "", body)
+    return without_pipes == ""
 
 
 def _clean_asset_images_from_line(line: str) -> str:

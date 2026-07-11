@@ -582,6 +582,7 @@ function appendCommonJobFields(formData) {
 async function createUploadJob() {
     const file = nodes.mediaFile?.files?.[0];
     if (!file) throw new Error('请选择一个媒体文件');
+    if (file.size <= 0) throw new Error('所选媒体文件为空，请重新选择原始文件');
     const formData = new FormData();
     formData.append('media', file);
     appendCommonJobFields(formData);
@@ -1967,11 +1968,59 @@ function docPreviewUrl(job, doc) {
     return doc.url || resourcePathUrl(job.job_id, doc.path);
 }
 
+let mermaidRenderSequence = 0;
+
+function initializeMermaid() {
+    if (!window.mermaid) return false;
+    if (!window.mermaid.__videoAnalyzerInitialized) {
+        window.mermaid.initialize({
+            startOnLoad: false,
+            securityLevel: 'antiscript',
+            theme: 'default',
+            flowchart: {
+                htmlLabels: true,
+                curve: 'basis',
+                useMaxWidth: true
+            }
+        });
+        window.mermaid.__videoAnalyzerInitialized = true;
+    }
+    return true;
+}
+
+async function renderMermaidDiagram(container, diagram) {
+    const target = container?.querySelector('[data-mermaid-diagram]');
+    if (!target) return;
+    const source = String(diagram || '').trim();
+    if (!source) {
+        target.innerHTML = '<div class="mindmap-empty">暂无 Mermaid 图定义。</div>';
+        return;
+    }
+    const fallbackHtml = renderSimpleMermaidFlowchart(source);
+    if (!initializeMermaid()) {
+        target.innerHTML = fallbackHtml || '<div class="mindmap-empty">Mermaid 渲染器未加载，请刷新页面。</div>';
+        return;
+    }
+    target.classList.add('loading');
+    target.textContent = 'Mermaid 渲染中...';
+    try {
+        const id = `video-doc-mermaid-${Date.now()}-${mermaidRenderSequence}`;
+        mermaidRenderSequence += 1;
+        const result = await window.mermaid.render(id, source);
+        target.classList.remove('loading');
+        target.innerHTML = result?.svg || '<div class="mindmap-empty">Mermaid 未返回可显示图形。</div>';
+    } catch (error) {
+        console.warn('Mermaid render failed', error);
+        target.classList.remove('loading');
+        const message = error?.message || String(error || '未知错误');
+        target.innerHTML = `${fallbackHtml || ''}<div class="mindmap-empty">Mermaid 渲染失败：${escapeHtml(message)}</div>`;
+    }
+}
+
 function renderDocMindmap(derivation) {
     const nodes = derivation?.nodes || [];
     const edges = derivation?.edges || [];
     const mermaid = derivation?.mermaid || 'flowchart LR';
-    const mermaidPreview = renderSimpleMermaidFlowchart(mermaid);
     const tiers = [...new Set(nodes.map(node => Number(node.tier || 0)))].sort((left, right) => left - right);
     const tierHtml = tiers.map(tier => {
         const tierNodes = nodes.filter(node => Number(node.tier || 0) === tier);
@@ -1987,7 +2036,7 @@ function renderDocMindmap(derivation) {
         <h2>文档推导脑图</h2>
         <p>重点文档来自前面的转写、抽帧、OCR/VL 与证据审计；过程文件默认折叠，只在排查或追溯时打开。</p>
         <h3>Mermaid 预览</h3>
-        <div class="mindmap-mermaid">${mermaidPreview || '<div class="mindmap-empty">当前 Mermaid 图超出内置预览能力，请查看源码。</div>'}</div>
+        <div class="mindmap-mermaid" data-mermaid-diagram></div>
         <h3>生成层级</h3>
         <div class="mindmap-canvas">${tierHtml}</div>
         <h3>递进关系</h3>
@@ -2046,13 +2095,13 @@ function updateLearningDocsLayout() {
     if (docListNeedsHandle) columns.push('14px');
 
     if (studyVisible) columns.push('minmax(280px, var(--study-pane-width, 1fr))');
-    const studyNeedsHandle = studyVisible && (playerVisible || contentVisible);
+    const studyNeedsHandle = studyVisible && studyCanResizeWidth(docListVisible, playerVisible, contentVisible);
     nodes.studyResizer?.classList.toggle('active', studyNeedsHandle);
     if (nodes.studyResizer) nodes.studyResizer.hidden = !studyNeedsHandle;
     if (studyNeedsHandle) columns.push('14px');
 
     if (playerVisible) columns.push('minmax(320px, var(--source-player-pane-width, 560px))');
-    const sourcePlayerNeedsHandle = playerVisible && (docListVisible || studyVisible || contentVisible);
+    const sourcePlayerNeedsHandle = playerVisible && contentVisible;
     nodes.sourcePlayerResizer?.classList.toggle('active', sourcePlayerNeedsHandle);
     if (nodes.sourcePlayerResizer) nodes.sourcePlayerResizer.hidden = !sourcePlayerNeedsHandle;
     if (sourcePlayerNeedsHandle) columns.push('14px');
@@ -2201,6 +2250,7 @@ async function loadDocPreview(job, path) {
         nodes.docOpenLink.removeAttribute('href');
         nodes.docPreviewBody.className = 'doc-preview-body mindmap';
         nodes.docPreviewBody.innerHTML = renderDocMindmap(job.document_preview?.derivation || {});
+        await renderMermaidDiagram(nodes.docPreviewBody, job.document_preview?.derivation?.mermaid || 'flowchart LR');
         loadedDocPreviewKey = previewKey;
         return;
     }
@@ -3092,15 +3142,29 @@ function sourcePlayerVisible() {
     return Boolean(nodes.sourcePlayerPanel && !nodes.sourcePlayerPanel.hidden);
 }
 
+function studyCanResizeWidth(
+    docListVisible = learningPanelVisibility.docList,
+    playerVisible = sourcePlayerVisible(),
+    contentVisible = hasDocContent()
+) {
+    return Boolean(docListVisible || playerVisible || contentVisible);
+}
+
+function studyRightReserve() {
+    const sourceReserve = sourcePlayerVisible() ? 14 + (paneWidth('source-player') || 560) : 0;
+    const contentReserve = hasDocContent() ? 14 + 320 : 0;
+    const rightPanelReserve = sourceReserve + contentReserve;
+    if (rightPanelReserve) return rightPanelReserve;
+    return nodes.studyResizer && !nodes.studyResizer.hidden ? 14 : 0;
+}
+
 function resizeStudyPane(clientX) {
     const docs = nodes.vscodeDocs;
     if (!docs || !learningPanelVisibility.study) return;
     const rect = docs.getBoundingClientRect();
     const docListOffset = learningPanelVisibility.docList ? (paneWidth('doc-list') || 300) + 14 : 0;
-    const sourceReserve = sourcePlayerVisible() ? 14 + (paneWidth('source-player') || 560) : 0;
-    const contentReserve = hasDocContent() ? 14 + 320 : 0;
     const leftEdge = rect.left + docListOffset;
-    const max = Math.max(280, rect.right - leftEdge - sourceReserve - contentReserve);
+    const max = Math.max(280, rect.right - leftEdge - studyRightReserve());
     applyPaneWidth('study', clamp(clientX - leftEdge, 280, max));
 }
 
@@ -3168,9 +3232,7 @@ function adjustPaneWidth(pane, delta) {
         return;
     }
     const docListReserve = learningPanelVisibility.docList ? (paneWidth('doc-list') || 300) + 14 : 0;
-    const sourceReserve = sourcePlayerVisible() ? 14 + (paneWidth('source-player') || 560) : 0;
-    const contentReserve = hasDocContent() ? 14 + 320 : 0;
-    const max = Math.max(280, rect.width - docListReserve - sourceReserve - contentReserve);
+    const max = Math.max(280, rect.width - docListReserve - studyRightReserve());
     applyPaneWidth('study', clamp(paneWidth('study') + delta, 280, max));
 }
 

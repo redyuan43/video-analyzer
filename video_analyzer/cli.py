@@ -13,6 +13,7 @@ from .artifacts import write_json, write_orin_artifacts, write_transcript_markdo
 from .candidate_frame_strategies import parse_candidate_frame_strategy
 from .config import Config, build_openai_extra_body, get_client, get_model, resolve_api_key, resolve_temperature
 from .frame import VideoProcessor
+from .frame_dedup_audit import write_frame_dedup_audit
 from .frame_selection import (
     AUTO,
     FrameDecision,
@@ -50,6 +51,7 @@ from .ocr_keyframes import (
 )
 from .local_model_runtime import local_model_runtime_session, local_model_stage
 from .resource_locks import analyzer_resource_lock
+from .review_artifacts import write_run_manifest, write_visual_review
 
 # Initialize logger at module level
 logger = logging.getLogger(__name__)
@@ -609,6 +611,12 @@ def main():
         timings = {}
         frame_selection_metadata = {}
         frame_extraction_metadata = {}
+        frame_dedup_audit_metadata = {}
+        frame_dedup_audit_path = None
+        visual_review_metadata = {}
+        visual_review_path = None
+        run_manifest_metadata = {}
+        run_manifest_path = None
         ocr_keyframe_metadata = {}
         ocr_text_events = []
         ocr_metadata = {}
@@ -845,6 +853,7 @@ def main():
                             frames_per_minute=max(1, int(round(ocr_scan_sample_fps * 60))),
                             duration=config.get("duration"),
                             max_frames=candidate_budget,
+                            transcript=transcript,
                         )
                     frames = extraction.frames
                     frame_extraction_metadata = extraction.metadata
@@ -854,6 +863,7 @@ def main():
                         frames_per_minute=max(1, int(round(ocr_scan_sample_fps * 60))),
                         duration=config.get("duration"),
                         max_frames=candidate_budget,
+                        transcript=transcript,
                     )
                     frames = extraction.frames
                     frame_extraction_metadata = extraction.metadata
@@ -894,6 +904,12 @@ def main():
                     artifacts={"frame_manifest": str(frame_manifest_path)},
                 )
             timings["candidate_frame_extraction_seconds"] = round(time.perf_counter() - stage_started, 3)
+            frame_dedup_audit_path, frame_dedup_audit = write_frame_dedup_audit(frames, output_dir)
+            frame_dedup_audit_metadata = {
+                key: value
+                for key, value in frame_dedup_audit.items()
+                if key != "records"
+            }
 
             if task == "operation_manual":
                 current_progress_step = "ocr"
@@ -1078,6 +1094,8 @@ def main():
                     operation_manual.get("response", ""),
                     frames,
                     frame_assets,
+                    frame_analyses=frame_analyses,
+                    ocr_events=ocr_events,
                 )
                 operation_manual["response"] = append_evidence_boundary_section(
                     operation_manual.get("response", ""),
@@ -1145,6 +1163,9 @@ def main():
                 "vl_frames_processed": len(selected_frame_numbers) if task == "operation_manual" else len(frame_analyses),
                 "frame_selection": frame_selection_metadata,
                 "frame_extraction": frame_extraction_metadata,
+                "frame_dedup_audit": frame_dedup_audit_metadata,
+                "visual_review": visual_review_metadata,
+                "run_manifest": run_manifest_metadata,
                 "vl_context": {
                     "before": max(args.vl_context_before, 0),
                     "after": max(args.vl_context_after, 0),
@@ -1174,6 +1195,24 @@ def main():
             "video_description": video_description,
             "operation_manual": operation_manual
         }
+
+        visual_review_path, visual_review_metadata = write_visual_review(
+            output_dir=output_dir,
+            video_path=video_path if has_video_stream else None,
+            frames=frames,
+            transcript=transcript,
+            ocr_events=ocr_events,
+            frame_analyses=frame_analyses,
+            metadata=results["metadata"],
+        )
+        results["metadata"]["visual_review"] = visual_review_metadata
+        run_manifest_path, run_manifest_metadata = write_run_manifest(
+            output_dir=output_dir,
+            results=results,
+            visual_review_path=visual_review_path,
+            dedup_audit_path=frame_dedup_audit_path,
+        )
+        results["metadata"]["run_manifest"] = run_manifest_metadata
         
         with open(output_dir / "analysis.json", "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)

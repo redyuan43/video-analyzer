@@ -97,8 +97,11 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn("vendor/katex/katex.min.css", html)
         self.assertIn("vendor/katex/katex.min.js", html)
         self.assertIn("vendor/katex/contrib/auto-render.min.js", html)
+        self.assertIn("vendor/mermaid/mermaid.min.js", html)
         main_js = (UI_ROOT / "video_analyzer_ui" / "static" / "js" / "main.js").read_text(encoding="utf-8")
         styles_css = (UI_ROOT / "video_analyzer_ui" / "static" / "css" / "styles.css").read_text(encoding="utf-8")
+        self.assertTrue((UI_ROOT / "video_analyzer_ui" / "static" / "vendor" / "mermaid" / "mermaid.min.js").is_file())
+        self.assertTrue((UI_ROOT / "video_analyzer_ui" / "static" / "vendor" / "mermaid" / "LICENSE").is_file())
         self.assertIn("study-workflow", main_js)
         self.assertIn("study-detail-shell", main_js)
         self.assertIn("representative_frame", main_js)
@@ -223,6 +226,22 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertEqual(result["source_type"], "upload")
         self.assertEqual(result["source_name"], "sample.mp3")
         self.assertEqual(list_response.get_json()["total"], 1)
+
+    def test_video_link_api_upload_media_rejects_empty_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp) / "jobs", video_link_auto_resume=False)
+            ui.video_link.repo_root = Path(tmp) / "repo"
+            ui.video_link.repo_root.mkdir()
+            client = ui.app.test_client()
+
+            response = client.post(
+                "/api/video-link/jobs/upload",
+                data={"media": (io.BytesIO(b""), "empty.mp3")},
+                content_type="multipart/form-data",
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["error"], "uploaded media file is empty")
 
     def test_video_link_api_open_run_dir(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -450,6 +469,11 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn("markdownit", js)
         self.assertIn("DOMPurify", js)
         self.assertIn("renderMathInElement", js)
+        self.assertIn("studyCanResizeWidth", js)
+        self.assertIn("studyRightReserve", js)
+        self.assertIn("return Boolean(docListVisible || playerVisible || contentVisible)", js)
+        self.assertIn("return nodes.studyResizer && !nodes.studyResizer.hidden ? 14 : 0", js)
+        self.assertIn("const sourcePlayerNeedsHandle = playerVisible && contentVisible", js)
         self.assertIn("normalizeMarkdownForPreview", js)
         self.assertIn("splitInlineMarkdownTableLine", js)
         self.assertIn("isPotentialMarkdownTableRow", js)
@@ -457,6 +481,10 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn("document_preview", js)
         self.assertIn("文档推导脑图", js)
         self.assertIn("Mermaid 预览", js)
+        self.assertIn("initializeMermaid", js)
+        self.assertIn("window.mermaid.render", js)
+        self.assertIn("data-mermaid-diagram", js)
+        self.assertIn("securityLevel: 'antiscript'", js)
         self.assertIn("重点阅读", js)
         self.assertIn("证据审计", js)
         self.assertIn("过程文件", js)
@@ -464,6 +492,7 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn(".doc-preview-body", css)
         self.assertIn(".mindmap-preview", css)
         self.assertIn(".mindmap-mermaid", css)
+        self.assertIn(".mindmap-mermaid svg", css)
         self.assertIn(".doc-group", css)
         self.assertIn("td img.markdown-image", css)
         self.assertIn(".doc-list", css)
@@ -493,7 +522,7 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertNotIn("bindSourcePlayerSurfacePause", js)
         self.assertIn("url.searchParams.set('t', String(value))", js)
         self.assertIn("nodes.sourcePlayerPanel && learningPanelVisibility.sourcePlayer", js)
-        self.assertIn("playerVisible && (docListVisible || studyVisible || contentVisible)", js)
+        self.assertIn("playerVisible && contentVisible", js)
         self.assertIn("qaSourceHeight", js)
         self.assertIn("--qa-source-pane-width", css)
         self.assertIn("--qa-source-player-height", css)

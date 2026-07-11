@@ -10,7 +10,7 @@ A lightweight web interface for the video-analyzer tool.
 - Session management and cleanup
 
 ## Prerequisites
-- Python 3.8 or higher
+- Python 3.11 or higher
 - video-analyzer package installed
 - FFmpeg (required by video-analyzer)
 

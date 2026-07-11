@@ -330,13 +330,20 @@ ORPHANED_PROCESS_REQUEUE_MESSAGE = (
     "server stopped while this stage was running; process is gone and artifacts are incomplete; queued for retry"
 )
 TRANSIENT_RESOURCE_REQUEUE_MESSAGE = "remote/system resource is temporarily busy; queued for retry"
-AUTO_RETRY_REASONS = {ORPHANED_PROCESS_REQUEUE_MESSAGE, TRANSIENT_RESOURCE_REQUEUE_MESSAGE}
+YOUTUBE_FORMAT_REQUEUE_MESSAGE = "YouTube returned no downloadable formats; queued for one automatic retry"
+AUTO_RETRY_REASONS = {
+    ORPHANED_PROCESS_REQUEUE_MESSAGE,
+    TRANSIENT_RESOURCE_REQUEUE_MESSAGE,
+    YOUTUBE_FORMAT_REQUEUE_MESSAGE,
+}
 TRANSIENT_RESOURCE_BUSY_PATTERNS = (
     "ray.exceptions.OutOfMemoryError",
     "Task was killed due to the node running low on memory",
     "exceeds the memory usage threshold",
     "Ray killed this worker",
 )
+YOUTUBE_FORMAT_UNAVAILABLE_PATTERN = "Requested format is not available"
+MAX_YOUTUBE_FORMAT_RETRIES = 1
 RESOURCE_WAIT_SECONDS = 5.0
 AUTO_RETRY_DELAY_SECONDS = float(os.environ.get("VIDEO_LINK_AUTO_RETRY_DELAY_SECONDS", "60"))
 AUTO_RETRY_POLL_SECONDS = float(os.environ.get("VIDEO_LINK_AUTO_RETRY_POLL_SECONDS", "5"))
@@ -506,6 +513,8 @@ class VideoLinkStatusServer:
             raise BridgeError(HTTPStatus.BAD_REQUEST, f"media file must be one of {sorted(MEDIA_EXTENSIONS)}")
         if not media_path.is_file():
             raise BridgeError(HTTPStatus.BAD_REQUEST, "media file is not available")
+        if media_path.stat().st_size <= 0:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "uploaded media file is empty")
 
         create_payload = dict(payload)
         create_payload["auto_start"] = False
@@ -1227,20 +1236,28 @@ class VideoLinkStatusServer:
     def _run_stage_locked(self, job_id: str, stage: str, continue_runner: bool = False) -> dict[str, Any]:
         stage = normalize_stage_name(stage)
         job = self.load_job(job_id)
-        current_status = job.get("stages", {}).get(stage, {}).get("status")
+        previous_stage_info = dict(job.get("stages", {}).get(stage, {}) or {})
+        current_status = previous_stage_info.get("status")
         if current_status in {"succeeded", "skipped"}:
             return self.public_job(job)
 
         start = time.time()
+        attempt = max(1, int(previous_stage_info.get("attempt") or 0) + 1)
+        log_path, attempt_log_paths = self.prepare_stage_log_attempt(job_id, stage, previous_stage_info, attempt)
         stage_info = {
             "status": "running",
             "started_at": iso_now(),
             "finished_at": None,
             "exit_code": None,
-            "log_path": str(self.stage_log_path(job_id, stage)),
+            "attempt": attempt,
+            "attempt_log_paths": attempt_log_paths,
+            "log_path": str(log_path),
             "artifacts": {},
             "queued_for": stage_resource(stage),
         }
+        for key in ("auto_retry_attempts", "first_error"):
+            if previous_stage_info.get(key):
+                stage_info[key] = previous_stage_info[key]
         job["status"] = "running"
         job["updated_at"] = iso_now()
         job["stages"][stage] = stage_info
@@ -1280,7 +1297,7 @@ class VideoLinkStatusServer:
             stage_info["finished_at"] = iso_now()
             job["status"] = "succeeded" if self.next_stage(job) is None else "running"
         except Exception as exc:
-            retry_reason = self.retryable_stage_failure_reason(stage, exc, stage_info["log_path"])
+            retry_reason = self.retryable_stage_failure_reason(job, stage, exc, stage_info["log_path"], previous_stage_info)
             stage_info["status"] = "queued" if retry_reason else "failed"
             stage_info["exit_code"] = getattr(exc, "returncode", 1)
             stage_info["duration_seconds"] = round(time.time() - start, 3)
@@ -1291,6 +1308,9 @@ class VideoLinkStatusServer:
                 stage_info["queued_for"] = stage_resource(stage)
                 stage_info["retry_reason"] = retry_reason
                 stage_info["last_error"] = self.exception_text(exc) or str(exc)
+                if retry_reason == YOUTUBE_FORMAT_REQUEUE_MESSAGE:
+                    stage_info["auto_retry_attempts"] = int(previous_stage_info.get("auto_retry_attempts") or 0) + 1
+                    stage_info["first_error"] = previous_stage_info.get("first_error") or stage_info["last_error"]
                 stage_info.pop("error", None)
                 job["status"] = "queued"
             elif self.stage_can_soft_fail(job, stage):
@@ -1312,7 +1332,14 @@ class VideoLinkStatusServer:
             raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, f"{stage} failed: {stage_info.get('error')}")
         return self.public_job(job)
 
-    def retryable_stage_failure_reason(self, stage: str, exc: Exception, log_path: str) -> str | None:
+    def retryable_stage_failure_reason(
+        self,
+        job: dict[str, Any],
+        stage: str,
+        exc: Exception,
+        log_path: str,
+        previous_stage_info: dict[str, Any] | None = None,
+    ) -> str | None:
         if normalize_stage_name(stage) != "analyze-core":
             return None
         text = self.exception_text(exc)
@@ -1322,7 +1349,12 @@ class VideoLinkStatusServer:
                 text += "\n" + Path(log_path).read_text(encoding="utf-8", errors="replace")
             except Exception:
                 pass
-        return self.retryable_stage_failure_text(stage, text)
+        retry_reason = self.retryable_stage_failure_text(stage, text)
+        if retry_reason:
+            return retry_reason
+        if not self.youtube_format_retry_allowed(job, previous_stage_info or {}, text):
+            return None
+        return YOUTUBE_FORMAT_REQUEUE_MESSAGE
 
     def retryable_stage_failure_text(self, stage: str, text: str) -> str | None:
         if "Ray frame driver failed" not in text and "run_frame_worker" not in text and "Jetson" not in text:
@@ -1330,6 +1362,22 @@ class VideoLinkStatusServer:
         if any(pattern in text for pattern in TRANSIENT_RESOURCE_BUSY_PATTERNS):
             return TRANSIENT_RESOURCE_REQUEUE_MESSAGE
         return None
+
+    def youtube_format_retry_allowed(self, job: dict[str, Any], previous_stage_info: dict[str, Any], text: str) -> bool:
+        if not is_youtube_url(str(job.get("video_url") or "")):
+            return False
+        if YOUTUBE_FORMAT_UNAVAILABLE_PATTERN not in text or "[youtube]" not in text.lower():
+            return False
+        if int(previous_stage_info.get("auto_retry_attempts") or 0) >= MAX_YOUTUBE_FORMAT_RETRIES:
+            return False
+        return not self.core_artifacts_exist(job)
+
+    def core_artifacts_exist(self, job: dict[str, Any]) -> bool:
+        run_dir_value = str(job.get("run_dir") or "")
+        if not run_dir_value:
+            return False
+        run_dir = Path(run_dir_value)
+        return any((run_dir / name).is_file() for name in ("analysis.json", "operation_manual.md", "manual_evidence.md"))
 
     def exception_text(self, exc: Exception) -> str:
         text = str(exc)
@@ -3309,14 +3357,23 @@ class VideoLinkStatusServer:
         if stage not in self.stage_order_for_job(job):
             raise BridgeError(HTTPStatus.NOT_FOUND, f"unknown stage: {stage}")
         limit = max(1, min(limit, 500))
-        log_path = self.stage_log_path(job_id, stage)
+        stage_info = (job.get("stages") or {}).get(stage) or {}
+        log_path = Path(str(stage_info.get("log_path") or self.stage_log_path(job_id, stage)))
         if not log_path.exists():
-            return {"job_id": job_id, "stage": stage, "log_path": str(log_path), "lines": [], "text": ""}
+            return {
+                "job_id": job_id,
+                "stage": stage,
+                "log_path": str(log_path),
+                "attempt_log_paths": list(stage_info.get("attempt_log_paths") or []),
+                "lines": [],
+                "text": "",
+            }
         text = log_path.read_text(encoding="utf-8", errors="replace")
         return {
             "job_id": job_id,
             "stage": stage,
             "log_path": str(log_path),
+            "attempt_log_paths": list(stage_info.get("attempt_log_paths") or []),
             "lines": text.splitlines() if full else tail_lines(text, limit),
             "text": text if full else "",
             "full": full,
@@ -3508,6 +3565,31 @@ class VideoLinkStatusServer:
     def stage_log_path(self, job_id: str, stage: str) -> Path:
         return self.job_dir(job_id) / "logs" / f"{stage}.log"
 
+    def stage_attempt_log_path(self, job_id: str, stage: str, attempt: int) -> Path:
+        return self.job_dir(job_id) / "logs" / f"{stage}.attempt-{attempt}.log"
+
+    def prepare_stage_log_attempt(
+        self,
+        job_id: str,
+        stage: str,
+        previous_stage_info: dict[str, Any],
+        attempt: int,
+    ) -> tuple[Path, list[str]]:
+        log_path = self.stage_log_path(job_id, stage)
+        attempt_log_paths = list(previous_stage_info.get("attempt_log_paths") or [])
+        previous_attempt = int(previous_stage_info.get("attempt") or 0)
+        previous_log_path = Path(str(previous_stage_info.get("log_path") or log_path))
+        if attempt > 1 and previous_attempt and previous_log_path == log_path and log_path.is_file():
+            archived_path = self.stage_attempt_log_path(job_id, stage, previous_attempt)
+            archived_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.replace(archived_path)
+            attempt_log_paths = [str(archived_path) if path == str(log_path) else path for path in attempt_log_paths]
+            if str(archived_path) not in attempt_log_paths:
+                attempt_log_paths.append(str(archived_path))
+        if str(log_path) not in attempt_log_paths:
+            attempt_log_paths.append(str(log_path))
+        return log_path, attempt_log_paths
+
 
 def sanitize_run_name(value: str) -> str:
     name = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip(".-")
@@ -3518,6 +3600,11 @@ def clean_display_title(value: Any) -> str:
     title = re.sub(r"\s+", " ", str(value or "")).strip()
     title = re.sub(r"^Page Context Evidence:\s*", "", title, flags=re.IGNORECASE).strip()
     return title[:180]
+
+
+def is_youtube_url(url: str) -> bool:
+    hostname = (urlparse(url).hostname or "").lower()
+    return hostname == "youtu.be" or hostname.endswith(".youtube.com")
 
 
 def artifact_value(job: dict[str, Any], name: str) -> str:

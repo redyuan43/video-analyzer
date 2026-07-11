@@ -1,0 +1,8 @@
+[Unit]
+Description=Update the video-analyzer yt-dlp runtime
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/github/video-analyzer
+EnvironmentFile=-%h/.config/video-analyzer/ytdlp-maintenance.env
+ExecStart=%h/github/video-analyzer/tools/ytdlp_runtime_maintenance.sh update

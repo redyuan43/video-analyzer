@@ -69,6 +69,116 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertIn("--extractor-args", command)
         self.assertIn("youtube:player_client=mweb,web", command)
 
+    def test_url_runner_uses_automatic_youtube_client_unless_explicitly_overridden(self):
+        script = REPO_ROOT / "tools" / "run_operation_manual_from_url.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                **os.environ,
+                "PYTHON": "/bin/echo",
+                "VIDEO_ANALYZER_YTDLP_RUNTIME_LOCK": str(Path(tmp) / "yt-dlp.lock"),
+            }
+            automatic = subprocess.run(
+                [str(script), "https://www.youtube.com/watch?v=b7IMBHMjNv8"],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                env=env,
+                check=True,
+            )
+            explicit = subprocess.run(
+                [
+                    str(script),
+                    "https://www.youtube.com/watch?v=b7IMBHMjNv8",
+                    "--ytdlp-extractor-args",
+                    "youtube:player_client=mweb,web",
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                env=env,
+                check=True,
+            )
+
+        self.assertNotIn("--ytdlp-extractor-args", automatic.stdout)
+        self.assertIn("--ytdlp-extractor-args youtube:player_client=mweb,web", explicit.stdout)
+
+    def test_youtube_format_error_retries_once_without_core_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            error = subprocess.CalledProcessError(
+                1,
+                ["yt-dlp"],
+                output="ERROR: [youtube] b7IMBHMjNv8: Requested format is not available",
+            )
+            job = {"video_url": "https://www.youtube.com/watch?v=b7IMBHMjNv8", "run_dir": None}
+
+            first_reason = server.retryable_stage_failure_reason(job, "analyze-core", error, str(Path(tmp) / "missing.log"), {})
+            second_reason = server.retryable_stage_failure_reason(
+                job,
+                "analyze-core",
+                error,
+                str(Path(tmp) / "missing.log"),
+                {"auto_retry_attempts": 1},
+            )
+
+        self.assertEqual(first_reason, server_mod.YOUTUBE_FORMAT_REQUEUE_MESSAGE)
+        self.assertIsNone(second_reason)
+
+    def test_youtube_format_error_does_not_retry_after_core_artifacts_exist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            (run_dir / "analysis.json").write_text("{}", encoding="utf-8")
+            error = subprocess.CalledProcessError(
+                1,
+                ["yt-dlp"],
+                output="ERROR: [youtube] b7IMBHMjNv8: Requested format is not available",
+            )
+            job = {"video_url": "https://www.youtube.com/watch?v=b7IMBHMjNv8", "run_dir": str(run_dir)}
+
+            reason = server.retryable_stage_failure_reason(job, "analyze-core", error, str(Path(tmp) / "missing.log"), {})
+
+        self.assertIsNone(reason)
+
+    def test_stage_retry_archives_the_first_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job_id = "a" * 32
+            log_path = server.stage_log_path(job_id, "analyze-core")
+            log_path.parent.mkdir(parents=True)
+            log_path.write_text("first attempt\n", encoding="utf-8")
+
+            current_path, attempt_paths = server.prepare_stage_log_attempt(
+                job_id,
+                "analyze-core",
+                {"attempt": 1, "log_path": str(log_path), "attempt_log_paths": [str(log_path)]},
+                2,
+            )
+
+            archived_path = server.stage_attempt_log_path(job_id, "analyze-core", 1)
+            self.assertEqual(current_path, log_path)
+            self.assertEqual(archived_path.read_text(encoding="utf-8"), "first attempt\n")
+            self.assertFalse(log_path.exists())
+            self.assertEqual(attempt_paths, [str(archived_path), str(log_path)])
+
+    def test_ytdlp_maintenance_script_has_valid_shell_syntax(self):
+        result = subprocess.run(
+            ["bash", "-n", str(REPO_ROOT / "tools" / "ytdlp_runtime_maintenance.sh")],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_package_metadata_requires_python_311(self):
+        setup_text = (REPO_ROOT / "setup.py").read_text(encoding="utf-8")
+        ui_project_text = (REPO_ROOT / "video-analyzer-ui" / "pyproject.toml").read_text(encoding="utf-8")
+
+        self.assertIn('python_requires=">=3.11"', setup_text)
+        self.assertIn('requires-python = ">=3.11"', ui_project_text)
+
     def test_remote_download_command_uses_mi_safe_ytdlp_shape(self):
         args = type(
             "Args",
@@ -493,6 +603,17 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             self.assertEqual(loaded["options"]["template_title_zh"], "默认总结")
             self.assertTrue(Path(loaded["media_path"]).is_file())
             self.assertIn("本地上传媒体文件", Path(loaded["page_context_path"]).read_text(encoding="utf-8"))
+
+    def test_create_uploaded_media_job_rejects_empty_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            source = Path(tmp) / "empty.mp3"
+            source.touch()
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", repo_root)
+
+            with self.assertRaisesRegex(server_mod.BridgeError, "uploaded media file is empty"):
+                server.create_uploaded_media_job({"analysis_mode": "auto"}, source, "empty.mp3")
 
     def test_uploaded_media_probe_uses_ffprobe_and_avoids_ytdlp(self):
         with tempfile.TemporaryDirectory() as tmp:
