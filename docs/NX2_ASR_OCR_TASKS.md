@@ -110,7 +110,7 @@ Measured 2026-07-11:
 
 ## T5 - Provision Unlimited-OCR Single-Worker Environment
 
-Status: pending
+Status: completed with NX2 resource rejection
 
 Goal: run the current Unlimited-OCR model on `nx2` without changing the model
 or the analyzer's OCR protocol.
@@ -128,9 +128,20 @@ Acceptance:
 - No VibeVoice or ASR model is resident during OCR.
 - Logs are stored under `logs/ocr/`.
 
+Measured 2026-07-11:
+
+- The model, 6.78 GiB after rsync, loaded in the isolated NX2 environment.
+- The first simple image inference failed in the vision encoder with
+  `NvMapMemAllocInternalTagged ... error 12` followed by a PyTorch CUDA
+  caching-allocator assertion.
+- Swap increased from 2 MiB to 435 MiB before process exit.
+
+Conclusion: Unlimited-OCR cannot run even one image on the 16 GiB NX2, so it
+is not eligible for the one-worker deployment.
+
 ## T6 - Validate OCR HTTP Contract And Real Frames
 
-Status: pending
+Status: blocked by T5 resource rejection
 
 Goal: validate the existing OpenAI-compatible OCR integration on `nx2`.
 
@@ -145,6 +156,9 @@ Acceptance:
 - The response is consumable by the current OCR provider.
 - All ten frames complete without OOM or swap growth.
 - Results are compared against the `ai` Unlimited-OCR baseline.
+
+Do not run this task for Unlimited-OCR on NX2. A smaller OCR runtime must
+first pass a fresh provisioning task.
 
 ## T7 - Integrate Only Passed Services
 

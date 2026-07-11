@@ -64,6 +64,17 @@ OCR acceptance gates:
 4. Results and wall time are compared with the current `ai` Unlimited-OCR
    baseline before enabling an `nx2` endpoint in a runtime profile.
 
+Validation result on 2026-07-11: rejected on NX2. The 6.78 GiB model completed
+loading in the isolated environment, but the first simple-image inference
+failed in the vision encoder with `NvMapMemAllocInternalTagged ... error 12`
+and a PyTorch CUDA caching-allocator assertion. Swap grew from 2 MiB to
+435 MiB. Do not attempt the 10-frame or HTTP acceptance gates with
+Unlimited-OCR on the 16 GiB Orin NX.
+
+The next NX2 OCR candidate must use a substantially smaller runtime. It must
+be evaluated as a new decision; DotsMOCR is not an appropriate fallback
+because it has a larger, P40/vLLM-oriented deployment footprint.
+
 ## Runtime Rules
 
 - ASR and OCR are mutually exclusive stages on `nx2`.
