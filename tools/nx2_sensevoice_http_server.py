@@ -54,7 +54,10 @@ def segments_from_result(result: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for word, timestamp in zip(words, timestamps):
             current_words.append(str(word))
             end_ms = int(timestamp[1])
-            if str(word).endswith(("。", "！", "？", ".", "!", "?")) or len(current_words) >= 42:
+            if (
+                str(word).endswith(("。", "！", "？", ".", "!", "?"))
+                and len(current_words) >= 4
+            ) or len(current_words) >= 42:
                 text = clean_text("".join(current_words))
                 if text:
                     segments.append({"start": round(start_ms / 1000, 3), "end": round(end_ms / 1000, 3), "text": text})
