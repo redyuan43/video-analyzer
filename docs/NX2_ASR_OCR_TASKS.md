@@ -23,7 +23,7 @@ Acceptance:
 
 ## T1 - Provision Jetson ASR Base Environment
 
-Status: pending
+Status: complete
 
 Goal: create an isolated ARM64 Python environment for SenseVoice/FunASR.
 
@@ -42,7 +42,7 @@ Acceptance:
 
 ## T2 - Run SenseVoice/FunASR ASR Smoke Test
 
-Status: pending
+Status: complete
 
 Goal: verify SenseVoice-Small can transcribe Chinese audio on `nx2`.
 
@@ -60,7 +60,7 @@ Acceptance:
 
 ## T3 - Add Local ASR HTTP Adapter
 
-Status: pending
+Status: complete with fallback-only approval
 
 Goal: expose SenseVoice through the analyzer-compatible endpoint.
 
@@ -76,6 +76,14 @@ Acceptance:
 - A multipart WAV request succeeds through the HTTP endpoint.
 - The response is accepted by `video_analyzer.asr_providers.transcribe_with_http_asr`.
 - A cold start and an idle reload both succeed.
+
+Measured 2026-07-11:
+
+- `transcribe_with_http_asr` successfully consumed the NX2 multipart response.
+- A 215.667-second real operation-manual sample returned 1,567 characters and
+  58 timestamped segments.
+- The service unloaded the model after the configured 2-second validation idle
+  window and reports `ready=false` until the next request cold-starts it.
 
 ## T4 - Validate ASR Against Real Operation-Manual Audio
 
