@@ -47,13 +47,12 @@ ASR acceptance gates:
 
 ## OCR Decision
 
-- Keep Unlimited-OCR as the first OCR candidate.
+- Test Unlimited-OCR as the first OCR candidate.
 - Do not migrate DotsMOCR: its P40/vLLM runtime is harder to reproduce and it
   is not the current project default.
-- Run exactly one Unlimited-OCR worker on `nx2`.
+- Do not run more than one OCR worker on `nx2` during validation.
 - Keep `ocr_concurrency=1` and use the existing OpenAI-compatible endpoint
-  contract on port `18088`.
-- Preserve the current lazy idle unload behavior.
+  contract for whichever candidate passes.
 
 OCR acceptance gates:
 
@@ -75,6 +74,13 @@ The next NX2 OCR candidate must use a substantially smaller runtime. It must
 be evaluated as a new decision; DotsMOCR is not an appropriate fallback
 because it has a larger, P40/vLLM-oriented deployment footprint.
 
+EasyOCR (`ch_sim,en`) is the accepted lightweight candidate for NX2 frame-text
+extraction. Its model files occupy 101 MiB and it exposes the existing
+OpenAI-compatible endpoint contract through a temporary one-worker service on
+port `18089`. It is approved for sparse OCR evidence extraction only, not as a
+quality-equivalent replacement for Unlimited-OCR: complex small Chinese text,
+proper nouns, and diagram labels remain error-prone.
+
 ## Runtime Rules
 
 - ASR and OCR are mutually exclusive stages on `nx2`.
@@ -82,3 +88,5 @@ because it has a larger, P40/vLLM-oriented deployment footprint.
   endpoint overrides in that host's local `config/config.json`.
 - Do not alter existing `ai` ASR/OCR services while validating `nx2`.
 - Switch the analyzer only after each service independently passes its gates.
+- Do not make the NX2 EasyOCR endpoint the default runtime-profile OCR path
+  until a full operation-manual smoke has been reviewed for quality.

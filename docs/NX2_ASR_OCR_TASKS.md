@@ -141,7 +141,7 @@ is not eligible for the one-worker deployment.
 
 ## T6 - Validate OCR HTTP Contract And Real Frames
 
-Status: blocked by T5 resource rejection
+Status: completed with EasyOCR limited-scope approval
 
 Goal: validate the existing OpenAI-compatible OCR integration on `nx2`.
 
@@ -157,8 +157,19 @@ Acceptance:
 - All ten frames complete without OOM or swap growth.
 - Results are compared against the `ai` Unlimited-OCR baseline.
 
-Do not run this task for Unlimited-OCR on NX2. A smaller OCR runtime must
-first pass a fresh provisioning task.
+Unlimited-OCR remains blocked by T5. EasyOCR passed the replacement
+provisioning and this task on 2026-07-11:
+
+- Simple text image: correct text, `0.796s` inference after a `25.985s` cold
+  model load, 1.32 GiB peak RSS, and no swap growth.
+- Ten real operation-manual frames through the existing OpenAI-compatible
+  contract: `10/10` success, `19.047s` total, `1.506s` median per frame, and
+  `4.223s` maximum per frame.
+- Direct ten-frame run recorded 2.82 GiB peak RSS with no swap growth.
+
+Quality is sufficient for sparse text evidence extraction. It is not
+equivalent to Unlimited-OCR for small Chinese UI text, diagrams, or proper
+nouns, so full operation-manual output needs review before default enablement.
 
 ## T7 - Integrate Only Passed Services
 
