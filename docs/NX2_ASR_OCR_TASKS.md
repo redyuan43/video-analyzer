@@ -181,7 +181,7 @@ nouns, so full operation-manual output needs review before default enablement.
 
 ## T7 - Integrate Only Passed Services
 
-Status: pending
+Status: complete with fallback-only profile
 
 Goal: connect proven nx2 services to a local runtime profile.
 
@@ -196,3 +196,22 @@ Acceptance:
 - `config/config.json` remains host-local and uncommitted.
 - The end-to-end run records which nx2 service handled ASR and OCR.
 - `ai` remains unchanged and available as a rollback path.
+
+Measured 2026-07-12:
+
+- NX2 local `config/config.json` defines the uncommitted `nx2_fallback`
+  profile with `ocr_concurrency=1`.
+- The project configuration loader resolved the local ASR endpoint
+  `http://127.0.0.1:18013/api/asr/transcribe` and OCR endpoint
+  `http://127.0.0.1:18089/v1`.
+- Sequential project-provider smoke used SenseVoice first on the 215.667-second
+  real operation-manual audio: 21.833 seconds end-to-end request time, 1,567
+  text characters, and 58 timestamped segments.
+- After ASR stopped, EasyOCR processed ten real operation-manual frames
+  through the configured endpoint in 18.997 seconds. All ten requests
+  succeeded.
+- No ASR or OCR service was left running after the smoke; `ai` was untouched.
+
+This profile is explicitly fallback-only. It is not approved as the default
+operation-manual profile because the separately measured ASR and OCR quality
+limits remain in effect.

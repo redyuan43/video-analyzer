@@ -94,3 +94,27 @@ For a full production-quality operation-manual run, keep VibeVoice and the
 existing `ai` OCR path as the default. Use NX2 SenseVoice and EasyOCR only as
 explicit, host-local fallback services where their documented quality limits
 are acceptable.
+
+## Sequential Fallback Smoke
+
+On 2026-07-12, an uncommitted NX2-local `nx2_fallback` profile was loaded by
+the project configuration system. It defined:
+
+- SenseVoice: `http://127.0.0.1:18013/api/asr/transcribe`
+- EasyOCR: `http://127.0.0.1:18089/v1`
+- OCR concurrency: `1`
+
+The services were started and stopped sequentially:
+
+1. The project HTTP ASR provider transcribed the 215.667-second real
+   operation-manual sample in 21.833 seconds, returning 1,567 characters and
+   58 timestamped segments.
+2. The ASR service stopped. The project OCR provider then processed ten real
+   operation-manual frames in 18.997 seconds, with all ten requests
+   succeeding.
+3. Both temporary services were confirmed stopped. NX2 returned to about
+   11 GiB available memory, and no `ai` service was modified.
+
+This demonstrates the intended mutually exclusive fallback integration. It is
+not a replacement-quality full publishing run because both NX2 model choices
+remain below the production-quality gates described above.
