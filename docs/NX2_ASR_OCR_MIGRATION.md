@@ -30,8 +30,8 @@ shared-memory GPU. ASR and OCR must not be loaded concurrently.
   `success`, `text`, `segments`, and `language`.
 - Use `remote_http` while validating the service so the analyzer does not need
   a new ASR provider immediately.
-- Keep `faster-whisper` with `whisper-large-v3-turbo` as the fallback path.
-  It is already implemented by the analyzer and has a cached model on `ai`.
+- Do not introduce `faster-whisper` as an NX2 fallback. Keep VibeVoice on `ai`
+  as the production-quality rollback path while SenseVoice is evaluated.
 
 ASR acceptance gates:
 
@@ -41,7 +41,9 @@ ASR acceptance gates:
 3. A 10-minute Chinese tutorial produces usable text, timestamps, and a
    measured RTF without OOM or swap growth.
 4. A mixed Chinese/English terminology sample is compared against the current
-   VibeVoice output before making it the default.
+   VibeVoice output before making it the default. Current result: SenseVoice
+   passes the runtime and timestamp gates, but terminology accuracy is not
+   sufficient to replace VibeVoice as the default.
 
 ## OCR Decision
 

@@ -79,7 +79,7 @@ Acceptance:
 
 ## T4 - Validate ASR Against Real Operation-Manual Audio
 
-Status: pending
+Status: completed with default-replacement rejection
 
 Goal: establish whether SenseVoice is good enough for the target workflow.
 
@@ -95,7 +95,18 @@ Acceptance:
 - RTF and peak memory are recorded.
 - No swap growth or OOM occurs.
 - The comparison identifies whether SenseVoice can become the nx2 default or
-  whether `faster-whisper` remains the local fallback.
+  must remain an on-demand fallback while VibeVoice stays the production path.
+
+Measured 2026-07-11:
+
+- 215.667-second mixed Chinese/English operation-manual sample: RTF `0.0709`,
+  peak RSS `5.76 GiB`, `1,380` ordered native timestamp tokens, and no
+  material swap growth.
+- 900-second Chinese interview sample: RTF `0.0609`, peak RSS `5.39 GiB`,
+  `5,226` ordered native timestamp tokens, and no swap growth.
+- Character similarity to VibeVoice references was `0.898` and `0.914`.
+  Proper-noun errors remain visible, so SenseVoice is not approved as the
+  default operation-manual ASR replacement.
 
 ## T5 - Provision Unlimited-OCR Single-Worker Environment
 
