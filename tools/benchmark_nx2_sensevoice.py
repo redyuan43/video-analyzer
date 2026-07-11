@@ -33,6 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=MODEL_NAME)
     parser.add_argument("--vad-model", default=VAD_MODEL)
     parser.add_argument("--punc-model", default=PUNC_MODEL)
+    parser.add_argument("--hotword", default="")
     parser.add_argument("--batch-size-seconds", type=int, default=60)
     parser.add_argument("--merge-length-seconds", type=int, default=15)
     return parser.parse_args()
@@ -115,6 +116,7 @@ def main() -> int:
         batch_size_s=args.batch_size_seconds,
         merge_vad=True,
         merge_length_s=args.merge_length_seconds,
+        hotword=args.hotword or None,
     )
     completed_at = time.perf_counter()
     after = meminfo()
@@ -136,6 +138,7 @@ def main() -> int:
             "asr": args.model,
             "vad": args.vad_model,
             "punc": args.punc_model,
+            "hotword": args.hotword or None,
         },
         "audio": {
             "path": str(audio),
