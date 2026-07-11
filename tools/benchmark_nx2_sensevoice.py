@@ -36,6 +36,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hotword", default="")
     parser.add_argument("--batch-size-seconds", type=int, default=60)
     parser.add_argument("--merge-length-seconds", type=int, default=15)
+    parser.add_argument(
+        "--remote-code",
+        type=Path,
+        help="SenseVoice model.py used for native token timestamps.",
+    )
+    parser.add_argument(
+        "--output-timestamp",
+        action="store_true",
+        help="Request native token-level timestamps from compatible SenseVoice remote code.",
+    )
     return parser.parse_args()
 
 
@@ -99,14 +109,23 @@ def main() -> int:
 
     before = meminfo()
     load_started = time.perf_counter()
-    model = AutoModel(
-        model=args.model,
-        vad_model=args.vad_model,
-        vad_kwargs={"max_single_segment_time": 30000},
-        punc_model=args.punc_model,
-        device="cuda:0",
-        disable_update=True,
-    )
+    model_kwargs: dict[str, Any] = {
+        "model": args.model,
+        "vad_model": args.vad_model,
+        "vad_kwargs": {"max_single_segment_time": 30000},
+        "punc_model": args.punc_model,
+        "device": "cuda:0",
+        "disable_update": True,
+    }
+    if args.remote_code:
+        remote_code = args.remote_code.resolve()
+        if not remote_code.is_file():
+            raise SystemExit(f"missing remote code: {remote_code}")
+        model_kwargs.update(
+            trust_remote_code=True,
+            remote_code=str(remote_code),
+        )
+    model = AutoModel(**model_kwargs)
     loaded_at = time.perf_counter()
     raw_result = model.generate(
         input=str(audio),
@@ -117,6 +136,7 @@ def main() -> int:
         merge_vad=True,
         merge_length_s=args.merge_length_seconds,
         hotword=args.hotword or None,
+        output_timestamp=args.output_timestamp,
     )
     completed_at = time.perf_counter()
     after = meminfo()
@@ -139,6 +159,8 @@ def main() -> int:
             "vad": args.vad_model,
             "punc": args.punc_model,
             "hotword": args.hotword or None,
+            "remote_code": str(args.remote_code.resolve()) if args.remote_code else None,
+            "output_timestamp": args.output_timestamp,
         },
         "audio": {
             "path": str(audio),
@@ -161,6 +183,9 @@ def main() -> int:
             "reference_character_count": len(comparable_reference),
             "result_character_count": len(comparable_result),
             "reference_character_similarity": round(similarity, 4) if similarity is not None else None,
+            "timestamp_token_count": sum(
+                len(item.get("timestamp") or []) for item in raw_result
+            ),
         },
         "text": text,
         "raw_result": raw_result,
