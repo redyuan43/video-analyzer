@@ -108,7 +108,8 @@ def _encode_image(path: Path, max_long_side: int = 1280) -> str:
         if longest > max_long_side:
             scale = max_long_side / longest
             resized = (max(1, int(width * scale)), max(1, int(height * scale)))
-            image = image.resize(resized, Image.Resampling.LANCZOS)
+            resampling = getattr(Image, "Resampling", Image)
+            image = image.resize(resized, resampling.LANCZOS)
         buffer = io.BytesIO()
         image.save(buffer, format="JPEG", quality=90, optimize=True)
         return base64.b64encode(buffer.getvalue()).decode("utf-8")
