@@ -52,6 +52,7 @@ from .ocr_keyframes import (
 from .local_model_runtime import local_model_runtime_session, local_model_stage
 from .resource_locks import analyzer_resource_lock
 from .review_artifacts import write_run_manifest, write_visual_review
+from .speaker_diarization import process_transcript_speakers
 
 # Initialize logger at module level
 logger = logging.getLogger(__name__)
@@ -430,7 +431,7 @@ def create_operation_manual_text_client(config: Config, fallback_client):
             text_base_url,
         ),
         text_base_url,
-        timeout_seconds=int(openai_config.get("timeout_seconds", 600)),
+        timeout_seconds=int(manual_config.get("text_timeout_seconds") or openai_config.get("timeout_seconds", 600)),
         extra_body=build_openai_extra_body(manual_config, text_base_url),
     )
 
@@ -608,6 +609,7 @@ def main():
         page_context = ""
         page_context_metadata = {"context_file": "", "text_length": 0}
         transcript_markdown_path = None
+        speaker_diarization_report = None
         timings = {}
         frame_selection_metadata = {}
         frame_extraction_metadata = {}
@@ -723,6 +725,21 @@ def main():
                             )
                         logger.warning("Could not generate reliable transcript. Proceeding with video analysis only.")
                     else:
+                        speaker_config = config.get("speaker_diarization") or {}
+                        try:
+                            transcript, speaker_diarization_report = process_transcript_speakers(
+                                audio_path,
+                                transcript,
+                                speaker_config,
+                            )
+                        except Exception as exc:
+                            logger.warning("speaker diarization failed: %s", exc)
+                            speaker_diarization_report = {"enabled": True, "error": str(exc)}
+                        qa_dir = output_dir / "qa"
+                        qa_dir.mkdir(parents=True, exist_ok=True)
+                        write_json(qa_dir / "speaker_diarization_report.json", speaker_diarization_report)
+                        if asr_result:
+                            asr_result.transcript = transcript
                         transcript_markdown_path = write_transcript_markdown(transcript, output_dir / "transcript.md")
                         current_progress_step = "asr_done"
                         write_analysis_progress(
@@ -1076,20 +1093,21 @@ def main():
                 page_context_metadata = read_page_context_metadata(config.get("context_file", ""), page_context)
                 text_model = manual_config.get("text_model") or model
                 frame_assets = prepare_frame_assets(frames, output_dir)
-                operation_manual = generate_operation_manual(
-                    client=text_client,
-                    text_model=text_model,
-                    frame_analyses=frame_analyses,
-                    frames=frames,
-                    transcript=transcript,
-                    asr_metadata=asr_result.to_metadata() if asr_result else {},
-                    ocr_events=ocr_events,
-                    page_context=page_context,
-                    language=config.get("manual_language", "zh-CN"),
-                    temperature=resolve_temperature(manual_config, config.get("clients", {}).get("temperature", 0.2)),
-                    frame_assets=frame_assets,
-                    no_think=bool(manual_config.get("manual_no_think", manual_config.get("frame_no_think", False))),
-                )
+                with local_model_stage("text", config.config, logger, str(output_dir)):
+                    operation_manual = generate_operation_manual(
+                        client=text_client,
+                        text_model=text_model,
+                        frame_analyses=frame_analyses,
+                        frames=frames,
+                        transcript=transcript,
+                        asr_metadata=asr_result.to_metadata() if asr_result else {},
+                        ocr_events=ocr_events,
+                        page_context=page_context,
+                        language=config.get("manual_language", "zh-CN"),
+                        temperature=resolve_temperature(manual_config, config.get("clients", {}).get("temperature", 0.2)),
+                        frame_assets=frame_assets,
+                        no_think=bool(manual_config.get("manual_no_think", manual_config.get("frame_no_think", False))),
+                    )
                 operation_manual["response"] = embed_step_images(
                     operation_manual.get("response", ""),
                     frames,

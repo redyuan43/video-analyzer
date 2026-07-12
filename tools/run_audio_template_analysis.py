@@ -29,7 +29,7 @@ from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient  # 
 from video_analyzer.config import Config, build_openai_extra_body, resolve_api_key, resolve_temperature  # noqa: E402
 from video_analyzer.local_model_runtime import local_model_runtime_session, local_model_stage  # noqa: E402
 from video_analyzer.resource_locks import analyzer_resource_lock  # noqa: E402
-from video_analyzer.speaker_diarization import refine_transcript_speakers  # noqa: E402
+from video_analyzer.speaker_diarization import process_transcript_speakers  # noqa: E402
 
 
 DEFAULT_TEMPLATE_CATALOG = REPO_ROOT / "video-analyzer-ui" / "video_analyzer_ui" / "static" / "data" / "audio_prompt_templates.json"
@@ -224,7 +224,7 @@ def refine_audio_speakers(
 ) -> tuple[AudioTranscript, dict[str, Any]]:
     speaker_config = config.get("speaker_diarization") or {}
     try:
-        refined, report = refine_transcript_speakers(audio_path, transcript, speaker_config)
+        refined, report = process_transcript_speakers(audio_path, transcript, speaker_config)
     except Exception as exc:
         logger.warning("speaker diarization refinement failed: %s", exc)
         report = {"enabled": True, "error": str(exc)}
