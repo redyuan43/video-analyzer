@@ -13,9 +13,9 @@ model_root="${NX2_MODEL_ROOT:-$(cd "$root_dir/.." && pwd)/models}"
 llama_server="${NX2_LLAMA_SERVER:-$HOME/github/llama.cpp-latest-mtp/build-vlm-bench/bin/llama-server}"
 asr_python="${NX2_ASR_PYTHON:-$(cd "$root_dir/.." && pwd)/asr/.venv/bin/python}"
 ocr_python="${NX2_OCR_PYTHON:-$(cd "$root_dir/.." && pwd)/ocr/.venv/bin/python}"
-vl_model="${NX2_VL_MODEL:-/data/models/video-analyzer-vl-modelscope/Qwen3-VL-8B-Instruct/Qwen3VL-8B-Instruct-Q4_K_M.gguf}"
-vl_mmproj="${NX2_VL_MMPROJ:-/data/models/video-analyzer-vl-modelscope/Qwen3-VL-8B-Instruct/mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf}"
-vl_alias="${NX2_VL_ALIAS:-qwen3-vl-8b-nx2}"
+vl_model="${NX2_VL_MODEL:-/data/models/video-analyzer-vl-modelscope/Qwen3-VL-4B-Instruct/Qwen3VL-4B-Instruct-Q4_K_M.gguf}"
+vl_mmproj="${NX2_VL_MMPROJ:-/data/models/video-analyzer-vl-modelscope/Qwen3-VL-4B-Instruct/mmproj-Qwen3VL-4B-Instruct-Q8_0.gguf}"
+vl_alias="${NX2_VL_ALIAS:-qwen3-vl-4b-nx2}"
 
 if [[ ! -x "$asr_python" ]]; then
   asr_python="$(command -v python3)"
