@@ -119,6 +119,7 @@ case "$stage" in
       --ctx-size 8192 \
       --parallel 1 \
       --gpu-layers 999 \
+      --image-min-tokens 1024 \
       --no-cache-prompt
     wait_for_url "http://127.0.0.1:${vl_port}/health" "VL"
     ;;
