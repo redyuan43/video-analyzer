@@ -199,7 +199,7 @@ MODULE_LABELS = {
     "multidoc": "多文档分析",
     "deep-v2": "章节深度报告",
     "evidence-review": "证据复核/发布门禁",
-    "web-evidence": "联网补证据",
+    "web-evidence": "联网事实核验",
     "qa-index": "问答证据索引",
     "image-prompts": "生成配图提示词",
     "final-publish": "最终定稿/发布",
@@ -291,8 +291,8 @@ DOCUMENT_PREVIEW_EVIDENCE = (
     ("visual_review.html", "视觉复核页", "快速检查抽帧、截图和视觉证据覆盖。"),
     ("evidence_review.json", "证据复核结果", "发布门禁和证据质量复核数据。"),
     ("publish_decision.json", "发布决策", "是否可发布及阻断原因。"),
-    ("web_evidence.md", "联网补证据摘要", "需要外部资料时的补证据结果。"),
-    ("web_evidence.json", "联网补证据数据", "联网补证据的结构化原始数据。"),
+    ("web_evidence.md", "联网事实核验报告", "视频断言的外部事实结论、依据与安全表述。"),
+    ("web_evidence.json", "联网事实核验数据", "联网事实核验的结构化原始数据。"),
 )
 DOCUMENT_PREVIEW_PROCESS = (
     ("transcript.md", "转写文本", "ASR 生成的全文转写。"),
@@ -419,9 +419,9 @@ STAGE_PROGRESS_STEPS = {
         ("gate", "写出发布门禁", (r"publish_decision", r"publishable", r"blocked")),
     ],
     "web-evidence": [
-        ("load", "读取证据缺口", (r"evidence_gaps", r"study_guide", r"web_evidence")),
-        ("search", "联网搜索外部证据", (r"search", r"external", r"web")),
-        ("write", "写出联网证据账本", (r"web_evidence\.json", r"web_evidence\.md", r"processed_gaps")),
+        ("load", "读取待核验断言", (r"evidence_gaps", r"study_guide", r"web_evidence", r"claim")),
+        ("search", "联网检索事实依据", (r"search", r"external", r"web", r"Brave")),
+        ("write", "写出事实核验账本", (r"web_evidence\.json", r"web_evidence\.md", r"supported", r"contradicted")),
     ],
     "qa-index": [
         ("load", "读取最终文档与证据", (r"operation_manual", r"manual_evidence", r"transcript")),

@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNTIME_DIR="$ROOT_DIR/tmp/video-link-status"
 PID_FILE="$RUNTIME_DIR/server.pid"
 LOG_FILE="$RUNTIME_DIR/server.log"
+JOBS_DIR="${VIDEO_LINK_STATUS_JOBS_DIR:-$RUNTIME_DIR/jobs}"
 default_host() {
   if command -v tailscale >/dev/null 2>&1; then
     tailscale ip -4 2>/dev/null | head -n 1
@@ -43,7 +44,7 @@ detect_agx_lan_host() {
   done
 }
 
-mkdir -p "$RUNTIME_DIR"
+mkdir -p "$RUNTIME_DIR" "$JOBS_DIR"
 
 is_running() {
   [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
@@ -67,7 +68,7 @@ start_server() {
     export JETSON_AGX_LAN_HOST="$AGX_LAN_HOST"
   fi
   PYTHONPATH="$ROOT_DIR/video-analyzer-ui:$ROOT_DIR:${PYTHONPATH:-}" \
-    setsid env JETSON_AGX_LAN_HOST="${JETSON_AGX_LAN_HOST:-}" "$PYTHON_BIN" -m video_analyzer_ui.server --host "$BIND_HOST" --port "$PORT" --jobs-dir "$RUNTIME_DIR/jobs" \
+    setsid env JETSON_AGX_LAN_HOST="${JETSON_AGX_LAN_HOST:-}" "$PYTHON_BIN" -m video_analyzer_ui.server --host "$BIND_HOST" --port "$PORT" --jobs-dir "$JOBS_DIR" \
     >"$LOG_FILE" 2>&1 < /dev/null &
   echo "$!" >"$PID_FILE"
   echo "video-link status server started: http://$PUBLIC_HOST:$PORT/ (bind: $BIND_HOST)"

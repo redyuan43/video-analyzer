@@ -1702,6 +1702,46 @@ th {
     color: #93370d;
 }
 
+.fact-audit-list {
+    display: grid;
+    gap: 4px;
+    margin: 2px 0 0;
+    padding: 0;
+    list-style: none;
+}
+
+.fact-audit-list li {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 6px;
+    align-items: start;
+}
+
+.fact-verdict {
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1.35;
+    white-space: nowrap;
+}
+
+.fact-verdict.supported {
+    color: #067647;
+    background: #ecfdf3;
+}
+
+.fact-verdict.contradicted {
+    color: #b42318;
+    background: #fef3f2;
+}
+
+.fact-verdict.not_enough_evidence,
+.fact-verdict.not_applicable {
+    color: #93370d;
+    background: #fffaeb;
+}
+
 .study-progress-meta {
     display: grid;
     gap: 6px;

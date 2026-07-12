@@ -1477,14 +1477,36 @@ function renderStudyGuide(guide, jobId) {
 function renderWebEvidenceSummary(webEvidence) {
     const summary = webEvidence?.summary || {};
     const processed = Number(summary.processed_gaps || 0);
-    if (!processed) return '';
+    const claims = Array.isArray(webEvidence?.claims) ? webEvidence.claims : [];
+    if (!processed && !claims.length) return '';
     const external = Number(summary.resolved_by_external || 0);
     const partial = Number(summary.partial_external_support || 0);
     const unresolved = Number(summary.unresolved || 0) + Number(summary.video_only_gap || 0);
+    const supported = Number(summary.supported || 0);
+    const contradicted = Number(summary.contradicted || 0);
+    const insufficient = Number(summary.not_enough_evidence || 0);
+    const claimRows = claims.slice(0, 4).map((claim) => {
+        const verdict = claim.verdict || 'not_enough_evidence';
+        return `<li>
+            <strong class="fact-verdict ${escapeHtml(verdict)}">${escapeHtml(factVerdictLabel(verdict))}</strong>
+            <span>${escapeHtml(claim.claim || '未命名断言')}</span>
+        </li>`;
+    }).join('');
     return `<div class="study-evidence-boundary">
-        <strong>联网补证据</strong>
-        <span>已处理 ${escapeHtml(processed)} 个缺口 · 外部补强 ${escapeHtml(external)} · 部分补强 ${escapeHtml(partial)} · 仍需复核 ${escapeHtml(unresolved)}</span>
+        <strong>联网事实核验</strong>
+        <span>断言 ${escapeHtml(claims.length)} 条 · 支持 ${escapeHtml(supported)} · 反驳 ${escapeHtml(contradicted)} · 证据不足 ${escapeHtml(insufficient)}</span>
+        ${processed ? `<span>缺口补强：外部补强 ${escapeHtml(external)} · 部分补强 ${escapeHtml(partial)} · 仍需复核 ${escapeHtml(unresolved)}</span>` : ''}
+        ${claimRows ? `<ul class="fact-audit-list">${claimRows}</ul>` : ''}
     </div>`;
+}
+
+function factVerdictLabel(verdict) {
+    return {
+        supported: '有支持',
+        contradicted: '有冲突',
+        not_enough_evidence: '证据不足',
+        not_applicable: '不适用'
+    }[verdict] || '待核验';
 }
 
 function renderStudyNode(chapter, selected, index) {
