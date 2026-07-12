@@ -10,9 +10,12 @@ fi
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 runtime_dir="${NX2_MODEL_RUNTIME_DIR:-$root_dir/tmp/nx2-local-models}"
 model_root="${NX2_MODEL_ROOT:-$(cd "$root_dir/.." && pwd)/models}"
-llama_server="${NX2_LLAMA_SERVER:-$HOME/github/llama.cpp-latest-mtp/build/bin/llama-server}"
+llama_server="${NX2_LLAMA_SERVER:-$HOME/github/llama.cpp-latest-mtp/build-vlm-bench/bin/llama-server}"
 asr_python="${NX2_ASR_PYTHON:-$(cd "$root_dir/.." && pwd)/asr/.venv/bin/python}"
 ocr_python="${NX2_OCR_PYTHON:-$(cd "$root_dir/.." && pwd)/ocr/.venv/bin/python}"
+vl_model="${NX2_VL_MODEL:-/data/models/video-analyzer-vl-modelscope/Qwen3-VL-8B-Instruct/Qwen3VL-8B-Instruct-Q4_K_M.gguf}"
+vl_mmproj="${NX2_VL_MMPROJ:-/data/models/video-analyzer-vl-modelscope/Qwen3-VL-8B-Instruct/mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf}"
+vl_alias="${NX2_VL_ALIAS:-qwen3-vl-8b-nx2}"
 
 if [[ ! -x "$asr_python" ]]; then
   asr_python="$(command -v python3)"
@@ -108,15 +111,16 @@ case "$stage" in
       "$runtime_dir/minicpm.pid" \
       "$runtime_dir/minicpm.log" \
       "$llama_server" \
-      --model "$model_root/vl/MiniCPM-V-4_5/ggml-model-Q4_K_M.gguf" \
-      --mmproj "$model_root/vl/MiniCPM-V-4_5/mmproj-model-f16.gguf" \
-      --alias minicpm-v-4.5-nx2 \
+      --model "$vl_model" \
+      --mmproj "$vl_mmproj" \
+      --alias "$vl_alias" \
       --host 127.0.0.1 \
       --port "$vl_port" \
       --ctx-size 8192 \
       --parallel 1 \
-      --gpu-layers 999
-    wait_for_url "http://127.0.0.1:${vl_port}/health" "MiniCPM"
+      --gpu-layers 999 \
+      --no-cache-prompt
+    wait_for_url "http://127.0.0.1:${vl_port}/health" "VL"
     ;;
 esac
 
