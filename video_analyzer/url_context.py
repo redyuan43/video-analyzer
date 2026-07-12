@@ -1197,8 +1197,13 @@ def build_analyzer_command(args: argparse.Namespace, video_path: Path, context_p
             getattr(args, "ocr_cache", "on"),
             "--ocr-cache-dir",
             getattr(args, "ocr_cache_dir", ".cache/video-analyzer/ocr"),
-            "--ocr-timeout-seconds",
-            str(getattr(args, "ocr_timeout_seconds", 120)),
+        ]
+    )
+    ocr_timeout_seconds = getattr(args, "ocr_timeout_seconds", None)
+    if ocr_timeout_seconds is not None:
+        command.extend(["--ocr-timeout-seconds", str(ocr_timeout_seconds)])
+    command.extend(
+        [
             "--ocr-keyframe-strategy",
             getattr(args, "ocr_keyframe_strategy", "auto"),
             "--ocr-keyframe-budget",
