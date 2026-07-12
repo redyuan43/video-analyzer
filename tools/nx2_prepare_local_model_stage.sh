@@ -13,6 +13,10 @@ runtime_dir="${NX2_MODEL_RUNTIME_DIR:-$root_dir/tmp/nx2-local-models}"
 model_root="${NX2_MODEL_ROOT:-$(cd "$root_dir/.." && pwd)/models}"
 llama_server="${NX2_LLAMA_SERVER:-$HOME/github/llama.cpp-latest-mtp/build/bin/llama-server}"
 
+if [[ ! -x "$python_bin" ]]; then
+  python_bin="$(command -v python3)"
+fi
+
 asr_port="${NX2_ASR_PORT:-18013}"
 ocr_port="${NX2_OCR_PORT:-18089}"
 vl_port="${NX2_VL_PORT:-18082}"
