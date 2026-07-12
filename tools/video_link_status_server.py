@@ -472,7 +472,7 @@ class VideoLinkStatusServer:
 
     def options(self) -> dict[str, Any]:
         profiles = runtime_profile_names()
-        default_profile = DEFAULT_PROFILE if DEFAULT_PROFILE in profiles else active_runtime_profile(profiles)
+        default_profile = active_runtime_profile(profiles)
         return {
             "defaults": {
                 "analysis_mode": "auto",
@@ -937,6 +937,31 @@ class VideoLinkStatusServer:
         thread.start()
         return self.public_job(self.load_job(job_id))
 
+    def rerun_from_stage(self, job_id: str, stage: str) -> dict[str, Any]:
+        stage = normalize_stage_name(stage)
+        job = self.load_job(job_id)
+        if stage not in self.stage_order_for_job(job):
+            raise BridgeError(HTTPStatus.NOT_FOUND, f"unknown stage: {stage}")
+        if self.current_stage(job):
+            raise BridgeError(HTTPStatus.CONFLICT, "job already has a running stage")
+
+        stage_order = self.stage_order_for_job(job)
+        stage_index = stage_order.index(stage)
+        for invalidated_stage in stage_order[stage_index:]:
+            job.setdefault("stages", {}).pop(invalidated_stage, None)
+            for artifact_name in MODULE_SPECS.get(invalidated_stage, {}).get("produces", []):
+                job.setdefault("artifacts", {}).pop(artifact_name, None)
+        job["warnings"] = [
+            warning
+            for warning in job.get("warnings", [])
+            if warning.get("stage") not in stage_order[stage_index:]
+        ]
+        job["status"] = "queued"
+        job["updated_at"] = iso_now()
+        job["summary"] = self.collect_summary(job)
+        self.save_job(job)
+        return self.start_run(job_id)
+
     def stop_job(self, job_id: str) -> dict[str, Any]:
         job = self.load_job(job_id)
         stage = normalize_stage_name((job.get("runner") or {}).get("current_stage") or self.current_stage(job) or self.next_stage(job) or "")
@@ -1183,6 +1208,8 @@ class VideoLinkStatusServer:
             return self.public_job(job)
         if stage == "final-publish" and current_status == "skipped" and not self.export_outputs_complete(job):
             current_status = None
+        if current_status == "skipped" and self.skipped_stage_outputs_incomplete(job, stage):
+            current_status = None
         if current_status in {"succeeded", "skipped"}:
             return self.public_job(job)
         if stage == "image-prompts" and (job["options"].get("skip_images") or not BAOYU_IMAGE_GENERATION_ENABLED):
@@ -1275,7 +1302,7 @@ class VideoLinkStatusServer:
             elif stage == "multidoc":
                 result = self.run_command_stage(job, stage, self.multidoc_command(job), stage_info["log_path"], stage_info)
             elif stage == "deep-v2":
-                result = self.run_command_stage(job, stage, self.deep_v2_command(job), stage_info["log_path"], stage_info)
+                result = self.stage_deep_v2(job, stage_info["log_path"], stage_info)
             elif stage == "study-guide":
                 result = self.run_command_stage(job, stage, self.study_guide_command(job), stage_info["log_path"], stage_info)
             elif stage == "evidence-review":
@@ -1483,13 +1510,22 @@ class VideoLinkStatusServer:
         if not job.get("resolved_mode"):
             self.stage_probe(job)
         command = self.operation_command(job)
-        result = self.run_command(command, log_path, on_start=self.record_stage_process(job, "analyze-core", stage_info))
+        jetson_ray = self.ensure_jetson_ray_ready(command, log_path)
+        run_kwargs = {"on_start": self.record_stage_process(job, "analyze-core", stage_info)}
+        if jetson_ray:
+            run_kwargs["append_log"] = True
+        result = self.run_command(command, log_path, **run_kwargs)
         run_dir = str(job.get("run_dir") or "") if self.uploaded_media_job(job) else parse_run_dir(Path(log_path).read_text(encoding="utf-8", errors="replace"))
         if not run_dir:
             raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, "operation stage did not print a run directory")
         job["run_dir"] = str(self.resolve_output_path(run_dir))
         run_dir_path = Path(job["run_dir"])
-        artifacts = {"run_dir": job["run_dir"], "command": command, **self.collect_core_artifacts(run_dir_path)}
+        artifacts = {
+            "run_dir": job["run_dir"],
+            "command": command,
+            **({"jetson_ray": jetson_ray} if jetson_ray else {}),
+            **self.collect_core_artifacts(run_dir_path),
+        }
         actual_template = self.audio_prompt_template_actual(run_dir_path)
         if actual_template:
             job["prompt_template_actual"] = actual_template
@@ -1497,6 +1533,39 @@ class VideoLinkStatusServer:
         if warning:
             self.add_warning(job, "analyze-core", warning)
         return {"artifacts": artifacts, "stdout_tail": result["stdout_tail"]}
+
+    def ensure_jetson_ray_ready(self, command: list[str], log_path: str) -> dict[str, Any] | None:
+        if "--jetson-frame-backend" not in command:
+            return None
+        backend_index = command.index("--jetson-frame-backend") + 1
+        if backend_index >= len(command) or command[backend_index] != "ray":
+            return None
+        script = self.repo_root / "tools" / "start_jetson_frame_ray.sh"
+        if not script.is_file():
+            raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, f"missing Jetson Ray startup script: {script}")
+        result = subprocess.run(
+            [str(script)],
+            cwd=str(self.repo_root),
+            capture_output=True,
+            text=True,
+            env=operation_env(),
+        )
+        preflight_log = "\n".join(
+            line
+            for line in (
+                "[jetson-ray] ensuring cluster readiness",
+                result.stdout.strip(),
+                result.stderr.strip(),
+            )
+            if line
+        )
+        Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(log_path).write_text(preflight_log + "\n", encoding="utf-8")
+        if result.returncode != 0:
+            error = subprocess.CalledProcessError(result.returncode, [str(script)])
+            error.output = preflight_log
+            raise error
+        return {"command": [str(script)], "stdout_tail": tail_lines(preflight_log)}
 
     def stage_verify_core(self, job: dict[str, Any]) -> dict[str, Any]:
         run_dir = self.require_run_dir(job)
@@ -1509,6 +1578,44 @@ class VideoLinkStatusServer:
             warnings.append(self.add_warning(job, "verify-core", warning))
         return {"artifacts": {"required": ["analysis.json", "operation_manual.md|operation_manual.quality_failed.md", "manual_evidence.md"], "missing": [], "warnings": warnings}}
 
+    def stage_deep_v2(self, job: dict[str, Any], log_path: str, stage_info: dict[str, Any]) -> dict[str, Any]:
+        run_dir = self.require_run_dir(job)
+        outputs = (
+            run_dir / "docs_analysis_chapters" / "knowledge_notes_v2.md",
+            run_dir / "docs_analysis_chapters" / "deep_report_v2.md",
+        )
+        if all(path.is_file() and path.stat().st_size > 0 for path in outputs):
+            Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(log_path).write_text("[docs] reusing chapter documents from multidoc\n", encoding="utf-8")
+            return {
+                "artifacts": {
+                    "stage": "deep-v2",
+                    "reused_from": "multidoc",
+                    "knowledge_notes_v2": str(outputs[0]),
+                    "deep_report_v2": str(outputs[1]),
+                },
+                "stdout_tail": ["[docs] reusing chapter documents from multidoc"],
+            }
+        return self.run_command_stage(job, "deep-v2", self.deep_v2_command(job), log_path, stage_info)
+
+    def skipped_stage_outputs_incomplete(self, job: dict[str, Any], stage: str) -> bool:
+        if stage not in {"multidoc", "deep-v2"}:
+            return False
+        run_dir = self.require_run_dir(job)
+        expected = {
+            "multidoc": (
+                run_dir / "docs_analysis" / "analysis.json",
+                run_dir / "docs_analysis" / "knowledge_notes.md",
+                run_dir / "docs_analysis" / "deep_report.md",
+                run_dir / "docs_analysis" / "operation_manual_review.md",
+            ),
+            "deep-v2": (
+                run_dir / "docs_analysis_chapters" / "knowledge_notes_v2.md",
+                run_dir / "docs_analysis_chapters" / "deep_report_v2.md",
+            ),
+        }
+        return any(not path.is_file() or path.stat().st_size == 0 for path in expected[stage])
+
     def run_command_stage(
         self,
         job: dict[str, Any],
@@ -1517,6 +1624,8 @@ class VideoLinkStatusServer:
         log_path: str,
         stage_info: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if stage in {"study-guide", "multidoc", "deep-v2", "evidence-review", "web-evidence"}:
+            command = self.local_text_command(job, command)
         result = self.run_command(command, log_path, on_start=self.record_stage_process(job, stage, stage_info))
         return {
             "artifacts": {
@@ -1527,15 +1636,30 @@ class VideoLinkStatusServer:
             "stdout_tail": result["stdout_tail"],
         }
 
+    def local_text_command(self, job: dict[str, Any], command: list[str]) -> list[str]:
+        return [
+            sys.executable,
+            "tools/run_local_model_stage.py",
+            "--stage",
+            "text",
+            "--config",
+            "config",
+            "--profile",
+            job["options"].get("profile") or DEFAULT_PROFILE,
+            "--",
+            *command,
+        ]
+
     def run_command(
         self,
         command: list[str],
         log_path: str,
         on_start: Any | None = None,
+        append_log: bool = False,
     ) -> dict[str, Any]:
         env = operation_env()
         Path(log_path).parent.mkdir(parents=True, exist_ok=True)
-        with Path(log_path).open("w", encoding="utf-8") as log_file:
+        with Path(log_path).open("a" if append_log else "w", encoding="utf-8") as log_file:
             process = subprocess.Popen(
                 command,
                 cwd=str(self.repo_root),
@@ -1597,6 +1721,7 @@ class VideoLinkStatusServer:
                 "--run-name",
                 opts["run_name"],
             ]
+            self.append_default_frame_extractor_options(command, job)
         else:
             command = [
                 "tools/run_operation_manual_from_url.sh",
@@ -1608,7 +1733,7 @@ class VideoLinkStatusServer:
                 "--pipeline-mode",
                 pipeline_mode_for(resolved_mode),
             ]
-            self.append_default_frame_extractor_options(command)
+            self.append_default_frame_extractor_options(command, job)
             if resolved_mode == "operation-fast":
                 command.extend(["--vl-frame-policy", "auto", "--min-vl-frames", "8", "--max-vl-frames", "16"])
         command.append("--resume-existing-core")
@@ -1706,17 +1831,22 @@ class VideoLinkStatusServer:
         if opts.get("focus_prompt"):
             command.extend(["--focus-prompt", opts["focus_prompt"]])
 
-    def append_default_frame_extractor_options(self, command: list[str]) -> None:
+    def append_default_frame_extractor_options(self, command: list[str], job: dict[str, Any] | None = None) -> None:
+        profile_name = str(((job or {}).get("options") or {}).get("profile") or "")
+        profile = (runtime_config().get("runtime_profiles") or {}).get(profile_name) or {}
         command.extend(
             [
                 "--frame-extractor",
-                os.environ.get("VIDEO_LINK_FRAME_EXTRACTOR", DEFAULT_FRAME_EXTRACTOR),
+                str(profile.get("frame_extractor") or os.environ.get("VIDEO_LINK_FRAME_EXTRACTOR", DEFAULT_FRAME_EXTRACTOR)),
                 "--jetson-frame-hosts",
-                os.environ.get("VIDEO_LINK_JETSON_FRAME_HOSTS", os.environ.get("JETSON_FRAME_HOSTS", DEFAULT_JETSON_FRAME_HOSTS)),
+                str(
+                    profile.get("jetson_frame_hosts")
+                    or os.environ.get("VIDEO_LINK_JETSON_FRAME_HOSTS", os.environ.get("JETSON_FRAME_HOSTS", DEFAULT_JETSON_FRAME_HOSTS))
+                ),
                 "--jetson-frame-backend",
-                os.environ.get("VIDEO_LINK_JETSON_FRAME_BACKEND", DEFAULT_JETSON_FRAME_BACKEND),
+                str(profile.get("jetson_frame_backend") or os.environ.get("VIDEO_LINK_JETSON_FRAME_BACKEND", DEFAULT_JETSON_FRAME_BACKEND)),
                 "--jetson-sample-fps",
-                os.environ.get("VIDEO_LINK_JETSON_SAMPLE_FPS", DEFAULT_JETSON_SAMPLE_FPS),
+                str(profile.get("jetson_sample_fps") or os.environ.get("VIDEO_LINK_JETSON_SAMPLE_FPS", DEFAULT_JETSON_SAMPLE_FPS)),
                 "--jetson-require-hwdec",
             ]
         )
@@ -3344,7 +3474,10 @@ class VideoLinkStatusServer:
 
     def next_stage(self, job: dict[str, Any]) -> str | None:
         for stage in self.stage_order_for_job(job):
-            if job.get("stages", {}).get(stage, {}).get("status") not in {"succeeded", "skipped"}:
+            status = job.get("stages", {}).get(stage, {}).get("status")
+            if status == "skipped" and self.skipped_stage_outputs_incomplete(job, stage):
+                return stage
+            if status not in {"succeeded", "skipped"}:
                 return stage
         return None
 
@@ -5662,6 +5795,10 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/stages/([a-z0-9-]+)", path)
             if match:
                 self.write_json(self.server_app.run_stage(match.group(1), match.group(2)))
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/stages/([a-z0-9-]+)/rerun", path)
+            if match:
+                self.write_json(self.server_app.rerun_from_stage(match.group(1), match.group(2)), HTTPStatus.ACCEPTED)
                 return
             raise BridgeError(HTTPStatus.NOT_FOUND, "not found")
         except BridgeError as exc:

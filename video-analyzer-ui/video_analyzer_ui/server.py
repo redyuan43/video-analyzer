@@ -196,6 +196,13 @@ class VideoAnalyzerUI:
             except BridgeError as exc:
                 return jsonify({'error': exc.message}), int(exc.status)
 
+        @self.app.route('/api/video-link/jobs/<job_id>/stages/<stage>/rerun', methods=['POST'])
+        def video_link_rerun_from_stage(job_id, stage):
+            try:
+                return jsonify(self.video_link.rerun_from_stage(job_id, stage)), int(HTTPStatus.ACCEPTED)
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
         @self.app.route('/api/video-link/jobs/<job_id>/logs/<stage>')
         def video_link_stage_log(job_id, stage):
             try:

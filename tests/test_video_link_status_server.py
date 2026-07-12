@@ -34,6 +34,21 @@ url_context_mod = load_module(URL_CONTEXT_PATH, "video_analyzer_url_context")
 
 
 class VideoLinkStatusServerTests(unittest.TestCase):
+    def setUp(self):
+        default_config = json.loads(
+            (REPO_ROOT / "video_analyzer" / "config" / "default_config.json").read_text(encoding="utf-8")
+        )
+        patcher = patch.object(
+            server_mod,
+            "runtime_config",
+            return_value={
+                "active_runtime_profile": "deepseek_v4_pro",
+                "runtime_profiles": default_config.get("runtime_profiles") or {},
+            },
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_focus_prompt_materializes_analysis_context(self):
         with tempfile.TemporaryDirectory() as tmp:
             context = Path(tmp) / "page_context.md"
@@ -496,6 +511,21 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertIn("deepseek_v4_pro", options["choices"]["profiles"])
         self.assertIn("mi", options["choices"]["download_devices"])
 
+    def test_options_use_machine_active_runtime_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            config = {
+                "active_runtime_profile": "nx2_fallback",
+                "runtime_profiles": {
+                    "deepseek_v4_pro": {},
+                    "nx2_fallback": {},
+                },
+            }
+            with patch.object(server_mod, "runtime_config", return_value=config):
+                options = server.options()
+
+        self.assertEqual(options["defaults"]["profile"], "nx2_fallback")
+
     def test_collect_core_artifacts_includes_review_and_ab_outputs(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "run"
@@ -921,11 +951,42 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(command[command.index("--profile") + 1], "deepseek_v4_pro")
         self.assertNotIn("--pipeline-mode", command)
 
+    def test_local_profile_routes_all_frame_work_to_nx2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            config = {
+                "active_runtime_profile": "nx2_fallback",
+                "runtime_profiles": {
+                    "nx2_fallback": {
+                        "frame_extractor": "jetson",
+                        "jetson_frame_hosts": "nx2,nx2",
+                        "jetson_frame_backend": "ssh",
+                        "jetson_sample_fps": 0.5,
+                    }
+                }
+            }
+            with patch.object(server_mod, "runtime_config", return_value=config):
+                job = server.create_job(
+                    {
+                        "video_url": "https://example.com/video",
+                        "analysis_mode": "long-talk-fast",
+                        "profile": "nx2_fallback",
+                    }
+                )
+                loaded = server.load_job(job["job_id"])
+                loaded["resolved_mode"] = "long-talk-fast"
+                command = server.operation_command(loaded)
+
+        self.assertEqual(command[command.index("--jetson-frame-hosts") + 1], "nx2,nx2")
+        self.assertEqual(command[command.index("--jetson-frame-backend") + 1], "ssh")
+
     def test_long_talk_wrapper_defaults_to_agx_dual_worker(self):
         text = (REPO_ROOT / "tools" / "run_long_talk_fast_from_url.sh").read_text(encoding="utf-8")
 
         self.assertIn('JETSON_FRAME_HOSTS="${JETSON_FRAME_HOSTS:-agx,agx}"', text)
-        self.assertIn("--jetson-frame-backend ray", text)
+        self.assertIn('JETSON_FRAME_BACKEND="${JETSON_FRAME_BACKEND:-ray}"', text)
+        self.assertIn('if [[ "$JETSON_FRAME_BACKEND" == "ray" ]]', text)
+        self.assertIn('--jetson-frame-backend "$JETSON_FRAME_BACKEND"', text)
         self.assertNotIn("nx1,nx2,nx3,nx4", text)
 
     def test_final_publish_stage_uses_finalize_only_script(self):
@@ -1229,6 +1290,146 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertTrue(result["stages"]["final-publish"]["soft_failed"])
         self.assertEqual(result["warnings"][0]["stage"], "final-publish")
         self.assertIn("publisher unavailable", result["warnings"][0]["message"])
+
+    def test_skipped_multidoc_with_missing_outputs_can_be_rerun(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "run_name": "operation-manual"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "video" / "operation-manual"
+            run_dir.mkdir(parents=True)
+            (run_dir / "analysis.json").write_text("{}", encoding="utf-8")
+            (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
+            (run_dir / "manual_evidence.md").write_text("# Evidence\n", encoding="utf-8")
+            loaded["run_dir"] = str(run_dir)
+            loaded["stages"].update(
+                {
+                    "probe": {"status": "succeeded"},
+                    "prepare": {"status": "succeeded"},
+                    "analyze-core": {"status": "succeeded"},
+                    "verify-core": {"status": "succeeded"},
+                    "study-guide": {"status": "succeeded"},
+                    "multidoc": {"status": "skipped", "error": "old timeout"},
+                }
+            )
+            server.save_job(loaded)
+
+            with patch.object(server, "run_command", return_value={"stdout_tail": []}) as run_command:
+                server.run_stage(job["job_id"], "multidoc")
+
+        run_command.assert_called_once()
+
+    def test_next_stage_recovers_skipped_multidoc_when_outputs_are_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "run_name": "operation-manual"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "video" / "operation-manual"
+            run_dir.mkdir(parents=True)
+            (run_dir / "analysis.json").write_text("{}", encoding="utf-8")
+            (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
+            (run_dir / "manual_evidence.md").write_text("# Evidence\n", encoding="utf-8")
+            loaded["run_dir"] = str(run_dir)
+            loaded["stages"].update(
+                {
+                    "probe": {"status": "succeeded"},
+                    "prepare": {"status": "succeeded"},
+                    "analyze-core": {"status": "succeeded"},
+                    "verify-core": {"status": "succeeded"},
+                    "study-guide": {"status": "succeeded"},
+                    "multidoc": {"status": "skipped"},
+                }
+            )
+
+            self.assertEqual(server.next_stage(loaded), "multidoc")
+
+    def test_rerun_from_stage_resets_downstream_outputs_and_starts_runner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "run_name": "operation-manual"})
+            loaded = server.load_job(job["job_id"])
+            loaded["stages"].update(
+                {
+                    "probe": {"status": "succeeded"},
+                    "prepare": {"status": "succeeded"},
+                    "analyze-core": {"status": "succeeded"},
+                    "verify-core": {"status": "succeeded"},
+                    "study-guide": {"status": "succeeded"},
+                    "multidoc": {"status": "succeeded"},
+                    "deep-v2": {"status": "succeeded"},
+                    "evidence-review": {"status": "succeeded"},
+                    "final-publish": {"status": "succeeded"},
+                }
+            )
+            loaded["artifacts"] = {
+                "docs_analysis": {"value": "old"},
+                "chapter_deep_report": {"value": "old"},
+                "evidence_review": {"value": "old"},
+                "exports": {"value": "old"},
+            }
+            loaded["warnings"] = [
+                {"stage": "multidoc", "message": "old warning"},
+                {"stage": "verify-core", "message": "keep"},
+            ]
+            server.save_job(loaded)
+
+            with patch.object(server, "_run_remaining_stages") as run_remaining:
+                result = server.rerun_from_stage(job["job_id"], "multidoc")
+
+            self.assertEqual(result["runner"]["current_stage"], "multidoc")
+            refreshed = server.load_job(job["job_id"])
+            self.assertEqual(refreshed["stages"]["study-guide"]["status"], "succeeded")
+            self.assertNotIn("multidoc", refreshed["stages"])
+            self.assertNotIn("final-publish", refreshed["stages"])
+            self.assertNotIn("docs_analysis", refreshed["artifacts"])
+            self.assertNotIn("exports", refreshed["artifacts"])
+            self.assertEqual(refreshed["warnings"], [{"stage": "verify-core", "message": "keep"}])
+            run_remaining.assert_called_once()
+
+    def test_final_publish_command_skips_pdfs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            loaded["run_dir"] = str(run_dir)
+
+            command = server.final_publish_command(loaded)
+
+        self.assertIn("--skip-pdf", command)
+        self.assertIn("--finalize-only", command)
+
+    def test_core_stage_starts_jetson_ray_before_ray_frame_extraction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            command = [
+                "tools/run_operation_manual_from_url.sh",
+                "https://example.com/video",
+                "--jetson-frame-backend",
+                "ray",
+            ]
+            log_path = Path(tmp) / "analyze-core.log"
+
+            completed = subprocess.CompletedProcess(["tools/start_jetson_frame_ray.sh"], 0, stdout="cluster ready", stderr="")
+            with patch("tools.video_link_status_server.subprocess.run", return_value=completed) as run:
+                result = server.ensure_jetson_ray_ready(command, str(log_path))
+            log_text = log_path.read_text(encoding="utf-8")
+
+        self.assertEqual(result["command"], [str(REPO_ROOT / "tools" / "start_jetson_frame_ray.sh")])
+        self.assertIn("cluster ready", log_text)
+        self.assertEqual(run.call_args.args[0], [str(REPO_ROOT / "tools" / "start_jetson_frame_ray.sh")])
+
+    def test_core_stage_skips_ray_preflight_for_ssh_backend(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            command = ["tools/run_operation_manual_from_url.sh", "https://example.com/video", "--jetson-frame-backend", "ssh"]
+
+            with patch("tools.video_link_status_server.subprocess.run") as run:
+                result = server.ensure_jetson_ray_ready(command, str(Path(tmp) / "analyze-core.log"))
+
+        self.assertIsNone(result)
+        run.assert_not_called()
 
     def test_public_job_hides_resolved_and_audio_only_visual_warnings(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2038,7 +2239,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
             server.run_stage(job["job_id"], "probe")
 
-            def fake_run(command, log_path, on_start=None):
+            def fake_run(command, log_path, on_start=None, append_log=False):
                 Path(log_path).parent.mkdir(parents=True, exist_ok=True)
                 Path(log_path).write_text(f"[done] run_dir: {run_dir}\n", encoding="utf-8")
                 return {"stdout_tail": ["ok"]}

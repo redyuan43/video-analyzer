@@ -203,6 +203,20 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertEqual(result["failed"], 1)
         self.assertEqual(list_response.get_json()["total"], 2)
 
+    def test_video_link_rerun_stage_route_restarts_from_requested_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp), video_link_auto_resume=False)
+            client = ui.app.test_client()
+            job_id = "0123456789abcdef0123456789abcdef"
+            expected = {"job_id": job_id, "runner": {"current_stage": "deep-v2"}}
+
+            with patch.object(ui.video_link, "rerun_from_stage", return_value=expected) as rerun:
+                response = client.post(f"/api/video-link/jobs/{job_id}/stages/deep-v2/rerun", json={})
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.get_json(), expected)
+        rerun.assert_called_once_with(job_id, "deep-v2")
+
     def test_video_link_api_upload_media_create(self):
         with tempfile.TemporaryDirectory() as tmp:
             ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp) / "jobs", video_link_auto_resume=False)

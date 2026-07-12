@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -582,7 +583,7 @@ def build_llm_client(
         resolve_api_key(api_key_env=api_key_env, api_url=llm_base_url),
         llm_base_url,
         max_retries=1,
-        timeout_seconds=180,
+        timeout_seconds=int(os.environ.get("VIDEO_ANALYZER_TEXT_TIMEOUT_SECONDS", "180")),
         extra_body=extra_body,
     )
 

@@ -204,15 +204,23 @@ EOF
 
 regenerate_docs() {
   echo "[docs] multidoc"
-  "$ROOT_DIR/tools/run_multidoc_analysis.sh" "$RUN_DIR" --profile "$PROFILE"
-  echo "[docs] deep-v2"
-  "$PYTHON_BIN" "$ROOT_DIR/tools/generate_chapter_deep_report.py" "$RUN_DIR" \
+  "$PYTHON_BIN" "$ROOT_DIR/tools/run_local_model_stage.py" \
+    --stage text \
+    --config config \
     --profile "$PROFILE" \
-    --deep-v2 \
-    --no-final-synthesis \
-    --no-format-markdown-final \
-    --refresh-chapters \
-    --chapter-concurrency "$JOBS"
+    -- "$ROOT_DIR/tools/run_multidoc_analysis.sh" "$RUN_DIR" --profile "$PROFILE"
+  echo "[docs] deep-v2"
+  "$PYTHON_BIN" "$ROOT_DIR/tools/run_local_model_stage.py" \
+    --stage text \
+    --config config \
+    --profile "$PROFILE" \
+    -- "$PYTHON_BIN" "$ROOT_DIR/tools/generate_chapter_deep_report.py" "$RUN_DIR" \
+      --profile "$PROFILE" \
+      --deep-v2 \
+      --no-final-synthesis \
+      --no-format-markdown-final \
+      --refresh-chapters \
+      --chapter-concurrency "$JOBS"
 }
 
 verify_counts() {
