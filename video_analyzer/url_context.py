@@ -1137,7 +1137,7 @@ def build_analyzer_command(args: argparse.Namespace, video_path: Path, context_p
         "--context-file",
         str(context_path),
         "--ocr-provider",
-        args.ocr_provider,
+        getattr(args, "ocr_provider", "auto"),
         "--llm-base-url",
         args.llm_base_url,
         "--vision-base-url",

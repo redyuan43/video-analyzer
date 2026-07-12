@@ -2,8 +2,8 @@
 set -euo pipefail
 
 stage="${1:-}"
-if [[ "$stage" != "asr" && "$stage" != "ocr" && "$stage" != "vl" ]]; then
-  echo "Usage: $0 asr|ocr|vl" >&2
+if [[ "$stage" != "asr" && "$stage" != "ocr" && "$stage" != "vl" && "$stage" != "text" && "$stage" != "stop" ]]; then
+  echo "Usage: $0 asr|ocr|vl|text|stop" >&2
   exit 2
 fi
 
@@ -16,6 +16,8 @@ ocr_python="${NX2_OCR_PYTHON:-$(cd "$root_dir/.." && pwd)/ocr/.venv/bin/python}"
 vl_model="${NX2_VL_MODEL:-/data/models/video-analyzer-vl-modelscope/Qwen3-VL-4B-Instruct/Qwen3VL-4B-Instruct-Q4_K_M.gguf}"
 vl_mmproj="${NX2_VL_MMPROJ:-/data/models/video-analyzer-vl-modelscope/Qwen3-VL-4B-Instruct/mmproj-Qwen3VL-4B-Instruct-Q8_0.gguf}"
 vl_alias="${NX2_VL_ALIAS:-qwen3-vl-4b-nx2}"
+text_model="${NX2_TEXT_MODEL:-/data/models/video-analyzer-text/Qwythos-9B-Claude-Mythos-5-1M-Q4_K_M.gguf}"
+text_alias="${NX2_TEXT_ALIAS:-qwythos}"
 
 if [[ ! -x "$asr_python" ]]; then
   asr_python="$(command -v python3)"
@@ -27,6 +29,7 @@ fi
 asr_port="${NX2_ASR_PORT:-18013}"
 ocr_port="${NX2_OCR_PORT:-18089}"
 vl_port="${NX2_VL_PORT:-18082}"
+text_port="${NX2_TEXT_PORT:-18081}"
 
 mkdir -p "$runtime_dir"
 
@@ -54,6 +57,7 @@ stop_all_models() {
   stop_pid_file "$runtime_dir/funasr.pid"
   stop_pid_file "$runtime_dir/easyocr.pid"
   stop_pid_file "$runtime_dir/minicpm.pid"
+  stop_pid_file "$runtime_dir/qwythos.pid"
 }
 
 wait_for_url() {
@@ -66,6 +70,22 @@ wait_for_url() {
     sleep 1
   done
   echo "$name did not become ready: $url" >&2
+  return 1
+}
+
+wait_for_text_generation() {
+  local url="http://127.0.0.1:${text_port}/v1/chat/completions"
+  local payload='{"model":"'"${text_alias}"'","messages":[{"role":"user","content":"/no_think ready"}],"max_tokens":1,"temperature":0}'
+  for _ in $(seq 1 180); do
+    if curl --noproxy "*" -fsS --max-time 30 \
+      -X POST "$url" \
+      -H "Content-Type: application/json" \
+      --data-binary "$payload" >/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "Qwythos did not accept chat requests: $url" >&2
   return 1
 }
 
@@ -122,6 +142,34 @@ case "$stage" in
       --image-min-tokens 1024 \
       --no-cache-prompt
     wait_for_url "http://127.0.0.1:${vl_port}/health" "VL"
+    ;;
+  text)
+    stop_all_models
+    if [[ ! -f "$text_model" ]]; then
+      echo "Qwythos model missing: $text_model" >&2
+      exit 1
+    fi
+    start_background \
+      "$runtime_dir/qwythos.pid" \
+      "$runtime_dir/qwythos.log" \
+      "$llama_server" \
+      --model "$text_model" \
+      --alias "$text_alias" \
+      --host 127.0.0.1 \
+      --port "$text_port" \
+      --ctx-size 65536 \
+      --parallel 1 \
+      --gpu-layers 999 \
+      --cache-ram 0 \
+      --no-cache-prompt \
+      --reasoning off \
+      --reasoning-budget 0
+    wait_for_url "http://127.0.0.1:${text_port}/health" "Qwythos"
+    wait_for_text_generation
+    sleep 2
+    ;;
+  stop)
+    stop_all_models
     ;;
 esac
 

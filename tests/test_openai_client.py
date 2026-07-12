@@ -74,6 +74,12 @@ class GenericOpenAIAPIClientTests(unittest.TestCase):
     def test_local_endpoint_allows_placeholder_key(self):
         self.assertEqual(resolve_api_key(api_url="http://100.90.114.26:18081/v1"), "0")
 
+    def test_text_timeout_environment_overrides_client_default(self):
+        with patch.dict("os.environ", {"VIDEO_ANALYZER_TEXT_TIMEOUT_SECONDS": "3600"}, clear=True):
+            client = GenericOpenAIAPIClient("0", "http://127.0.0.1:18081/v1")
+
+        self.assertEqual(client.timeout_seconds, 3600)
+
     def test_missing_deepseek_key_reports_env_name(self):
         with TemporaryDirectory() as tmpdir:
             missing_env = str(Path(tmpdir) / "missing.env")

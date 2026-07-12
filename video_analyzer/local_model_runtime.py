@@ -50,11 +50,14 @@ def local_model_stage_needed(stage: str, config: dict) -> bool:
     if stage == "vl":
         manual = config.get("operation_manual") or {}
         return is_loopback_endpoint(manual.get("vision_base_url") or manual.get("llm_base_url"))
+    if stage == "text":
+        manual = config.get("operation_manual") or {}
+        return is_loopback_endpoint(manual.get("text_base_url") or manual.get("llm_base_url"))
     return False
 
 
 def local_model_runtime_needed(config: dict) -> bool:
-    return any(local_model_stage_needed(stage, config) for stage in ("asr", "ocr", "vl"))
+    return any(local_model_stage_needed(stage, config) for stage in ("asr", "ocr", "vl", "text"))
 
 
 @contextlib.contextmanager
@@ -81,12 +84,18 @@ def local_model_stage(stage: str, config: dict, logger: logging.Logger, owner: s
 
     if _SESSION_DEPTH.get() > 0:
         prepare_local_model_stage(stage, config, logger)
-        yield
+        try:
+            yield
+        finally:
+            unload_local_model_stage(config, logger)
         return
 
     with _local_model_lock(stage, config, logger, owner):
         prepare_local_model_stage(stage, config, logger)
-        yield
+        try:
+            yield
+        finally:
+            unload_local_model_stage(config, logger)
 
 
 @contextlib.contextmanager
@@ -152,7 +161,7 @@ def _write_lock_metadata(fd: int, stage: str, owner: str) -> None:
 
 
 def prepare_local_model_stage(stage: str, config: dict, logger: logging.Logger) -> None:
-    if not local_model_stage_needed(stage, config):
+    if stage != "stop" and not local_model_stage_needed(stage, config):
         return
 
     runtime = config.get("local_model_runtime") or {}
@@ -173,3 +182,10 @@ def prepare_local_model_stage(stage: str, config: dict, logger: logging.Logger) 
     timeout = int(runtime.get("stage_timeout_seconds") or 900)
     logger.info("Preparing local GPU model stage '%s' with %s", stage, " ".join(command_args))
     subprocess.run(command_args, cwd=REPO_ROOT, env=env, timeout=timeout, check=True)
+
+
+def unload_local_model_stage(config: dict, logger: logging.Logger) -> None:
+    runtime = config.get("local_model_runtime") or {}
+    if not runtime.get("unload_on_stage_exit", False):
+        return
+    prepare_local_model_stage("stop", config, logger)

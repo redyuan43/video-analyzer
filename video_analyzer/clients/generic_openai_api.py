@@ -1,5 +1,6 @@
 import requests
 import json
+import os
 import time
 import re
 import ipaddress
@@ -22,14 +23,18 @@ class GenericOpenAIAPIClient(LLMClient):
         api_key: str,
         api_url: str,
         max_retries: int = DEFAULT_MAX_RETRIES,
-        timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+        timeout_seconds: int | None = None,
         extra_body: Optional[Dict[str, Any]] = None,
     ):
         self.api_key = api_key
         self.base_url = api_url.rstrip('/')  # Remove trailing slash if present
         self.generate_url = f"{self.base_url}/chat/completions"
         self.max_retries = max_retries
-        self.timeout_seconds = timeout_seconds
+        self.timeout_seconds = int(
+            timeout_seconds
+            if timeout_seconds is not None
+            else os.environ.get("VIDEO_ANALYZER_TEXT_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS)
+        )
         self.extra_body = dict(extra_body or {})
         self.session = requests.Session()
         if self._should_bypass_env_proxy():
