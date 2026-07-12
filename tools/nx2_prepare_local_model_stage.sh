@@ -8,13 +8,17 @@ if [[ "$stage" != "asr" && "$stage" != "ocr" && "$stage" != "vl" ]]; then
 fi
 
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-python_bin="${NX2_MODEL_PYTHON:-$root_dir/.venv/bin/python}"
 runtime_dir="${NX2_MODEL_RUNTIME_DIR:-$root_dir/tmp/nx2-local-models}"
 model_root="${NX2_MODEL_ROOT:-$(cd "$root_dir/.." && pwd)/models}"
 llama_server="${NX2_LLAMA_SERVER:-$HOME/github/llama.cpp-latest-mtp/build/bin/llama-server}"
+asr_python="${NX2_ASR_PYTHON:-$(cd "$root_dir/.." && pwd)/asr/.venv/bin/python}"
+ocr_python="${NX2_OCR_PYTHON:-$(cd "$root_dir/.." && pwd)/ocr/.venv/bin/python}"
 
-if [[ ! -x "$python_bin" ]]; then
-  python_bin="$(command -v python3)"
+if [[ ! -x "$asr_python" ]]; then
+  asr_python="$(command -v python3)"
+fi
+if [[ ! -x "$ocr_python" ]]; then
+  ocr_python="$(command -v python3)"
 fi
 
 asr_port="${NX2_ASR_PORT:-18013}"
@@ -76,7 +80,7 @@ case "$stage" in
     start_background \
       "$runtime_dir/funasr.pid" \
       "$runtime_dir/funasr.log" \
-      "$python_bin" "$root_dir/tools/nx2_sensevoice_http_server.py" \
+      "$asr_python" "$root_dir/tools/nx2_sensevoice_http_server.py" \
       --host 127.0.0.1 \
       --port "$asr_port" \
       --model "$model_root/asr/modelscope/models/iic--SenseVoiceSmall/snapshots/master" \
@@ -90,7 +94,7 @@ case "$stage" in
     start_background \
       "$runtime_dir/easyocr.pid" \
       "$runtime_dir/easyocr.log" \
-      "$python_bin" "$root_dir/tools/nx2_easyocr_openai_server.py" \
+      "$ocr_python" "$root_dir/tools/nx2_easyocr_openai_server.py" \
       --host 127.0.0.1 \
       --port "$ocr_port" \
       --model-storage-directory "$model_root/ocr/easyocr" \
