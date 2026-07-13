@@ -732,6 +732,18 @@ class WebDebugConsole:
                 )
             )
 
+        @bp.get("/api/debug/sessions/<session_id>")
+        def debug_session(session_id: str):
+            session = self._debug(session_id)
+            return jsonify(
+                {
+                    "session_id": session_id,
+                    "thread_id": session.thread_id,
+                    "job_id": self.debug_session_jobs.get(session_id),
+                    "running": session.process.poll() is None,
+                }
+            )
+
         @bp.delete("/api/debug/sessions/<session_id>")
         def debug_delete(session_id: str):
             session = self.debug_sessions.pop(session_id, None)

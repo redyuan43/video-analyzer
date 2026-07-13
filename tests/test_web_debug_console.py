@@ -2,7 +2,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from flask import Flask
 
@@ -27,6 +27,8 @@ class FakeCodexAppServer:
         self.thread_id = thread_id or "thread-test"
         self.event_callback = event_callback
         self.closed = False
+        self.process = Mock()
+        self.process.poll.return_value = None
         self.__class__.instances.append(self)
 
     def start_turn(self, prompt):
@@ -124,6 +126,8 @@ class WebDebugConsoleTests(unittest.TestCase):
         self.assertIn("body.innerHTML = render(text)", script)
         self.assertIn("/debug/history?job=", script)
         self.assertIn("result.resumed ? '已恢复'", script)
+        self.assertIn("window.sessionStorage.setItem", script)
+        self.assertIn("restoreLiveDebugSession", script)
 
     def test_terminal_session_runs_real_pty_in_context_directory(self):
         created = self.client.post(
@@ -185,6 +189,10 @@ class WebDebugConsoleTests(unittest.TestCase):
             session_id = created.get_json()["session_id"]
             session = self.console.debug_sessions[session_id]
             self.assertEqual(session.context["log_tail"], "first fatal error")
+            live = self.client.get(
+                f"/devtools/api/debug/sessions/{session_id}",
+                headers=self.headers,
+            )
 
             message = self.client.post(
                 f"/devtools/api/debug/sessions/{session_id}/messages",
@@ -201,6 +209,7 @@ class WebDebugConsoleTests(unittest.TestCase):
             )
 
         self.assertEqual(message.status_code, 202)
+        self.assertTrue(live.get_json()["running"])
         self.assertEqual(message.get_json()["turn_id"], "turn-test")
         self.assertEqual(events.get_json()["events"][0]["text"], "定位完成")
         self.assertTrue(stopped.get_json()["stopped"])

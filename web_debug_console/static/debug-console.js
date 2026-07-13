@@ -58,6 +58,25 @@ function currentJobId() {
     return new URL(window.location.href).searchParams.get('job') || '';
 }
 
+function debugSessionStorageKey() {
+    return `web-debug-console:${currentJobId() || '__project__'}`;
+}
+
+function saveLiveDebugSession() {
+    if (!state.debugSessionId) return;
+    window.sessionStorage.setItem(
+        debugSessionStorageKey(),
+        JSON.stringify({
+            session_id: state.debugSessionId,
+            sequence: state.debugSequence,
+        })
+    );
+}
+
+function clearLiveDebugSession() {
+    window.sessionStorage.removeItem(debugSessionStorageKey());
+}
+
 async function api(path, options = {}) {
     const response = await fetch(`/devtools/api${path}`, {
         ...options,
@@ -172,7 +191,10 @@ function switchTab(tab) {
 
 async function openConsole(tab = 'terminal') {
     await refreshConfig();
-    if (tab === 'debug') await loadDebugHistory();
+    if (tab === 'debug') {
+        await loadDebugHistory();
+        await restoreLiveDebugSession();
+    }
     node('.web-debug-panel').hidden = false;
     node('.web-debug-backdrop').hidden = false;
     document.body.classList.add('web-debug-open');
@@ -349,6 +371,33 @@ async function loadDebugHistory(force = false) {
     );
 }
 
+async function restoreLiveDebugSession() {
+    if (state.debugSessionId) return;
+    let saved;
+    try {
+        saved = JSON.parse(
+            window.sessionStorage.getItem(debugSessionStorageKey()) || 'null'
+        );
+    } catch {
+        clearLiveDebugSession();
+        return;
+    }
+    if (!saved?.session_id) return;
+    try {
+        const session = await api(`/debug/sessions/${saved.session_id}`);
+        if (!session.running) {
+            clearLiveDebugSession();
+            return;
+        }
+        state.debugSessionId = saved.session_id;
+        state.debugSequence = Number(saved.sequence) || 0;
+        setStatus('[data-debug-status]', '已恢复连接', 'ok');
+        pollDebugEvents();
+    } catch {
+        clearLiveDebugSession();
+    }
+}
+
 async function ensureDebugSession() {
     if (state.debugSessionId) return;
     setStatus('[data-debug-status]', '连接中');
@@ -362,6 +411,7 @@ async function ensureDebugSession() {
     });
     state.debugSessionId = result.session_id;
     state.debugSequence = 0;
+    saveLiveDebugSession();
     setStatus('[data-debug-status]', result.resumed ? '已恢复' : '已连接', 'ok');
     pollDebugEvents();
 }
@@ -369,6 +419,7 @@ async function ensureDebugSession() {
 async function resetDebugSession() {
     const sessionId = state.debugSessionId;
     state.debugSessionId = null;
+    clearLiveDebugSession();
     if (sessionId) {
         await api(`/debug/sessions/${sessionId}`, { method: 'DELETE' }).catch(() => {});
     }
@@ -436,9 +487,11 @@ async function pollDebugEvents() {
                 `/debug/sessions/${state.debugSessionId}/events?after=${state.debugSequence}&wait=20`
             );
             state.debugSequence = result.sequence;
+            saveLiveDebugSession();
             result.events.forEach(renderDebugEvent);
             if (!result.running) {
                 state.debugSessionId = null;
+                clearLiveDebugSession();
                 break;
             }
         }
@@ -457,7 +510,9 @@ function bindConsole() {
     root.querySelectorAll('[data-debug-tab]').forEach(button => {
         button.addEventListener('click', () => {
             const tab = button.dataset.debugTab;
-            const loading = tab === 'debug' ? loadDebugHistory() : Promise.resolve();
+            const loading = tab === 'debug'
+                ? loadDebugHistory().then(restoreLiveDebugSession)
+                : Promise.resolve();
             loading
                 .then(() => switchTab(tab))
                 .catch(error => setStatus('[data-debug-status]', error.message, 'error'));
@@ -486,13 +541,6 @@ function bindConsole() {
     window.addEventListener('pagehide', () => {
         if (state.terminalSessionId) {
             fetch(`/devtools/api/terminal/sessions/${state.terminalSessionId}`, {
-                method: 'DELETE',
-                headers: { 'X-Debug-Token': token },
-                keepalive: true,
-            }).catch(() => {});
-        }
-        if (state.debugSessionId) {
-            fetch(`/devtools/api/debug/sessions/${state.debugSessionId}`, {
                 method: 'DELETE',
                 headers: { 'X-Debug-Token': token },
                 keepalive: true,
