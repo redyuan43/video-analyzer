@@ -69,8 +69,10 @@ stage, error, selected stage log path, and the last 160 log lines.
   `approvalPolicy=never` and does not expose `danger-full-access`.
 - Server-side approval requests are declined because the current web module
   does not implement an approval review UI.
-- Page unload requests close active processes without deleting persisted Debug
-  history. The server reaps live sessions idle for
+- Page reloads retain the live Debug session id and event cursor in same-origin
+  session storage, allowing an in-flight response to reconnect after reload.
+  Terminal processes still close on page unload. The server reaps live Debug
+  sessions idle for
   `WEB_DEBUG_SESSION_TTL_SECONDS` (default 3600 seconds).
 
 ## Persistence
