@@ -27,6 +27,34 @@ from tools import video_link_status_server as status_server
 
 
 class VideoAnalyzerUITests(unittest.TestCase):
+    def test_debug_console_context_falls_back_for_external_run_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(
+                jobs_dir=Path(tmp) / "jobs",
+                video_link_auto_resume=False,
+            )
+            external_run_dir = Path(tmp) / "runs" / "job-1"
+            external_run_dir.mkdir(parents=True)
+            job = {
+                "job_id": "job-1",
+                "run_dir": str(external_run_dir),
+                "status": "failed",
+                "current_stage": "analyze-core",
+                "stages": {
+                    "analyze-core": {
+                        "status": "failed",
+                        "error": "worker failed",
+                    }
+                },
+            }
+
+            with patch.object(ui.video_link, "load_job", return_value=job):
+                context = ui.debug_console_context("job-1")
+
+        self.assertEqual(context["cwd"], str(ui_mod.VIDEO_LINK_REPO_ROOT))
+        self.assertEqual(context["status"], "failed")
+        self.assertEqual(context["failed_stage"], "analyze-core")
+
     def test_home_page_contains_unified_video_link_workspace(self):
         with tempfile.TemporaryDirectory() as tmp:
             ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp), video_link_auto_resume=False)

@@ -551,9 +551,14 @@ class VideoAnalyzerUI:
             context['error'] = exc.message
             return context
 
-        run_dir = Path(job.get('run_dir') or VIDEO_LINK_REPO_ROOT)
-        if run_dir.is_dir():
-            context['cwd'] = str(run_dir)
+        run_dir = Path(job.get('run_dir') or VIDEO_LINK_REPO_ROOT).resolve()
+        try:
+            run_dir.relative_to(VIDEO_LINK_REPO_ROOT.resolve())
+        except ValueError:
+            pass
+        else:
+            if run_dir.is_dir():
+                context['cwd'] = str(run_dir)
         runner = job.get('runner') or {}
         stages = job.get('stages') or {}
         failed_stage = next(
