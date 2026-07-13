@@ -7,9 +7,16 @@ development surfaces:
 - a Debug conversation backed by `codex app-server --stdio`.
 
 The browser terminal can start the login shell, Codex CLI, or Claude CLI when
-the corresponding executable is installed. The Debug surface creates an
-ephemeral Codex thread and injects the current page context only on the first
+the corresponding executable is installed. The Debug surface creates a
+persisted Codex thread and injects the current page context only on the first
 turn.
+
+Debug history is partitioned by the current `job` query parameter. User
+messages, Markdown assistant replies, and key command/file/error events are
+written atomically to the user state directory. Reloading the page restores the
+visible history, and the next message resumes the saved Codex `thread_id` so
+the model context is preserved as well. The `新会话` action explicitly clears
+the current job history and starts a fresh thread on the next message.
 
 ## Integration
 
@@ -62,8 +69,23 @@ stage, error, selected stage log path, and the last 160 log lines.
   `approvalPolicy=never` and does not expose `danger-full-access`.
 - Server-side approval requests are declined because the current web module
   does not implement an approval review UI.
-- Page unload requests close active sessions, and the server reaps sessions
-  idle for `WEB_DEBUG_SESSION_TTL_SECONDS` (default 3600 seconds).
+- Page unload requests close active processes without deleting persisted Debug
+  history. The server reaps live sessions idle for
+  `WEB_DEBUG_SESSION_TTL_SECONDS` (default 3600 seconds).
+
+## Persistence
+
+The default history location is:
+
+```text
+$XDG_STATE_HOME/web-debug-console/<project-hash>/
+```
+
+When `XDG_STATE_HOME` is unset, the module uses
+`~/.local/state/web-debug-console/<project-hash>/`. Override it with
+`WEB_DEBUG_HISTORY_DIR`. Each JSON file is mode `0600`; the directory is mode
+`0700`. `WEB_DEBUG_HISTORY_LIMIT` controls the retained event count per job and
+defaults to `500`.
 
 The host page still needs its own user authentication when it is shared with
 multiple people. The capability token is a CSRF boundary, not user identity.
@@ -72,9 +94,10 @@ multiple people. The capability token is a CSRF boundary, not user identity.
 
 - `@xterm/xterm` 6.0.0, MIT
 - `@xterm/addon-fit` 0.11.0, MIT
+- `markdown-it` 14.1.0, MIT
+- `DOMPurify`, Apache-2.0 or MPL-2.0
 
-Their license files are stored under
-`web_debug_console/static/vendor/xterm/`.
+Their license files are stored under `web_debug_console/static/vendor/`.
 
 ## Verification
 
@@ -86,4 +109,4 @@ Their license files are stored under
 
 The module test suite starts a real PTY, runs a shell command, checks the
 working directory, verifies access controls, and covers the Debug API
-lifecycle.
+lifecycle, persistence, thread resume, and history clearing.
