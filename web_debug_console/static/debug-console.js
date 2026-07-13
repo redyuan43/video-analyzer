@@ -4,6 +4,8 @@ import { FitAddon } from './vendor/xterm/addon-fit.mjs';
 const token = document.querySelector('meta[name="web-debug-token"]')?.content || '';
 if (!token) throw new Error('Web debug console token is missing');
 
+const markdownRendererReady = createMarkdownRenderer();
+
 const state = {
     panel: null,
     activeTab: 'terminal',
@@ -19,6 +21,37 @@ const state = {
     debugSequence: 0,
     debugPoll: false,
 };
+
+function loadVendorScript(relativePath, globalName) {
+    if (window[globalName]) return Promise.resolve(window[globalName]);
+    return new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = new URL(relativePath, import.meta.url).href;
+        script.onload = () => {
+            if (window[globalName]) {
+                resolve(window[globalName]);
+                return;
+            }
+            reject(new Error(`${globalName} did not initialize`));
+        };
+        script.onerror = () => reject(new Error(`Failed to load ${relativePath}`));
+        document.head.appendChild(script);
+    });
+}
+
+async function createMarkdownRenderer() {
+    const [markdownit, DOMPurify] = await Promise.all([
+        loadVendorScript('./vendor/markdown-it/markdown-it.min.js', 'markdownit'),
+        loadVendorScript('./vendor/dompurify/purify.min.js', 'DOMPurify'),
+    ]);
+    const renderer = markdownit({
+        html: false,
+        breaks: true,
+        linkify: true,
+        typographer: false,
+    });
+    return markdown => DOMPurify.sanitize(renderer.render(String(markdown || '')));
+}
 
 function currentJobId() {
     return new URL(window.location.href).searchParams.get('job') || '';
@@ -272,8 +305,16 @@ function appendDebugMessage(kind, text, details = '') {
     const item = document.createElement('article');
     item.className = `web-debug-message ${kind}`;
     const body = document.createElement('div');
+    body.className = 'web-debug-message-body';
     body.textContent = text;
     item.appendChild(body);
+    if (kind === 'assistant') {
+        markdownRendererReady
+            .then(render => {
+                if (body.isConnected) body.innerHTML = render(text);
+            })
+            .catch(() => {});
+    }
     if (details) {
         const pre = document.createElement('pre');
         pre.textContent = details;

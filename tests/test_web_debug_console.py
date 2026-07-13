@@ -64,6 +64,12 @@ class WebDebugConsoleTests(unittest.TestCase):
 
     def test_config_requires_capability_token_and_restricts_remote_network(self):
         static_asset = self.client.get("/devtools/assets/debug-console.css")
+        markdown_asset = self.client.get(
+            "/devtools/assets/vendor/markdown-it/markdown-it.min.js"
+        )
+        purifier_asset = self.client.get(
+            "/devtools/assets/vendor/dompurify/purify.min.js"
+        )
         missing = self.client.get("/devtools/api/config")
         external = self.client.get(
             "/devtools/api/config",
@@ -77,12 +83,29 @@ class WebDebugConsoleTests(unittest.TestCase):
         )
 
         self.assertEqual(static_asset.status_code, 200)
+        self.assertEqual(markdown_asset.status_code, 200)
+        self.assertEqual(purifier_asset.status_code, 200)
         self.assertEqual(missing.status_code, 403)
         self.assertEqual(external.status_code, 403)
         self.assertEqual(allowed.status_code, 200)
         self.assertEqual(allowed.get_json()["cwd"], str(self.run_dir))
         self.assertEqual(allowed.get_json()["context"]["failed_stage"], "analyze-core")
         static_asset.close()
+        markdown_asset.close()
+        purifier_asset.close()
+
+    def test_debug_console_renders_assistant_messages_as_sanitized_markdown(self):
+        script = (
+            Path(__file__).resolve().parents[1]
+            / "web_debug_console"
+            / "static"
+            / "debug-console.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("markdownit({", script)
+        self.assertIn("DOMPurify.sanitize", script)
+        self.assertIn("kind === 'assistant'", script)
+        self.assertIn("body.innerHTML = render(text)", script)
 
     def test_terminal_session_runs_real_pty_in_context_directory(self):
         created = self.client.post(
