@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import hmac
 import ipaddress
 import json
@@ -27,7 +28,109 @@ from flask import Blueprint, Flask, jsonify, request
 
 ContextProvider = Callable[[str | None], dict[str, Any]]
 MAX_BUFFER_BYTES = 2 * 1024 * 1024
+MAX_HISTORY_TEXT_CHARS = 128 * 1024
 TAILSCALE_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+PERSISTED_DEBUG_EVENT_TYPES = {
+    "assistant",
+    "command",
+    "file_change",
+    "error",
+}
+
+
+class DebugHistoryStore:
+    def __init__(self, root: Path, limit: int = 500) -> None:
+        self.root = root.expanduser().resolve()
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.root.chmod(0o700)
+        self.limit = max(20, min(int(limit), 5000))
+        self._lock = threading.Lock()
+
+    def load(self, job_id: str | None) -> dict[str, Any]:
+        with self._lock:
+            return self._load_unlocked(job_id)
+
+    def set_thread(
+        self,
+        job_id: str | None,
+        thread_id: str,
+        cwd: Path,
+        sandbox: str,
+    ) -> dict[str, Any]:
+        with self._lock:
+            record = self._load_unlocked(job_id)
+            now = time.time()
+            record.update(
+                {
+                    "version": 1,
+                    "job_id": job_id,
+                    "thread_id": thread_id,
+                    "cwd": str(cwd),
+                    "sandbox": sandbox,
+                    "created_at": record.get("created_at") or now,
+                    "updated_at": now,
+                }
+            )
+            self._write_unlocked(job_id, record)
+            return record
+
+    def append(self, job_id: str | None, event: dict[str, Any]) -> None:
+        with self._lock:
+            record = self._load_unlocked(job_id)
+            messages = list(record.get("messages") or [])
+            messages.append(
+                {
+                    **event,
+                    "created_at": time.time(),
+                }
+            )
+            record["messages"] = messages[-self.limit :]
+            record["updated_at"] = time.time()
+            self._write_unlocked(job_id, record)
+
+    def clear(self, job_id: str | None) -> bool:
+        with self._lock:
+            path = self._path(job_id)
+            if not path.exists():
+                return False
+            path.unlink()
+            return True
+
+    def _load_unlocked(self, job_id: str | None) -> dict[str, Any]:
+        path = self._path(job_id)
+        if not path.is_file():
+            return {
+                "version": 1,
+                "job_id": job_id,
+                "thread_id": None,
+                "messages": [],
+            }
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {
+                "version": 1,
+                "job_id": job_id,
+                "thread_id": None,
+                "messages": [],
+            }
+        payload["messages"] = list(payload.get("messages") or [])[-self.limit :]
+        return payload
+
+    def _write_unlocked(self, job_id: str | None, record: dict[str, Any]) -> None:
+        path = self._path(job_id)
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        temporary.write_text(
+            json.dumps(record, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+
+    def _path(self, job_id: str | None) -> Path:
+        identity = job_id or "__project__"
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        return self.root / f"{digest}.json"
 
 
 class TerminalSession:
@@ -136,12 +239,20 @@ class TerminalSession:
 
 
 class CodexAppServer:
-    def __init__(self, cwd: Path, context: dict[str, Any], sandbox: str) -> None:
+    def __init__(
+        self,
+        cwd: Path,
+        context: dict[str, Any],
+        sandbox: str,
+        thread_id: str | None = None,
+        event_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
         codex = shutil.which("codex")
         if not codex:
             raise RuntimeError("codex CLI is not installed")
         self.cwd = cwd
         self.context = context
+        self.event_callback = event_callback
         self.created_at = time.time()
         self.updated_at = self.created_at
         self.process = subprocess.Popen(
@@ -159,7 +270,7 @@ class CodexAppServer:
         self._event_sequence = 0
         self._condition = threading.Condition()
         self._closed = False
-        self._context_sent = False
+        self._context_sent = bool(thread_id)
         threading.Thread(target=self._read_stdout, daemon=True).start()
         threading.Thread(target=self._drain_stderr, daemon=True).start()
         self._request(
@@ -184,22 +295,35 @@ class CodexAppServer:
             },
         )
         self._notify("initialized", {})
-        result = self._request(
-            "thread/start",
-            {
-                "cwd": str(cwd),
-                "runtimeWorkspaceRoots": [str(cwd)],
-                "approvalPolicy": "never",
-                "sandbox": sandbox,
-                "ephemeral": True,
-                "developerInstructions": (
-                    "你是嵌入网页的故障诊断助手。使用简体中文，先定位第一处 fatal "
-                    "evidence，并继续追踪子服务日志，不要把页面上的 connection refused "
-                    "当作根因。只在当前工作目录内读取或修改；不要执行破坏性操作，不要提交或推送。"
-                ),
-            },
-            timeout=30,
-        )
+        thread_params = {
+            "cwd": str(cwd),
+            "approvalPolicy": "never",
+            "sandbox": sandbox,
+            "developerInstructions": (
+                "你是嵌入网页的故障诊断助手。使用简体中文，先定位第一处 fatal "
+                "evidence，并继续追踪子服务日志，不要把页面上的 connection refused "
+                "当作根因。只在当前工作目录内读取或修改；不要执行破坏性操作，不要提交或推送。"
+            ),
+        }
+        if thread_id:
+            result = self._request(
+                "thread/resume",
+                {
+                    "threadId": thread_id,
+                    **thread_params,
+                },
+                timeout=30,
+            )
+        else:
+            result = self._request(
+                "thread/start",
+                {
+                    **thread_params,
+                    "runtimeWorkspaceRoots": [str(cwd)],
+                    "ephemeral": False,
+                },
+                timeout=30,
+            )
         self.thread_id = result["thread"]["id"]
 
     def _write(self, payload: dict[str, Any]) -> None:
@@ -326,6 +450,11 @@ class CodexAppServer:
             self._events.append((self._event_sequence, event))
             self.updated_at = time.time()
             self._condition.notify_all()
+        if self.event_callback:
+            try:
+                self.event_callback(event)
+            except Exception:
+                pass
 
     def start_turn(self, prompt: str) -> str:
         text = prompt.strip()
@@ -382,6 +511,7 @@ class WebDebugConsole:
         project_root: Path,
         context_provider: ContextProvider | None = None,
         enabled: bool = True,
+        history_dir: Path | None = None,
     ) -> None:
         self.project_root = project_root.resolve()
         self.context_provider = context_provider or (
@@ -391,6 +521,23 @@ class WebDebugConsole:
         self.token = secrets.token_urlsafe(32)
         self.terminals: dict[str, TerminalSession] = {}
         self.debug_sessions: dict[str, CodexAppServer] = {}
+        self.debug_session_jobs: dict[str, str | None] = {}
+        project_digest = hashlib.sha256(
+            str(self.project_root).encode("utf-8")
+        ).hexdigest()[:16]
+        default_state_root = Path(
+            os.environ.get(
+                "XDG_STATE_HOME",
+                str(Path.home() / ".local" / "state"),
+            )
+        )
+        configured_history_dir = os.environ.get("WEB_DEBUG_HISTORY_DIR")
+        self.history = DebugHistoryStore(
+            history_dir
+            or (Path(configured_history_dir) if configured_history_dir else None)
+            or default_state_root / "web-debug-console" / project_digest,
+            limit=int(os.environ.get("WEB_DEBUG_HISTORY_LIMIT", "500")),
+        )
         self.session_ttl_seconds = max(
             300, int(os.environ.get("WEB_DEBUG_SESSION_TTL_SECONDS", "3600"))
         )
@@ -502,30 +649,78 @@ class WebDebugConsole:
                 session.terminate()
             return jsonify({"stopped": bool(session)})
 
+        @bp.get("/api/debug/history")
+        def debug_history():
+            job_id = request.args.get("job") or None
+            record = self.history.load(job_id)
+            return jsonify(
+                {
+                    "job_id": job_id,
+                    "thread_id": record.get("thread_id"),
+                    "messages": record.get("messages") or [],
+                    "updated_at": record.get("updated_at"),
+                }
+            )
+
+        @bp.delete("/api/debug/history")
+        def debug_history_delete():
+            job_id = request.args.get("job") or None
+            for session_id, session_job_id in list(self.debug_session_jobs.items()):
+                if session_job_id != job_id:
+                    continue
+                session = self.debug_sessions.pop(session_id, None)
+                self.debug_session_jobs.pop(session_id, None)
+                if session:
+                    session.close()
+            return jsonify({"cleared": self.history.clear(job_id)})
+
         @bp.post("/api/debug/sessions")
         def create_debug():
             payload = request.get_json(silent=True) or {}
-            context = self._context(payload.get("job_id"))
+            job_id = str(payload.get("job_id") or "") or None
+            context = self._context(job_id)
             cwd = self._resolve_cwd(payload.get("cwd") or context["cwd"])
             sandbox = str(payload.get("sandbox") or "workspace-write")
             if sandbox not in {"read-only", "workspace-write"}:
                 raise ValueError("unsupported debug sandbox")
-            session = CodexAppServer(cwd, context, sandbox)
+            history = self.history.load(job_id)
+            resumed_thread_id = (
+                str(history.get("thread_id") or "")
+                if payload.get("resume", True)
+                else ""
+            )
+            session = CodexAppServer(
+                cwd,
+                context,
+                sandbox,
+                thread_id=resumed_thread_id or None,
+                event_callback=lambda event: self._persist_debug_event(job_id, event),
+            )
             session_id = uuid.uuid4().hex
             self.debug_sessions[session_id] = session
+            self.debug_session_jobs[session_id] = job_id
+            self.history.set_thread(job_id, session.thread_id, cwd, sandbox)
             return jsonify(
                 {
                     "session_id": session_id,
                     "thread_id": session.thread_id,
                     "cwd": str(cwd),
                     "sandbox": sandbox,
+                    "resumed": bool(resumed_thread_id),
                 }
             ), 201
 
         @bp.post("/api/debug/sessions/<session_id>/messages")
         def debug_message(session_id: str):
             payload = request.get_json(silent=True) or {}
-            turn_id = self._debug(session_id).start_turn(str(payload.get("message") or ""))
+            message = str(payload.get("message") or "").strip()
+            if not message:
+                raise ValueError("debug message is required")
+            self.history.append(
+                self.debug_session_jobs.get(session_id),
+                {"type": "user", "text": message},
+            )
+            turn_id = self._debug(session_id).start_turn(message)
             return jsonify({"turn_id": turn_id}), 202
 
         @bp.get("/api/debug/sessions/<session_id>/events")
@@ -540,6 +735,7 @@ class WebDebugConsole:
         @bp.delete("/api/debug/sessions/<session_id>")
         def debug_delete(session_id: str):
             session = self.debug_sessions.pop(session_id, None)
+            self.debug_session_jobs.pop(session_id, None)
             if session:
                 session.close()
             return jsonify({"stopped": bool(session)})
@@ -603,6 +799,21 @@ class WebDebugConsole:
             raise ValueError("debug session not found")
         return session
 
+    def _persist_debug_event(
+        self, job_id: str | None, event: dict[str, Any]
+    ) -> None:
+        if event.get("type") not in PERSISTED_DEBUG_EVENT_TYPES:
+            return
+        persisted = dict(event)
+        for key in ("text", "message", "output", "command"):
+            value = persisted.get(key)
+            if isinstance(value, str) and len(value) > MAX_HISTORY_TEXT_CHARS:
+                persisted[key] = value[:MAX_HISTORY_TEXT_CHARS] + "\n[truncated]"
+        changes = persisted.get("changes")
+        if isinstance(changes, list):
+            persisted["changes"] = changes[:200]
+        self.history.append(job_id, persisted)
+
     def _reap_idle_sessions(self) -> None:
         while True:
             time.sleep(60)
@@ -614,4 +825,5 @@ class WebDebugConsole:
             for session_id, session in list(self.debug_sessions.items()):
                 if session.updated_at < cutoff:
                     self.debug_sessions.pop(session_id, None)
+                    self.debug_session_jobs.pop(session_id, None)
                     session.close()

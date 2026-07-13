@@ -20,6 +20,7 @@ const state = {
     debugSessionId: null,
     debugSequence: 0,
     debugPoll: false,
+    debugHistoryKey: null,
 };
 
 function loadVendorScript(relativePath, globalName) {
@@ -171,6 +172,7 @@ function switchTab(tab) {
 
 async function openConsole(tab = 'terminal') {
     await refreshConfig();
+    if (tab === 'debug') await loadDebugHistory();
     node('.web-debug-panel').hidden = false;
     node('.web-debug-backdrop').hidden = false;
     document.body.classList.add('web-debug-open');
@@ -324,6 +326,29 @@ function appendDebugMessage(kind, text, details = '') {
     messages.scrollTop = messages.scrollHeight;
 }
 
+function renderPersistedDebugEvent(event) {
+    if (event.type === 'user') {
+        appendDebugMessage('user', event.text || '');
+        return;
+    }
+    renderDebugEvent(event);
+}
+
+async function loadDebugHistory(force = false) {
+    const historyKey = currentJobId() || '__project__';
+    if (!force && state.debugHistoryKey === historyKey) return;
+    const result = await api(`/debug/history?job=${encodeURIComponent(currentJobId())}`);
+    const messages = node('.web-debug-messages');
+    messages.replaceChildren();
+    (result.messages || []).forEach(renderPersistedDebugEvent);
+    state.debugHistoryKey = historyKey;
+    setStatus(
+        '[data-debug-status]',
+        result.thread_id ? '历史已加载' : '未连接',
+        result.thread_id ? 'ok' : ''
+    );
+}
+
 async function ensureDebugSession() {
     if (state.debugSessionId) return;
     setStatus('[data-debug-status]', '连接中');
@@ -337,7 +362,7 @@ async function ensureDebugSession() {
     });
     state.debugSessionId = result.session_id;
     state.debugSequence = 0;
-    setStatus('[data-debug-status]', '已连接', 'ok');
+    setStatus('[data-debug-status]', result.resumed ? '已恢复' : '已连接', 'ok');
     pollDebugEvents();
 }
 
@@ -347,7 +372,11 @@ async function resetDebugSession() {
     if (sessionId) {
         await api(`/debug/sessions/${sessionId}`, { method: 'DELETE' }).catch(() => {});
     }
+    await api(`/debug/history?job=${encodeURIComponent(currentJobId())}`, {
+        method: 'DELETE',
+    });
     node('.web-debug-messages').replaceChildren();
+    state.debugHistoryKey = currentJobId() || '__project__';
     setStatus('[data-debug-status]', '未连接');
 }
 
@@ -426,13 +455,24 @@ function bindConsole() {
         button.addEventListener('click', () => openConsole(button.dataset.debugOpen));
     });
     root.querySelectorAll('[data-debug-tab]').forEach(button => {
-        button.addEventListener('click', () => switchTab(button.dataset.debugTab));
+        button.addEventListener('click', () => {
+            const tab = button.dataset.debugTab;
+            const loading = tab === 'debug' ? loadDebugHistory() : Promise.resolve();
+            loading
+                .then(() => switchTab(tab))
+                .catch(error => setStatus('[data-debug-status]', error.message, 'error'));
+        });
     });
     node('[data-debug-close]').addEventListener('click', closeConsole);
     node('.web-debug-backdrop').addEventListener('click', closeConsole);
     node('[data-terminal-start]').addEventListener('click', () => startTerminal().catch(error => setStatus('[data-terminal-status]', error.message, 'error')));
     node('[data-terminal-stop]').addEventListener('click', stopTerminal);
-    node('[data-debug-reset]').addEventListener('click', resetDebugSession);
+    node('[data-debug-reset]').addEventListener('click', () => {
+        resetDebugSession().catch(error => {
+            appendDebugMessage('error', error.message);
+            setStatus('[data-debug-status]', '异常', 'error');
+        });
+    });
     node('.web-debug-form').addEventListener('submit', event => sendDebugMessage(event).catch(error => {
         appendDebugMessage('error', error.message);
         setStatus('[data-debug-status]', '异常', 'error');

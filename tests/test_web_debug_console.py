@@ -10,16 +10,30 @@ from web_debug_console import WebDebugConsole
 
 
 class FakeCodexAppServer:
-    def __init__(self, cwd, context, sandbox):
+    instances = []
+
+    def __init__(
+        self,
+        cwd,
+        context,
+        sandbox,
+        thread_id=None,
+        event_callback=None,
+    ):
         self.cwd = cwd
         self.context = context
         self.sandbox = sandbox
-        self.thread_id = "thread-test"
+        self.resumed_from = thread_id
+        self.thread_id = thread_id or "thread-test"
+        self.event_callback = event_callback
         self.closed = False
+        self.__class__.instances.append(self)
 
     def start_turn(self, prompt):
         if not prompt:
             raise ValueError("debug message is required")
+        if self.event_callback:
+            self.event_callback({"type": "assistant", "text": "定位完成"})
         return "turn-test"
 
     def events(self, after, wait):
@@ -35,6 +49,7 @@ class FakeCodexAppServer:
 
 class WebDebugConsoleTests(unittest.TestCase):
     def setUp(self):
+        FakeCodexAppServer.instances.clear()
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.run_dir = self.root / "run"
@@ -51,6 +66,7 @@ class WebDebugConsoleTests(unittest.TestCase):
                 "error": "worker failed",
                 "log_tail": "first fatal error",
             },
+            history_dir=self.root / "history",
         )
         self.client = self.app.test_client()
         self.headers = {"X-Debug-Token": self.console.token}
@@ -106,6 +122,8 @@ class WebDebugConsoleTests(unittest.TestCase):
         self.assertIn("DOMPurify.sanitize", script)
         self.assertIn("kind === 'assistant'", script)
         self.assertIn("body.innerHTML = render(text)", script)
+        self.assertIn("/debug/history?job=", script)
+        self.assertIn("result.resumed ? '已恢复'", script)
 
     def test_terminal_session_runs_real_pty_in_context_directory(self):
         created = self.client.post(
@@ -187,3 +205,61 @@ class WebDebugConsoleTests(unittest.TestCase):
         self.assertEqual(events.get_json()["events"][0]["text"], "定位完成")
         self.assertTrue(stopped.get_json()["stopped"])
         self.assertTrue(session.closed)
+
+    def test_debug_history_persists_and_resumes_thread(self):
+        with patch(
+            "web_debug_console.console.CodexAppServer", FakeCodexAppServer
+        ):
+            created = self.client.post(
+                "/devtools/api/debug/sessions",
+                headers=self.headers,
+                json={
+                    "job_id": "job-1",
+                    "sandbox": "workspace-write",
+                },
+            )
+            session_id = created.get_json()["session_id"]
+            self.client.post(
+                f"/devtools/api/debug/sessions/{session_id}/messages",
+                headers=self.headers,
+                json={"message": "继续定位"},
+            )
+            self.client.delete(
+                f"/devtools/api/debug/sessions/{session_id}",
+                headers=self.headers,
+            )
+
+            history = self.client.get(
+                "/devtools/api/debug/history?job=job-1",
+                headers=self.headers,
+            )
+            resumed = self.client.post(
+                "/devtools/api/debug/sessions",
+                headers=self.headers,
+                json={
+                    "job_id": "job-1",
+                    "sandbox": "read-only",
+                },
+            )
+
+        payload = history.get_json()
+        self.assertEqual(payload["thread_id"], "thread-test")
+        self.assertEqual(
+            [message["type"] for message in payload["messages"]],
+            ["user", "assistant"],
+        )
+        self.assertTrue(resumed.get_json()["resumed"])
+        self.assertEqual(FakeCodexAppServer.instances[-1].resumed_from, "thread-test")
+
+        cleared = self.client.delete(
+            "/devtools/api/debug/history?job=job-1",
+            headers=self.headers,
+        )
+        empty = self.client.get(
+            "/devtools/api/debug/history?job=job-1",
+            headers=self.headers,
+        )
+
+        self.assertTrue(cleared.get_json()["cleared"])
+        self.assertIsNone(empty.get_json()["thread_id"])
+        self.assertEqual(empty.get_json()["messages"], [])
