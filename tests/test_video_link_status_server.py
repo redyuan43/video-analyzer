@@ -760,6 +760,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
                     "python": sys.executable,
                     "llm_base_url": "http://127.0.0.1:8000/v1",
                     "vision_base_url": "http://127.0.0.1:18082/v1",
+                    "ocr_provider": "auto",
                     "text_base_url": "http://127.0.0.1:8000/v1",
                     "vision_model": "minicpm-v-4.5-v100",
                     "text_model": "deepseek-v4-pro",
@@ -2492,6 +2493,31 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(by_id["asr_done"]["status"], "succeeded")
         self.assertEqual(by_id["frames"]["status"], "running")
         self.assertEqual(progress["source"], "progress_json")
+
+    def test_core_progress_uses_frame_level_vl_fraction(self):
+        parsed = server_mod.parse_core_progress("Selecting and analyzing VL frames", "running")
+        snapshot = {
+            "current_step": "vl",
+            "status": "running",
+            "message": "VL frames 25/100",
+            "details": {
+                "vl": {
+                    "total_selected": 100,
+                    "completed": 25,
+                    "reused": 10,
+                    "failed": 1,
+                    "average_frame_seconds": 30.0,
+                    "eta_seconds": 2250.0,
+                }
+            },
+        }
+
+        progress = server_mod.merge_core_progress_snapshot(parsed, snapshot, "running")
+
+        by_id = {step["id"]: step for step in progress["steps"]}
+        self.assertEqual(progress["vl"]["completed"], 25)
+        self.assertIn("25/100", by_id["vl"]["message"])
+        self.assertIn("复用 10", by_id["vl"]["message"])
 
     def test_core_progress_infers_asr_done_from_transcript_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:

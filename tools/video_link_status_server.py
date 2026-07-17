@@ -1243,7 +1243,12 @@ class VideoLinkStatusServer:
 
         start = time.time()
         attempt = max(1, int(previous_stage_info.get("attempt") or 0) + 1)
-        log_path, attempt_log_paths = self.prepare_stage_log_attempt(job_id, stage, previous_stage_info, attempt)
+        log_path, attempt_log_paths = self.prepare_stage_log_attempt(
+            job_id,
+            stage,
+            previous_stage_info,
+            attempt,
+        )
         stage_info = {
             "status": "running",
             "started_at": iso_now(),
@@ -3359,21 +3364,27 @@ class VideoLinkStatusServer:
         limit = max(1, min(limit, 500))
         stage_info = (job.get("stages") or {}).get(stage) or {}
         log_path = Path(str(stage_info.get("log_path") or self.stage_log_path(job_id, stage)))
-        if not log_path.exists():
-            return {
-                "job_id": job_id,
-                "stage": stage,
-                "log_path": str(log_path),
-                "attempt_log_paths": list(stage_info.get("attempt_log_paths") or []),
-                "lines": [],
-                "text": "",
-            }
-        text = log_path.read_text(encoding="utf-8", errors="replace")
+        attempt_log_paths = self.stage_attempt_log_paths(job_id, stage, stage_info)
+        text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+        displayed_log_path = log_path
+        history_fallback = False
+        if not text.strip():
+            for attempt_log_path in reversed(attempt_log_paths):
+                if attempt_log_path == log_path or not attempt_log_path.is_file():
+                    continue
+                history_text = attempt_log_path.read_text(encoding="utf-8", errors="replace")
+                if history_text.strip():
+                    text = history_text
+                    displayed_log_path = attempt_log_path
+                    history_fallback = True
+                    break
         return {
             "job_id": job_id,
             "stage": stage,
             "log_path": str(log_path),
-            "attempt_log_paths": list(stage_info.get("attempt_log_paths") or []),
+            "displayed_log_path": str(displayed_log_path),
+            "attempt_log_paths": [str(path) for path in attempt_log_paths],
+            "history_fallback": history_fallback,
             "lines": text.splitlines() if full else tail_lines(text, limit),
             "text": text if full else "",
             "full": full,
@@ -3568,6 +3579,23 @@ class VideoLinkStatusServer:
     def stage_attempt_log_path(self, job_id: str, stage: str, attempt: int) -> Path:
         return self.job_dir(job_id) / "logs" / f"{stage}.attempt-{attempt}.log"
 
+    def stage_attempt_log_paths(self, job_id: str, stage: str, stage_info: dict[str, Any]) -> list[Path]:
+        paths: list[Path] = []
+        seen: set[Path] = set()
+        for value in stage_info.get("attempt_log_paths") or []:
+            path = Path(str(value))
+            if path not in seen:
+                paths.append(path)
+                seen.add(path)
+        for path in sorted(
+            self.job_dir(job_id).joinpath("logs").glob(f"{stage}.attempt-*.log"),
+            key=lambda candidate: candidate.stat().st_mtime,
+        ):
+            if path not in seen:
+                paths.append(path)
+                seen.add(path)
+        return paths
+
     def prepare_stage_log_attempt(
         self,
         job_id: str,
@@ -3576,7 +3604,7 @@ class VideoLinkStatusServer:
         attempt: int,
     ) -> tuple[Path, list[str]]:
         log_path = self.stage_log_path(job_id, stage)
-        attempt_log_paths = list(previous_stage_info.get("attempt_log_paths") or [])
+        attempt_log_paths = [str(path) for path in self.stage_attempt_log_paths(job_id, stage, previous_stage_info)]
         previous_attempt = int(previous_stage_info.get("attempt") or 0)
         previous_log_path = Path(str(previous_stage_info.get("log_path") or log_path))
         if attempt > 1 and previous_attempt and previous_log_path == log_path and log_path.is_file():
@@ -3768,6 +3796,8 @@ def merge_core_progress_snapshot(
     snapshot_index = core_step_index(current_step)
     if snapshot_index is None:
         return progress
+    details = snapshot.get("details") if isinstance(snapshot.get("details"), dict) else {}
+    vl_progress = details.get("vl") if isinstance(details.get("vl"), dict) else None
 
     parsed_index = max(
         (
@@ -3778,7 +3808,12 @@ def merge_core_progress_snapshot(
         default=None,
     )
     if parsed_index is not None and parsed_index > snapshot_index:
-        return progress
+        merged = dict(progress)
+        if details:
+            merged["details"] = details
+        if vl_progress:
+            merged["vl"] = vl_progress
+        return merged
 
     snapshot_status = str(snapshot.get("status") or "running")
     merged = dict(progress)
@@ -3791,7 +3826,14 @@ def merge_core_progress_snapshot(
             item["status"] = "succeeded"
         elif index == snapshot_index:
             item["status"] = "failed" if snapshot_status == "failed" else "running"
-            if snapshot.get("message") and not item.get("message"):
+            if current_step == "vl" and vl_progress:
+                completed = max(int(vl_progress.get("completed") or 0), 0)
+                total = max(int(vl_progress.get("total_selected") or 0), 0)
+                reused = max(int(vl_progress.get("reused") or 0), 0)
+                eta_seconds = vl_progress.get("eta_seconds")
+                eta_text = format_seconds_label(float(eta_seconds)) if isinstance(eta_seconds, (int, float)) else "-"
+                item["message"] = f"VL {completed}/{total} · 复用 {reused} · ETA {eta_text}"
+            elif snapshot.get("message") and not item.get("message"):
                 item["message"] = str(snapshot["message"])
         elif item.get("status") != "pending":
             item["status"] = "pending"
@@ -3804,9 +3846,24 @@ def merge_core_progress_snapshot(
     merged["current_step"] = None if effective_status in {"succeeded", "skipped"} else current_step
     merged["current_label"] = next((step["label"] for step in steps if step["id"] == merged["current_step"]), None)
     merged["percent"] = progress_percent_from_steps(steps, CORE_PROGRESS_STEPS, effective_status, CORE_PROGRESS_WEIGHTS)
+    if current_step == "vl" and vl_progress and effective_status not in {"succeeded", "skipped"}:
+        total = max(int(vl_progress.get("total_selected") or 0), 0)
+        completed = max(int(vl_progress.get("completed") or 0), 0)
+        fraction = min(completed / total, 1.0) if total else 1.0
+        total_weight = sum(CORE_PROGRESS_WEIGHTS.values()) or 1
+        completed_weight = sum(
+            CORE_PROGRESS_WEIGHTS.get(step_id, 0)
+            for step_id, _label, _patterns in CORE_PROGRESS_STEPS[:snapshot_index]
+        )
+        completed_weight += CORE_PROGRESS_WEIGHTS.get("vl", 0) * fraction
+        merged["percent"] = min(99, max(0, int(round(completed_weight / total_weight * 100))))
     merged["steps"] = steps
     merged["source"] = "progress_json"
     merged["progress_updated_at"] = snapshot.get("updated_at")
+    if details:
+        merged["details"] = details
+    if vl_progress:
+        merged["vl"] = vl_progress
     return merged
 
 

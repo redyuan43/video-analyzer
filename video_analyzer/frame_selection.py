@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import ceil
+from math import ceil, floor
 from statistics import median
 from typing import Any, Iterable, List, Optional
 
@@ -15,6 +15,9 @@ VL_FRAME_POLICIES = {"auto", "all", "none"}
 MIN_VL_CONTEXT_GAP_SECONDS = 8.0
 MAX_VL_CONTEXT_GAP_SECONDS = 45.0
 VL_CONTEXT_GAP_MULTIPLIER = 3.0
+DEFAULT_VL_TARGET_SECONDS = 45 * 60
+DEFAULT_VL_SECONDS_PER_FRAME = 30.0
+VL_TIME_SAFETY_FACTOR = 1.10
 
 
 @dataclass(frozen=True)
@@ -25,6 +28,8 @@ class FrameSelectionOptions:
     max_vl_frames: int | str = AUTO
     vl_frame_policy: str = AUTO
     explicit_max_frames: Optional[int] = None
+    vl_target_seconds: float = DEFAULT_VL_TARGET_SECONDS
+    vl_seconds_per_frame: float = DEFAULT_VL_SECONDS_PER_FRAME
 
 
 @dataclass(frozen=True)
@@ -186,22 +191,37 @@ def select_vl_frames(
 
     policy = options.vl_frame_policy
     if policy == AUTO:
-        policy = "none" if options.pipeline_mode == "fast" else "all" if options.pipeline_mode == "deep" else "auto"
+        policy = "none" if options.pipeline_mode == "fast" else "auto"
 
     scored = _score_frames(frames, ocr_events, transcript, video_duration_seconds)
     if policy == "none":
         selected_numbers: set[int] = set()
+        budget_details = {
+            "vl_quality_budget": 0,
+            "vl_time_capacity": 0,
+            "vl_budget_resolved": 0,
+            "vl_projected_seconds": 0.0,
+        }
     elif policy == "all":
         selected_numbers = {frame.number for frame, _ in scored}
+        seconds_per_frame = max(float(options.vl_seconds_per_frame or DEFAULT_VL_SECONDS_PER_FRAME), 0.1)
+        target_seconds = max(float(options.vl_target_seconds or DEFAULT_VL_TARGET_SECONDS), 0.0)
+        time_capacity = max(1, floor(target_seconds / (seconds_per_frame * VL_TIME_SAFETY_FACTOR)))
+        budget_details = {
+            "vl_quality_budget": len(selected_numbers),
+            "vl_time_capacity": min(time_capacity, len(selected_numbers)),
+            "vl_budget_resolved": len(selected_numbers),
+            "vl_projected_seconds": round(len(selected_numbers) * seconds_per_frame, 3),
+        }
     else:
-        budget = resolve_vl_frame_budget(
+        budget_details = resolve_vl_frame_budget_details(
             frames=frames,
             ocr_events=ocr_events,
             transcript=transcript,
             video_duration_seconds=video_duration_seconds,
             options=options,
         )
-        selected_numbers = _select_with_coverage(scored, budget)
+        selected_numbers = _select_with_coverage(scored, int(budget_details["vl_budget_resolved"]))
 
     decisions = [
         _build_decision(frame, score, frame.number in selected_numbers, policy)
@@ -216,6 +236,10 @@ def select_vl_frames(
         decisions=decisions,
     )
     meta["vl_frame_policy_resolved"] = policy
+    meta.update(budget_details)
+    meta["vl_time_target_seconds"] = round(max(options.vl_target_seconds, 0.0), 3)
+    meta["vl_seconds_per_frame_estimate"] = round(max(options.vl_seconds_per_frame, 0.0), 3)
+    meta["vl_time_target_bypassed"] = policy == "all"
     return selected_numbers, decisions, meta
 
 
@@ -226,19 +250,67 @@ def resolve_vl_frame_budget(
     video_duration_seconds: float,
     options: FrameSelectionOptions,
 ) -> int:
+    return int(
+        resolve_vl_frame_budget_details(
+            frames=frames,
+            ocr_events=ocr_events,
+            transcript=transcript,
+            video_duration_seconds=video_duration_seconds,
+            options=options,
+        )["vl_budget_resolved"]
+    )
+
+
+def resolve_vl_frame_budget_details(
+    frames: List[Frame],
+    ocr_events: List[OCREvent],
+    transcript: Optional[AudioTranscript],
+    video_duration_seconds: float,
+    options: FrameSelectionOptions,
+) -> dict[str, float | int]:
     candidate_count = len(frames)
     if candidate_count == 0:
-        return 0
+        return {
+            "vl_quality_budget": 0,
+            "vl_time_capacity": 0,
+            "vl_budget_resolved": 0,
+            "vl_projected_seconds": 0.0,
+        }
 
-    min_budget = _resolve_auto_vl_min(video_duration_seconds, candidate_count, options.min_vl_frames)
-    max_budget = _resolve_auto_vl_max(video_duration_seconds, candidate_count, options.max_vl_frames)
+    min_budget = _resolve_auto_vl_min(
+        video_duration_seconds,
+        candidate_count,
+        options.min_vl_frames,
+        options.pipeline_mode,
+    )
+    max_budget = _resolve_auto_vl_max(
+        video_duration_seconds,
+        candidate_count,
+        options.max_vl_frames,
+        options.pipeline_mode,
+    )
     if min_budget > max_budget:
         min_budget = max_budget
 
     density = _combined_density(ocr_events, transcript, video_duration_seconds)
     ratio = 0.14 + (0.32 * density)
-    budget = int(ceil(candidate_count * ratio))
-    return min(max(budget, min_budget), max_budget, candidate_count)
+    if options.pipeline_mode == "deep":
+        ratio *= 1.25
+    quality_budget = min(max(int(ceil(candidate_count * ratio)), min_budget), max_budget, candidate_count)
+
+    seconds_per_frame = max(float(options.vl_seconds_per_frame or DEFAULT_VL_SECONDS_PER_FRAME), 0.1)
+    target_seconds = max(float(options.vl_target_seconds or DEFAULT_VL_TARGET_SECONDS), 0.0)
+    time_capacity = max(1, floor(target_seconds / (seconds_per_frame * VL_TIME_SAFETY_FACTOR)))
+    resolved = min(quality_budget, time_capacity, candidate_count)
+    resolved = max(min(resolved, candidate_count), min(min_budget, candidate_count))
+    if options.explicit_max_frames is not None:
+        resolved = min(resolved, max(int(options.explicit_max_frames), 0))
+    return {
+        "vl_quality_budget": quality_budget,
+        "vl_time_capacity": min(time_capacity, candidate_count),
+        "vl_budget_resolved": resolved,
+        "vl_projected_seconds": round(resolved * seconds_per_frame, 3),
+    }
 
 
 def make_skipped_visual_event(frame: Frame, decision: FrameDecision) -> dict[str, Any]:
@@ -295,10 +367,12 @@ def _select_with_coverage(scored: list[tuple[Frame, dict[str, Any]]], budget: in
         return {frame.number for frame, _ in scored}
 
     selected_indexes = {0, len(scored) - 1}
-    if budget > 2:
-        step = (len(scored) - 1) / max(budget // 3, 1)
-        for pos in range(1, max(budget // 3, 1)):
-            selected_indexes.add(round(pos * step))
+    coverage_slots = min(budget, max(2, int(ceil(budget * 0.60))))
+    for slot in range(coverage_slots):
+        start = floor(slot * len(scored) / coverage_slots)
+        end = max(start + 1, floor((slot + 1) * len(scored) / coverage_slots))
+        window = range(start, min(end, len(scored)))
+        selected_indexes.add(max(window, key=lambda idx: scored[idx][1]["score"]))
 
     remaining = max(budget - len(selected_indexes), 0)
     ranked = sorted(
@@ -350,26 +424,44 @@ def _metadata(
     }
 
 
-def _resolve_auto_vl_min(video_duration_seconds: float, candidate_count: int, value: int | str) -> int:
+def _resolve_auto_vl_min(
+    video_duration_seconds: float,
+    candidate_count: int,
+    value: int | str,
+    pipeline_mode: str = "balanced",
+) -> int:
     if isinstance(value, int):
         return min(value, candidate_count)
     minutes = video_duration_seconds / 60.0
     if minutes <= 5:
-        return min(4, candidate_count)
-    if minutes <= 30:
-        return min(8, candidate_count)
-    return min(12, candidate_count)
+        budget = 4
+    elif minutes <= 30:
+        budget = 8
+    else:
+        budget = 12
+    if pipeline_mode == "deep":
+        budget = int(ceil(budget * 1.5))
+    return min(budget, candidate_count)
 
 
-def _resolve_auto_vl_max(video_duration_seconds: float, candidate_count: int, value: int | str) -> int:
+def _resolve_auto_vl_max(
+    video_duration_seconds: float,
+    candidate_count: int,
+    value: int | str,
+    pipeline_mode: str = "balanced",
+) -> int:
     if isinstance(value, int):
         return min(max(value, 0), candidate_count)
     minutes = video_duration_seconds / 60.0
     if minutes <= 5:
-        return min(18, candidate_count)
-    if minutes <= 30:
-        return min(72, candidate_count)
-    return min(72 + int(ceil((minutes - 30) * 3)), 300, candidate_count)
+        budget = 18
+    elif minutes <= 30:
+        budget = 72
+    else:
+        budget = min(72 + int(ceil((minutes - 30) * 3)), 300)
+    if pipeline_mode == "deep":
+        budget = min(int(ceil(budget * 1.5)), 300)
+    return min(budget, candidate_count)
 
 
 def _combined_density(
