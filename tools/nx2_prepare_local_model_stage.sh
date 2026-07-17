@@ -35,11 +35,19 @@ mkdir -p "$runtime_dir"
 
 stop_pid_file() {
   local pid_file="$1"
+  local expected_command="$2"
   [[ -f "$pid_file" ]] || return 0
 
   local pid
   pid="$(cat "$pid_file")"
   if kill -0 "$pid" 2>/dev/null; then
+    local command
+    command="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+    if [[ "$command" != *"$expected_command"* ]]; then
+      echo "Ignoring stale pid $pid from $pid_file; command no longer matches $expected_command" >&2
+      rm -f "$pid_file"
+      return 0
+    fi
     kill "$pid"
     for _ in $(seq 1 30); do
       kill -0 "$pid" 2>/dev/null || break
@@ -53,18 +61,50 @@ stop_pid_file() {
   rm -f "$pid_file"
 }
 
+stop_matching_processes() {
+  local pattern="$1"
+  local pids
+  pids="$(pgrep -f "$pattern" || true)"
+  [[ -z "$pids" ]] && return 0
+  kill $pids 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    local remaining=""
+    for pid in $pids; do
+      kill -0 "$pid" 2>/dev/null && remaining="${remaining} ${pid}"
+    done
+    [[ -z "$remaining" ]] && return 0
+    sleep 1
+  done
+  kill -KILL $pids 2>/dev/null || true
+}
+
+stop_external_gpu_models() {
+  # The lazy gateway may stay online, but its backend must not coexist with this stage.
+  docker stop qwen36-reap-iq1s-64k-backend >/dev/null 2>&1 || true
+  systemctl --user stop \
+    qwen36-mtp-8100.service \
+    qwen36-mtp-wait-proxy.service \
+    qwen36-hauhau-llama.service \
+    >/dev/null 2>&1 || true
+  stop_matching_processes "[l]lama-server"
+  stop_matching_processes "[v]llm.entrypoints.openai.api_server"
+  stop_matching_processes "[h]ttp_api_server.py"
+}
+
 stop_all_models() {
-  stop_pid_file "$runtime_dir/funasr.pid"
-  stop_pid_file "$runtime_dir/easyocr.pid"
-  stop_pid_file "$runtime_dir/minicpm.pid"
-  stop_pid_file "$runtime_dir/qwythos.pid"
+  stop_pid_file "$runtime_dir/funasr.pid" "nx2_sensevoice_http_server.py"
+  stop_pid_file "$runtime_dir/easyocr.pid" "nx2_easyocr_openai_server.py"
+  stop_pid_file "$runtime_dir/minicpm.pid" "$vl_model"
+  stop_pid_file "$runtime_dir/qwythos.pid" "$text_model"
+  stop_external_gpu_models
 }
 
 wait_for_url() {
   local url="$1"
   local name="$2"
+  echo "Waiting for ${name} readiness: ${url}" >&2
   for _ in $(seq 1 180); do
-    if curl --noproxy "*" -fsS "$url" >/dev/null; then
+    if curl --noproxy "*" -fsS "$url" >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
@@ -76,11 +116,12 @@ wait_for_url() {
 wait_for_text_generation() {
   local url="http://127.0.0.1:${text_port}/v1/chat/completions"
   local payload='{"model":"'"${text_alias}"'","messages":[{"role":"user","content":"/no_think ready"}],"max_tokens":1,"temperature":0}'
+  echo "Waiting for Qwythos generation readiness: ${url}" >&2
   for _ in $(seq 1 180); do
     if curl --noproxy "*" -fsS --max-time 30 \
       -X POST "$url" \
       -H "Content-Type: application/json" \
-      --data-binary "$payload" >/dev/null; then
+      --data-binary "$payload" >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
@@ -93,7 +134,7 @@ start_background() {
   local pid_file="$1"
   local log_file="$2"
   shift 2
-  nohup "$@" >"$log_file" 2>&1 < /dev/null &
+  setsid "$@" >"$log_file" 2>&1 < /dev/null &
   echo "$!" >"$pid_file"
 }
 
@@ -136,10 +177,16 @@ case "$stage" in
       --alias "$vl_alias" \
       --host 127.0.0.1 \
       --port "$vl_port" \
-      --ctx-size 8192 \
+      --ctx-size "${NX2_VL_CTX_SIZE:-4096}" \
       --parallel 1 \
       --gpu-layers 999 \
-      --image-min-tokens 1024 \
+      --flash-attn on \
+      --cache-type-k q4_0 \
+      --cache-type-v q4_0 \
+      --cache-ram 0 \
+      --image-min-tokens "${NX2_VL_IMAGE_MIN_TOKENS:-256}" \
+      --image-max-tokens "${NX2_VL_IMAGE_MAX_TOKENS:-1024}" \
+      --mtmd-batch-max-tokens "${NX2_VL_MTMD_BATCH_MAX_TOKENS:-512}" \
       --no-cache-prompt
     wait_for_url "http://127.0.0.1:${vl_port}/health" "VL"
     ;;

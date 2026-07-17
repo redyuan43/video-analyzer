@@ -5,7 +5,7 @@ import time
 import re
 import ipaddress
 from urllib.parse import urlparse
-from typing import Optional, Dict, Any, List
+from typing import Callable, Optional, Dict, Any, List
 from .llm_client import LLMClient
 import logging
 
@@ -16,6 +16,12 @@ DEFAULT_MAX_RETRIES = 3
 RATE_LIMIT_WAIT_TIME = 25  # seconds
 DEFAULT_WAIT_TIME = 25  # seconds
 DEFAULT_TIMEOUT_SECONDS = 600
+PEG_NATIVE_MAX_RETRIES = 2
+
+
+class BackendUnavailableError(RuntimeError):
+    """Raised when an OpenAI-compatible backend cannot accept connections."""
+
 
 class GenericOpenAIAPIClient(LLMClient):
     def __init__(
@@ -25,6 +31,7 @@ class GenericOpenAIAPIClient(LLMClient):
         max_retries: int = DEFAULT_MAX_RETRIES,
         timeout_seconds: int | None = None,
         extra_body: Optional[Dict[str, Any]] = None,
+        transient_failure_recovery: Optional[Callable[[Exception], bool]] = None,
     ):
         self.api_key = api_key
         self.base_url = api_url.rstrip('/')  # Remove trailing slash if present
@@ -36,6 +43,7 @@ class GenericOpenAIAPIClient(LLMClient):
             else os.environ.get("VIDEO_ANALYZER_TEXT_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS)
         )
         self.extra_body = dict(extra_body or {})
+        self.transient_failure_recovery = transient_failure_recovery
         self.session = requests.Session()
         if self._should_bypass_env_proxy():
             self.session.trust_env = False
@@ -86,6 +94,9 @@ class GenericOpenAIAPIClient(LLMClient):
             "Content-Type": "application/json"
         }
 
+        recovery_attempted = False
+        peg_native_retries = 0
+
         # Try request with retries
         for attempt in range(self.max_retries):
             try:
@@ -135,9 +146,40 @@ class GenericOpenAIAPIClient(LLMClient):
                     raise Exception(f"Invalid JSON response: {response.text}")
                     
             except Exception as e:
+                if self._is_peg_native_format_error(e):
+                    if (
+                        peg_native_retries >= PEG_NATIVE_MAX_RETRIES
+                        or attempt == self.max_retries - 1
+                    ):
+                        raise Exception(f"An error occurred: {str(e)}") from e
+                    peg_native_retries += 1
+                    logger.warning(
+                        "Model output did not match peg-native format; retrying immediately (%s/%s)",
+                        peg_native_retries,
+                        PEG_NATIVE_MAX_RETRIES,
+                    )
+                    continue
                 if attempt == self.max_retries - 1:  # Last attempt
                     raise Exception(f"An error occurred: {str(e)}")
-                
+
+                if (
+                    not recovery_attempted
+                    and self.transient_failure_recovery is not None
+                    and self._is_recoverable_connection_error(e)
+                ):
+                    recovery_attempted = True
+                    try:
+                        if self.transient_failure_recovery(e):
+                            logger.warning("Recovered local backend after connection interruption; retrying now")
+                            continue
+                    except Exception as recovery_error:
+                        logger.warning("Local backend recovery failed: %s", recovery_error)
+
+                if self._is_recoverable_connection_error(e):
+                    raise BackendUnavailableError(
+                        f"Backend unavailable at {self.base_url}: {e}"
+                    ) from e
+
                 # Get wait time based on error
                 wait_time = RATE_LIMIT_WAIT_TIME
                 if isinstance(e, requests.exceptions.HTTPError) and 400 <= e.response.status_code < 500 and e.response.status_code != 429:
@@ -157,6 +199,25 @@ class GenericOpenAIAPIClient(LLMClient):
                 logger.warning(f"Request failed (attempt {attempt + 1}/{self.max_retries}): {str(e)}")
                 logger.warning(f"Waiting {wait_time} seconds before retry")
                 time.sleep(wait_time)
+
+    @staticmethod
+    def _is_recoverable_connection_error(error: Exception) -> bool:
+        return isinstance(
+            error,
+            (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError,
+            ),
+        )
+
+    @staticmethod
+    def _is_peg_native_format_error(error: Exception) -> bool:
+        return (
+            isinstance(error, requests.exceptions.HTTPError)
+            and error.response is not None
+            and error.response.status_code >= 500
+            and "does not match the expected peg-native format" in str(error)
+        )
 
     def _allows_reasoning_content_fallback(self) -> bool:
         parsed = urlparse(self.base_url)

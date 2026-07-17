@@ -1,10 +1,14 @@
 import unittest
 from argparse import Namespace
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient
+import requests
+
+from video_analyzer.clients.generic_openai_api import BackendUnavailableError, GenericOpenAIAPIClient
+from video_analyzer.cli import load_frame_analysis_checkpoint
 from video_analyzer.config import Config, build_openai_extra_body, resolve_api_key, resolve_temperature
 
 
@@ -160,6 +164,133 @@ class GenericOpenAIAPIClientTests(unittest.TestCase):
 
         self.assertEqual(result["response"], "ok")
         self.assertEqual(post.call_args.kwargs["json"]["thinking"], {"type": "disabled"})
+
+    def test_connection_error_recovers_once_and_retries_without_waiting(self):
+        recovered = []
+        client = GenericOpenAIAPIClient(
+            "0",
+            "http://127.0.0.1:18082/v1",
+            max_retries=2,
+            transient_failure_recovery=lambda error: recovered.append(str(error)) or True,
+        )
+        response = type("Response", (), {})()
+        response.status_code = 200
+        response.json = lambda: {"choices": [{"message": {"content": "ok"}}]}
+
+        with patch.object(
+            client.session,
+            "post",
+            side_effect=[requests.exceptions.ConnectionError("backend exited"), response],
+        ) as post, patch("video_analyzer.clients.generic_openai_api.time.sleep") as sleep:
+            result = client.generate(prompt="hello")
+
+        self.assertEqual(result["response"], "ok")
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(post.call_count, 2)
+        sleep.assert_not_called()
+
+    def test_connection_error_fails_immediately_when_backend_is_unavailable(self):
+        client = GenericOpenAIAPIClient(
+            "0",
+            "http://127.0.0.1:18082/v1",
+            max_retries=3,
+        )
+
+        with patch.object(
+            client.session,
+            "post",
+            side_effect=requests.exceptions.ConnectionError("connection refused"),
+        ) as post, patch("video_analyzer.clients.generic_openai_api.time.sleep") as sleep:
+            with self.assertRaises(BackendUnavailableError) as raised:
+                client.generate(prompt="hello")
+
+        self.assertIn("http://127.0.0.1:18082/v1", str(raised.exception))
+        self.assertEqual(post.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_connection_error_fails_after_one_unsuccessful_recovery(self):
+        recovered = []
+        client = GenericOpenAIAPIClient(
+            "0",
+            "http://127.0.0.1:18082/v1",
+            max_retries=3,
+            transient_failure_recovery=lambda error: recovered.append(str(error)) or True,
+        )
+
+        with patch.object(
+            client.session,
+            "post",
+            side_effect=requests.exceptions.ConnectionError("backend exited"),
+        ) as post, patch("video_analyzer.clients.generic_openai_api.time.sleep") as sleep:
+            with self.assertRaises(BackendUnavailableError):
+                client.generate(prompt="hello")
+
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(post.call_count, 2)
+        sleep.assert_not_called()
+
+    def test_peg_native_format_error_retries_immediately_then_succeeds(self):
+        client = GenericOpenAIAPIClient(
+            "0",
+            "http://127.0.0.1:18082/v1",
+            max_retries=3,
+        )
+        response = type("Response", (), {})()
+        response.status_code = 500
+        response.text = "The model produced output that does not match the expected peg-native format"
+        success = type("Response", (), {})()
+        success.status_code = 200
+        success.json = lambda: {"choices": [{"message": {"content": "ok"}}]}
+
+        with patch.object(
+            client.session,
+            "post",
+            side_effect=[response, response, success],
+        ) as post, patch(
+            "video_analyzer.clients.generic_openai_api.time.sleep"
+        ) as sleep:
+            result = client.generate(prompt="hello")
+
+        self.assertEqual(result["response"], "ok")
+        self.assertEqual(post.call_count, 3)
+        sleep.assert_not_called()
+
+    def test_peg_native_format_error_fails_after_two_immediate_retries(self):
+        client = GenericOpenAIAPIClient(
+            "0",
+            "http://127.0.0.1:18082/v1",
+            max_retries=5,
+        )
+        response = type("Response", (), {})()
+        response.status_code = 500
+        response.text = "The model produced output that does not match the expected peg-native format"
+
+        with patch.object(client.session, "post", return_value=response) as post, patch(
+            "video_analyzer.clients.generic_openai_api.time.sleep"
+        ) as sleep:
+            with self.assertRaises(Exception) as raised:
+                client.generate(prompt="hello")
+
+        self.assertIn("peg-native format", str(raised.exception))
+        self.assertEqual(post.call_count, 3)
+        sleep.assert_not_called()
+
+    def test_failed_vl_checkpoint_entries_are_retried(self):
+        with TemporaryDirectory() as tmpdir:
+            checkpoint = Path(tmpdir) / "frame_analyses.partial.json"
+            checkpoint.write_text(
+                json.dumps(
+                    [
+                        {"frame_number": 1, "response": "usable result"},
+                        {"frame_number": 2, "response": "Error analyzing frame 2: backend unavailable"},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = load_frame_analysis_checkpoint(checkpoint)
+
+        self.assertEqual(loaded, {1: {"frame_number": 1, "response": "usable result"}})
 
 
 if __name__ == "__main__":

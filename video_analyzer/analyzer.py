@@ -1,6 +1,7 @@
 from typing import List, Dict, Any, Optional
 import logging
 from .clients.llm_client import LLMClient
+from .clients.generic_openai_api import BackendUnavailableError
 from .prompt import PromptLoader
 from .frame import Frame
 from .frame_selection import FrameContextItem
@@ -118,6 +119,9 @@ class VideoAnalyzer:
                 self.previous_analyses.append(analysis_result)
             
             return analysis_result
+        except BackendUnavailableError:
+            logger.exception("Vision backend became unavailable while analyzing frame %s", frame.number)
+            raise
         except Exception as e:
             logger.error(f"Error analyzing frame {frame.number}: {e}")
             error_result = {"response": f"Error analyzing frame {frame.number}: {str(e)}"}
