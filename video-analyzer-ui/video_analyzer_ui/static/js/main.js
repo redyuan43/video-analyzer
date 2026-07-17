@@ -1004,6 +1004,25 @@ function renderStageProgress(progress) {
     const percentText = progress.percent != null ? ` · 约 ${progress.percent}%` : '';
     nodes.corePanelTitle.textContent = progress.stage_label ? `${progress.stage_label}子项${percentText}` : `阶段子项${percentText}`;
     const summary = progress.summary || progress.current_label || progress.last_signal_label || '';
+    const vl = progress.vl || progress.details?.vl;
+    const vlTotal = Number(vl?.total_selected);
+    const vlCompleted = Number(vl?.completed);
+    const vlAverageSeconds = Number(vl?.average_frame_seconds);
+    const vlEtaSeconds = Number(vl?.eta_seconds);
+    const vlPercent = Number.isFinite(vlTotal) && vlTotal > 0 && Number.isFinite(vlCompleted)
+        ? clampPercent((vlCompleted / vlTotal) * 100)
+        : 0;
+    const vlSpeed = Number.isFinite(vlAverageSeconds) && vlAverageSeconds > 0
+        ? `${(60 / vlAverageSeconds).toFixed(2)} 帧/分钟`
+        : '-';
+    const vlDetail = vl ? `<div class="vl-progress-detail">
+        <div><span>VL 帧进度</span><strong>${escapeHtml(vlCompleted || 0)} / ${escapeHtml(vlTotal || 0)} (${escapeHtml(vlPercent.toFixed(1))}%)</strong></div>
+        <div><span>断点复用</span><strong>${escapeHtml(vl.reused || 0)} 帧</strong></div>
+        <div><span>本轮失败</span><strong>${escapeHtml(vl.failed || 0)} 帧</strong></div>
+        <div><span>处理速度</span><strong>${escapeHtml(vlSpeed)}</strong></div>
+        <div><span>单帧中位耗时</span><strong>${Number.isFinite(vlAverageSeconds) && vlAverageSeconds > 0 ? escapeHtml(`${vlAverageSeconds.toFixed(1)} 秒`) : '-'}</strong></div>
+        <div><span>预计剩余</span><strong>${Number.isFinite(vlEtaSeconds) && vlEtaSeconds >= 0 ? escapeHtml(formatClock(vlEtaSeconds)) : '-'}</strong></div>
+    </div>` : '';
     const summaryRow = `<tr class="stage-progress-meta ${progress.live ? 'live' : ''} ${progress.stale ? 'stale' : ''}">
         <td colspan="4">
             <div class="stage-progress-head">
@@ -1011,6 +1030,7 @@ function renderStageProgress(progress) {
                 <strong>${escapeHtml(progress.percent ?? 0)}%</strong>
             </div>
             <div class="bar stage-progress-bar"><div style="width:${escapeHtml(progress.percent ?? 0)}%"></div></div>
+            ${vlDetail}
         </td>
     </tr>`;
     nodes.coreRows.innerHTML = summaryRow + progress.steps.map(step => `<tr class="substep-row ${escapeHtml(step.status || 'pending')} ${progress.stale && step.status !== 'pending' ? 'stale' : ''}">

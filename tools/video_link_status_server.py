@@ -66,6 +66,8 @@ CORE_ANALYSIS_ERROR_PATTERNS = (
     "model-resource-busy",
     "ActorDiedError",
 )
+PEG_NATIVE_FORMAT_ERROR_PATTERN = "does not match the expected peg-native format"
+MAX_TOLERATED_PEG_NATIVE_ERROR_RATE = 0.01
 CORE_DIAGNOSTIC_ERROR_PATTERNS = (
     "Traceback",
     "CUDA out of memory",
@@ -341,6 +343,15 @@ TRANSIENT_RESOURCE_BUSY_PATTERNS = (
     "Task was killed due to the node running low on memory",
     "exceeds the memory usage threshold",
     "Ray killed this worker",
+)
+LOCAL_MODEL_NOT_READY_PATTERNS = (
+    "FunASR did not become ready",
+    "EasyOCR did not become ready",
+    "VL did not become ready",
+    "Qwythos did not become ready",
+    "backend unavailable at",
+    "failed to connect to 127.0.0.1 port",
+    "connection refused",
 )
 YOUTUBE_FORMAT_UNAVAILABLE_PATTERN = "Requested format is not available"
 MAX_YOUTUBE_FORMAT_RETRIES = 1
@@ -948,6 +959,8 @@ class VideoLinkStatusServer:
         stage_order = self.stage_order_for_job(job)
         stage_index = stage_order.index(stage)
         for invalidated_stage in stage_order[stage_index:]:
+            previous_stage = dict((job.get("stages") or {}).get(invalidated_stage) or {})
+            self.archive_stage_log_for_rerun(job_id, invalidated_stage, previous_stage)
             job.setdefault("stages", {}).pop(invalidated_stage, None)
             for artifact_name in MODULE_SPECS.get(invalidated_stage, {}).get("produces", []):
                 job.setdefault("artifacts", {}).pop(artifact_name, None)
@@ -1044,6 +1057,7 @@ class VideoLinkStatusServer:
     def _auto_retry_loop(self) -> None:
         while not self.auto_retry_stop.wait(max(1.0, AUTO_RETRY_POLL_SECONDS)):
             try:
+                self.recover_interrupted_jobs(auto_start=True)
                 self.auto_retry_queued_jobs_once()
             except Exception:
                 continue
@@ -1384,9 +1398,14 @@ class VideoLinkStatusServer:
         return YOUTUBE_FORMAT_REQUEUE_MESSAGE
 
     def retryable_stage_failure_text(self, stage: str, text: str) -> str | None:
-        if "Ray frame driver failed" not in text and "run_frame_worker" not in text and "Jetson" not in text:
-            return None
-        if any(pattern in text for pattern in TRANSIENT_RESOURCE_BUSY_PATTERNS):
+        normalized = text.lower()
+        if any(pattern.lower() in normalized for pattern in LOCAL_MODEL_NOT_READY_PATTERNS):
+            return TRANSIENT_RESOURCE_REQUEUE_MESSAGE
+        if (
+            "Ray frame driver failed" in text
+            or "run_frame_worker" in text
+            or "Jetson" in text
+        ) and any(pattern in text for pattern in TRANSIENT_RESOURCE_BUSY_PATTERNS):
             return TRANSIENT_RESOURCE_REQUEUE_MESSAGE
         return None
 
@@ -2115,20 +2134,88 @@ class VideoLinkStatusServer:
                 json.loads((run_dir / "analysis.json").read_text(encoding="utf-8"))
             except Exception:
                 missing.append("analysis.json (invalid JSON)")
-        core_errors = self.core_analysis_errors(run_dir)
-        if core_errors:
-            missing.append(f"core analysis errors: {len(core_errors)} VL/resource failure(s)")
+        error_policy = self.core_analysis_error_policy(run_dir)
+        if error_policy["blocking"]:
+            missing.append(
+                f"core analysis errors: {len(error_policy['blocking'])} VL/resource failure(s)"
+            )
         return missing
 
     def core_quality_warning(self, run_dir: Path) -> str | None:
         quality_failed_path = run_dir / "operation_manual.quality_failed.md"
         if quality_failed_path.is_file() and not (run_dir / "operation_manual.md").is_file():
             return f"operation manual failed quality gate; review artifact: {quality_failed_path}"
-        core_errors = self.core_analysis_errors(run_dir)
-        if core_errors:
-            sample = "; ".join(core_errors[:3])
+        error_policy = self.core_analysis_error_policy(run_dir)
+        if error_policy["blocking"]:
+            sample = "; ".join(error_policy["blocking"][:3])
             return f"core analysis contains VL/resource failure(s): {sample}"
+        if error_policy["tolerated"]:
+            sample = "; ".join(error_policy["tolerated"][:3])
+            return (
+                "core analysis tolerated "
+                f"{len(error_policy['tolerated'])}/{error_policy['vl_frames']} "
+                f"peg-native VL format failure(s) ({error_policy['rate']:.2%}): {sample}"
+            )
         return None
+
+    def core_analysis_error_policy(self, run_dir: Path) -> dict[str, Any]:
+        errors = self.core_analysis_errors(run_dir)
+        vl_frames = self.core_vl_frame_count(run_dir)
+        peg_errors = [
+            error for error in errors
+            if PEG_NATIVE_FORMAT_ERROR_PATTERN in error
+        ]
+        blocking = [
+            error for error in errors
+            if PEG_NATIVE_FORMAT_ERROR_PATTERN not in error
+        ]
+        rate = len(peg_errors) / vl_frames if vl_frames > 0 else 1.0
+        tolerated = (
+            peg_errors
+            if not blocking and vl_frames > 0 and rate < MAX_TOLERATED_PEG_NATIVE_ERROR_RATE
+            else []
+        )
+        if peg_errors and not tolerated:
+            blocking.extend(peg_errors)
+        return {
+            "all": errors,
+            "blocking": blocking,
+            "tolerated": tolerated,
+            "vl_frames": vl_frames,
+            "rate": rate,
+        }
+
+    def core_vl_frame_count(self, run_dir: Path) -> int:
+        analysis_path = run_dir / "analysis.json"
+        if analysis_path.is_file():
+            try:
+                metadata = (
+                    json.loads(analysis_path.read_text(encoding="utf-8")).get("metadata")
+                    or {}
+                )
+                count = int(
+                    (metadata.get("frame_selection") or {}).get("vl_frames_count")
+                    or metadata.get("vl_frames_processed")
+                    or 0
+                )
+                if count > 0:
+                    return count
+            except Exception:
+                pass
+        frame_analyses_path = run_dir / "orin" / "frame_analyses.json"
+        if not frame_analyses_path.is_file():
+            return 0
+        try:
+            payload = json.loads(frame_analyses_path.read_text(encoding="utf-8"))
+        except Exception:
+            return 0
+        if not isinstance(payload, list):
+            return 0
+        return sum(
+            1
+            for item in payload
+            if isinstance(item, dict) and str(item.get("status") or "") != "skipped"
+        )
 
     def core_analysis_errors(self, run_dir: Path) -> list[str]:
         candidates = [
@@ -3406,8 +3493,13 @@ class VideoLinkStatusServer:
         if not stage_info and not run_dir and not log_text:
             return None
 
+        error_policy = self.core_analysis_error_policy(run_dir) if run_dir else None
         add_core_process_issues(job, stage_info, issues)
-        add_core_log_issues(log_text, issues)
+        add_core_log_issues(
+            log_text,
+            issues,
+            tolerate_peg_native_errors=bool(error_policy and error_policy["tolerated"]),
+        )
         add_core_artifact_issues(self, job, run_dir, stage_info, issues)
         add_core_stale_issue(progress, issues)
         add_core_queue_issue(job, issues)
@@ -3492,21 +3584,27 @@ class VideoLinkStatusServer:
         limit = max(1, min(limit, 500))
         stage_info = (job.get("stages") or {}).get(stage) or {}
         log_path = Path(str(stage_info.get("log_path") or self.stage_log_path(job_id, stage)))
-        if not log_path.exists():
-            return {
-                "job_id": job_id,
-                "stage": stage,
-                "log_path": str(log_path),
-                "attempt_log_paths": list(stage_info.get("attempt_log_paths") or []),
-                "lines": [],
-                "text": "",
-            }
-        text = log_path.read_text(encoding="utf-8", errors="replace")
+        attempt_log_paths = self.stage_attempt_log_paths(job_id, stage, stage_info)
+        text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+        displayed_log_path = log_path
+        history_fallback = False
+        if not text.strip():
+            for attempt_log_path in reversed(attempt_log_paths):
+                if attempt_log_path == log_path or not attempt_log_path.is_file():
+                    continue
+                history_text = attempt_log_path.read_text(encoding="utf-8", errors="replace")
+                if history_text.strip():
+                    text = history_text
+                    displayed_log_path = attempt_log_path
+                    history_fallback = True
+                    break
         return {
             "job_id": job_id,
             "stage": stage,
             "log_path": str(log_path),
-            "attempt_log_paths": list(stage_info.get("attempt_log_paths") or []),
+            "displayed_log_path": str(displayed_log_path),
+            "attempt_log_paths": [str(path) for path in attempt_log_paths],
+            "history_fallback": history_fallback,
             "lines": text.splitlines() if full else tail_lines(text, limit),
             "text": text if full else "",
             "full": full,
@@ -3701,6 +3799,41 @@ class VideoLinkStatusServer:
     def stage_attempt_log_path(self, job_id: str, stage: str, attempt: int) -> Path:
         return self.job_dir(job_id) / "logs" / f"{stage}.attempt-{attempt}.log"
 
+    def stage_attempt_log_paths(self, job_id: str, stage: str, stage_info: dict[str, Any]) -> list[Path]:
+        paths: list[Path] = []
+        seen: set[Path] = set()
+        for value in stage_info.get("attempt_log_paths") or []:
+            path = Path(str(value))
+            if path not in seen:
+                paths.append(path)
+                seen.add(path)
+        for path in sorted(
+            self.job_dir(job_id).joinpath("logs").glob(f"{stage}.attempt-*.log"),
+            key=lambda candidate: candidate.stat().st_mtime,
+        ):
+            if path not in seen:
+                paths.append(path)
+                seen.add(path)
+        return paths
+
+    def archive_stage_log_for_rerun(
+        self,
+        job_id: str,
+        stage: str,
+        stage_info: dict[str, Any],
+    ) -> None:
+        log_path = Path(str(stage_info.get("log_path") or self.stage_log_path(job_id, stage)))
+        if not log_path.is_file() or log_path.stat().st_size == 0:
+            return
+        attempt = max(1, int(stage_info.get("attempt") or 1))
+        archived_path = self.stage_attempt_log_path(job_id, stage, attempt)
+        if archived_path.exists():
+            archived_path = archived_path.with_name(
+                f"{archived_path.stem}.rerun-{int(time.time())}{archived_path.suffix}"
+            )
+        archived_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.replace(archived_path)
+
     def prepare_stage_log_attempt(
         self,
         job_id: str,
@@ -3709,7 +3842,10 @@ class VideoLinkStatusServer:
         attempt: int,
     ) -> tuple[Path, list[str]]:
         log_path = self.stage_log_path(job_id, stage)
-        attempt_log_paths = list(previous_stage_info.get("attempt_log_paths") or [])
+        attempt_log_paths = [
+            str(path)
+            for path in self.stage_attempt_log_paths(job_id, stage, previous_stage_info)
+        ]
         previous_attempt = int(previous_stage_info.get("attempt") or 0)
         previous_log_path = Path(str(previous_stage_info.get("log_path") or log_path))
         if attempt > 1 and previous_attempt and previous_log_path == log_path and log_path.is_file():
@@ -3901,6 +4037,8 @@ def merge_core_progress_snapshot(
     snapshot_index = core_step_index(current_step)
     if snapshot_index is None:
         return progress
+    details = snapshot.get("details") if isinstance(snapshot.get("details"), dict) else {}
+    vl_progress = details.get("vl") if isinstance(details.get("vl"), dict) else None
 
     parsed_index = max(
         (
@@ -3911,7 +4049,12 @@ def merge_core_progress_snapshot(
         default=None,
     )
     if parsed_index is not None and parsed_index > snapshot_index:
-        return progress
+        merged = dict(progress)
+        if details:
+            merged["details"] = details
+        if vl_progress:
+            merged["vl"] = vl_progress
+        return merged
 
     snapshot_status = str(snapshot.get("status") or "running")
     merged = dict(progress)
@@ -3924,7 +4067,14 @@ def merge_core_progress_snapshot(
             item["status"] = "succeeded"
         elif index == snapshot_index:
             item["status"] = "failed" if snapshot_status == "failed" else "running"
-            if snapshot.get("message") and not item.get("message"):
+            if current_step == "vl" and vl_progress:
+                completed = max(int(vl_progress.get("completed") or 0), 0)
+                total = max(int(vl_progress.get("total_selected") or 0), 0)
+                reused = max(int(vl_progress.get("reused") or 0), 0)
+                eta_seconds = vl_progress.get("eta_seconds")
+                eta_text = format_seconds_label(float(eta_seconds)) if isinstance(eta_seconds, (int, float)) else "-"
+                item["message"] = f"VL {completed}/{total} · 复用 {reused} · ETA {eta_text}"
+            elif snapshot.get("message") and not item.get("message"):
                 item["message"] = str(snapshot["message"])
         elif item.get("status") != "pending":
             item["status"] = "pending"
@@ -3937,9 +4087,24 @@ def merge_core_progress_snapshot(
     merged["current_step"] = None if effective_status in {"succeeded", "skipped"} else current_step
     merged["current_label"] = next((step["label"] for step in steps if step["id"] == merged["current_step"]), None)
     merged["percent"] = progress_percent_from_steps(steps, CORE_PROGRESS_STEPS, effective_status, CORE_PROGRESS_WEIGHTS)
+    if current_step == "vl" and vl_progress and effective_status not in {"succeeded", "skipped"}:
+        total = max(int(vl_progress.get("total_selected") or 0), 0)
+        completed = max(int(vl_progress.get("completed") or 0), 0)
+        fraction = min(completed / total, 1.0) if total else 1.0
+        total_weight = sum(CORE_PROGRESS_WEIGHTS.values()) or 1
+        completed_weight = sum(
+            CORE_PROGRESS_WEIGHTS.get(step_id, 0)
+            for step_id, _label, _patterns in CORE_PROGRESS_STEPS[:snapshot_index]
+        )
+        completed_weight += CORE_PROGRESS_WEIGHTS.get("vl", 0) * fraction
+        merged["percent"] = min(99, max(0, int(round(completed_weight / total_weight * 100))))
     merged["steps"] = steps
     merged["source"] = "progress_json"
     merged["progress_updated_at"] = snapshot.get("updated_at")
+    if details:
+        merged["details"] = details
+    if vl_progress:
+        merged["vl"] = vl_progress
     return merged
 
 
@@ -4153,9 +4318,24 @@ def add_core_process_issues(job: dict[str, Any], stage_info: dict[str, Any], iss
             )
 
 
-def add_core_log_issues(log_text: str, issues: list[dict[str, Any]]) -> None:
+def add_core_log_issues(
+    log_text: str,
+    issues: list[dict[str, Any]],
+    tolerate_peg_native_errors: bool = False,
+) -> None:
     for pattern in CORE_DIAGNOSTIC_ERROR_PATTERNS:
-        line = first_line_containing(log_text, pattern)
+        line = next(
+            (
+                candidate
+                for candidate in log_text.splitlines()
+                if pattern in candidate
+                and not (
+                    tolerate_peg_native_errors
+                    and PEG_NATIVE_FORMAT_ERROR_PATTERN in candidate
+                )
+            ),
+            None,
+        )
         if line:
             issues.append(
                 issue(
@@ -5597,6 +5777,9 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
       text("logHint", stageForLog ? `显示：${{stageNames[stageForLog] || stageForLog}} 的日志尾部` : "暂无日志");
       if (stageForLog) logUrl = `/api/video-link/jobs/${{job.job_id}}/logs/${{stageForLog}}?tail=80`;
       const log = await fetch(logUrl).then(r => r.json()).catch(() => ({{lines: []}}));
+      if (log.history_fallback) {{
+        text("logHint", `显示：${{stageNames[stageForLog] || stageForLog}} 的上一轮尝试日志；当前尝试尚未写入输出`);
+      }}
       text("logs", (log.lines || []).join("\\n"));
     }}
     document.getElementById("copyLogButton").addEventListener("click", async () => {{

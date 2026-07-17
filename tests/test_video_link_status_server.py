@@ -1234,6 +1234,71 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
         self.assertIn("core analysis errors", caught.exception.message)
 
+    def test_verify_core_tolerates_rare_peg_native_frame_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "run_name": "operation-manual"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "video" / "operation-manual"
+            run_dir.mkdir(parents=True)
+            (run_dir / "analysis.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": {"vl_frames_processed": 225},
+                        "frame_analyses": [
+                            {
+                                "response": (
+                                    "Error analyzing frame 216: 500 The model produced output "
+                                    "that does not match the expected peg-native format"
+                                )
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "manual_evidence.md").write_text("# Evidence\n", encoding="utf-8")
+            (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
+            loaded["run_dir"] = str(run_dir)
+
+            result = server.stage_verify_core(loaded)
+
+        self.assertEqual(result["artifacts"]["missing"], [])
+        self.assertIn("1/225", result["artifacts"]["warnings"][0]["message"])
+        self.assertIn("peg-native", result["artifacts"]["warnings"][0]["message"])
+
+    def test_verify_core_rejects_peg_native_error_at_one_percent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "run_name": "operation-manual"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "video" / "operation-manual"
+            run_dir.mkdir(parents=True)
+            (run_dir / "analysis.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": {"vl_frames_processed": 100},
+                        "frame_analyses": [
+                            {
+                                "response": (
+                                    "Error analyzing frame 12: 500 The model produced output "
+                                    "that does not match the expected peg-native format"
+                                )
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "manual_evidence.md").write_text("# Evidence\n", encoding="utf-8")
+            (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
+            loaded["run_dir"] = str(run_dir)
+
+            with self.assertRaises(server_mod.BridgeError) as caught:
+                server.stage_verify_core(loaded)
+
+        self.assertIn("core analysis errors", caught.exception.message)
+
     def test_analyze_core_accepts_quality_failed_manual_with_warning(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
@@ -1385,6 +1450,45 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             self.assertNotIn("exports", refreshed["artifacts"])
             self.assertEqual(refreshed["warnings"], [{"stage": "verify-core", "message": "keep"}])
             run_remaining.assert_called_once()
+
+    def test_rerun_from_stage_archives_previous_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "run_name": "operation-manual"})
+            log_path = server.stage_log_path(job["job_id"], "analyze-core")
+            log_path.parent.mkdir(parents=True)
+            log_path.write_text("old frame error\n", encoding="utf-8")
+            loaded = server.load_job(job["job_id"])
+            loaded["stages"]["analyze-core"] = {
+                "status": "failed",
+                "attempt": 1,
+                "log_path": str(log_path),
+            }
+            server.save_job(loaded)
+
+            with patch.object(server, "_run_remaining_stages"):
+                server.rerun_from_stage(job["job_id"], "analyze-core")
+
+            archived_path = server.stage_attempt_log_path(job["job_id"], "analyze-core", 1)
+            self.assertEqual(archived_path.read_text(encoding="utf-8"), "old frame error\n")
+            self.assertFalse(log_path.exists())
+
+    def test_stage_log_falls_back_to_latest_attempt_while_current_log_is_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "run_name": "operation-manual"})
+            log_path = server.stage_log_path(job["job_id"], "analyze-core")
+            archived_path = server.stage_attempt_log_path(job["job_id"], "analyze-core", 1)
+            log_path.parent.mkdir(parents=True)
+            log_path.write_text("", encoding="utf-8")
+            archived_path.write_text("previous attempt output\n", encoding="utf-8")
+
+            result = server.stage_log(job["job_id"], "analyze-core")
+
+            self.assertTrue(result["history_fallback"])
+            self.assertEqual(result["displayed_log_path"], str(archived_path))
+            self.assertEqual(result["lines"], ["previous attempt output"])
+            self.assertIn(str(archived_path), result["attempt_log_paths"])
 
     def test_final_publish_command_skips_pdfs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1994,6 +2098,24 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertIn("Ray frame driver failed", result["stages"]["analyze-core"]["last_error"])
         self.assertTrue(server.auto_retry_info(reloaded).get("auto_retry"))
 
+    def test_local_model_not_ready_requeues_core_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
+            loaded = server.load_job(job["job_id"])
+            loaded["stages"]["probe"] = {"status": "succeeded"}
+            loaded["stages"]["prepare"] = {"status": "succeeded"}
+            server.save_job(loaded)
+            error = subprocess.CalledProcessError(1, ["nx2_prepare_local_model_stage.sh", "asr"])
+            error.output = "FunASR did not become ready: http://127.0.0.1:18013/api/health"
+
+            with patch.object(server, "stage_analyze_core", side_effect=error):
+                result = server.run_stage(job["job_id"], "analyze-core")
+
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(result["runner"]["status"], "queued")
+        self.assertEqual(result["stages"]["analyze-core"]["retry_reason"], server_mod.TRANSIENT_RESOURCE_REQUEUE_MESSAGE)
+
     def test_load_job_requeues_legacy_ray_frame_oom_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
@@ -2027,6 +2149,30 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(recovered["stages"]["analyze-core"]["status"], "queued")
         self.assertEqual(recovered["stages"]["analyze-core"]["retry_reason"], server_mod.TRANSIENT_RESOURCE_REQUEUE_MESSAGE)
         self.assertIn("Ray frame driver failed", recovered["stages"]["analyze-core"]["last_error"])
+
+    def test_load_job_requeues_legacy_local_model_not_ready_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
+            loaded = server.load_job(job["job_id"])
+            loaded["status"] = "failed"
+            loaded["runner"] = {
+                "status": "failed",
+                "current_stage": "analyze-core",
+                "error": "analyze-core failed: FunASR did not become ready",
+            }
+            loaded["stages"]["analyze-core"] = {
+                "status": "failed",
+                "error": "FunASR did not become ready: http://127.0.0.1:18013/api/health",
+            }
+            server.save_job(loaded)
+
+            recovered = server.load_job(job["job_id"])
+
+        self.assertEqual(recovered["status"], "queued")
+        self.assertEqual(recovered["runner"]["status"], "queued")
+        self.assertEqual(recovered["stages"]["analyze-core"]["status"], "queued")
+        self.assertEqual(recovered["stages"]["analyze-core"]["retry_reason"], server_mod.TRANSIENT_RESOURCE_REQUEUE_MESSAGE)
 
     def test_load_job_keeps_orphaned_stage_running_when_process_is_alive(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2367,6 +2513,44 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(diagnostics["efficiency"]["counts"]["vl_frames"], 24)
         self.assertIn("dominant-core-bottleneck", [item["code"] for item in diagnostics["issues"]])
 
+    def test_core_diagnostics_downgrades_rare_peg_native_error_to_warning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            error = (
+                "Error analyzing frame 216: 500 The model produced output "
+                "that does not match the expected peg-native format"
+            )
+            (run_dir / "analysis.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": {"vl_frames_processed": 225},
+                        "frame_analyses": [{"response": error}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
+            (run_dir / "manual_evidence.md").write_text("# Evidence\n", encoding="utf-8")
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            log_path = server.stage_log_path(job["job_id"], "analyze-core")
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(error + "\n", encoding="utf-8")
+            loaded["run_dir"] = str(run_dir)
+            loaded["stages"]["analyze-core"] = {
+                "status": "succeeded",
+                "log_path": str(log_path),
+            }
+
+            diagnostics = server.public_job(loaded)["core_diagnostics"]
+
+        self.assertEqual(diagnostics["status"], "warning")
+        codes = [item["code"] for item in diagnostics["issues"]]
+        self.assertNotIn("core-log-error", codes)
+        self.assertIn("core-result-errors", codes)
+
     def test_core_diagnostics_warns_when_minicpm_vl_concurrency_is_low(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
@@ -2693,6 +2877,46 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(by_id["asr_done"]["status"], "succeeded")
         self.assertEqual(by_id["frames"]["status"], "running")
         self.assertEqual(progress["source"], "progress_json")
+
+    def test_core_progress_uses_frame_level_vl_fraction(self):
+        parsed = server_mod.parse_core_progress("Selecting and analyzing VL frames", "running")
+        snapshot = {
+            "current_step": "vl",
+            "status": "running",
+            "message": "VL frames 25/100",
+            "details": {
+                "vl": {
+                    "total_selected": 100,
+                    "completed": 25,
+                    "reused": 10,
+                    "failed": 1,
+                    "average_frame_seconds": 30.0,
+                    "eta_seconds": 2250.0,
+                }
+            },
+        }
+
+        progress = server_mod.merge_core_progress_snapshot(parsed, snapshot, "running")
+
+        by_id = {step["id"]: step for step in progress["steps"]}
+        completed_before_vl = sum(
+            server_mod.CORE_PROGRESS_WEIGHTS[step_id]
+            for step_id, _label, _patterns in server_mod.CORE_PROGRESS_STEPS[
+                : server_mod.core_step_index("vl")
+            ]
+        )
+        expected = round(
+            (
+                completed_before_vl
+                + server_mod.CORE_PROGRESS_WEIGHTS["vl"] * 0.25
+            )
+            / sum(server_mod.CORE_PROGRESS_WEIGHTS.values())
+            * 100
+        )
+        self.assertEqual(progress["percent"], expected)
+        self.assertEqual(progress["vl"]["completed"], 25)
+        self.assertIn("25/100", by_id["vl"]["message"])
+        self.assertIn("复用 10", by_id["vl"]["message"])
 
     def test_core_progress_infers_asr_done_from_transcript_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:

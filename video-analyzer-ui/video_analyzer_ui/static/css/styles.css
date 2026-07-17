@@ -865,6 +865,42 @@ th {
     height: 8px;
 }
 
+.vl-progress-detail {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px 18px;
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid #e4e7ec;
+}
+
+.vl-progress-detail div {
+    min-width: 0;
+}
+
+.vl-progress-detail span,
+.vl-progress-detail strong {
+    display: block;
+}
+
+.vl-progress-detail span {
+    color: #667085;
+    font-size: 12px;
+}
+
+.vl-progress-detail strong {
+    margin-top: 3px;
+    color: #1f2933;
+    font-size: 13px;
+    overflow-wrap: anywhere;
+}
+
+@media (max-width: 760px) {
+    .vl-progress-detail {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
 .core-diagnostics-panel[data-status="ok"] {
     border-color: #bbf7d0;
 }
