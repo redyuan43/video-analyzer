@@ -517,7 +517,7 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn("renderMathInElement", js)
         self.assertIn("studyCanResizeWidth", js)
         self.assertIn("studyRightReserve", js)
-        self.assertIn("return Boolean(docListVisible || playerVisible || contentVisible)", js)
+        self.assertIn("return Boolean(playerVisible || contentVisible)", js)
         self.assertIn("return nodes.studyResizer && !nodes.studyResizer.hidden ? 14 : 0", js)
         self.assertIn("const sourcePlayerNeedsHandle = playerVisible && contentVisible", js)
         self.assertIn("normalizeMarkdownForPreview", js)

@@ -2117,7 +2117,10 @@ function hasDocContent() {
 function updateLearningDocsLayout() {
     if (!nodes.vscodeDocs) return;
     const docListVisible = learningPanelVisibility.docList;
-    const studyVisible = learningPanelVisibility.study;
+    const studyVisible = Boolean(
+        learningPanelVisibility.study
+        && currentJob?.summary?.study?.available
+    );
     const contentVisible = hasDocContent();
     const playerVisible = Boolean(nodes.sourcePlayerPanel && learningPanelVisibility.sourcePlayer);
     const visiblePanelCount = [docListVisible, studyVisible, playerVisible, contentVisible].filter(Boolean).length;
@@ -2130,19 +2133,40 @@ function updateLearningDocsLayout() {
     nodes.vscodeDocs.classList.toggle('preview-open', contentVisible);
     nodes.vscodeDocs.classList.toggle('empty-layout', visiblePanelCount === 0);
 
-    if (docListVisible) columns.push('minmax(220px, var(--doc-list-pane-width, 300px))');
+    const docListIsRightmost = docListVisible && !studyVisible && !playerVisible && !contentVisible;
+    if (docListVisible) {
+        columns.push(
+            docListIsRightmost
+                ? 'minmax(220px, 1fr)'
+                : 'minmax(220px, var(--doc-list-pane-width, 300px))'
+        );
+    }
     const docListNeedsHandle = docListVisible && (studyVisible || playerVisible || contentVisible);
     nodes.docListResizer?.classList.toggle('active', docListNeedsHandle);
     if (nodes.docListResizer) nodes.docListResizer.hidden = !docListNeedsHandle;
     if (docListNeedsHandle) columns.push('14px');
 
-    if (studyVisible) columns.push('minmax(280px, var(--study-pane-width, 1fr))');
+    const studyIsRightmost = studyVisible && !playerVisible && !contentVisible;
+    if (studyVisible) {
+        columns.push(
+            studyIsRightmost
+                ? 'minmax(280px, 1fr)'
+                : 'minmax(280px, var(--study-pane-width, 1fr))'
+        );
+    }
     const studyNeedsHandle = studyVisible && studyCanResizeWidth(docListVisible, playerVisible, contentVisible);
     nodes.studyResizer?.classList.toggle('active', studyNeedsHandle);
     if (nodes.studyResizer) nodes.studyResizer.hidden = !studyNeedsHandle;
     if (studyNeedsHandle) columns.push('14px');
 
-    if (playerVisible) columns.push('minmax(320px, var(--source-player-pane-width, 560px))');
+    const sourcePlayerIsRightmost = playerVisible && !contentVisible;
+    if (playerVisible) {
+        columns.push(
+            sourcePlayerIsRightmost
+                ? 'minmax(320px, 1fr)'
+                : 'minmax(320px, var(--source-player-pane-width, 560px))'
+        );
+    }
     const sourcePlayerNeedsHandle = playerVisible && contentVisible;
     nodes.sourcePlayerResizer?.classList.toggle('active', sourcePlayerNeedsHandle);
     if (nodes.sourcePlayerResizer) nodes.sourcePlayerResizer.hidden = !sourcePlayerNeedsHandle;
@@ -3189,7 +3213,7 @@ function studyCanResizeWidth(
     playerVisible = sourcePlayerVisible(),
     contentVisible = hasDocContent()
 ) {
-    return Boolean(docListVisible || playerVisible || contentVisible);
+    return Boolean(playerVisible || contentVisible);
 }
 
 function studyRightReserve() {
