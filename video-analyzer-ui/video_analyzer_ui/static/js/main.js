@@ -1003,6 +1003,25 @@ function renderStageProgress(progress) {
     const percentText = progress.percent != null ? ` · 约 ${progress.percent}%` : '';
     nodes.corePanelTitle.textContent = progress.stage_label ? `${progress.stage_label}子项${percentText}` : `阶段子项${percentText}`;
     const summary = progress.summary || progress.current_label || progress.last_signal_label || '';
+    const vl = progress.vl || progress.details?.vl;
+    const vlTotal = Number(vl?.total_selected);
+    const vlCompleted = Number(vl?.completed);
+    const vlAverageSeconds = Number(vl?.average_frame_seconds);
+    const vlEtaSeconds = Number(vl?.eta_seconds);
+    const vlPercent = Number.isFinite(vlTotal) && vlTotal > 0 && Number.isFinite(vlCompleted)
+        ? clampPercent((vlCompleted / vlTotal) * 100)
+        : 0;
+    const vlSpeed = Number.isFinite(vlAverageSeconds) && vlAverageSeconds > 0
+        ? `${(60 / vlAverageSeconds).toFixed(2)} 帧/分钟`
+        : '-';
+    const vlDetail = vl ? `<div class="vl-progress-detail">
+        <div><span>VL 帧进度</span><strong>${escapeHtml(vlCompleted || 0)} / ${escapeHtml(vlTotal || 0)} (${escapeHtml(vlPercent.toFixed(1))}%)</strong></div>
+        <div><span>断点复用</span><strong>${escapeHtml(vl.reused || 0)} 帧</strong></div>
+        <div><span>本轮失败</span><strong>${escapeHtml(vl.failed || 0)} 帧</strong></div>
+        <div><span>处理速度</span><strong>${escapeHtml(vlSpeed)}</strong></div>
+        <div><span>单帧中位耗时</span><strong>${Number.isFinite(vlAverageSeconds) && vlAverageSeconds > 0 ? escapeHtml(`${vlAverageSeconds.toFixed(1)} 秒`) : '-'}</strong></div>
+        <div><span>预计剩余</span><strong>${Number.isFinite(vlEtaSeconds) && vlEtaSeconds >= 0 ? escapeHtml(formatClock(vlEtaSeconds)) : '-'}</strong></div>
+    </div>` : '';
     const summaryRow = `<tr class="stage-progress-meta ${progress.live ? 'live' : ''} ${progress.stale ? 'stale' : ''}">
         <td colspan="4">
             <div class="stage-progress-head">
@@ -1010,6 +1029,7 @@ function renderStageProgress(progress) {
                 <strong>${escapeHtml(progress.percent ?? 0)}%</strong>
             </div>
             <div class="bar stage-progress-bar"><div style="width:${escapeHtml(progress.percent ?? 0)}%"></div></div>
+            ${vlDetail}
         </td>
     </tr>`;
     nodes.coreRows.innerHTML = summaryRow + progress.steps.map(step => `<tr class="substep-row ${escapeHtml(step.status || 'pending')} ${progress.stale && step.status !== 'pending' ? 'stale' : ''}">
@@ -1877,7 +1897,10 @@ function hasDocContent() {
 function updateLearningDocsLayout() {
     if (!nodes.vscodeDocs) return;
     const docListVisible = learningPanelVisibility.docList;
-    const studyVisible = learningPanelVisibility.study;
+    const studyVisible = Boolean(
+        learningPanelVisibility.study
+        && currentJob?.summary?.study?.available
+    );
     const contentVisible = hasDocContent();
     const playerVisible = Boolean(nodes.sourcePlayerPanel && learningPanelVisibility.sourcePlayer);
     const visiblePanelCount = [docListVisible, studyVisible, playerVisible, contentVisible].filter(Boolean).length;
@@ -1890,19 +1913,40 @@ function updateLearningDocsLayout() {
     nodes.vscodeDocs.classList.toggle('preview-open', contentVisible);
     nodes.vscodeDocs.classList.toggle('empty-layout', visiblePanelCount === 0);
 
-    if (docListVisible) columns.push('minmax(220px, var(--doc-list-pane-width, 300px))');
+    const docListIsRightmost = docListVisible && !studyVisible && !playerVisible && !contentVisible;
+    if (docListVisible) {
+        columns.push(
+            docListIsRightmost
+                ? 'minmax(220px, 1fr)'
+                : 'minmax(220px, var(--doc-list-pane-width, 300px))'
+        );
+    }
     const docListNeedsHandle = docListVisible && (studyVisible || playerVisible || contentVisible);
     nodes.docListResizer?.classList.toggle('active', docListNeedsHandle);
     if (nodes.docListResizer) nodes.docListResizer.hidden = !docListNeedsHandle;
     if (docListNeedsHandle) columns.push('14px');
 
-    if (studyVisible) columns.push('minmax(280px, var(--study-pane-width, 1fr))');
+    const studyIsRightmost = studyVisible && !playerVisible && !contentVisible;
+    if (studyVisible) {
+        columns.push(
+            studyIsRightmost
+                ? 'minmax(280px, 1fr)'
+                : 'minmax(280px, var(--study-pane-width, 1fr))'
+        );
+    }
     const studyNeedsHandle = studyVisible && (playerVisible || contentVisible);
     nodes.studyResizer?.classList.toggle('active', studyNeedsHandle);
     if (nodes.studyResizer) nodes.studyResizer.hidden = !studyNeedsHandle;
     if (studyNeedsHandle) columns.push('14px');
 
-    if (playerVisible) columns.push('minmax(320px, var(--source-player-pane-width, 560px))');
+    const sourcePlayerIsRightmost = playerVisible && !contentVisible;
+    if (playerVisible) {
+        columns.push(
+            sourcePlayerIsRightmost
+                ? 'minmax(320px, 1fr)'
+                : 'minmax(320px, var(--source-player-pane-width, 560px))'
+        );
+    }
     const sourcePlayerNeedsHandle = playerVisible && (docListVisible || studyVisible || contentVisible);
     nodes.sourcePlayerResizer?.classList.toggle('active', sourcePlayerNeedsHandle);
     if (nodes.sourcePlayerResizer) nodes.sourcePlayerResizer.hidden = !sourcePlayerNeedsHandle;
@@ -2647,6 +2691,9 @@ async function loadSelectedLog(job) {
     }
     nodes.logHint.textContent = `显示：${stageNames[stage] || stage} 的日志尾部`;
     const log = await getJson(`/api/video-link/jobs/${job.job_id}/logs/${stage}?tail=80`).catch(() => ({ lines: [] }));
+    if (log.history_fallback) {
+        nodes.logHint.textContent = `显示：${stageNames[stage] || stage} 的上一轮尝试日志；当前尝试尚未写入输出`;
+    }
     nodes.logText.textContent = (log.lines || []).join('\n') || '-';
 }
 
