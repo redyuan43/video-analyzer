@@ -602,6 +602,7 @@ def run_ocr(
     warmup_retry_interval_seconds: float = 5,
     cache_mode: str = "on",
     cache_dir: Optional[str] = ".cache/video-analyzer/ocr",
+    progress_callback=None,
 ) -> List[OCREvent]:
     if provider == "none":
         return []
@@ -669,10 +670,17 @@ def run_ocr(
         endpoint_family = f"{fallback.base_url}:{fallback.model}"
         cached_events = read_all_cached("openai_vision", endpoint_family)
         if cached_events is not None:
+            if progress_callback:
+                for event in cached_events:
+                    progress_callback(event)
             return cached_events
         if not fallback.probe():
-            return _unavailable_events(frames, f"OpenAI-compatible OCR endpoint is not reachable: {fallback_base_url}")
-        return [
+            events = _unavailable_events(frames, f"OpenAI-compatible OCR endpoint is not reachable: {fallback_base_url}")
+            if progress_callback:
+                for event in events:
+                    progress_callback(event)
+            return events
+        events = [
             cached_or_analyze(
                 frame,
                 "openai_vision",
@@ -681,11 +689,18 @@ def run_ocr(
             )
             for frame in frames
         ]
+        if progress_callback:
+            for event in events:
+                progress_callback(event)
+        return events
 
     dots_endpoints = _resolve_dots_endpoints(base_url, base_urls)
     dots_endpoint_family = ",".join(dots_endpoints) if dots_endpoints else base_url
     cached_events = read_all_cached("dots_mocr_vllm", dots_endpoint_family)
     if cached_events is not None:
+        if progress_callback:
+            for event in cached_events:
+                progress_callback(event)
         return cached_events
 
     dots_providers = _probe_dots_providers(
@@ -723,8 +738,14 @@ def run_ocr(
                 for event in events:
                     if event.error:
                         event.error = f"DotsMOCR unavailable first: {error}; fallback error: {event.error}"
+                    if progress_callback:
+                        progress_callback(event)
                 return events
-        return _unavailable_events(frames, error)
+        events = _unavailable_events(frames, error)
+        if progress_callback:
+            for event in events:
+                progress_callback(event)
+        return events
 
     cached_by_number: Dict[int, OCREvent] = {}
     pending_frames: List[Frame] = []
@@ -794,5 +815,7 @@ def run_ocr(
         for future in as_completed(futures):
             event = future.result()
             results[event.frame_number] = event
+            if progress_callback:
+                progress_callback(event)
 
     return [results[frame.number] for frame in frames]

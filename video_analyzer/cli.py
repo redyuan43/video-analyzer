@@ -8,6 +8,9 @@ import shutil
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
+from statistics import median
+from typing import Any
 
 from .artifacts import write_json, write_orin_artifacts, write_transcript_markdown
 from .candidate_frame_strategies import parse_candidate_frame_strategy
@@ -41,7 +44,7 @@ from .manual import (
     review_operation_manual_markdown,
     write_frame_evidence_index,
 )
-from .ocr import run_ocr
+from .ocr import OCREvent, run_ocr
 from .ocr_keyframes import (
     AUTO as OCR_AUTO,
     build_ocr_text_events,
@@ -50,6 +53,12 @@ from .ocr_keyframes import (
 )
 from .local_model_runtime import local_model_runtime_session, local_model_stage
 from .resource_locks import analyzer_resource_lock
+from .vl_checkpoint import (
+    analysis_signature,
+    frame_sha256,
+    load_vl_checkpoint,
+    write_vl_checkpoint,
+)
 
 # Initialize logger at module level
 logger = logging.getLogger(__name__)
@@ -57,6 +66,8 @@ TRANSCRIPT_LINE_RE = re.compile(
     r"^-\s+\[(?P<start>\d\d:\d\d:\d\d)\s+-\s+(?P<end>\d\d:\d\d:\d\d)\]\s+(?P<text>.*)$"
 )
 PROGRESS_FILENAME = "progress.json"
+DEFAULT_VL_SECONDS_PER_FRAME = 30.0
+DEFAULT_VL_TARGET_SECONDS = 45 * 60
 
 
 def media_has_video_stream(media_path: Path) -> bool:
@@ -179,17 +190,19 @@ def write_analysis_progress(
     status: str = "running",
     message: str | None = None,
     artifacts: dict[str, str] | None = None,
+    details: dict[str, Any] | None = None,
 ) -> None:
     """Best-effort durable progress for status UIs; never fail analysis work."""
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
         payload = {
-            "version": 1,
+            "version": 2,
             "stage": "analyze-core",
             "current_step": current_step,
             "status": status,
             "message": message,
             "artifacts": artifacts or {},
+            "details": details or {},
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
         }
         progress_path = output_dir / PROGRESS_FILENAME
@@ -251,6 +264,125 @@ def append_evidence_boundary_section(
     return markdown.rstrip() + section + "\n"
 
 
+def recent_vl_seconds_per_frame(output_dir: Path, model: str, limit: int = 5) -> float:
+    samples: list[float] = []
+    try:
+        runs_root = output_dir.parents[1]
+        candidates = sorted(
+            runs_root.glob("*/*/analysis.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except Exception:
+        candidates = []
+    for path in candidates:
+        if path == output_dir / "analysis.json":
+            continue
+        try:
+            metadata = (json.loads(path.read_text(encoding="utf-8")) or {}).get("metadata") or {}
+            if str(metadata.get("model") or "") != str(model):
+                continue
+            timings = metadata.get("timings") or {}
+            seconds = float(timings.get("vl_seconds") or 0.0)
+            frames = int(metadata.get("vl_frames_processed") or 0)
+        except Exception:
+            continue
+        if seconds > 0 and frames > 0:
+            samples.append(seconds / frames)
+        if len(samples) >= limit:
+            break
+    return float(median(samples)) if samples else DEFAULT_VL_SECONDS_PER_FRAME
+
+
+def vl_signature_payload(
+    analyzer: VideoAnalyzer,
+    *,
+    model: str,
+    context_before: int,
+    context_after: int,
+    context_max_gap: float | str,
+) -> dict[str, Any]:
+    return {
+        "model": model,
+        "frame_prompt": analyzer.frame_prompt,
+        "user_prompt": analyzer.user_prompt,
+        "temperature": analyzer.temperature,
+        "frame_num_predict": analyzer.frame_num_predict,
+        "frame_no_think": analyzer.frame_no_think,
+        "context_before": context_before,
+        "context_after": context_after,
+        "context_max_gap": context_max_gap,
+    }
+
+
+def ocr_signature_payload(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "provider": config.get("provider", "auto"),
+        "base_url": config.get("base_url", "auto"),
+        "base_urls": config.get("base_urls") or [],
+        "model": config.get("model", "model"),
+        "prompt_mode": config.get("prompt_mode", "prompt_scene_spotting"),
+        "max_tokens": config.get("max_tokens", 1024),
+        "max_image_long_side": config.get("max_image_long_side", 1280),
+    }
+
+
+def load_ocr_checkpoint(path: Path, frames, expected_signature: str) -> dict[int, OCREvent]:
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict) or payload.get("analysis_signature") != expected_signature:
+        return {}
+    frames_by_number = {int(frame.number): frame for frame in frames}
+    loaded: dict[int, OCREvent] = {}
+    for item in payload.get("frames") or []:
+        if not isinstance(item, dict) or item.get("status") != "succeeded":
+            continue
+        frame_number = item.get("frame_number")
+        frame = frames_by_number.get(int(frame_number)) if frame_number is not None else None
+        if frame is None or item.get("frame_sha256") != frame_sha256(Path(frame.path)):
+            continue
+        event_payload = item.get("event")
+        if isinstance(event_payload, dict):
+            loaded[int(frame_number)] = OCREvent.from_dict(event_payload)
+    return loaded
+
+
+def write_ocr_checkpoint(
+    path: Path,
+    events_by_frame: dict[int, OCREvent],
+    frames_by_number: dict[int, Any],
+    signature: str,
+    signature_payload: dict[str, Any],
+) -> None:
+    entries = []
+    for frame_number, event in sorted(events_by_frame.items()):
+        frame = frames_by_number.get(frame_number)
+        if frame is None:
+            continue
+        entries.append(
+            {
+                "frame_number": frame_number,
+                "frame_sha256": frame_sha256(Path(frame.path)),
+                "status": "succeeded" if event.status == "ok" else "failed",
+                "event": event.to_dict(),
+            }
+        )
+    payload = {
+        "version": 1,
+        "analysis_signature": signature,
+        "signature_payload": signature_payload,
+        "frames": entries,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+
 def analyze_frames_for_vl(
     analyzer: VideoAnalyzer,
     frames,
@@ -262,17 +394,63 @@ def analyze_frames_for_vl(
     context_after: int,
     context_max_gap: float | str,
     checkpoint_path: Path | None = None,
+    checkpoint_by_frame: dict[int, dict] | None = None,
+    checkpoint_signature: str = "",
+    checkpoint_signature_payload: dict[str, Any] | None = None,
+    progress_callback=None,
 ):
     ocr_by_frame = {event.frame_number: event for event in ocr_events}
     context_ocr_texts = {event.frame_number: event.text for event in ocr_events if event.text}
     decisions_by_frame = {decision.frame_number: decision for decision in decisions}
-    checkpoint_by_frame = load_frame_analysis_checkpoint(checkpoint_path)
+    checkpoint_by_frame = dict(checkpoint_by_frame or {})
     frame_analyses = [checkpoint_by_frame.get(frame.number) for frame in frames]
 
     def save_checkpoint() -> None:
-        if checkpoint_path is None:
+        if checkpoint_path is None or not checkpoint_signature:
             return
-        write_frame_analysis_checkpoint(checkpoint_path, [item for item in frame_analyses if item is not None])
+        write_vl_checkpoint(
+            checkpoint_path,
+            [item for item in frame_analyses if item is not None],
+            signature=checkpoint_signature,
+            signature_payload=checkpoint_signature_payload or {},
+        )
+
+    selected_total = len(selected_frame_numbers)
+    reused = sum(
+        1
+        for frame in frames
+        if frame.number in selected_frame_numbers and frame.number in checkpoint_by_frame
+    )
+    completed = reused
+    succeeded = reused
+    failed = 0
+    analyzed_durations: list[float] = [
+        float(item.get("duration_seconds"))
+        for item in checkpoint_by_frame.values()
+        if isinstance(item.get("duration_seconds"), (int, float))
+        and float(item.get("duration_seconds")) > 0
+    ]
+    progress_started = time.perf_counter()
+
+    def report_progress(current_frame_number: int | None = None) -> None:
+        if progress_callback is None:
+            return
+        average_seconds = float(median(analyzed_durations)) if analyzed_durations else 0.0
+        remaining = max(selected_total - completed, 0)
+        progress_callback(
+            {
+                "total_selected": selected_total,
+                "completed": completed,
+                "succeeded": succeeded,
+                "failed": failed,
+                "reused": reused,
+                "remaining": remaining,
+                "current_frame_number": current_frame_number,
+                "elapsed_seconds": round(time.perf_counter() - progress_started, 3),
+                "average_frame_seconds": round(average_seconds, 3),
+                "eta_seconds": round(remaining * average_seconds, 3) if average_seconds else None,
+            }
+        )
 
     def analyze_one(index_frame):
         index, frame = index_frame
@@ -284,12 +462,28 @@ def analyze_frames_for_vl(
             after=context_after,
             max_gap_seconds=context_max_gap,
         )
-        return index, analyzer.analyze_frame(
+        started = time.perf_counter()
+        analysis = analyzer.analyze_frame(
             frame,
             ocr_text=ocr_text,
             context_window=context_window,
             context_ocr_texts=context_ocr_texts,
         )
+        duration_seconds = round(time.perf_counter() - started, 3)
+        response = str(analysis.get("response") or "")
+        status = "failed" if response.startswith("Error analyzing frame ") else "succeeded"
+        analysis.update(
+            {
+                "frame_number": int(frame.number),
+                "timestamp": float(frame.timestamp),
+                "frame_sha256": frame_sha256(Path(frame.path)),
+                "status": status,
+                "duration_seconds": duration_seconds,
+                "completed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
+                "analysis_signature": checkpoint_signature,
+            }
+        )
+        return index, analysis
 
     selected = [(index, frame) for index, frame in enumerate(frames) if frame.number in selected_frame_numbers]
     skipped = [(index, frame) for index, frame in enumerate(frames) if frame.number not in selected_frame_numbers]
@@ -298,6 +492,7 @@ def analyze_frames_for_vl(
             frame_analyses[index] = make_skipped_visual_event(frame, decisions_by_frame[frame.number])
 
     selected = [(index, frame) for index, frame in selected if frame_analyses[index] is None]
+    report_progress()
 
     if not selected:
         save_checkpoint()
@@ -307,7 +502,14 @@ def analyze_frames_for_vl(
         for index_frame in selected:
             index, analysis = analyze_one(index_frame)
             frame_analyses[index] = analysis
+            completed += 1
+            if analysis.get("status") == "succeeded":
+                succeeded += 1
+            else:
+                failed += 1
+            analyzed_durations.append(float(analysis.get("duration_seconds") or 0.0))
             save_checkpoint()
+            report_progress(int(analysis["frame_number"]))
         return frame_analyses
 
     with ThreadPoolExecutor(max_workers=max(concurrency, 1)) as executor:
@@ -315,7 +517,14 @@ def analyze_frames_for_vl(
         for future in as_completed(futures):
             index, analysis = future.result()
             frame_analyses[index] = analysis
+            completed += 1
+            if analysis.get("status") == "succeeded":
+                succeeded += 1
+            else:
+                failed += 1
+            analyzed_durations.append(float(analysis.get("duration_seconds") or 0.0))
             save_checkpoint()
+            report_progress(int(analysis["frame_number"]))
     return frame_analyses
 
 
@@ -917,11 +1126,42 @@ def main():
                     len(frames),
                     ocr_keyframe_metadata.get("scan_frames_count"),
                 )
-                if selected_ocr_frames:
+                ocr_checkpoint_path = output_dir / "orin" / "ocr_events.partial.json"
+                ocr_signature_data = ocr_signature_payload(ocr_config)
+                ocr_signature = analysis_signature(ocr_signature_data)
+                selected_ocr_by_number = {int(frame.number): frame for frame in selected_ocr_frames}
+                ocr_events_by_frame = load_ocr_checkpoint(
+                    ocr_checkpoint_path,
+                    selected_ocr_frames,
+                    ocr_signature,
+                )
+                missing_ocr_frames = [
+                    frame
+                    for frame in selected_ocr_frames
+                    if int(frame.number) not in ocr_events_by_frame
+                ]
+                if ocr_events_by_frame:
+                    logger.info(
+                        "Resume mode reusing %s OCR results; %s frame(s) remain",
+                        len(ocr_events_by_frame),
+                        len(missing_ocr_frames),
+                    )
+
+                def save_ocr_event(event: OCREvent) -> None:
+                    ocr_events_by_frame[int(event.frame_number)] = event
+                    write_ocr_checkpoint(
+                        ocr_checkpoint_path,
+                        ocr_events_by_frame,
+                        selected_ocr_by_number,
+                        ocr_signature,
+                        ocr_signature_data,
+                    )
+
+                if missing_ocr_frames:
                     with analyzer_resource_lock(config.config, "ocr", str(output_dir), logger):
                         with local_model_stage("ocr", config.config, logger, str(output_dir)):
-                            ocr_events = run_ocr(
-                                frames=selected_ocr_frames,
+                            run_ocr(
+                                frames=missing_ocr_frames,
                                 provider=ocr_config.get("provider", "auto"),
                                 base_url=ocr_config.get("base_url", "auto"),
                                 model=ocr_config.get("model", "model"),
@@ -949,9 +1189,15 @@ def main():
                                 warmup_retry_interval_seconds=ocr_config.get("warmup_retry_interval_seconds", 5),
                                 cache_mode=ocr_config.get("cache", "on"),
                                 cache_dir=ocr_config.get("cache_dir", ".cache/video-analyzer/ocr"),
+                                progress_callback=save_ocr_event,
                             )
                 else:
-                    logger.info("No OCR frames selected; skipping OCR provider calls.")
+                    logger.info("No missing OCR frames; skipping OCR provider calls.")
+                ocr_events = [
+                    ocr_events_by_frame[int(frame.number)]
+                    for frame in selected_ocr_frames
+                    if int(frame.number) in ocr_events_by_frame
+                ]
                 ocr_text_events = build_ocr_text_events(ocr_events)
                 ocr_keyframe_metadata["ocr_text_events_count"] = len(ocr_text_events)
                 ocr_keyframe_metadata["text_events"] = ocr_text_events
@@ -999,6 +1245,34 @@ def main():
                 frame_no_think=bool(config.get("operation_manual", {}).get("frame_no_think", False)),
             )
             if task == "operation_manual":
+                context_before = max(args.vl_context_before, 0)
+                context_after = max(args.vl_context_after, 0)
+                signature_payload = vl_signature_payload(
+                    analyzer,
+                    model=model,
+                    context_before=context_before,
+                    context_after=context_after,
+                    context_max_gap=args.vl_context_max_gap,
+                )
+                checkpoint_signature = analysis_signature(signature_payload)
+                checkpoint_path = output_dir / "orin" / "frame_analyses.partial.json"
+                checkpoint_by_frame, checkpoint_metadata = load_vl_checkpoint(
+                    checkpoint_path,
+                    frames,
+                    checkpoint_signature,
+                    allow_legacy_ordered=max(args.vl_concurrency, 1) == 1,
+                )
+                checkpoint_durations = [
+                    float(item.get("duration_seconds"))
+                    for item in checkpoint_by_frame.values()
+                    if isinstance(item.get("duration_seconds"), (int, float))
+                    and float(item.get("duration_seconds")) > 0
+                ]
+                seconds_per_frame = (
+                    float(median(checkpoint_durations))
+                    if checkpoint_durations
+                    else recent_vl_seconds_per_frame(output_dir, model)
+                )
                 options = FrameSelectionOptions(
                     pipeline_mode=args.pipeline_mode,
                     candidate_frames=args.candidate_frames,
@@ -1006,6 +1280,8 @@ def main():
                     max_vl_frames=args.max_vl_frames,
                     vl_frame_policy=args.vl_frame_policy,
                     explicit_max_frames=args.max_frames,
+                    vl_target_seconds=DEFAULT_VL_TARGET_SECONDS,
+                    vl_seconds_per_frame=seconds_per_frame,
                 )
                 selected_frame_numbers, frame_decisions, selection_metadata = select_vl_frames(
                     frames=frames,
@@ -1014,9 +1290,71 @@ def main():
                     video_duration_seconds=frame_selection_metadata.get("video_duration_seconds", config.get("duration") or 0.0),
                     options=options,
                 )
+                budget_selected_frame_numbers = set(selected_frame_numbers)
+                reusable_frame_numbers = set(checkpoint_by_frame)
+                reused_outside_budget = reusable_frame_numbers - budget_selected_frame_numbers
+                selected_frame_numbers |= reusable_frame_numbers
+                if reused_outside_budget:
+                    frame_decisions = [
+                        replace(
+                            decision,
+                            selected_for_vl=True,
+                            reason="reused_checkpoint",
+                            skip_reason="",
+                        )
+                        if decision.frame_number in reused_outside_budget
+                        else decision
+                        for decision in frame_decisions
+                    ]
+                new_requests = budget_selected_frame_numbers - reusable_frame_numbers
+                selection_metadata["vl_budget_selected_count"] = len(budget_selected_frame_numbers)
+                selection_metadata["vl_checkpoint_reused_outside_budget"] = len(reused_outside_budget)
+                selection_metadata["vl_frames_count"] = len(selected_frame_numbers)
+                selection_metadata["vl_new_requests_count"] = len(new_requests)
+                selection_metadata["vl_projected_remaining_seconds"] = round(
+                    len(new_requests) * seconds_per_frame,
+                    3,
+                )
+                selection_metadata["checkpoint"] = checkpoint_metadata
+                if selection_metadata.get("vl_time_target_bypassed"):
+                    logger.warning(
+                        "Explicit VL policy=all bypasses the %.0f second target; projected VL time is %.1f seconds",
+                        selection_metadata.get("vl_time_target_seconds") or DEFAULT_VL_TARGET_SECONDS,
+                        selection_metadata.get("vl_projected_seconds") or 0.0,
+                    )
+                if checkpoint_metadata.get("legacy_migrated"):
+                    write_vl_checkpoint(
+                        checkpoint_path,
+                        checkpoint_by_frame.values(),
+                        signature=checkpoint_signature,
+                        signature_payload=signature_payload,
+                    )
                 frame_selection_metadata.update(selection_metadata)
                 timings["frame_selection_seconds"] = round(time.perf_counter() - stage_started, 3)
                 vl_started = time.perf_counter()
+                static_vl_progress = {
+                    "policy": selection_metadata.get("vl_frame_policy_resolved"),
+                    "quality_budget": selection_metadata.get("vl_quality_budget"),
+                    "time_capacity": selection_metadata.get("vl_time_capacity"),
+                    "target_seconds": selection_metadata.get("vl_time_target_seconds"),
+                    "projected_seconds": selection_metadata.get("vl_projected_remaining_seconds"),
+                    "seconds_per_frame_estimate": selection_metadata.get("vl_seconds_per_frame_estimate"),
+                    "time_target_bypassed": selection_metadata.get("vl_time_target_bypassed"),
+                    "budget_selected": selection_metadata.get("vl_budget_selected_count"),
+                    "reused_outside_budget": selection_metadata.get("vl_checkpoint_reused_outside_budget"),
+                }
+
+                def update_vl_progress(snapshot: dict[str, Any]) -> None:
+                    vl_progress = {**static_vl_progress, **snapshot}
+                    total = max(int(vl_progress.get("total_selected") or 0), 0)
+                    completed_count = max(int(vl_progress.get("completed") or 0), 0)
+                    vl_progress["percent"] = int(round((completed_count / total) * 100)) if total else 100
+                    write_analysis_progress(
+                        output_dir,
+                        "vl",
+                        message=f"VL frames {completed_count}/{total}",
+                        details={"vl": vl_progress},
+                    )
                 if frames:
                     with analyzer_resource_lock(config.config, "vl", str(output_dir), logger):
                         with local_model_stage("vl", config.config, logger, str(output_dir)):
@@ -1027,10 +1365,14 @@ def main():
                                 selected_frame_numbers=selected_frame_numbers,
                                 decisions=frame_decisions,
                                 concurrency=max(args.vl_concurrency, 1),
-                                context_before=max(args.vl_context_before, 0),
-                                context_after=max(args.vl_context_after, 0),
+                                context_before=context_before,
+                                context_after=context_after,
                                 context_max_gap=args.vl_context_max_gap,
-                                checkpoint_path=output_dir / "orin" / "frame_analyses.partial.json",
+                                checkpoint_path=checkpoint_path,
+                                checkpoint_by_frame=checkpoint_by_frame,
+                                checkpoint_signature=checkpoint_signature,
+                                checkpoint_signature_payload=signature_payload,
+                                progress_callback=update_vl_progress,
                             )
                 else:
                     logger.info("No video frames available; skipping VL provider calls.")
