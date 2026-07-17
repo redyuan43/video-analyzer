@@ -28,6 +28,10 @@ class QaIndexTests(unittest.TestCase):
                 "# 证据\n\n[00:01:02] frame_012 显示 Settings 页面和 API Token 输入框。",
                 encoding="utf-8",
             )
+            (run_dir / "RUN_MANIFEST.md").write_text(
+                "# RUN_MANIFEST\n\n先读 visual_review.html，再核对 manual_evidence.md。",
+                encoding="utf-8",
+            )
             (run_dir / "analysis.json").write_text(
                 json.dumps(
                     {
@@ -45,8 +49,9 @@ class QaIndexTests(unittest.TestCase):
             index = build_qa_index(run_dir)
             context = retrieve_context(run_dir, "API Token 在哪里填写？", max_context_chars=300)
 
-            self.assertEqual(index["source_count"], 3)
-            self.assertGreaterEqual(index["chunk_count"], 3)
+            self.assertEqual(index["source_count"], 4)
+            self.assertGreaterEqual(index["chunk_count"], 4)
+            self.assertTrue(any(item["name"] == "run_manifest" for item in index["sources"]))
             self.assertTrue((run_dir / "qa" / "answer_index.json").is_file())
             self.assertTrue((run_dir / "qa" / "source_chunks.jsonl").is_file())
             joined = "\n".join(chunk["text"] for chunk in context["chunks"])

@@ -72,8 +72,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vl-context-max-gap")
     parser.add_argument("--duration", type=float, help="Optional duration in seconds to process")
     parser.add_argument("--manual-language")
-    parser.add_argument("--asr-provider", choices=["none", "vibevoice"], help="Analyzer ASR provider when no subtitle transcript is used")
+    parser.add_argument(
+        "--asr-provider",
+        choices=["none", "remote_http", "capswriter_http", "vibevoice", "faster_whisper"],
+        help="Analyzer ASR provider when no subtitle transcript is used",
+    )
     parser.add_argument("--vibevoice-url", action="append", help="Remote GPU VibeVoice ASR endpoint; can be provided multiple times")
+    parser.add_argument("--remote-asr-url", action="append", help="Generic multipart ASR endpoint; can be provided multiple times")
+    parser.add_argument(
+        "--ocr-provider",
+        choices=["auto", "dots_mocr_vllm", "openai_vision", "none"],
+        help="OCR provider used by the analyzer",
+    )
     parser.add_argument("--ocr-base-url", action="append", help="DotsMOCR OpenAI-compatible base URL; can be provided multiple times")
     parser.add_argument("--ocr-concurrency", help="OCR concurrency per endpoint, or auto")
     parser.add_argument("--ocr-cache", choices=["on", "off", "refresh"], help="OCR cache mode")
@@ -169,6 +179,8 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
         "manual_language": profile.get("manual_language", "zh-CN"),
         "asr_provider": profile.get("asr_provider", "vibevoice"),
         "vibevoice_url": profile.get("vibevoice_urls") or profile.get("vibevoice_url"),
+        "remote_asr_url": profile.get("remote_asr_urls") or profile.get("remote_asr_url"),
+        "ocr_provider": profile.get("ocr_provider", "auto"),
         "ocr_base_url": profile.get("ocr_base_urls") or profile.get("ocr_base_url"),
         "ocr_concurrency": profile.get("ocr_concurrency", "auto"),
         "ocr_cache": profile.get("ocr_cache", "on"),
@@ -202,8 +214,10 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
     for key, value in defaults.items():
         if getattr(args, key, None) is None and value is not None:
             setattr(args, key, value)
-    if not args.vibevoice_url:
+    if args.asr_provider == "vibevoice" and not args.vibevoice_url:
         raise ValueError("Runtime profile must provide vibevoice_url, or pass --vibevoice-url")
+    if args.asr_provider == "remote_http" and not args.remote_asr_url:
+        raise ValueError("Runtime profile must provide remote_asr_url, or pass --remote-asr-url")
     if not args.ocr_base_url:
         raise ValueError("Runtime profile must provide ocr_base_url, or pass --ocr-base-url")
     return args
@@ -1123,7 +1137,7 @@ def build_analyzer_command(args: argparse.Namespace, video_path: Path, context_p
         "--context-file",
         str(context_path),
         "--ocr-provider",
-        "auto",
+        getattr(args, "ocr_provider", "auto"),
         "--llm-base-url",
         args.llm_base_url,
         "--vision-base-url",
@@ -1167,6 +1181,9 @@ def build_analyzer_command(args: argparse.Namespace, video_path: Path, context_p
         if asr_provider == "vibevoice":
             for vibevoice_url in _as_list(args.vibevoice_url):
                 command.extend(["--vibevoice-url", vibevoice_url])
+        elif asr_provider == "remote_http":
+            for remote_asr_url in _as_list(args.remote_asr_url):
+                command.extend(["--remote-asr-url", remote_asr_url])
     command.extend(
         [
             "--frame-extractor",
@@ -1197,8 +1214,13 @@ def build_analyzer_command(args: argparse.Namespace, video_path: Path, context_p
             getattr(args, "ocr_cache", "on"),
             "--ocr-cache-dir",
             getattr(args, "ocr_cache_dir", ".cache/video-analyzer/ocr"),
-            "--ocr-timeout-seconds",
-            str(getattr(args, "ocr_timeout_seconds", 120)),
+        ]
+    )
+    ocr_timeout_seconds = getattr(args, "ocr_timeout_seconds", None)
+    if ocr_timeout_seconds is not None:
+        command.extend(["--ocr-timeout-seconds", str(ocr_timeout_seconds)])
+    command.extend(
+        [
             "--ocr-keyframe-strategy",
             getattr(args, "ocr_keyframe_strategy", "auto"),
             "--ocr-keyframe-budget",

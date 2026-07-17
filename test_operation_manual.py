@@ -818,6 +818,7 @@ class OperationManualTests(unittest.TestCase):
         self.assertIn("http://100.90.114.26:18081/v1", command)
         self.assertEqual(command.count("--ocr-base-url"), 2)
         self.assertIn("--ocr-cache", command)
+        self.assertNotIn("--ocr-timeout-seconds", command)
 
     def test_url_runner_rejects_unsafe_run_name_before_delete(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -77,6 +77,13 @@ def select_candidate_frames_with_strategy(
                 algorithm_trace,
             )
             strategy_selected = selector(_merge_unique(strategy_selected, secondary_selected), candidate_budget)
+    strategy_selected, cue_anchor_trace = _apply_cue_anchor_treatment(
+        selected=strategy_selected,
+        candidates=deduped,
+        candidate_budget=candidate_budget,
+        transcript_segments=transcript_segments,
+    )
+    algorithm_trace["cue_anchors"] = cue_anchor_trace
     guard = _quality_guard(
         selected_strategy,
         strategy_selected,
@@ -652,9 +659,104 @@ def _transcript_anchor_items(
     return _merge_unique(anchors)
 
 
+def _apply_cue_anchor_treatment(
+    selected: list[tuple[int, Any, float, float]],
+    candidates: list[tuple[int, Any, float, float]],
+    candidate_budget: int,
+    transcript_segments: Iterable[dict[str, Any]] | None,
+) -> tuple[list[tuple[int, Any, float, float]], dict[str, Any]]:
+    anchors = _transcript_anchor_items(candidates, transcript_segments)
+    baseline_timestamps = [item[2] for item in selected]
+    baseline_coverage = _transcript_anchor_coverage(baseline_timestamps, transcript_segments)
+    if not anchors or candidate_budget <= 0:
+        return selected, {
+            "enabled": False,
+            "reason": "no_transcript_cues" if not anchors else "empty_budget",
+            "baseline_anchor_coverage": round(baseline_coverage, 4),
+            "treatment_anchor_coverage": round(baseline_coverage, 4),
+            "coverage_delta": 0.0,
+            "anchor_candidate_count": len(anchors),
+            "anchors_forced_count": 0,
+        }
+
+    anchor_budget = min(len(anchors), max(1, candidate_budget // 3))
+    forced = _coverage_select(anchors, anchor_budget)
+    treatment = _merge_required_with_fill(forced, selected, candidates, candidate_budget)
+    treatment_coverage = _transcript_anchor_coverage([item[2] for item in treatment], transcript_segments)
+    selected_keys = {round(item[2], 3) for item in selected}
+    forced_keys = {round(item[2], 3) for item in forced}
+    if treatment_coverage < baseline_coverage:
+        return selected, {
+            "enabled": True,
+            "reason": "guardrail_kept_baseline_primary_metric",
+            "baseline_anchor_coverage": round(baseline_coverage, 4),
+            "treatment_anchor_coverage": round(baseline_coverage, 4),
+            "coverage_delta": 0.0,
+            "anchor_candidate_count": len(anchors),
+            "anchors_forced_count": len(forced),
+            "anchors_added_count": 0,
+            "anchor_budget": anchor_budget,
+            "guardrail_triggered": True,
+            "ab_test": {
+                "name": "subtitle_cue_nearest_candidate_anchors",
+                "baseline": "candidate strategy output without forced cue-nearest frames",
+                "treatment": "preserve cue-nearest candidate frames before filling remaining budget",
+                "primary_metric": "transcript_anchor_coverage",
+            },
+        }
+    return treatment, {
+        "enabled": True,
+        "baseline_anchor_coverage": round(baseline_coverage, 4),
+        "treatment_anchor_coverage": round(treatment_coverage, 4),
+        "coverage_delta": round(treatment_coverage - baseline_coverage, 4),
+        "anchor_candidate_count": len(anchors),
+        "anchors_forced_count": len(forced),
+        "anchors_added_count": len(forced_keys - selected_keys),
+        "anchor_budget": anchor_budget,
+        "ab_test": {
+            "name": "subtitle_cue_nearest_candidate_anchors",
+            "baseline": "candidate strategy output without forced cue-nearest frames",
+            "treatment": "preserve cue-nearest candidate frames before filling remaining budget",
+            "primary_metric": "transcript_anchor_coverage",
+        },
+    }
+
+
+def _merge_required_with_fill(
+    required: list[tuple[int, Any, float, float]],
+    preferred: list[tuple[int, Any, float, float]],
+    candidates: list[tuple[int, Any, float, float]],
+    budget: int,
+) -> list[tuple[int, Any, float, float]]:
+    merged: dict[float, tuple[int, Any, float, float]] = {}
+    for item in required[:budget]:
+        merged[round(item[2], 3)] = item
+    if len(merged) >= budget:
+        return [merged[key] for key in sorted(merged)]
+    fill = _merge_unique(preferred, sorted(candidates, key=lambda item: item[3], reverse=True))
+    for item in fill:
+        merged.setdefault(round(item[2], 3), item)
+        if len(merged) >= budget:
+            break
+    return [merged[key] for key in sorted(merged)]
+
+
+def _coverage_select(
+    candidates: list[tuple[int, Any, float, float]],
+    budget: int,
+) -> list[tuple[int, Any, float, float]]:
+    if len(candidates) <= budget:
+        return candidates
+    if budget <= 1:
+        return [candidates[0]]
+    step = (len(candidates) - 1) / max(budget - 1, 1)
+    indexes = {round(index * step) for index in range(budget)}
+    return [candidates[index] for index in sorted(indexes)[:budget]]
+
+
 def _segment_midpoint(segment: dict[str, Any]) -> float | None:
-    start = segment.get("start", segment.get("start_time"))
-    end = segment.get("end", segment.get("end_time"))
+    start = _first_present(segment, "start", "start_time", "Start", "startTime")
+    end = _first_present(segment, "end", "end_time", "End", "endTime")
     try:
         if start is None and end is None:
             return None
@@ -665,6 +767,13 @@ def _segment_midpoint(segment: dict[str, Any]) -> float | None:
         return (float(start) + float(end)) / 2.0
     except (TypeError, ValueError):
         return None
+
+
+def _first_present(segment: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in segment:
+            return segment.get(key)
+    return None
 
 
 def _transcript_density(segments: Iterable[dict[str, Any]] | None, duration: float) -> float:

@@ -438,7 +438,13 @@ def main() -> int:
         frame_assets=frame_assets,
         no_think=True,
     )
-    operation_manual["response"] = embed_step_images(operation_manual.get("response", ""), frames, frame_assets)
+    operation_manual["response"] = embed_step_images(
+        operation_manual.get("response", ""),
+        frames,
+        frame_assets,
+        frame_analyses=frame_analyses,
+        ocr_events=ocr_events,
+    )
     operation_manual["quality_review"] = review_operation_manual_markdown(operation_manual.get("response", ""))
     operation_manual["quality_gate_passed"] = not any(
         issue.get("severity") == "error" for issue in operation_manual["quality_review"]

@@ -27,6 +27,34 @@ from tools import video_link_status_server as status_server
 
 
 class VideoAnalyzerUITests(unittest.TestCase):
+    def test_debug_console_context_falls_back_for_external_run_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(
+                jobs_dir=Path(tmp) / "jobs",
+                video_link_auto_resume=False,
+            )
+            external_run_dir = Path(tmp) / "runs" / "job-1"
+            external_run_dir.mkdir(parents=True)
+            job = {
+                "job_id": "job-1",
+                "run_dir": str(external_run_dir),
+                "status": "failed",
+                "current_stage": "analyze-core",
+                "stages": {
+                    "analyze-core": {
+                        "status": "failed",
+                        "error": "worker failed",
+                    }
+                },
+            }
+
+            with patch.object(ui.video_link, "load_job", return_value=job):
+                context = ui.debug_console_context("job-1")
+
+        self.assertEqual(context["cwd"], str(ui_mod.VIDEO_LINK_REPO_ROOT))
+        self.assertEqual(context["status"], "failed")
+        self.assertEqual(context["failed_stage"], "analyze-core")
+
     def test_home_page_contains_unified_video_link_workspace(self):
         with tempfile.TemporaryDirectory() as tmp:
             ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp), video_link_auto_resume=False)
@@ -97,8 +125,15 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn("vendor/katex/katex.min.css", html)
         self.assertIn("vendor/katex/katex.min.js", html)
         self.assertIn("vendor/katex/contrib/auto-render.min.js", html)
+        self.assertIn("vendor/mermaid/mermaid.min.js", html)
+        self.assertIn('name="web-debug-token"', html)
+        self.assertIn("web_debug_console.static", (UI_ROOT / "video_analyzer_ui" / "templates" / "index.html").read_text(encoding="utf-8"))
+        self.assertIn("debug-console.js", html)
+        self.assertIn("debug-console.css", html)
         main_js = (UI_ROOT / "video_analyzer_ui" / "static" / "js" / "main.js").read_text(encoding="utf-8")
         styles_css = (UI_ROOT / "video_analyzer_ui" / "static" / "css" / "styles.css").read_text(encoding="utf-8")
+        self.assertTrue((UI_ROOT / "video_analyzer_ui" / "static" / "vendor" / "mermaid" / "mermaid.min.js").is_file())
+        self.assertTrue((UI_ROOT / "video_analyzer_ui" / "static" / "vendor" / "mermaid" / "LICENSE").is_file())
         self.assertIn("study-workflow", main_js)
         self.assertIn("study-detail-shell", main_js)
         self.assertIn("representative_frame", main_js)
@@ -200,6 +235,20 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertEqual(result["failed"], 1)
         self.assertEqual(list_response.get_json()["total"], 2)
 
+    def test_video_link_rerun_stage_route_restarts_from_requested_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp), video_link_auto_resume=False)
+            client = ui.app.test_client()
+            job_id = "0123456789abcdef0123456789abcdef"
+            expected = {"job_id": job_id, "runner": {"current_stage": "deep-v2"}}
+
+            with patch.object(ui.video_link, "rerun_from_stage", return_value=expected) as rerun:
+                response = client.post(f"/api/video-link/jobs/{job_id}/stages/deep-v2/rerun", json={})
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.get_json(), expected)
+        rerun.assert_called_once_with(job_id, "deep-v2")
+
     def test_video_link_api_upload_media_create(self):
         with tempfile.TemporaryDirectory() as tmp:
             ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp) / "jobs", video_link_auto_resume=False)
@@ -223,6 +272,22 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertEqual(result["source_type"], "upload")
         self.assertEqual(result["source_name"], "sample.mp3")
         self.assertEqual(list_response.get_json()["total"], 1)
+
+    def test_video_link_api_upload_media_rejects_empty_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp) / "jobs", video_link_auto_resume=False)
+            ui.video_link.repo_root = Path(tmp) / "repo"
+            ui.video_link.repo_root.mkdir()
+            client = ui.app.test_client()
+
+            response = client.post(
+                "/api/video-link/jobs/upload",
+                data={"media": (io.BytesIO(b""), "empty.mp3")},
+                content_type="multipart/form-data",
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["error"], "uploaded media file is empty")
 
     def test_video_link_api_open_run_dir(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -257,14 +322,22 @@ class VideoAnalyzerUITests(unittest.TestCase):
             ui.video_link.save_job(loaded)
 
             response = client.get(f"/api/video-link/jobs/{job_id}/resource?path=operation_manual.md")
+            path_response = client.get(f"/api/video-link/jobs/{job_id}/resources/operation_manual.md")
             escaped = client.get(f"/api/video-link/jobs/{job_id}/resource?path=../secret.md")
+            escaped_path = client.get(f"/api/video-link/jobs/{job_id}/resources/../secret.md")
             body = response.get_data(as_text=True)
+            path_body = path_response.get_data(as_text=True)
             response.close()
+            path_response.close()
             escaped.close()
+            escaped_path.close()
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("# 标题", body)
+        self.assertEqual(path_response.status_code, 200)
+        self.assertIn("# 标题", path_body)
         self.assertEqual(escaped.status_code, 403)
+        self.assertIn(escaped_path.status_code, {403, 404})
 
     def test_video_link_api_starts_vscode_session(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -442,11 +515,31 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn("markdownit", js)
         self.assertIn("DOMPurify", js)
         self.assertIn("renderMathInElement", js)
+        self.assertIn("studyCanResizeWidth", js)
+        self.assertIn("studyRightReserve", js)
+        self.assertIn("return Boolean(playerVisible || contentVisible)", js)
+        self.assertIn("return nodes.studyResizer && !nodes.studyResizer.hidden ? 14 : 0", js)
+        self.assertIn("const sourcePlayerNeedsHandle = playerVisible && contentVisible", js)
         self.assertIn("normalizeMarkdownForPreview", js)
         self.assertIn("splitInlineMarkdownTableLine", js)
         self.assertIn("isPotentialMarkdownTableRow", js)
         self.assertIn("standaloneNodes", js)
+        self.assertIn("document_preview", js)
+        self.assertIn("文档推导脑图", js)
+        self.assertIn("Mermaid 预览", js)
+        self.assertIn("initializeMermaid", js)
+        self.assertIn("window.mermaid.render", js)
+        self.assertIn("data-mermaid-diagram", js)
+        self.assertIn("securityLevel: 'antiscript'", js)
+        self.assertIn("重点阅读", js)
+        self.assertIn("证据审计", js)
+        self.assertIn("过程文件", js)
+        self.assertIn("DOCUMENT_DERIVATION_PATH", js)
         self.assertIn(".doc-preview-body", css)
+        self.assertIn(".mindmap-preview", css)
+        self.assertIn(".mindmap-mermaid", css)
+        self.assertIn(".mindmap-mermaid svg", css)
+        self.assertIn(".doc-group", css)
         self.assertIn("td img.markdown-image", css)
         self.assertIn(".doc-list", css)
         self.assertNotIn("video-seek", js)
@@ -475,7 +568,7 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertNotIn("bindSourcePlayerSurfacePause", js)
         self.assertIn("url.searchParams.set('t', String(value))", js)
         self.assertIn("nodes.sourcePlayerPanel && learningPanelVisibility.sourcePlayer", js)
-        self.assertIn("playerVisible && (docListVisible || studyVisible || contentVisible)", js)
+        self.assertIn("playerVisible && contentVisible", js)
         self.assertIn("qaSourceHeight", js)
         self.assertIn("--qa-source-pane-width", css)
         self.assertIn("--qa-source-player-height", css)

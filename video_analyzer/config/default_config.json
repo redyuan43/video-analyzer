@@ -424,6 +424,10 @@
     },
     "speaker_diarization": {
         "enabled": true,
+        "assignment_enabled": true,
+        "diarization_project_root": "",
+        "assignment_device": "cuda",
+        "assignment_timeout_seconds": 900,
         "enable_3dspeaker": true,
         "enable_ecapa": true,
         "sample_seconds": 90,

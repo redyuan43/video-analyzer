@@ -26,12 +26,16 @@ class LocalModelRuntimeTests(unittest.TestCase):
         config = {
             "asr": {"vibevoice": {"deep_remote_urls": ["http://127.0.0.1:18012/api/asr/transcribe"]}},
             "ocr": {"base_urls": ["http://127.0.0.1:18088/v1"]},
-            "operation_manual": {"vision_base_url": "http://127.0.0.1:18082/v1"},
+            "operation_manual": {
+                "vision_base_url": "http://127.0.0.1:18082/v1",
+                "text_base_url": "http://127.0.0.1:18081/v1",
+            },
         }
 
         self.assertTrue(local_model_stage_needed("asr", config))
         self.assertTrue(local_model_stage_needed("ocr", config))
         self.assertTrue(local_model_stage_needed("vl", config))
+        self.assertTrue(local_model_stage_needed("text", config))
 
     def test_remote_endpoints_do_not_run_local_stage_switch(self):
         config = {
@@ -43,6 +47,30 @@ class LocalModelRuntimeTests(unittest.TestCase):
         self.assertFalse(local_model_stage_needed("asr", config))
         self.assertFalse(local_model_stage_needed("ocr", config))
         self.assertFalse(local_model_stage_needed("vl", config))
+        self.assertFalse(local_model_stage_needed("text", config))
+
+    @patch("video_analyzer.local_model_runtime.subprocess.run")
+    def test_local_model_stage_unloads_on_exit_when_enabled(self, run):
+        with TemporaryDirectory() as tmp:
+            config = {
+                "operation_manual": {"text_base_url": "http://127.0.0.1:18081/v1"},
+                "local_model_runtime": {
+                    "lock_path": str(Path(tmp) / "local.lock"),
+                    "stage_commands": {
+                        "text": ["/bin/echo", "text"],
+                        "stop": ["/bin/echo", "stop"],
+                    },
+                    "unload_on_stage_exit": True,
+                },
+            }
+
+            with local_model_stage("text", config, __import__("logging").getLogger(__name__), "text-job"):
+                pass
+
+            self.assertEqual(
+                [call.args[0] for call in run.call_args_list],
+                [["/bin/echo", "text"], ["/bin/echo", "stop"]],
+            )
 
     @patch("video_analyzer.local_model_runtime.subprocess.run")
     def test_prepare_stage_runs_configured_command(self, run):

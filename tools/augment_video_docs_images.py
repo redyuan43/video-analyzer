@@ -31,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Add generated images and representative frames to final Markdown docs")
     parser.add_argument("run_dir", help="Operation-manual run directory")
     parser.add_argument("--max-frame-images", type=int, default=6)
+    parser.add_argument("--skip-final-images", action="store_true", help="remove generated final-image blocks and keep real representative frames")
     return parser.parse_args()
 
 
@@ -51,7 +52,11 @@ def main() -> int:
             continue
         final_image = final_dir / final_name
         text = path.read_text(encoding="utf-8")
-        text = ensure_final_image(text, path, final_image, title, target_heading, deprecated_image_names)
+        if args.skip_final_images:
+            text = remove_final_image_block(text, title)
+            text = remove_deprecated_image_refs(text, deprecated_image_names + (final_name,))
+        else:
+            text = ensure_final_image(text, path, final_image, title, target_heading, deprecated_image_names)
         text = ensure_representative_images(text, path, chapter_assets, frame_assets)
         path.write_text(normalize_spacing(text), encoding="utf-8")
         changed.append(rel)

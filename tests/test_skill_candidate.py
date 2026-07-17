@@ -26,6 +26,7 @@ class SkillCandidateTests(unittest.TestCase):
             self.assertIn("name:", skill_text)
             self.assertIn("description:", skill_text)
             self.assertIn("Demo Tool Setup", skill_text)
+            self.assertIn("RUN_MANIFEST.md", reference_path.read_text(encoding="utf-8"))
             review = json.loads(review_path.read_text(encoding="utf-8"))
             self.assertEqual(review["status"], "needs_review")
             self.assertTrue(review["review_required"])
@@ -101,6 +102,10 @@ class SkillCandidateTests(unittest.TestCase):
 
 
 def write_artifacts(run_dir: Path, title: str = "Demo Tool Setup") -> None:
+    (run_dir / "RUN_MANIFEST.md").write_text(
+        "# RUN_MANIFEST\n\n先读 visual_review.html，再核对 manual_evidence.md。\n",
+        encoding="utf-8",
+    )
     (run_dir / "operation_manual.md").write_text(
         f"# {title}\n\n1. 打开设置页面。\n2. 填写 API Token。\n",
         encoding="utf-8",

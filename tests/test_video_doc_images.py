@@ -73,6 +73,38 @@ class VideoDocImageTests(unittest.TestCase):
             text_again = doc.read_text(encoding="utf-8")
             self.assertEqual(text_again.count("02-infographic-knowledge-notes.png"), 1)
 
+    def test_augment_video_docs_images_can_skip_generated_final_images(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            final_dir = run_dir / "baoyu_images" / "final"
+            final_dir.mkdir(parents=True)
+            (final_dir / "03-infographic-deep-report.png").write_bytes(b"png")
+            manual_assets = run_dir / "manual_assets"
+            manual_assets.mkdir()
+            (manual_assets / "frame_000.jpg").write_bytes(b"jpg")
+            doc_dir = run_dir / "docs_analysis_chapters"
+            doc_dir.mkdir()
+            doc = doc_dir / "deep_report_v2.md"
+            doc.write_text(
+                "# 深度报告\n\n"
+                "![逐章深度报告视觉摘要](../baoyu_images/final/03-infographic-deep-report.png)\n\n"
+                "## 逐章分析\n\n正文\n",
+                encoding="utf-8",
+            )
+
+            import sys
+
+            old_argv = sys.argv
+            try:
+                sys.argv = ["augment_video_docs_images.py", str(run_dir), "--skip-final-images"]
+                augment_main()
+            finally:
+                sys.argv = old_argv
+
+            text = doc.read_text(encoding="utf-8")
+            self.assertNotIn("03-infographic-deep-report.png", text)
+            self.assertIn("../manual_assets/frame_000.jpg", text)
+
     def test_operation_manual_reuses_knowledge_notes_image_and_removes_legacy_01(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)

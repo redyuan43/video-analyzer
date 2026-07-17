@@ -24,7 +24,7 @@ def build_tool_skill_candidate(run_dir: Path, *, force: bool = True) -> dict[str
         raise FileNotFoundError(f"Run directory does not exist: {run_dir}")
 
     artifacts = load_artifacts(run_dir)
-    if not any(artifacts.get(key) for key in ("operation_manual", "study_guide", "manual_evidence", "transcript")):
+    if not any(artifacts.get(key) for key in ("run_manifest", "operation_manual", "study_guide", "manual_evidence", "transcript")):
         raise FileNotFoundError(f"No supported analysis artifacts found in: {run_dir}")
 
     candidate_dir = run_dir / SKILL_ROOT_NAME / CANDIDATE_NAME
@@ -115,6 +115,7 @@ def enable_tool_skill_candidate(run_dir: Path, repo_root: Path, *, overwrite: bo
 
 def load_artifacts(run_dir: Path) -> dict[str, Any]:
     return {
+        "run_manifest": read_text(run_dir / "RUN_MANIFEST.md"),
         "operation_manual": read_text(run_dir / "operation_manual.md")
         or read_text(run_dir / "operation_manual.quality_failed.md"),
         "manual_evidence": read_text(run_dir / "manual_evidence.md"),
@@ -221,6 +222,11 @@ def render_evidence_reference(run_dir: Path, artifacts: dict[str, Any], review: 
         "## Review Warnings",
         "",
         *[f"- `{item['code']}` {item['message']}" for item in review.get("warnings") or []],
+        "",
+        "## Agent-First Manifest",
+        "",
+        sentence_trim(strip_markdown(artifacts.get("run_manifest") or ""), 900)
+        or "RUN_MANIFEST.md 不可用；按 Sources 列出的证据文件逐项核对。",
         "",
         "## Extracted Workflow Text",
         "",
@@ -374,6 +380,7 @@ def strip_markdown(text: str) -> str:
 def available_sources(artifacts: dict[str, Any]) -> list[str]:
     names = []
     for key, rel in (
+        ("run_manifest", "RUN_MANIFEST.md"),
         ("operation_manual", "operation_manual.md"),
         ("manual_evidence", "manual_evidence.md"),
         ("transcript", "transcript.md"),

@@ -27,6 +27,7 @@ DEFAULT_TOP_K = 10
 DEFAULT_CONTEXT_CHARS = 60000
 
 DOC_SOURCES = [
+    ("run_manifest", "RUN_MANIFEST.md", "agent-first run summary, read order, artifact map, and A/B metric deltas", "high"),
     ("manual_evidence", "manual_evidence.md", "highest confidence for visible UI, OCR, VL, screenshots", "high"),
     ("transcript", "transcript.md", "timestamped ASR/subtitle transcript for spoken claims", "high"),
     ("operation_manual", "operation_manual.md", "user-facing derived manual", "medium"),

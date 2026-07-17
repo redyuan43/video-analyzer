@@ -177,6 +177,7 @@ class Config:
             )
             text_model = manual_config.get("text_model") or profile.get("text_model") or vision_model
             text_temperature = manual_config.get("text_temperature", profile.get("text_temperature"))
+            text_timeout_seconds = manual_config.get("text_timeout_seconds", profile.get("text_timeout_seconds"))
             manual_config["llm_base_url"] = llm_base_url
             manual_config["vision_base_url"] = vision_base_url
             manual_config["text_base_url"] = text_base_url
@@ -184,6 +185,8 @@ class Config:
             manual_config["text_model"] = text_model
             if text_temperature is not None:
                 manual_config["text_temperature"] = text_temperature
+            if text_timeout_seconds is not None:
+                manual_config["text_timeout_seconds"] = int(text_timeout_seconds)
             if profile.get("text_api_key_env") and _is_deepseek_api(text_base_url):
                 manual_config["text_api_key_env"] = profile["text_api_key_env"]
             elif (

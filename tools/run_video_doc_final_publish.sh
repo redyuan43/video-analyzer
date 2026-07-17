@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [ "${1:-}" = "" ]; then
-  echo "Usage: tools/run_video_doc_final_publish.sh RUN_DIR [--profile PROFILE] [--jobs N] [--finalize-only] [--skip-images] [--skip-send] [--to WECHAT_ID] [--long-png]" >&2
+  echo "Usage: tools/run_video_doc_final_publish.sh RUN_DIR [--profile PROFILE] [--jobs N] [--finalize-only] [--skip-images] [--skip-pdf] [--skip-send] [--to WECHAT_ID] [--long-png]" >&2
   exit 2
 fi
 
@@ -14,6 +14,7 @@ PROFILE="deepseek_v4_pro"
 JOBS=3
 FINALIZE_ONLY=0
 SKIP_IMAGES=0
+SKIP_PDF=0
 SKIP_SEND=0
 LONG_PNG=0
 WECHAT_TO="${WECLAW_TO:-}"
@@ -36,6 +37,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --skip-images)
       SKIP_IMAGES=1
+      shift
+      ;;
+    --skip-pdf)
+      SKIP_PDF=1
       shift
       ;;
     --skip-send)
@@ -199,18 +204,35 @@ EOF
 
 regenerate_docs() {
   echo "[docs] multidoc"
-  "$ROOT_DIR/tools/run_multidoc_analysis.sh" "$RUN_DIR" --profile "$PROFILE"
-  echo "[docs] deep-v2"
-  "$PYTHON_BIN" "$ROOT_DIR/tools/generate_chapter_deep_report.py" "$RUN_DIR" \
+  "$PYTHON_BIN" "$ROOT_DIR/tools/run_local_model_stage.py" \
+    --stage text \
+    --config config \
     --profile "$PROFILE" \
-    --deep-v2 \
-    --no-final-synthesis \
-    --no-format-markdown-final \
-    --refresh-chapters \
-    --chapter-concurrency "$JOBS"
+    -- "$ROOT_DIR/tools/run_multidoc_analysis.sh" "$RUN_DIR" --profile "$PROFILE"
+  echo "[docs] deep-v2"
+  "$PYTHON_BIN" "$ROOT_DIR/tools/run_local_model_stage.py" \
+    --stage text \
+    --config config \
+    --profile "$PROFILE" \
+    -- "$PYTHON_BIN" "$ROOT_DIR/tools/generate_chapter_deep_report.py" "$RUN_DIR" \
+      --profile "$PROFILE" \
+      --deep-v2 \
+      --no-final-synthesis \
+      --no-format-markdown-final \
+      --refresh-chapters \
+      --chapter-concurrency "$JOBS"
 }
 
 verify_counts() {
+  if [ "$SKIP_IMAGES" -eq 0 ]; then
+    for name in "${FINAL_IMAGES[@]}"; do
+      test -s "$FINAL_DIR/$name"
+    done
+  fi
+  if [ "$SKIP_PDF" -eq 1 ]; then
+    echo "[verify] pdf=skipped"
+    return 0
+  fi
   local pdf_count
   pdf_count="$(find "$EXPORT_DIR" -maxdepth 1 -type f -name '*.pdf' | wc -l)"
   echo "[verify] pdf=$pdf_count"
@@ -316,17 +338,27 @@ if [ "$FINALIZE_ONLY" -eq 0 ]; then
   wait "$docs_pid"
 fi
 
-"$PYTHON_BIN" "$ROOT_DIR/tools/augment_video_docs_images.py" "$RUN_DIR"
+augment_args=()
+if [ "$SKIP_IMAGES" -eq 1 ]; then
+  augment_args+=(--skip-final-images)
+fi
+"$PYTHON_BIN" "$ROOT_DIR/tools/augment_video_docs_images.py" "$RUN_DIR" "${augment_args[@]}"
 export_args=(--final-only --jobs "$JOBS")
-if [ "$LONG_PNG" -eq 1 ]; then
+if [ "$SKIP_PDF" -eq 1 ]; then
+  echo "[export] skipped pdf"
+elif [ "$LONG_PNG" -eq 1 ]; then
   export_args+=(--long-png)
 fi
-"$ROOT_DIR/tools/export_video_docs.sh" "$RUN_DIR" "${export_args[@]}"
+if [ "$SKIP_PDF" -eq 0 ]; then
+  "$ROOT_DIR/tools/export_video_docs.sh" "$RUN_DIR" "${export_args[@]}"
+fi
 verify_counts
 write_summary
 
-if [ "$SKIP_SEND" -eq 0 ]; then
+if [ "$SKIP_SEND" -eq 0 ] && [ "$SKIP_PDF" -eq 0 ]; then
   send_outputs
+elif [ "$SKIP_SEND" -eq 0 ]; then
+  echo "[send] skipped: pdf export disabled"
 else
   echo "[send] skipped"
 fi

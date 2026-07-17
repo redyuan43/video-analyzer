@@ -582,6 +582,7 @@ function appendCommonJobFields(formData) {
 async function createUploadJob() {
     const file = nodes.mediaFile?.files?.[0];
     if (!file) throw new Error('请选择一个媒体文件');
+    if (file.size <= 0) throw new Error('所选媒体文件为空，请重新选择原始文件');
     const formData = new FormData();
     formData.append('media', file);
     appendCommonJobFields(formData);
@@ -1003,6 +1004,25 @@ function renderStageProgress(progress) {
     const percentText = progress.percent != null ? ` · 约 ${progress.percent}%` : '';
     nodes.corePanelTitle.textContent = progress.stage_label ? `${progress.stage_label}子项${percentText}` : `阶段子项${percentText}`;
     const summary = progress.summary || progress.current_label || progress.last_signal_label || '';
+    const vl = progress.vl || progress.details?.vl;
+    const vlTotal = Number(vl?.total_selected);
+    const vlCompleted = Number(vl?.completed);
+    const vlAverageSeconds = Number(vl?.average_frame_seconds);
+    const vlEtaSeconds = Number(vl?.eta_seconds);
+    const vlPercent = Number.isFinite(vlTotal) && vlTotal > 0 && Number.isFinite(vlCompleted)
+        ? clampPercent((vlCompleted / vlTotal) * 100)
+        : 0;
+    const vlSpeed = Number.isFinite(vlAverageSeconds) && vlAverageSeconds > 0
+        ? `${(60 / vlAverageSeconds).toFixed(2)} 帧/分钟`
+        : '-';
+    const vlDetail = vl ? `<div class="vl-progress-detail">
+        <div><span>VL 帧进度</span><strong>${escapeHtml(vlCompleted || 0)} / ${escapeHtml(vlTotal || 0)} (${escapeHtml(vlPercent.toFixed(1))}%)</strong></div>
+        <div><span>断点复用</span><strong>${escapeHtml(vl.reused || 0)} 帧</strong></div>
+        <div><span>本轮失败</span><strong>${escapeHtml(vl.failed || 0)} 帧</strong></div>
+        <div><span>处理速度</span><strong>${escapeHtml(vlSpeed)}</strong></div>
+        <div><span>单帧中位耗时</span><strong>${Number.isFinite(vlAverageSeconds) && vlAverageSeconds > 0 ? escapeHtml(`${vlAverageSeconds.toFixed(1)} 秒`) : '-'}</strong></div>
+        <div><span>预计剩余</span><strong>${Number.isFinite(vlEtaSeconds) && vlEtaSeconds >= 0 ? escapeHtml(formatClock(vlEtaSeconds)) : '-'}</strong></div>
+    </div>` : '';
     const summaryRow = `<tr class="stage-progress-meta ${progress.live ? 'live' : ''} ${progress.stale ? 'stale' : ''}">
         <td colspan="4">
             <div class="stage-progress-head">
@@ -1010,6 +1030,7 @@ function renderStageProgress(progress) {
                 <strong>${escapeHtml(progress.percent ?? 0)}%</strong>
             </div>
             <div class="bar stage-progress-bar"><div style="width:${escapeHtml(progress.percent ?? 0)}%"></div></div>
+            ${vlDetail}
         </td>
     </tr>`;
     nodes.coreRows.innerHTML = summaryRow + progress.steps.map(step => `<tr class="substep-row ${escapeHtml(step.status || 'pending')} ${progress.stale && step.status !== 'pending' ? 'stale' : ''}">
@@ -1476,14 +1497,36 @@ function renderStudyGuide(guide, jobId) {
 function renderWebEvidenceSummary(webEvidence) {
     const summary = webEvidence?.summary || {};
     const processed = Number(summary.processed_gaps || 0);
-    if (!processed) return '';
+    const claims = Array.isArray(webEvidence?.claims) ? webEvidence.claims : [];
+    if (!processed && !claims.length) return '';
     const external = Number(summary.resolved_by_external || 0);
     const partial = Number(summary.partial_external_support || 0);
     const unresolved = Number(summary.unresolved || 0) + Number(summary.video_only_gap || 0);
+    const supported = Number(summary.supported || 0);
+    const contradicted = Number(summary.contradicted || 0);
+    const insufficient = Number(summary.not_enough_evidence || 0);
+    const claimRows = claims.slice(0, 4).map((claim) => {
+        const verdict = claim.verdict || 'not_enough_evidence';
+        return `<li>
+            <strong class="fact-verdict ${escapeHtml(verdict)}">${escapeHtml(factVerdictLabel(verdict))}</strong>
+            <span>${escapeHtml(claim.claim || '未命名断言')}</span>
+        </li>`;
+    }).join('');
     return `<div class="study-evidence-boundary">
-        <strong>联网补证据</strong>
-        <span>已处理 ${escapeHtml(processed)} 个缺口 · 外部补强 ${escapeHtml(external)} · 部分补强 ${escapeHtml(partial)} · 仍需复核 ${escapeHtml(unresolved)}</span>
+        <strong>联网事实核验</strong>
+        <span>断言 ${escapeHtml(claims.length)} 条 · 支持 ${escapeHtml(supported)} · 反驳 ${escapeHtml(contradicted)} · 证据不足 ${escapeHtml(insufficient)}</span>
+        ${processed ? `<span>缺口补强：外部补强 ${escapeHtml(external)} · 部分补强 ${escapeHtml(partial)} · 仍需复核 ${escapeHtml(unresolved)}</span>` : ''}
+        ${claimRows ? `<ul class="fact-audit-list">${claimRows}</ul>` : ''}
     </div>`;
+}
+
+function factVerdictLabel(verdict) {
+    return {
+        supported: '有支持',
+        contradicted: '有冲突',
+        not_enough_evidence: '证据不足',
+        not_applicable: '不适用'
+    }[verdict] || '待核验';
 }
 
 function renderStudyNode(chapter, selected, index) {
@@ -1765,6 +1808,15 @@ function resourceUrl(jobId, path) {
     return `/api/video-link/jobs/${jobId}/resource?path=${encodeURIComponent(path)}`;
 }
 
+function resourcePathUrl(jobId, path) {
+    const encodedPath = String(path || '')
+        .split('/')
+        .filter(Boolean)
+        .map(part => encodeURIComponent(part))
+        .join('/');
+    return `/api/video-link/jobs/${jobId}/resources/${encodedPath}`;
+}
+
 async function loadFrameTimeMap(jobId) {
     if (!jobId) return {};
     if (frameTimeMaps[jobId]) return frameTimeMaps[jobId];
@@ -1817,25 +1869,71 @@ function parseTimestampToSeconds(value) {
     return third == null ? first * 60 + second : first * 3600 + second * 60 + third;
 }
 
-function previewableDocs(job) {
+const DOCUMENT_DERIVATION_PATH = '__document_derivation__';
+
+function formatBytes(value) {
+    const bytes = Number(value || 0);
+    if (!bytes) return '';
+    if (bytes < 1024) return `${bytes} B`;
+    const units = ['KB', 'MB', 'GB'];
+    let amount = bytes / 1024;
+    let unit = units.shift();
+    while (amount >= 1024 && units.length) {
+        amount /= 1024;
+        unit = units.shift();
+    }
+    return `${amount.toFixed(amount >= 10 ? 0 : 1)} ${unit}`;
+}
+
+function docKindFromPath(path) {
+    const value = String(path || '').toLowerCase();
+    if (value.endsWith('.pdf')) return 'pdf';
+    if (value.endsWith('.html') || value.endsWith('.htm')) return 'html';
+    if (value.endsWith('.json')) return 'json';
+    return 'markdown';
+}
+
+function normalizePreviewItems(items, group) {
+    return (items || []).map(item => ({
+        ...item,
+        group,
+        kind: item.type === 'directory' ? 'directory' : docKindFromPath(item.path),
+        previewable: item.type !== 'directory'
+    }));
+}
+
+function fallbackPreviewableDocs(job) {
     const summary = job?.summary || {};
-    const markdownFiles = (summary.markdown_files || []).map(path => ({ path, kind: 'markdown' }));
+    const markdownFiles = (summary.markdown_files || []).map(path => ({
+        path,
+        title: path,
+        description: '历史 Markdown 产物',
+        group: 'process',
+        kind: 'markdown',
+        previewable: true
+    }));
     const pdfFiles = (summary.export_files || [])
         .filter(path => path.toLowerCase().endsWith('.pdf'))
-        .map(path => ({ path, kind: 'pdf' }));
+        .map(path => ({
+            path,
+            title: path,
+            description: '历史 PDF 导出',
+            group: 'process',
+            kind: 'pdf',
+            previewable: true
+        }));
     const preferred = [
+        'operation_manual.md',
+        'docs_analysis_chapters/knowledge_notes_v2.md',
+        'docs_analysis_chapters/deep_report_v2.md',
+        'manual_evidence.md',
+        'evidence_index.md',
         'study_overview.md',
         'study_cards.md',
-        'evidence_index.md',
-        'review_notes.md',
         'exports/operation_manual.pdf',
-        'operation_manual.md',
         'exports/knowledge_notes_v2.pdf',
-        'docs_analysis_chapters/knowledge_notes_v2.md',
         'exports/deep_report_v2.pdf',
-        'docs_analysis_chapters/deep_report_v2.md',
-        'exports/manual_evidence.pdf',
-        'manual_evidence.md'
+        'exports/manual_evidence.pdf'
     ];
     return [...markdownFiles, ...pdfFiles].sort((left, right) => {
         const leftIndex = preferred.indexOf(left.path);
@@ -1843,9 +1941,151 @@ function previewableDocs(job) {
         const leftRank = leftIndex === -1 ? 1000 : leftIndex;
         const rightRank = rightIndex === -1 ? 1000 : rightIndex;
         if (leftRank !== rightRank) return leftRank - rightRank;
-        if (left.kind !== right.kind) return left.kind === 'pdf' ? -1 : 1;
+        if (left.kind !== right.kind) return left.kind === 'markdown' ? -1 : 1;
         return left.path.localeCompare(right.path);
     });
+}
+
+function previewableDocs(job) {
+    const preview = job?.document_preview || {};
+    const primary = normalizePreviewItems(preview.primary, 'primary');
+    const evidence = normalizePreviewItems(preview.evidence, 'evidence');
+    const process = normalizePreviewItems(preview.process, 'process');
+    const assets = normalizePreviewItems(preview.assets, 'assets');
+    const derivation = preview.derivation ? [{
+        type: 'mindmap',
+        path: DOCUMENT_DERIVATION_PATH,
+        title: '文档推导脑图',
+        description: '理解重点文档、证据文件和过程文件之间的递进关系',
+        group: 'mindmap',
+        kind: 'mindmap',
+        previewable: true
+    }] : [];
+    const grouped = [...primary, ...derivation, ...evidence, ...process, ...assets];
+    return grouped.length ? grouped : fallbackPreviewableDocs(job);
+}
+
+function docGroupDefinitions(docs) {
+    const groups = [
+        ['primary', '重点阅读', '最终用户最应该先看的结论文档'],
+        ['mindmap', '文档推导', '这些文件如何一步步生成'],
+        ['evidence', '证据审计', '抽帧、OCR/VL、发布判断等可追溯证据'],
+        ['process', '过程文件', '中间分析、QA、调试与结构化产物'],
+        ['assets', '素材目录', '帧图、截图和报告素材目录']
+    ];
+    return groups
+        .map(([key, title, description]) => ({
+            key,
+            title,
+            description,
+            docs: docs.filter(doc => doc.group === key)
+        }))
+        .filter(group => group.docs.length);
+}
+
+function docTypeLabel(doc) {
+    if (doc.kind === 'mindmap') return '图';
+    if (doc.kind === 'directory') return '目录';
+    if (doc.kind === 'pdf') return 'PDF';
+    if (doc.kind === 'html') return 'HTML';
+    if (doc.kind === 'json') return 'JSON';
+    return 'MD';
+}
+
+function docMetaText(doc) {
+    const parts = [];
+    if (doc.file_count != null) parts.push(`${doc.file_count} 个文件`);
+    const size = formatBytes(doc.size_bytes);
+    if (size) parts.push(size);
+    if (doc.updated_at) parts.push(String(doc.updated_at).replace('T', ' ').replace(/\+00:00$/, 'Z'));
+    return parts.join(' · ');
+}
+
+function findPreviewDoc(job, path) {
+    return previewableDocs(job).find(doc => doc.path === path);
+}
+
+function docPreviewUrl(job, doc) {
+    if (!job?.job_id || !doc?.path) return '';
+    return doc.url || resourcePathUrl(job.job_id, doc.path);
+}
+
+let mermaidRenderSequence = 0;
+
+function initializeMermaid() {
+    if (!window.mermaid) return false;
+    if (!window.mermaid.__videoAnalyzerInitialized) {
+        window.mermaid.initialize({
+            startOnLoad: false,
+            securityLevel: 'antiscript',
+            theme: 'default',
+            flowchart: {
+                htmlLabels: true,
+                curve: 'basis',
+                useMaxWidth: true
+            }
+        });
+        window.mermaid.__videoAnalyzerInitialized = true;
+    }
+    return true;
+}
+
+async function renderMermaidDiagram(container, diagram) {
+    const target = container?.querySelector('[data-mermaid-diagram]');
+    if (!target) return;
+    const source = String(diagram || '').trim();
+    if (!source) {
+        target.innerHTML = '<div class="mindmap-empty">暂无 Mermaid 图定义。</div>';
+        return;
+    }
+    const fallbackHtml = renderSimpleMermaidFlowchart(source);
+    if (!initializeMermaid()) {
+        target.innerHTML = fallbackHtml || '<div class="mindmap-empty">Mermaid 渲染器未加载，请刷新页面。</div>';
+        return;
+    }
+    target.classList.add('loading');
+    target.textContent = 'Mermaid 渲染中...';
+    try {
+        const id = `video-doc-mermaid-${Date.now()}-${mermaidRenderSequence}`;
+        mermaidRenderSequence += 1;
+        const result = await window.mermaid.render(id, source);
+        target.classList.remove('loading');
+        target.innerHTML = result?.svg || '<div class="mindmap-empty">Mermaid 未返回可显示图形。</div>';
+    } catch (error) {
+        console.warn('Mermaid render failed', error);
+        target.classList.remove('loading');
+        const message = error?.message || String(error || '未知错误');
+        target.innerHTML = `${fallbackHtml || ''}<div class="mindmap-empty">Mermaid 渲染失败：${escapeHtml(message)}</div>`;
+    }
+}
+
+function renderDocMindmap(derivation) {
+    const nodes = derivation?.nodes || [];
+    const edges = derivation?.edges || [];
+    const mermaid = derivation?.mermaid || 'flowchart LR';
+    const tiers = [...new Set(nodes.map(node => Number(node.tier || 0)))].sort((left, right) => left - right);
+    const tierHtml = tiers.map(tier => {
+        const tierNodes = nodes.filter(node => Number(node.tier || 0) === tier);
+        return `<div class="mindmap-tier">
+            ${tierNodes.map(node => `<div class="mindmap-node${node.available ? '' : ' missing'}">
+                <strong>${escapeHtml(node.label || node.id || '')}</strong>
+                <span>${escapeHtml(node.description || '')}</span>
+            </div>`).join('')}
+        </div>`;
+    }).join('');
+    const edgeHtml = edges.map(edge => `<li>${escapeHtml(edge.from_label || edge.from)} -> ${escapeHtml(edge.to_label || edge.to)}</li>`).join('');
+    return `<section class="mindmap-preview">
+        <h2>文档推导脑图</h2>
+        <p>重点文档来自前面的转写、抽帧、OCR/VL 与证据审计；过程文件默认折叠，只在排查或追溯时打开。</p>
+        <h3>Mermaid 预览</h3>
+        <div class="mindmap-mermaid" data-mermaid-diagram></div>
+        <h3>生成层级</h3>
+        <div class="mindmap-canvas">${tierHtml}</div>
+        <h3>递进关系</h3>
+        <ol>${edgeHtml}</ol>
+        <h3>Mermaid 源码</h3>
+        <pre class="mindmap-source">${escapeHtml(mermaid)}</pre>
+    </section>`;
 }
 
 function loadLearningPanelVisibility() {
@@ -1877,7 +2117,10 @@ function hasDocContent() {
 function updateLearningDocsLayout() {
     if (!nodes.vscodeDocs) return;
     const docListVisible = learningPanelVisibility.docList;
-    const studyVisible = learningPanelVisibility.study;
+    const studyVisible = Boolean(
+        learningPanelVisibility.study
+        && currentJob?.summary?.study?.available
+    );
     const contentVisible = hasDocContent();
     const playerVisible = Boolean(nodes.sourcePlayerPanel && learningPanelVisibility.sourcePlayer);
     const visiblePanelCount = [docListVisible, studyVisible, playerVisible, contentVisible].filter(Boolean).length;
@@ -1890,20 +2133,41 @@ function updateLearningDocsLayout() {
     nodes.vscodeDocs.classList.toggle('preview-open', contentVisible);
     nodes.vscodeDocs.classList.toggle('empty-layout', visiblePanelCount === 0);
 
-    if (docListVisible) columns.push('minmax(220px, var(--doc-list-pane-width, 300px))');
+    const docListIsRightmost = docListVisible && !studyVisible && !playerVisible && !contentVisible;
+    if (docListVisible) {
+        columns.push(
+            docListIsRightmost
+                ? 'minmax(220px, 1fr)'
+                : 'minmax(220px, var(--doc-list-pane-width, 300px))'
+        );
+    }
     const docListNeedsHandle = docListVisible && (studyVisible || playerVisible || contentVisible);
     nodes.docListResizer?.classList.toggle('active', docListNeedsHandle);
     if (nodes.docListResizer) nodes.docListResizer.hidden = !docListNeedsHandle;
     if (docListNeedsHandle) columns.push('14px');
 
-    if (studyVisible) columns.push('minmax(280px, var(--study-pane-width, 1fr))');
-    const studyNeedsHandle = studyVisible && (playerVisible || contentVisible);
+    const studyIsRightmost = studyVisible && !playerVisible && !contentVisible;
+    if (studyVisible) {
+        columns.push(
+            studyIsRightmost
+                ? 'minmax(280px, 1fr)'
+                : 'minmax(280px, var(--study-pane-width, 1fr))'
+        );
+    }
+    const studyNeedsHandle = studyVisible && studyCanResizeWidth(docListVisible, playerVisible, contentVisible);
     nodes.studyResizer?.classList.toggle('active', studyNeedsHandle);
     if (nodes.studyResizer) nodes.studyResizer.hidden = !studyNeedsHandle;
     if (studyNeedsHandle) columns.push('14px');
 
-    if (playerVisible) columns.push('minmax(320px, var(--source-player-pane-width, 560px))');
-    const sourcePlayerNeedsHandle = playerVisible && (docListVisible || studyVisible || contentVisible);
+    const sourcePlayerIsRightmost = playerVisible && !contentVisible;
+    if (playerVisible) {
+        columns.push(
+            sourcePlayerIsRightmost
+                ? 'minmax(320px, 1fr)'
+                : 'minmax(320px, var(--source-player-pane-width, 560px))'
+        );
+    }
+    const sourcePlayerNeedsHandle = playerVisible && contentVisible;
     nodes.sourcePlayerResizer?.classList.toggle('active', sourcePlayerNeedsHandle);
     if (nodes.sourcePlayerResizer) nodes.sourcePlayerResizer.hidden = !sourcePlayerNeedsHandle;
     if (sourcePlayerNeedsHandle) columns.push('14px');
@@ -1940,7 +2204,12 @@ function bindLearningPanelToggles() {
 function renderDocPreviewPanel(job) {
     if (!nodes.docList) return;
     const docs = previewableDocs(job);
-    nodes.docPreviewSummary.textContent = docs.length ? `${docs.length} 个文档` : '无文档';
+    const primaryCount = docs.filter(doc => doc.group === 'primary').length;
+    const evidenceCount = docs.filter(doc => doc.group === 'evidence').length;
+    const processCount = docs.filter(doc => doc.group === 'process').length;
+    nodes.docPreviewSummary.textContent = docs.length
+        ? `${primaryCount} 个重点 · ${evidenceCount} 个证据 · ${processCount} 个过程`
+        : '无文档';
     if (!job || !docs.length) {
         selectedDocPath = '';
         renderedDocListKey = '';
@@ -1950,19 +2219,44 @@ function renderDocPreviewPanel(job) {
         return;
     }
     if (selectedDocPath && !docs.some(doc => doc.path === selectedDocPath)) selectedDocPath = '';
-    const listKey = `${job.job_id}|${selectedDocPath}|${docs.map(doc => `${doc.kind}:${doc.path}`).join('|')}`;
+    const listKey = `${job.job_id}|${selectedDocPath}|${docs.map(doc => `${doc.group}:${doc.kind}:${doc.path}`).join('|')}`;
     if (renderedDocListKey !== listKey) {
         renderedDocListKey = listKey;
-        nodes.docList.innerHTML = docs.map(doc => {
-            const active = doc.path === selectedDocPath ? ' active' : '';
-            const label = doc.kind === 'pdf' ? 'PDF' : 'MD';
-            return `<button class="doc-item${active}" type="button" data-doc-path="${escapeHtml(doc.path)}">
-                <span>${escapeHtml(label)}</span>
-                <strong>${escapeHtml(doc.path)}</strong>
-            </button>`;
+        nodes.docList.innerHTML = docGroupDefinitions(docs).map(group => {
+            const body = group.docs.map(doc => {
+                const active = doc.path === selectedDocPath ? ' active' : '';
+                const disabled = doc.previewable ? '' : ' disabled';
+                const meta = docMetaText(doc);
+                return `<button class="doc-item ${escapeHtml(doc.group)}${active}" type="button" data-doc-path="${escapeHtml(doc.path)}"${disabled}>
+                    <span class="doc-kind">${escapeHtml(docTypeLabel(doc))}</span>
+                    <strong>${escapeHtml(doc.title || doc.path)}</strong>
+                    <small>${escapeHtml(doc.description || doc.path)}</small>
+                    <em>${escapeHtml(meta || doc.path)}</em>
+                </button>`;
+            }).join('');
+            const content = `<div class="doc-group-body">${body}</div>`;
+            if (group.key === 'process' || group.key === 'assets') {
+                return `<details class="doc-group" ${group.key === 'process' ? '' : ''}>
+                    <summary>
+                        <strong>${escapeHtml(group.title)}</strong>
+                        <span>${group.docs.length} 项</span>
+                    </summary>
+                    <p>${escapeHtml(group.description)}</p>
+                    ${content}
+                </details>`;
+            }
+            return `<section class="doc-group">
+                <header>
+                    <strong>${escapeHtml(group.title)}</strong>
+                    <span>${group.docs.length} 项</span>
+                </header>
+                <p>${escapeHtml(group.description)}</p>
+                ${content}
+            </section>`;
         }).join('');
         nodes.docList.querySelectorAll('.doc-item').forEach(button => {
             button.addEventListener('click', () => {
+                if (button.disabled) return;
                 selectedDocPath = button.dataset.docPath || '';
                 loadedDocPreviewKey = '';
                 renderedDocListKey = '';
@@ -2015,11 +2309,28 @@ async function loadDocPreview(job, path) {
     if (!job?.job_id || !path) return;
     const previewKey = `${job.job_id}|${path}`;
     if (loadedDocPreviewKey === previewKey) return;
-    const url = resourceUrl(job.job_id, path);
-    nodes.docPreviewTitle.textContent = path;
+    const doc = findPreviewDoc(job, path) || { path, kind: docKindFromPath(path), title: path, previewable: true };
+    if (doc.kind === 'mindmap') {
+        nodes.docPreviewTitle.textContent = doc.title || '文档推导脑图';
+        nodes.docOpenLink.hidden = true;
+        nodes.docOpenLink.removeAttribute('href');
+        nodes.docPreviewBody.className = 'doc-preview-body mindmap';
+        nodes.docPreviewBody.innerHTML = renderDocMindmap(job.document_preview?.derivation || {});
+        await renderMermaidDiagram(nodes.docPreviewBody, job.document_preview?.derivation?.mermaid || 'flowchart LR');
+        loadedDocPreviewKey = previewKey;
+        return;
+    }
+    const url = docPreviewUrl(job, doc);
+    nodes.docPreviewTitle.textContent = doc.title || path;
     nodes.docOpenLink.href = url;
     nodes.docOpenLink.hidden = false;
     if (path.toLowerCase().endsWith('.pdf')) {
+        nodes.docPreviewBody.className = 'doc-preview-body pdf';
+        nodes.docPreviewBody.innerHTML = `<iframe title="${escapeHtml(path)}" src="${escapeHtml(url)}"></iframe>`;
+        loadedDocPreviewKey = previewKey;
+        return;
+    }
+    if (path.toLowerCase().endsWith('.html') || path.toLowerCase().endsWith('.htm')) {
         nodes.docPreviewBody.className = 'doc-preview-body pdf';
         nodes.docPreviewBody.innerHTML = `<iframe title="${escapeHtml(path)}" src="${escapeHtml(url)}"></iframe>`;
         loadedDocPreviewKey = previewKey;
@@ -2030,10 +2341,14 @@ async function loadDocPreview(job, path) {
     try {
         const response = await fetch(url);
         if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-        const markdown = await response.text();
+        const text = await response.text();
         if (selectedDocPath !== path) return;
         nodes.docPreviewBody.className = 'doc-preview-body markdown';
-        nodes.docPreviewBody.innerHTML = renderMarkdown(markdown, job.job_id, path);
+        if (path.toLowerCase().endsWith('.json')) {
+            nodes.docPreviewBody.innerHTML = `<pre>${escapeHtml(text)}</pre>`;
+        } else {
+            nodes.docPreviewBody.innerHTML = renderMarkdown(text, job.job_id, path);
+        }
         renderMarkdownMath(nodes.docPreviewBody);
         await enhanceTimestampTargets(nodes.docPreviewBody, job.job_id);
         loadedDocPreviewKey = previewKey;
@@ -2893,15 +3208,29 @@ function sourcePlayerVisible() {
     return Boolean(nodes.sourcePlayerPanel && !nodes.sourcePlayerPanel.hidden);
 }
 
+function studyCanResizeWidth(
+    docListVisible = learningPanelVisibility.docList,
+    playerVisible = sourcePlayerVisible(),
+    contentVisible = hasDocContent()
+) {
+    return Boolean(playerVisible || contentVisible);
+}
+
+function studyRightReserve() {
+    const sourceReserve = sourcePlayerVisible() ? 14 + (paneWidth('source-player') || 560) : 0;
+    const contentReserve = hasDocContent() ? 14 + 320 : 0;
+    const rightPanelReserve = sourceReserve + contentReserve;
+    if (rightPanelReserve) return rightPanelReserve;
+    return nodes.studyResizer && !nodes.studyResizer.hidden ? 14 : 0;
+}
+
 function resizeStudyPane(clientX) {
     const docs = nodes.vscodeDocs;
     if (!docs || !learningPanelVisibility.study) return;
     const rect = docs.getBoundingClientRect();
     const docListOffset = learningPanelVisibility.docList ? (paneWidth('doc-list') || 300) + 14 : 0;
-    const sourceReserve = sourcePlayerVisible() ? 14 + (paneWidth('source-player') || 560) : 0;
-    const contentReserve = hasDocContent() ? 14 + 320 : 0;
     const leftEdge = rect.left + docListOffset;
-    const max = Math.max(280, rect.right - leftEdge - sourceReserve - contentReserve);
+    const max = Math.max(280, rect.right - leftEdge - studyRightReserve());
     applyPaneWidth('study', clamp(clientX - leftEdge, 280, max));
 }
 
@@ -2969,9 +3298,7 @@ function adjustPaneWidth(pane, delta) {
         return;
     }
     const docListReserve = learningPanelVisibility.docList ? (paneWidth('doc-list') || 300) + 14 : 0;
-    const sourceReserve = sourcePlayerVisible() ? 14 + (paneWidth('source-player') || 560) : 0;
-    const contentReserve = hasDocContent() ? 14 + 320 : 0;
-    const max = Math.max(280, rect.width - docListReserve - sourceReserve - contentReserve);
+    const max = Math.max(280, rect.width - docListReserve - studyRightReserve());
     applyPaneWidth('study', clamp(paneWidth('study') + delta, 280, max));
 }
 

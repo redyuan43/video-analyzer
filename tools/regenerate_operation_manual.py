@@ -107,6 +107,8 @@ def main() -> int:
         operation_manual.get("response", ""),
         frames,
         frame_assets,
+        frame_analyses=visual_events,
+        ocr_events=ocr_events,
     )
     operation_manual["quality_review"] = review_operation_manual_markdown(operation_manual.get("response", ""))
     operation_manual["quality_gate_passed"] = not any(

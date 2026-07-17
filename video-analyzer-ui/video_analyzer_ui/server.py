@@ -22,12 +22,21 @@ from tools.video_link_status_server import (  # noqa: E402
     STAGE_ORDER,
     VideoLinkStatusServer,
 )
+from web_debug_console import WebDebugConsole  # noqa: E402
 
 # Initialize logger
 logger = logging.getLogger(__name__)
 
 class VideoAnalyzerUI:
-    def __init__(self, host='localhost', port=5000, dev_mode=False, jobs_dir=DEFAULT_JOBS_DIR, video_link_auto_resume=True):
+    def __init__(
+        self,
+        host='localhost',
+        port=5000,
+        dev_mode=False,
+        jobs_dir=DEFAULT_JOBS_DIR,
+        video_link_auto_resume=True,
+        debug_console_enabled=True,
+    ):
         package_dir = Path(__file__).resolve().parent
         self.app = Flask(
             __name__,
@@ -39,6 +48,12 @@ class VideoAnalyzerUI:
         self.dev_mode = dev_mode
         self.sessions = {}
         self.video_link = VideoLinkStatusServer(Path(jobs_dir), VIDEO_LINK_REPO_ROOT, auto_resume=video_link_auto_resume)
+        self.debug_console = WebDebugConsole(
+            self.app,
+            VIDEO_LINK_REPO_ROOT,
+            context_provider=self.debug_console_context,
+            enabled=debug_console_enabled,
+        )
         
         # Ensure tmp directories exist
         self.tmp_root = Path(tempfile.gettempdir()) / 'video-analyzer-ui'
@@ -63,11 +78,17 @@ class VideoAnalyzerUI:
                     static_root / 'vendor' / 'katex' / 'katex.min.css',
                     static_root / 'vendor' / 'katex' / 'katex.min.js',
                     static_root / 'vendor' / 'katex' / 'contrib' / 'auto-render.min.js',
+                    REPO_ROOT / 'web_debug_console' / 'static' / 'debug-console.js',
+                    REPO_ROOT / 'web_debug_console' / 'static' / 'debug-console.css',
                 ]
                 static_version = int(max(path.stat().st_mtime for path in assets))
             except OSError:
                 static_version = 1
-            return render_template('index.html', static_version=static_version)
+            return render_template(
+                'index.html',
+                static_version=static_version,
+                debug_console_token=self.debug_console.token,
+            )
 
         @self.app.route('/video-link')
         def video_link_home():
@@ -196,6 +217,13 @@ class VideoAnalyzerUI:
             except BridgeError as exc:
                 return jsonify({'error': exc.message}), int(exc.status)
 
+        @self.app.route('/api/video-link/jobs/<job_id>/stages/<stage>/rerun', methods=['POST'])
+        def video_link_rerun_from_stage(job_id, stage):
+            try:
+                return jsonify(self.video_link.rerun_from_stage(job_id, stage)), int(HTTPStatus.ACCEPTED)
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
         @self.app.route('/api/video-link/jobs/<job_id>/logs/<stage>')
         def video_link_stage_log(job_id, stage):
             try:
@@ -217,6 +245,14 @@ class VideoAnalyzerUI:
         def video_link_resource_file(job_id):
             try:
                 file_path, mimetype = self.video_link.resource_file(job_id, request.args.get('path', ''))
+                return send_file(file_path, mimetype=mimetype, conditional=True)
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>/resources/<path:relative_path>')
+        def video_link_resource_path(job_id, relative_path):
+            try:
+                file_path, mimetype = self.video_link.resource_file(job_id, relative_path)
                 return send_file(file_path, mimetype=mimetype, conditional=True)
             except BridgeError as exc:
                 return jsonify({'error': exc.message}), int(exc.status)
@@ -504,6 +540,71 @@ class VideoAnalyzerUI:
                 logger.error(f"Cleanup error: {e}")
                 return jsonify({'error': str(e)}), 500
     
+    def debug_console_context(self, job_id):
+        context = {
+            'cwd': str(VIDEO_LINK_REPO_ROOT),
+            'job_id': job_id,
+            'status': None,
+            'failed_stage': None,
+            'error': None,
+            'log_path': None,
+            'log_tail': None,
+        }
+        if not job_id:
+            return context
+        try:
+            job = self.video_link.load_job(job_id)
+        except BridgeError as exc:
+            context['error'] = exc.message
+            return context
+
+        run_dir = Path(job.get('run_dir') or VIDEO_LINK_REPO_ROOT).resolve()
+        try:
+            run_dir.relative_to(VIDEO_LINK_REPO_ROOT.resolve())
+        except ValueError:
+            pass
+        else:
+            if run_dir.is_dir():
+                context['cwd'] = str(run_dir)
+        runner = job.get('runner') or {}
+        stages = job.get('stages') or {}
+        failed_stage = next(
+            (
+                stage
+                for stage in STAGE_ORDER
+                if (stages.get(stage) or {}).get('status') == 'failed'
+            ),
+            None,
+        )
+        stage = failed_stage or runner.get('current_stage') or job.get('current_stage')
+        if not stage:
+            stage = next(
+                (
+                    candidate
+                    for candidate in reversed(STAGE_ORDER)
+                    if (stages.get(candidate) or {}).get('status') in {'succeeded', 'skipped'}
+                ),
+                None,
+            )
+        stage_data = stages.get(stage) or {}
+        context.update(
+            {
+                'status': job.get('status') or runner.get('status'),
+                'failed_stage': failed_stage,
+                'error': runner.get('error') or stage_data.get('error'),
+                'title': job.get('title'),
+                'video_url': job.get('video_url'),
+            }
+        )
+        if stage:
+            try:
+                log = self.video_link.stage_log(job_id, stage, 160, False)
+                context['log_path'] = log.get('log_path')
+                context['log_tail'] = '\n'.join(log.get('lines') or [])[-16000:]
+            except BridgeError:
+                pass
+        return context
+
     def run(self):
         self.app.run(
             host=self.host,

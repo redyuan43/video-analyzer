@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 import logging
 import subprocess
 import tempfile
@@ -318,6 +318,7 @@ class VideoProcessor:
         change_threshold: float = 6.0,
         min_gap_seconds: float = 1.0,
         similarity_threshold: float = 2.0,
+        transcript_segments: Optional[List[dict[str, Any]]] = None,
     ) -> List[Frame]:
         """Extract keyframes with a screen-recording friendly fixed+change strategy."""
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -379,8 +380,41 @@ class VideoProcessor:
             return self._extract_ffmpeg_keyframes(frames_per_minute, duration, max_frames, similarity_threshold)
 
         raw_candidate_count = len(candidates)
+        cue_anchor_metadata: dict[str, Any] = {
+            "enabled": False,
+            "reason": "no_transcript_cues",
+            "baseline_anchor_coverage": 0.0,
+            "treatment_anchor_coverage": 0.0,
+            "coverage_delta": 0.0,
+        }
         if max_frames is not None:
-            candidates = self._select_opencv_density_budget(candidates, fps, max_frames)
+            baseline = self._select_opencv_density_budget(candidates, fps, max_frames)
+            required_indexes = self._transcript_anchor_candidate_indexes(
+                candidates,
+                fps,
+                transcript_segments,
+                max_anchors=max(1, max_frames // 3),
+            )
+            treatment = self._select_opencv_density_budget(candidates, fps, max_frames, required_indexes=required_indexes)
+            cue_anchor_metadata = self._cue_anchor_metadata(
+                baseline=baseline,
+                treatment=treatment,
+                fps=fps,
+                transcript_segments=transcript_segments,
+                required_indexes=required_indexes,
+            )
+            if cue_anchor_metadata.get("coverage_delta", 0.0) < 0:
+                candidates = baseline
+                cue_anchor_metadata.update(
+                    {
+                        "reason": "guardrail_kept_baseline_primary_metric",
+                        "treatment_anchor_coverage": cue_anchor_metadata.get("baseline_anchor_coverage", 0.0),
+                        "coverage_delta": 0.0,
+                        "guardrail_triggered": True,
+                    }
+                )
+            else:
+                candidates = treatment
 
         self.frames = []
         for idx, (source_frame_num, frame, score) in enumerate(candidates):
@@ -395,6 +429,7 @@ class VideoProcessor:
             "raw_decoded_frames": frame_num,
             "raw_candidate_frames": raw_candidate_count,
             "sample_interval_frames": sample_interval,
+            "cue_anchors": cue_anchor_metadata,
         }
         return self.frames
 
@@ -404,13 +439,16 @@ class VideoProcessor:
         fps: float,
         max_frames: int,
         coverage_interval_seconds: float = 20.0,
+        required_indexes: Optional[set[int]] = None,
     ) -> List[tuple[int, np.ndarray, float]]:
         if len(candidates) <= max_frames:
             return candidates
 
-        selected_indexes = set()
+        selected_indexes = set(required_indexes or set())
         last_bucket = None
         for idx, (source_frame_num, _, _) in enumerate(candidates):
+            if len(selected_indexes) >= max_frames:
+                break
             timestamp = source_frame_num / fps if fps else 0.0
             bucket = int(timestamp // coverage_interval_seconds)
             if bucket != last_bucket:
@@ -429,3 +467,100 @@ class VideoProcessor:
             selected_indexes = set(sorted(selected_indexes)[:max_frames])
 
         return [candidates[idx] for idx in sorted(selected_indexes)]
+
+    def _transcript_anchor_candidate_indexes(
+        self,
+        candidates: List[tuple[int, np.ndarray, float]],
+        fps: float,
+        transcript_segments: Optional[List[dict[str, Any]]],
+        max_anchors: int,
+    ) -> set[int]:
+        if not candidates or not transcript_segments or max_anchors <= 0:
+            return set()
+        anchors = []
+        for segment in transcript_segments:
+            timestamp = self._segment_anchor_timestamp(segment)
+            if timestamp is None:
+                continue
+            nearest = min(
+                range(len(candidates)),
+                key=lambda index: abs((candidates[index][0] / fps if fps else 0.0) - timestamp),
+            )
+            anchors.append(nearest)
+        if not anchors:
+            return set()
+        unique = sorted(set(anchors))
+        if len(unique) <= max_anchors:
+            return set(unique)
+        step = (len(unique) - 1) / max(max_anchors - 1, 1)
+        return {unique[round(index * step)] for index in range(max_anchors)}
+
+    def _cue_anchor_metadata(
+        self,
+        baseline: List[tuple[int, np.ndarray, float]],
+        treatment: List[tuple[int, np.ndarray, float]],
+        fps: float,
+        transcript_segments: Optional[List[dict[str, Any]]],
+        required_indexes: set[int],
+    ) -> dict[str, Any]:
+        baseline_coverage = self._anchor_coverage(
+            [source_frame_num / fps if fps else 0.0 for source_frame_num, _, _ in baseline],
+            transcript_segments,
+        )
+        treatment_coverage = self._anchor_coverage(
+            [source_frame_num / fps if fps else 0.0 for source_frame_num, _, _ in treatment],
+            transcript_segments,
+        )
+        return {
+            "enabled": bool(required_indexes),
+            "reason": "" if required_indexes else "no_transcript_cues",
+            "baseline_anchor_coverage": round(baseline_coverage, 4),
+            "treatment_anchor_coverage": round(treatment_coverage, 4),
+            "coverage_delta": round(treatment_coverage - baseline_coverage, 4),
+            "anchors_forced_count": len(required_indexes),
+            "ab_test": {
+                "name": "subtitle_cue_nearest_candidate_anchors",
+                "baseline": "local density-budget candidate frames",
+                "treatment": "local density budget with cue-nearest frames protected",
+                "primary_metric": "transcript_anchor_coverage",
+            },
+        }
+
+    def _anchor_coverage(
+        self,
+        timestamps: List[float],
+        transcript_segments: Optional[List[dict[str, Any]]],
+        window_seconds: float = 30.0,
+    ) -> float:
+        anchors = [
+            value
+            for value in (self._segment_anchor_timestamp(segment) for segment in transcript_segments or [])
+            if value is not None
+        ]
+        if not anchors:
+            return 0.0
+        if not timestamps:
+            return 0.0
+        covered = sum(1 for anchor in anchors if min(abs(timestamp - anchor) for timestamp in timestamps) <= window_seconds)
+        return covered / len(anchors)
+
+    def _segment_anchor_timestamp(self, segment: dict[str, Any]) -> float | None:
+        start = self._first_present(segment, "start", "start_time", "Start", "startTime")
+        end = self._first_present(segment, "end", "end_time", "End", "endTime")
+        try:
+            if start is None and end is None:
+                return None
+            if start is None:
+                return float(end)
+            if end is None:
+                return float(start)
+            return (float(start) + float(end)) / 2.0
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _first_present(segment: dict[str, Any], *keys: str) -> Any:
+        for key in keys:
+            if key in segment:
+                return segment.get(key)
+        return None

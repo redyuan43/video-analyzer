@@ -1194,12 +1194,14 @@ def extract_local_screen_keyframes(
     frames_per_minute: int,
     duration: Optional[float],
     max_frames: int,
+    transcript: AudioTranscript | None = None,
 ) -> JetsonFrameExtractionResult:
     started = time.perf_counter()
     frames = processor.extract_screen_keyframes(
         frames_per_minute=frames_per_minute,
         duration=duration,
         max_frames=max_frames,
+        transcript_segments=transcript.segments if transcript else None,
     )
     metadata = {"backend": "local", "total_seconds": round(time.perf_counter() - started, 3)}
     metadata.update(getattr(processor, "last_extraction_metadata", {}) or {})
