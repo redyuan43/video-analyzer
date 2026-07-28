@@ -1,4 +1,6 @@
 import importlib.util
+import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -28,10 +30,10 @@ class AudioTemplateAnalysisModelTests(unittest.TestCase):
         config = Config('config')
         _client, model, base_url, temperature = run_audio_template_analysis.build_content_analysis_client(
             config,
-            'deepseek_v4_pro',
+            'deepseek_v4_flash',
         )
 
-        self.assertEqual(model, 'deepseek-v4-pro')
+        self.assertEqual(model, 'deepseek-v4-flash')
         self.assertEqual(base_url, 'https://api.deepseek.com')
         self.assertEqual(temperature, 1.0)
 
@@ -68,6 +70,56 @@ class AudioTemplateAnalysisModelTests(unittest.TestCase):
         self.assertIs(got_transcript, transcript)
         self.assertIs(got_result, result)
         self.assertEqual(strategy_mock.call_args.kwargs['strategy'], 'deep')
+
+    def test_main_with_provided_transcript_skips_audio_asr_and_diarization(self):
+        transcript = AudioTranscript(
+            text='provided words',
+            segments=[{'start': 0.1, 'end': 1.2, 'speaker': 'A', 'text': 'provided words'}],
+            language='en',
+            metadata={'source': 'provided'},
+        )
+        result = ASRStrategyResult(
+            strategy='provided_transcript',
+            transcript=transcript,
+            providers_run=[],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            media = root / 'demo.mp3'
+            media.write_bytes(b'audio is intentionally unused')
+            provided = root / 'provided.json'
+            provided.write_text(json.dumps({'text': 'provided words'}), encoding='utf-8')
+            output = root / 'output'
+            argv = [
+                'run_audio_template_analysis.py', str(media), '--output', str(output),
+                '--transcript-json', str(provided),
+            ]
+            selected = {'id': 'test', 'title': 'Test', 'prompt_original': '{transcript}'}
+            with (
+                patch('sys.argv', argv),
+                patch.object(run_audio_template_analysis, 'load_operation_config'),
+                patch.object(run_audio_template_analysis, 'load_templates', return_value=[selected]),
+                patch.object(run_audio_template_analysis, 'load_provided_transcript', return_value=(transcript, result)),
+                patch.object(run_audio_template_analysis, 'extract_audio_to_wav') as extract_mock,
+                patch.object(run_audio_template_analysis, 'transcribe_audio') as asr_mock,
+                patch.object(run_audio_template_analysis, 'refine_audio_speakers') as diarization_mock,
+                patch.object(run_audio_template_analysis, 'build_template_selector_client', return_value=(object(), 'selector', 'http://selector', 0.1)),
+                patch.object(run_audio_template_analysis, 'build_content_analysis_client', return_value=(object(), 'content', 'http://content', 0.1)),
+                patch.object(run_audio_template_analysis, 'choose_template', return_value=(selected, {'method': 'test'})),
+                patch.object(run_audio_template_analysis, 'summarize_with_template', return_value='summary'),
+                patch.object(run_audio_template_analysis, 'write_audio_only_manifest'),
+                patch.object(run_audio_template_analysis, 'build_light_study_guide'),
+                patch.object(run_audio_template_analysis, 'write_operation_manual', return_value=output / 'operation_manual.md'),
+                patch.object(run_audio_template_analysis, 'write_manual_evidence', return_value=output / 'manual_evidence.md'),
+                patch.object(run_audio_template_analysis, 'write_analysis_json', return_value=output / 'analysis.json'),
+            ):
+                self.assertEqual(run_audio_template_analysis.main(), 0)
+
+        extract_mock.assert_not_called()
+        asr_mock.assert_not_called()
+        diarization_mock.assert_not_called()
+        self.assertEqual(result.strategy, 'provided_transcript')
+        self.assertEqual(result.providers_run, [])
 
 
 if __name__ == '__main__':
