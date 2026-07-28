@@ -22,6 +22,7 @@ from tools.video_link_status_server import (  # noqa: E402
     STAGE_ORDER,
     VideoLinkStatusServer,
 )
+from video_analyzer_ui.runtime_identity import RuntimeIdentity  # noqa: E402
 from web_debug_console import WebDebugConsole  # noqa: E402
 
 # Initialize logger
@@ -47,6 +48,7 @@ class VideoAnalyzerUI:
         self.port = port
         self.dev_mode = dev_mode
         self.sessions = {}
+        self.runtime_identity = RuntimeIdentity(VIDEO_LINK_REPO_ROOT)
         self.video_link = VideoLinkStatusServer(Path(jobs_dir), VIDEO_LINK_REPO_ROOT, auto_resume=video_link_auto_resume)
         self.debug_console = WebDebugConsole(
             self.app,
@@ -65,6 +67,37 @@ class VideoAnalyzerUI:
         self.setup_routes()
         
     def setup_routes(self):
+        def require_mobile_audio_token():
+            expected = os.environ.get('VIDEO_ANALYZER_AUDIO_PIPELINE_TOKEN', '').strip()
+            supplied = request.headers.get('X-Audio-Pipeline-Token', '').strip()
+            if expected and supplied != expected:
+                return jsonify({'error': 'audio pipeline token is invalid'}), int(HTTPStatus.UNAUTHORIZED)
+            return None
+
+        @self.app.before_request
+        def reject_mutations_from_stale_runtime():
+            if request.method not in {'POST', 'PUT', 'PATCH', 'DELETE'}:
+                return None
+            if not request.path.startswith(
+                (
+                    '/api/video-link/',
+                    '/api/mobile/audio-jobs',
+                    '/api/mobile/audio-transcriptions',
+                )
+            ):
+                return None
+            if request.path.endswith('/stop'):
+                return None
+            runtime = self.runtime_identity.payload()
+            if not runtime['source_stale']:
+                return None
+            return jsonify(
+                {
+                    'error': 'status service source code changed; waiting for supervised restart',
+                    'runtime': runtime,
+                }
+            ), int(HTTPStatus.SERVICE_UNAVAILABLE)
+
         @self.app.route('/')
         def index():
             static_root = Path(self.app.static_folder or '')
@@ -100,7 +133,8 @@ class VideoAnalyzerUI:
 
         @self.app.route('/api/video-link/health')
         def video_link_health():
-            return jsonify({'ok': True, 'stages': STAGE_ORDER})
+            runtime = self.runtime_identity.payload()
+            return jsonify({'ok': not runtime['source_stale'], 'stages': STAGE_ORDER, 'runtime': runtime})
 
         @self.app.route('/api/video-link/options')
         def video_link_options():
@@ -113,13 +147,187 @@ class VideoAnalyzerUI:
 
         @self.app.route('/api/mobile/audio-jobs')
         def mobile_audio_jobs():
+            denied = require_mobile_audio_token()
+            if denied:
+                return denied
             limit = request.args.get('limit', default=50, type=int)
             return jsonify(self.video_link.list_mobile_audio_jobs(limit))
 
+        @self.app.route('/api/mobile/audio-jobs/by-attempt/<external_attempt_id>')
+        def mobile_audio_job_by_attempt(external_attempt_id):
+            denied = require_mobile_audio_token()
+            if denied:
+                return denied
+            try:
+                return jsonify(
+                    self.video_link.get_mobile_audio_job_by_attempt(
+                        external_attempt_id
+                    )
+                )
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
         @self.app.route('/api/mobile/audio-jobs/<job_id>')
         def mobile_audio_job(job_id):
+            denied = require_mobile_audio_token()
+            if denied:
+                return denied
             try:
                 return jsonify(self.video_link.get_mobile_audio_job(job_id))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/mobile/audio-templates')
+        def mobile_audio_templates():
+            denied = require_mobile_audio_token()
+            if denied:
+                return denied
+            try:
+                return jsonify(self.video_link.mobile_audio_templates())
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/mobile/audio-jobs/upload', methods=['POST'])
+        def mobile_audio_upload_job():
+            denied = require_mobile_audio_token()
+            if denied:
+                return denied
+            media = request.files.get('media')
+            if not media or not media.filename:
+                return jsonify({'error': 'media file is required'}), int(HTTPStatus.BAD_REQUEST)
+            temp_dir = self.tmp_root / 'mobile-audio-uploads'
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            temp_path = temp_dir / f"{uuid.uuid4().hex}-{secure_filename(media.filename)}"
+            try:
+                media.save(temp_path)
+                payload = dict(request.form.items())
+                return (
+                    jsonify(self.video_link.create_mobile_audio_job(payload, temp_path, media.filename)),
+                    int(HTTPStatus.CREATED),
+                )
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+            finally:
+                temp_path.unlink(missing_ok=True)
+
+        @self.app.route('/api/mobile/audio-jobs/from-transcript', methods=['POST'])
+        def mobile_audio_job_from_transcript():
+            denied = require_mobile_audio_token()
+            if denied:
+                return denied
+            transcript = request.files.get('transcript') or request.files.get('transcript_json')
+            if not transcript or not transcript.filename:
+                return jsonify({'error': 'transcript JSON file is required'}), int(HTTPStatus.BAD_REQUEST)
+            temp_dir = self.tmp_root / 'mobile-transcript-uploads'
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            temp_path = temp_dir / f"{uuid.uuid4().hex}-{secure_filename(transcript.filename)}"
+            try:
+                transcript.save(temp_path)
+                payload = dict(request.form.items())
+                return (
+                    jsonify(self.video_link.create_mobile_transcript_job(payload, temp_path, transcript.filename)),
+                    int(HTTPStatus.CREATED),
+                )
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+            finally:
+                temp_path.unlink(missing_ok=True)
+
+        @self.app.route('/api/mobile/audio-jobs/<job_id>/ack', methods=['POST'])
+        def mobile_audio_ack(job_id):
+            denied = require_mobile_audio_token()
+            if denied:
+                return denied
+            try:
+                return jsonify(self.video_link.acknowledge_mobile_audio_job(job_id))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/mobile/audio-jobs/<job_id>/resources/<path:resource_path>')
+        def mobile_audio_resource(job_id, resource_path):
+            denied = require_mobile_audio_token()
+            if denied:
+                return denied
+            try:
+                self.video_link.get_mobile_audio_job(job_id)
+                file_path, _content_type = self.video_link.resource_file(job_id, resource_path)
+                return send_file(file_path, as_attachment=False)
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/mobile/audio-transcriptions/by-attempt/<external_attempt_id>')
+        def mobile_audio_transcription_by_attempt(external_attempt_id):
+            denied = require_mobile_audio_token()
+            if denied:
+                return denied
+            try:
+                return jsonify(
+                    self.video_link.get_mobile_audio_job_by_attempt(
+                        external_attempt_id
+                    )
+                )
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/mobile/audio-transcriptions/<job_id>')
+        def mobile_audio_transcription(job_id):
+            denied = require_mobile_audio_token()
+            if denied:
+                return denied
+            try:
+                return jsonify(self.video_link.get_mobile_audio_job(job_id))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/mobile/audio-transcriptions/upload', methods=['POST'])
+        def mobile_audio_transcription_upload():
+            denied = require_mobile_audio_token()
+            if denied:
+                return denied
+            media = request.files.get('media')
+            if not media or not media.filename:
+                return jsonify({'error': 'media file is required'}), int(HTTPStatus.BAD_REQUEST)
+            temp_dir = self.tmp_root / 'mobile-audio-uploads'
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            temp_path = temp_dir / f"{uuid.uuid4().hex}-{secure_filename(media.filename)}"
+            try:
+                media.save(temp_path)
+                payload = dict(request.form.items())
+                return (
+                    jsonify(
+                        self.video_link.create_mobile_audio_job(
+                            payload,
+                            temp_path,
+                            media.filename,
+                            pipeline_kind='transcription',
+                        )
+                    ),
+                    int(HTTPStatus.CREATED),
+                )
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+            finally:
+                temp_path.unlink(missing_ok=True)
+
+        @self.app.route('/api/mobile/audio-transcriptions/<job_id>/ack', methods=['POST'])
+        def mobile_audio_transcription_ack(job_id):
+            denied = require_mobile_audio_token()
+            if denied:
+                return denied
+            try:
+                return jsonify(self.video_link.acknowledge_mobile_audio_job(job_id))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/mobile/audio-transcriptions/<job_id>/resources/<path:resource_path>')
+        def mobile_audio_transcription_resource(job_id, resource_path):
+            denied = require_mobile_audio_token()
+            if denied:
+                return denied
+            try:
+                self.video_link.get_mobile_audio_job(job_id)
+                file_path, _content_type = self.video_link.resource_file(job_id, resource_path)
+                return send_file(file_path, as_attachment=False)
             except BridgeError as exc:
                 return jsonify({'error': exc.message}), int(exc.status)
 
@@ -175,7 +383,8 @@ class VideoAnalyzerUI:
         @self.app.route('/api/video-link/jobs/<job_id>/run', methods=['POST'])
         def video_link_run_job(job_id):
             try:
-                return jsonify(self.video_link.start_run(job_id)), int(HTTPStatus.ACCEPTED)
+                payload = request.get_json(silent=True) or {}
+                return jsonify(self.video_link.start_run(job_id, profile=payload.get('profile'))), int(HTTPStatus.ACCEPTED)
             except BridgeError as exc:
                 return jsonify({'error': exc.message}), int(exc.status)
 
@@ -214,6 +423,13 @@ class VideoAnalyzerUI:
         def video_link_run_stage(job_id, stage):
             try:
                 return jsonify(self.video_link.run_stage(job_id, stage))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>/stages/<stage>/rerun', methods=['POST'])
+        def video_link_rerun_from_stage(job_id, stage):
+            try:
+                return jsonify(self.video_link.rerun_from_stage(job_id, stage)), int(HTTPStatus.ACCEPTED)
             except BridgeError as exc:
                 return jsonify({'error': exc.message}), int(exc.status)
 

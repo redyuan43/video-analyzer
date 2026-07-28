@@ -1,9 +1,12 @@
 import importlib.util
+import hashlib
+import http.client
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from io import BytesIO
@@ -34,6 +37,21 @@ url_context_mod = load_module(URL_CONTEXT_PATH, "video_analyzer_url_context")
 
 
 class VideoLinkStatusServerTests(unittest.TestCase):
+    def setUp(self):
+        default_config = json.loads(
+            (REPO_ROOT / "video_analyzer" / "config" / "default_config.json").read_text(encoding="utf-8")
+        )
+        patcher = patch.object(
+            server_mod,
+            "runtime_config",
+            return_value={
+                "active_runtime_profile": "deepseek_v4_flash",
+                "runtime_profiles": default_config.get("runtime_profiles") or {},
+            },
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_focus_prompt_materializes_analysis_context(self):
         with tempfile.TemporaryDirectory() as tmp:
             context = Path(tmp) / "page_context.md"
@@ -481,7 +499,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             options = server.options()
 
         self.assertEqual(options["defaults"]["analysis_mode"], "auto")
-        self.assertEqual(options["defaults"]["profile"], "deepseek_v4_pro")
+        self.assertEqual(options["defaults"]["profile"], "deepseek_v4_flash")
         self.assertEqual(options["defaults"]["cookies_from_browser"], "none")
         self.assertEqual(options["defaults"]["download_device"], "local")
         self.assertTrue(options["defaults"]["keep_existing"])
@@ -493,8 +511,125 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(options["defaults"]["max_comments"], 3000)
         self.assertIn("balanced", options["choices"]["analysis_modes"])
         self.assertIn("operation-fast", options["choices"]["analysis_modes"])
-        self.assertIn("deepseek_v4_pro", options["choices"]["profiles"])
+        self.assertIn("deepseek_v4_flash", options["choices"]["profiles"])
         self.assertIn("mi", options["choices"]["download_devices"])
+
+    def test_options_use_machine_active_runtime_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            config = {
+                "active_runtime_profile": "nx2_fallback",
+                "runtime_profiles": {
+                    "deepseek_v4_pro": {},
+                    "nx2_fallback": {},
+                },
+            }
+            with patch.object(server_mod, "runtime_config", return_value=config):
+                options = server.options()
+
+        self.assertEqual(options["defaults"]["profile"], "nx2_fallback")
+
+    def test_balance_failure_recommends_resume_with_active_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "profile": "deepseek_v4_pro"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            (run_dir / "analysis.json").write_text("{}", encoding="utf-8")
+            (run_dir / "manual_evidence.md").write_text("# Evidence\n", encoding="utf-8")
+            loaded["run_dir"] = str(run_dir)
+            loaded["status"] = "failed"
+            loaded["runner"] = {"status": "failed", "error": "402 Insufficient Balance"}
+
+            disposition = server.failure_disposition(loaded)
+
+        self.assertEqual(disposition["category"], "external_block")
+        self.assertTrue(disposition["rerun_recommended"])
+        self.assertEqual(disposition["recommended_profile"], "deepseek_v4_flash")
+
+    def test_complete_markdown_failure_does_not_recommend_rerun(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "run"
+            for relative in server_mod.EXPECTED_FINAL_DOCUMENTS:
+                path = run_dir / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("# Complete\n", encoding="utf-8")
+            loaded["run_dir"] = str(run_dir)
+            loaded["status"] = "failed"
+            loaded["runner"] = {"status": "failed", "error": "legacy final publish failed"}
+
+            disposition = server.failure_disposition(loaded)
+
+        self.assertEqual(disposition["category"], "artifacts_complete")
+        self.assertFalse(disposition["rerun_recommended"])
+
+    def test_failed_job_is_superseded_by_successful_job_for_same_run_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            run_dir = str(Path(tmp) / "run")
+            failed = {
+                "job_id": "a" * 32,
+                "status": "failed",
+                "video_url": "https://example.com/video",
+                "run_dir": run_dir,
+                "created_at": "2026-07-01T00:00:00+0800",
+            }
+            succeeded = {
+                "job_id": "b" * 32,
+                "status": "succeeded",
+                "video_url": "https://example.com/video",
+                "run_dir": run_dir,
+                "created_at": "2026-07-02T00:00:00+0800",
+            }
+
+            disposition = server.failure_disposition(failed, [failed, succeeded])
+
+        self.assertEqual(disposition["category"], "superseded")
+        self.assertEqual(disposition["superseded_by"], succeeded["job_id"])
+
+    def test_next_stage_retries_skipped_multidoc_when_outputs_are_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            loaded["run_dir"] = str(run_dir)
+            loaded["stages"] = {
+                stage: {"status": "succeeded"}
+                for stage in server.stage_order_for_job(loaded)
+            }
+            loaded["stages"]["multidoc"] = {"status": "skipped", "error": "402 Insufficient Balance"}
+
+            next_stage = server.next_stage(loaded)
+
+        self.assertEqual(next_stage, "multidoc")
+
+    def test_resume_can_switch_legacy_job_to_flash_and_preserve_profile_history(self):
+        class FakeThread:
+            def is_alive(self):
+                return False
+
+            def start(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "profile": "deepseek_v4_pro"})
+
+            with patch.object(server_mod.threading, "Thread", return_value=FakeThread()):
+                result = server.start_run(job["job_id"], profile="deepseek_v4_flash")
+
+            saved = server.load_job(job["job_id"])
+
+        self.assertEqual(result["options"]["profile"], "deepseek_v4_flash")
+        self.assertEqual(saved["options"]["profile"], "deepseek_v4_flash")
+        self.assertEqual(saved["profile_history"][-1]["profile"], "deepseek_v4_pro")
+        self.assertEqual(saved["profile_history"][-1]["replaced_by"], "deepseek_v4_flash")
 
     def test_collect_core_artifacts_includes_review_and_ab_outputs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -614,6 +749,540 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
             with self.assertRaisesRegex(server_mod.BridgeError, "uploaded media file is empty"):
                 server.create_uploaded_media_job({"analysis_mode": "auto"}, source, "empty.mp3")
+
+    def test_mobile_audio_job_is_idempotent_by_external_attempt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            source = Path(tmp) / "demo.mp3"
+            source.write_bytes(b"fake audio")
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", repo_root)
+
+            with patch.object(
+                server,
+                "start_run",
+                side_effect=lambda job_id: server.mobile_audio_job(
+                    server.load_job(job_id),
+                    include_resources=True,
+                ),
+            ):
+                first = server.create_mobile_audio_job(
+                    {
+                        "external_attempt_id": "asset-1-attempt-1",
+                        "source_device": "xnote",
+                        "profile": "deepseek_v4_pro",
+                    },
+                    source,
+                    "demo.mp3",
+                )
+                second = server.create_mobile_audio_job(
+                    {
+                        "external_attempt_id": "asset-1-attempt-1",
+                        "source_device": "xnote",
+                        "profile": "deepseek_v4_pro",
+                    },
+                    source,
+                    "demo.mp3",
+                )
+
+        self.assertEqual(first["job_id"], second["job_id"])
+        self.assertEqual(first["external_attempt_id"], "asset-1-attempt-1")
+        self.assertEqual(first["profile"], "deepseek_v4_pro")
+
+    def test_transcript_only_mobile_http_command_and_idempotency(self):
+        transcript_bytes = json.dumps({"text": "provided words", "segments": []}).encode()
+        transcript_sha256 = hashlib.sha256(transcript_bytes).hexdigest()
+        source_sha256 = "a" * 64
+        boundary = "codex-acceptance-boundary"
+        fields = {
+            "external_attempt_id": "provided-attempt-1",
+            "source_sha256": source_sha256,
+            "source_transcription_id": "transcription-42",
+            "source_transcript_sha256": transcript_sha256,
+            "template_id": "tmpl-001",
+            "focus_prompt": "focus",
+            "profile": "deepseek_v4_pro",
+        }
+        chunks = []
+        for name, value in fields.items():
+            chunks.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode())
+        chunks.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"transcript\"; filename=\"transcript.json\"\r\nContent-Type: application/json\r\n\r\n".encode()
+            + transcript_bytes + b"\r\n"
+        )
+        chunks.append(f"--{boundary}--\r\n".encode())
+        body = b"".join(chunks)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            app = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", repo_root)
+            server_mod.StatusRequestHandler.server_app = app
+            httpd = server_mod.ThreadingHTTPServer(("127.0.0.1", 0), server_mod.StatusRequestHandler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            with patch.object(
+                app, "start_run",
+                side_effect=lambda job_id: app.mobile_audio_job(app.load_job(job_id), include_resources=True),
+            ):
+                thread.start()
+                connection = http.client.HTTPConnection("127.0.0.1", httpd.server_port, timeout=2)
+                connection.request(
+                    "POST", "/api/mobile/audio-jobs/from-transcript", body,
+                    {"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                )
+                response = connection.getresponse()
+                first = json.loads(response.read())
+                connection.close()
+                self.assertEqual(response.status, 201)
+                loaded = app.load_job(first["job_id"])
+                command = app.uploaded_media_operation_command(loaded)
+                prepare = app.stage_prepare_uploaded_media(loaded)
+                run_dir = Path(loaded["run_dir"])
+                run_dir.mkdir(parents=True)
+                (run_dir / "analysis.json").write_text(
+                    json.dumps({"asr": {"providers_run": []}, "transcript": {"text": "provided words"}}),
+                    encoding="utf-8",
+                )
+                result = app.mobile_audio_result(loaded)
+
+                provided_copy = Path(loaded["provided_transcript_path"])
+                second = app.create_mobile_transcript_job(fields, provided_copy, "transcript.json")
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(first["job_id"], second["job_id"])
+        self.assertTrue(first["provided_transcript"])
+        self.assertTrue(result["provided_transcript"])
+        self.assertEqual(result["providers_run"], [])
+        self.assertEqual(first["source_transcription_id"], "transcription-42")
+        self.assertIn("--transcript-json", command)
+        self.assertEqual(command[command.index("--transcript-json") + 1], loaded["provided_transcript_path"])
+        self.assertEqual(prepare["artifacts"]["video_path"], loaded["provided_transcript_path"])
+
+    def test_transcript_only_attempt_rejects_changed_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            transcript = Path(tmp) / "transcript.json"
+            transcript.write_text('{"text":"hello"}', encoding="utf-8")
+            transcript_sha = server_mod.sha256_file(transcript)
+            app = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", repo_root)
+            payload = {
+                "external_attempt_id": "same-attempt", "source_sha256": "a" * 64,
+                "source_transcription_id": "tx-1", "source_transcript_sha256": transcript_sha,
+            }
+            with patch.object(app, "start_run", side_effect=lambda job_id: app.mobile_audio_job(app.load_job(job_id))):
+                app.create_mobile_transcript_job(payload, transcript, "transcript.json")
+                changed = dict(payload, source_sha256="b" * 64)
+                with self.assertRaisesRegex(server_mod.BridgeError, "another transcript source"):
+                    app.create_mobile_transcript_job(changed, transcript, "transcript.json")
+
+    def test_mobile_audio_transcription_passes_default_firered_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            source = Path(tmp) / "demo.mp3"
+            source.write_bytes(b"fake audio")
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", repo_root)
+
+            with patch.object(
+                server,
+                "start_run",
+                side_effect=lambda job_id: server.mobile_audio_job(
+                    server.load_job(job_id),
+                    include_resources=True,
+                ),
+            ):
+                created = server.create_mobile_audio_job(
+                    {
+                        "external_attempt_id": "transcription-1",
+                        "source_device": "xnote",
+                        "profile": "deepseek_v4_flash",
+                    },
+                    source,
+                    "demo.mp3",
+                    pipeline_kind="transcription",
+                )
+
+            loaded = server.load_job(created["job_id"])
+            command = server.uploaded_media_operation_command(loaded)
+
+        self.assertEqual(created["pipeline_kind"], "transcription")
+        self.assertEqual(loaded["audio_pipeline_kind"], "transcription")
+        self.assertIn("tools/run_audio_transcription.py", command)
+        provider_index = command.index("--asr-provider")
+        self.assertEqual(command[provider_index + 1], "firered_3dspeaker")
+        self.assertEqual(created["asr_provider"], "firered_3dspeaker")
+        self.assertNotIn("tools/run_audio_template_analysis.py", command)
+        self.assertNotIn("--template-id", command)
+        self.assertNotIn("--focus-prompt", command)
+
+    def test_mobile_audio_transcription_passes_requested_provider_only_to_mobile_job(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            source = Path(tmp) / "demo.mp3"
+            source.write_bytes(b"fake audio")
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", repo_root)
+            with patch.object(
+                server,
+                "start_run",
+                side_effect=lambda job_id: server.mobile_audio_job(
+                    server.load_job(job_id), include_resources=True
+                ),
+            ):
+                created = server.create_mobile_audio_job(
+                    {"external_attempt_id": "provider-1", "asr_provider": "vibevoice"},
+                    source,
+                    "demo.mp3",
+                    pipeline_kind="transcription",
+                )
+            mobile_command = server.uploaded_media_operation_command(
+                server.load_job(created["job_id"])
+            )
+            video_job = server.create_job({"video_url": "https://example.com/video"})
+            video_command = server.operation_command(server.load_job(video_job["job_id"]))
+
+        self.assertEqual(
+            mobile_command[mobile_command.index("--asr-provider") + 1], "vibevoice"
+        )
+        self.assertNotIn("tools/run_audio_transcription.py", video_command)
+        self.assertNotIn("firered_3dspeaker", video_command)
+
+    def test_mobile_audio_transcription_result_has_no_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", repo_root)
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            (run_dir / "transcription.json").write_text(
+                json.dumps(
+                    {
+                        "pipeline": "long-talk-vibevoice-transcription",
+                        "transcript": {"text": "hello", "segments": []},
+                        "asr": {"providers_run": ["vibevoice"]},
+                        "speaker_diarization": {"final_speaker_count": 1},
+                        "speaker_count": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            job = {
+                "run_dir": str(run_dir),
+                "audio_pipeline_kind": "transcription",
+            }
+
+            result = server.mobile_audio_result(job)
+
+        self.assertEqual(result["asr"]["providers_run"], ["vibevoice"])
+        self.assertEqual(result["speaker_count"], 1)
+        self.assertNotIn("audio_template_analysis", result)
+
+    def test_mobile_audio_transcription_runs_while_analysis_waits_for_audio_analysis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            source = Path(tmp) / "demo.mp3"
+            source.write_bytes(b"fake audio")
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", repo_root)
+            analysis = server.create_uploaded_media_job(
+                {"run_name": "audio-summary", "analysis_depth": "light"},
+                source,
+                "analysis.mp3",
+            )
+            transcription = server.create_uploaded_media_job(
+                {"run_name": "audio-transcription", "analysis_depth": "light"},
+                source,
+                "transcription.mp3",
+            )
+            for created, pipeline_kind in (
+                (analysis, "analysis"),
+                (transcription, "transcription"),
+            ):
+                job = server.load_job(created["job_id"])
+                job["audio_pipeline_kind"] = pipeline_kind
+                job["stages"]["probe"] = {"status": "succeeded"}
+                job["stages"]["prepare"] = {"status": "succeeded"}
+                server.save_job(job)
+
+            transcription_ran = threading.Event()
+
+            def fake_locked(job_id, stage, continue_runner=False):
+                current = server.load_job(job_id)
+                stage_info = dict(current["stages"][stage])
+                stage_info["status"] = "succeeded"
+                current["stages"][stage] = stage_info
+                current["status"] = "running"
+                server.save_job(current)
+                if current["audio_pipeline_kind"] == "transcription":
+                    transcription_ran.set()
+                return server.public_job(current)
+
+            server.resource_locks["audio-analysis"].acquire()
+            analysis_thread = threading.Thread(
+                target=server._run_remaining_stages,
+                args=(analysis["job_id"],),
+            )
+            transcription_thread = threading.Thread(
+                target=server._run_remaining_stages,
+                args=(transcription["job_id"],),
+            )
+            audio_analysis_locked = True
+            try:
+                with patch.object(server, "_run_stage_locked", side_effect=fake_locked):
+                    analysis_thread.start()
+                    for _ in range(100):
+                        queued = server.load_job(analysis["job_id"])
+                        if queued["stages"].get("analyze-core", {}).get("status") == "queued":
+                            break
+                        time.sleep(0.01)
+                    transcription_thread.start()
+                    self.assertTrue(transcription_ran.wait(1))
+                    transcription_thread.join(timeout=1)
+                    self.assertFalse(transcription_thread.is_alive())
+                    self.assertTrue(analysis_thread.is_alive())
+                    server.resource_locks["audio-analysis"].release()
+                    audio_analysis_locked = False
+                    analysis_thread.join(timeout=1)
+            finally:
+                if audio_analysis_locked:
+                    server.resource_locks["audio-analysis"].release()
+                transcription_thread.join(timeout=1)
+
+            analysis_result = server.load_job(analysis["job_id"])
+            transcription_result = server.load_job(transcription["job_id"])
+
+        self.assertFalse(analysis_thread.is_alive())
+        self.assertEqual(analysis_result["stages"]["analyze-core"]["status"], "succeeded")
+        self.assertEqual(transcription_result["stages"]["analyze-core"]["status"], "succeeded")
+        self.assertEqual(analysis_result["stages"]["analyze-core"]["queued_for"], "audio-analysis")
+        self.assertEqual(transcription_result["stages"]["analyze-core"]["queued_for"], "asr")
+
+    def test_mobile_audio_analysis_runs_while_video_waits_for_core(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            source = Path(tmp) / "demo.mp3"
+            source.write_bytes(b"fake audio")
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", repo_root)
+            video = server.create_job(
+                {
+                    "video_url": "https://example.com/video",
+                    "analysis_depth": "light",
+                }
+            )
+            analysis = server.create_uploaded_media_job(
+                {"run_name": "audio-summary", "analysis_depth": "light"},
+                source,
+                "analysis.mp3",
+            )
+            for created in (video, analysis):
+                job = server.load_job(created["job_id"])
+                job["stages"]["probe"] = {"status": "succeeded"}
+                job["stages"]["prepare"] = {"status": "succeeded"}
+                server.save_job(job)
+            audio_job = server.load_job(analysis["job_id"])
+            audio_job["audio_pipeline_kind"] = "analysis"
+            server.save_job(audio_job)
+
+            audio_ran = threading.Event()
+
+            def fake_locked(job_id, stage, continue_runner=False):
+                current = server.load_job(job_id)
+                stage_info = dict(current["stages"][stage])
+                stage_info["status"] = "succeeded"
+                current["stages"][stage] = stage_info
+                current["status"] = "running"
+                server.save_job(current)
+                if current.get("audio_pipeline_kind") == "analysis":
+                    audio_ran.set()
+                return server.public_job(current)
+
+            server.resource_locks["core"].acquire()
+            video_thread = threading.Thread(
+                target=server._run_remaining_stages,
+                args=(video["job_id"],),
+            )
+            audio_thread = threading.Thread(
+                target=server._run_remaining_stages,
+                args=(analysis["job_id"],),
+            )
+            core_locked = True
+            try:
+                with patch.object(server, "_run_stage_locked", side_effect=fake_locked):
+                    video_thread.start()
+                    for _ in range(100):
+                        queued = server.load_job(video["job_id"])
+                        if queued["stages"].get("analyze-core", {}).get("status") == "queued":
+                            break
+                        time.sleep(0.01)
+                    audio_thread.start()
+                    self.assertTrue(audio_ran.wait(1))
+                    audio_thread.join(timeout=1)
+                    self.assertFalse(audio_thread.is_alive())
+                    self.assertTrue(video_thread.is_alive())
+                    server.resource_locks["core"].release()
+                    core_locked = False
+                    video_thread.join(timeout=1)
+            finally:
+                if core_locked:
+                    server.resource_locks["core"].release()
+                audio_thread.join(timeout=1)
+
+            video_result = server.load_job(video["job_id"])
+            audio_result = server.load_job(analysis["job_id"])
+
+        self.assertFalse(video_thread.is_alive())
+        self.assertEqual(video_result["stages"]["analyze-core"]["queued_for"], "core")
+        self.assertEqual(audio_result["stages"]["analyze-core"]["status"], "succeeded")
+        self.assertEqual(audio_result["stages"]["analyze-core"]["queued_for"], "audio-analysis")
+
+    def test_mobile_audio_analysis_resource_is_serial(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            source = Path(tmp) / "demo.mp3"
+            source.write_bytes(b"fake audio")
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", repo_root)
+            jobs = [
+                server.create_uploaded_media_job(
+                    {"run_name": "audio-summary", "analysis_depth": "light"},
+                    source,
+                    f"analysis-{index}.mp3",
+                )
+                for index in (1, 2)
+            ]
+            for created in jobs:
+                job = server.load_job(created["job_id"])
+                job["audio_pipeline_kind"] = "analysis"
+                job["stages"]["probe"] = {"status": "succeeded"}
+                job["stages"]["prepare"] = {"status": "succeeded"}
+                server.save_job(job)
+
+            first_started = threading.Event()
+            second_started = threading.Event()
+            release_first = threading.Event()
+            state_lock = threading.Lock()
+            active = 0
+            maximum = 0
+
+            def fake_locked(job_id, stage, continue_runner=False):
+                nonlocal active, maximum
+                with state_lock:
+                    active += 1
+                    maximum = max(maximum, active)
+                if job_id == jobs[0]["job_id"]:
+                    first_started.set()
+                    release_first.wait(1)
+                else:
+                    second_started.set()
+                current = server.load_job(job_id)
+                stage_info = dict(current["stages"][stage])
+                stage_info["status"] = "succeeded"
+                current["stages"][stage] = stage_info
+                current["status"] = "running"
+                server.save_job(current)
+                with state_lock:
+                    active -= 1
+                return server.public_job(current)
+
+            threads = [
+                threading.Thread(
+                    target=server._run_remaining_stages,
+                    args=(created["job_id"],),
+                )
+                for created in jobs
+            ]
+            with patch.object(server, "_run_stage_locked", side_effect=fake_locked):
+                threads[0].start()
+                self.assertTrue(first_started.wait(1))
+                threads[1].start()
+                self.assertFalse(second_started.wait(0.1))
+                queued_second = server.load_job(jobs[1]["job_id"])
+                self.assertEqual(
+                    queued_second["stages"]["analyze-core"]["queued_for"],
+                    "audio-analysis",
+                )
+                release_first.set()
+                for thread in threads:
+                    thread.join(timeout=1)
+
+        self.assertTrue(second_started.is_set())
+        self.assertEqual(maximum, 1)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+
+    def test_mobile_audio_analysis_queue_uses_dedicated_resource(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            source = Path(tmp) / "demo.mp3"
+            source.write_bytes(b"fake audio")
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", repo_root)
+            created = server.create_uploaded_media_job(
+                {"run_name": "audio-summary", "analysis_depth": "light"},
+                source,
+                "analysis.mp3",
+            )
+            job = server.load_job(created["job_id"])
+            job["audio_pipeline_kind"] = "analysis"
+            job["status"] = "queued"
+            job["runner"] = {
+                "status": "queued",
+                "current_stage": "analyze-core",
+            }
+            job["stages"]["analyze-core"] = {"status": "queued"}
+            server.save_job(job)
+
+            resources = server.resource_summary([job])
+            queue = server.queue_info(job)
+
+        self.assertEqual(resources["audio-analysis"]["limit"], 1)
+        self.assertEqual(resources["audio-analysis"]["queued_count"], 1)
+        self.assertEqual(queue["resource"], "audio-analysis")
+        self.assertEqual(queue["position"], 1)
+
+    def test_mobile_audio_ack_is_cleaned_after_retention(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            source = Path(tmp) / "demo.mp3"
+            source.write_bytes(b"fake audio")
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", repo_root)
+            created = server.create_uploaded_media_job(
+                {"run_name": "audio-summary"},
+                source,
+                "demo.mp3",
+            )
+            job = server.load_job(created["job_id"])
+            job["status"] = "succeeded"
+            server.save_job(job)
+            acknowledged = server.acknowledge_mobile_audio_job(job["job_id"])
+            acknowledged_ts = server_mod.parse_iso_timestamp(
+                acknowledged["consumer_acknowledged_at"]
+            )
+
+            deleted = server.cleanup_acknowledged_mobile_audio_jobs(
+                now=acknowledged_ts + (server_mod.AUDIO_JOB_RETENTION_DAYS + 1) * 86400
+            )
+
+        self.assertEqual(deleted, [created["job_id"]])
+
+    def test_mobile_audio_templates_exposes_metadata_only_catalog(self):
+        server = server_mod.VideoLinkStatusServer(Path(tempfile.mkdtemp()), REPO_ROOT)
+        payload = server.mobile_audio_templates()
+
+        self.assertEqual(payload["total"], 382)
+        self.assertEqual(len(payload["templates"]), 382)
+        self.assertEqual(len(payload["version"]), 64)
+        self.assertEqual(
+            set(payload["templates"][0]),
+            {"id", "title", "title_zh", "first_category", "first_category_zh"},
+        )
+        self.assertNotIn("prompt_original", payload["templates"][0])
+        self.assertNotIn("prompt", payload["templates"][0])
+        self.assertNotIn("icon_asset", payload["templates"][0])
 
     def test_uploaded_media_probe_uses_ffprobe_and_avoids_ytdlp(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -919,14 +1588,45 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
         self.assertEqual(command[0], "tools/run_long_talk_fast_from_url.sh")
         self.assertIn("--profile", command)
-        self.assertEqual(command[command.index("--profile") + 1], "deepseek_v4_pro")
+        self.assertEqual(command[command.index("--profile") + 1], "deepseek_v4_flash")
         self.assertNotIn("--pipeline-mode", command)
+
+    def test_local_profile_routes_all_frame_work_to_nx2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            config = {
+                "active_runtime_profile": "nx2_fallback",
+                "runtime_profiles": {
+                    "nx2_fallback": {
+                        "frame_extractor": "jetson",
+                        "jetson_frame_hosts": "nx2,nx2",
+                        "jetson_frame_backend": "ssh",
+                        "jetson_sample_fps": 0.5,
+                    }
+                }
+            }
+            with patch.object(server_mod, "runtime_config", return_value=config):
+                job = server.create_job(
+                    {
+                        "video_url": "https://example.com/video",
+                        "analysis_mode": "long-talk-fast",
+                        "profile": "nx2_fallback",
+                    }
+                )
+                loaded = server.load_job(job["job_id"])
+                loaded["resolved_mode"] = "long-talk-fast"
+                command = server.operation_command(loaded)
+
+        self.assertEqual(command[command.index("--jetson-frame-hosts") + 1], "nx2,nx2")
+        self.assertEqual(command[command.index("--jetson-frame-backend") + 1], "ssh")
 
     def test_long_talk_wrapper_defaults_to_agx_dual_worker(self):
         text = (REPO_ROOT / "tools" / "run_long_talk_fast_from_url.sh").read_text(encoding="utf-8")
 
         self.assertIn('JETSON_FRAME_HOSTS="${JETSON_FRAME_HOSTS:-agx,agx}"', text)
-        self.assertIn("--jetson-frame-backend ray", text)
+        self.assertIn('JETSON_FRAME_BACKEND="${JETSON_FRAME_BACKEND:-ray}"', text)
+        self.assertIn('if [[ "$JETSON_FRAME_BACKEND" == "ray" ]]', text)
+        self.assertIn('--jetson-frame-backend "$JETSON_FRAME_BACKEND"', text)
         self.assertNotIn("nx1,nx2,nx3,nx4", text)
 
     def test_final_publish_stage_uses_finalize_only_script(self):
@@ -947,7 +1647,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertIn("--jobs", command)
         self.assertEqual(command[command.index("--jobs") + 1], "3")
         self.assertIn("--profile", command)
-        self.assertEqual(command[command.index("--profile") + 1], "deepseek_v4_pro")
+        self.assertEqual(command[command.index("--profile") + 1], "deepseek_v4_flash")
         self.assertIn("--skip-images", command)
 
     def test_final_publish_stage_respects_skip_images_option(self):
@@ -962,6 +1662,72 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             command = server.final_publish_command(loaded)
 
         self.assertIn("--skip-images", command)
+
+    def test_final_publish_script_requires_explicit_pdf_opt_in(self):
+        text = (REPO_ROOT / "tools" / "run_video_doc_final_publish.sh").read_text(encoding="utf-8")
+
+        self.assertIn("SKIP_PDF=1", text)
+        self.assertIn("--pdf)", text)
+        self.assertIn('test -s "$RUN_DIR/operation_manual.md"', text)
+
+    def test_collect_summary_exposes_multidoc_generation_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "run"
+            analysis_path = run_dir / "docs_analysis" / "analysis.json"
+            analysis_path.parent.mkdir(parents=True)
+            analysis_path.write_text(
+                json.dumps(
+                    {
+                        "generation": {
+                            "chapter_count": 7,
+                            "chapter_checkpoints": str(run_dir / "docs_analysis" / "orin" / "chapters"),
+                            "resumable": True,
+                            "metrics": {
+                                "model_calls": 8,
+                                "checkpoint_hits": 0,
+                                "prompt_chars_total": 72534,
+                                "prompt_chars_max": 10751,
+                                "output_token_budget_total": 8224,
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded["run_dir"] = str(run_dir)
+
+            summary = server.collect_summary(loaded)
+
+        self.assertTrue(summary["multidoc"]["available"])
+        self.assertEqual(summary["multidoc"]["chapter_count"], 7)
+        self.assertEqual(summary["multidoc"]["metrics"]["model_calls"], 8)
+        self.assertEqual(
+            summary["multidoc"]["chapter_checkpoints"],
+            "docs_analysis/orin/chapters",
+        )
+
+    def test_deep_v2_reuses_documents_created_by_multidoc(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "run"
+            output_dir = run_dir / "docs_analysis_chapters"
+            output_dir.mkdir(parents=True)
+            (output_dir / "knowledge_notes_v2.md").write_text("# Notes\n", encoding="utf-8")
+            (output_dir / "deep_report_v2.md").write_text("# Report\n", encoding="utf-8")
+            loaded["run_dir"] = str(run_dir)
+            log_path = Path(tmp) / "deep-v2.log"
+
+            with patch.object(server, "run_command_stage") as run_command_stage:
+                result = server.stage_deep_v2(loaded, str(log_path), {})
+
+            run_command_stage.assert_not_called()
+            self.assertEqual(result["artifacts"]["reused_from"], "multidoc")
+            self.assertIn("reusing chapter documents", log_path.read_text(encoding="utf-8"))
 
     def test_final_publish_stage_keeps_images_disabled_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1199,7 +1965,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(loaded["warnings"][0]["stage"], "analyze-core")
         self.assertIn("failed quality gate", loaded["warnings"][0]["message"])
 
-    def test_optional_stage_failure_becomes_warning_when_core_markdown_exists(self):
+    def test_final_publish_failure_is_terminal_when_exports_are_incomplete(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
             job = server.create_job({"video_url": "https://example.com/video", "run_name": "operation-manual"})
@@ -1224,12 +1990,307 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             server.save_job(loaded)
 
             with patch.object(server, "run_command", side_effect=RuntimeError("publisher unavailable")):
-                result = server.run_stage(job["job_id"], "final-publish")
+                with self.assertRaises(server_mod.BridgeError):
+                    server.run_stage(job["job_id"], "final-publish")
+            result = server.load_job(job["job_id"])
 
-        self.assertEqual(result["stages"]["final-publish"]["status"], "skipped")
-        self.assertTrue(result["stages"]["final-publish"]["soft_failed"])
-        self.assertEqual(result["warnings"][0]["stage"], "final-publish")
-        self.assertIn("publisher unavailable", result["warnings"][0]["message"])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["stages"]["final-publish"]["status"], "failed")
+        self.assertIn("publisher unavailable", result["runner"]["error"])
+
+    def test_verify_core_rejects_manual_generation_error_placeholder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            (run_dir / "analysis.json").write_text("{}", encoding="utf-8")
+            (run_dir / "manual_evidence.md").write_text("# Evidence\n", encoding="utf-8")
+            (run_dir / "operation_manual.quality_failed.md").write_text(
+                "Error generating operation manual: 402 Insufficient Balance\n",
+                encoding="utf-8",
+            )
+            loaded["run_dir"] = str(run_dir)
+
+            with self.assertRaises(server_mod.BridgeError) as raised:
+                server.stage_verify_core(loaded)
+
+        self.assertIn("402 Insufficient Balance", raised.exception.message)
+
+    def test_load_job_corrects_false_success_with_incomplete_exports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "run"
+            exports = run_dir / "exports"
+            exports.mkdir(parents=True)
+            (exports / "manual_evidence.pdf").write_bytes(b"%PDF incomplete")
+            loaded["run_dir"] = str(run_dir)
+            loaded["status"] = "succeeded"
+            loaded["runner"] = {"status": "succeeded", "current_stage": None}
+            loaded["stages"]["final-publish"] = {
+                "status": "skipped",
+                "soft_failed": True,
+                "error": "only one PDF was generated",
+            }
+            server.save_job(loaded)
+
+            corrected = server.load_job(job["job_id"])
+
+        self.assertEqual(corrected["status"], "failed")
+        self.assertEqual(corrected["runner"]["current_stage"], "final-publish")
+        self.assertEqual(corrected["stages"]["final-publish"]["status"], "failed")
+
+    def test_load_job_promotes_core_generation_error_over_publish_wrapper_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            (run_dir / "operation_manual.quality_failed.md").write_text(
+                "Error generating operation manual: 402 Insufficient Balance\n",
+                encoding="utf-8",
+            )
+            loaded["run_dir"] = str(run_dir)
+            loaded["status"] = "failed"
+            loaded["runner"] = {"status": "failed", "error": "publisher exited 1"}
+            loaded["stages"]["final-publish"] = {"status": "failed", "error": "publisher exited 1"}
+            server.save_job(loaded)
+
+            corrected = server.load_job(job["job_id"])
+
+        self.assertIn("402 Insufficient Balance", corrected["runner"]["error"])
+        self.assertEqual(corrected["stages"]["final-publish"]["root_cause_stage"], "analyze-core")
+
+    def test_skipped_multidoc_with_missing_outputs_can_be_rerun(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "run_name": "operation-manual"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "video" / "operation-manual"
+            run_dir.mkdir(parents=True)
+            (run_dir / "analysis.json").write_text("{}", encoding="utf-8")
+            (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
+            (run_dir / "manual_evidence.md").write_text("# Evidence\n", encoding="utf-8")
+            loaded["run_dir"] = str(run_dir)
+            loaded["stages"].update(
+                {
+                    "probe": {"status": "succeeded"},
+                    "prepare": {"status": "succeeded"},
+                    "analyze-core": {"status": "succeeded"},
+                    "verify-core": {"status": "succeeded"},
+                    "study-guide": {"status": "succeeded"},
+                    "multidoc": {"status": "skipped", "error": "old timeout"},
+                }
+            )
+            server.save_job(loaded)
+
+            with patch.object(server, "run_command", return_value={"stdout_tail": []}) as run_command:
+                server.run_stage(job["job_id"], "multidoc")
+
+        run_command.assert_called_once()
+
+    def test_next_stage_advances_past_skipped_multidoc_only_when_outputs_exist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "run_name": "operation-manual"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "video" / "operation-manual"
+            run_dir.mkdir(parents=True)
+            (run_dir / "analysis.json").write_text("{}", encoding="utf-8")
+            (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
+            (run_dir / "manual_evidence.md").write_text("# Evidence\n", encoding="utf-8")
+            docs_dir = run_dir / "docs_analysis"
+            docs_dir.mkdir()
+            (docs_dir / "analysis.json").write_text("{}", encoding="utf-8")
+            (docs_dir / "knowledge_notes.md").write_text("# Notes\n", encoding="utf-8")
+            (docs_dir / "deep_report.md").write_text("# Report\n", encoding="utf-8")
+            (docs_dir / "operation_manual_review.md").write_text("# Review\n", encoding="utf-8")
+            loaded["run_dir"] = str(run_dir)
+            loaded["stages"].update(
+                {
+                    "probe": {"status": "succeeded"},
+                    "prepare": {"status": "succeeded"},
+                    "analyze-core": {"status": "succeeded"},
+                    "verify-core": {"status": "succeeded"},
+                    "study-guide": {"status": "succeeded"},
+                    "multidoc": {"status": "skipped", "soft_failed": True},
+                }
+            )
+
+            self.assertEqual(server.next_stage(loaded), "deep-v2")
+
+    def test_permanent_billing_failure_is_terminal_even_for_optional_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "run_name": "operation-manual"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
+            loaded["run_dir"] = str(run_dir)
+            loaded["stages"].update(
+                {
+                    "probe": {"status": "succeeded"},
+                    "prepare": {"status": "succeeded"},
+                    "analyze-core": {"status": "succeeded"},
+                    "verify-core": {"status": "succeeded"},
+                    "study-guide": {"status": "succeeded"},
+                }
+            )
+            server.save_job(loaded)
+
+            def fail_with_billing(_command, _log_path, **kwargs):
+                failure_path = Path(kwargs["env_overrides"]["VIDEO_ANALYZER_FAILURE_FILE"])
+                failure_path.parent.mkdir(parents=True, exist_ok=True)
+                failure_path.write_text(
+                    json.dumps(
+                        {
+                            "kind": "permanent_billing",
+                            "retryable": False,
+                            "status_code": 402,
+                            "provider_code": "invalid_request_error",
+                            "message": "Insufficient Balance",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                raise subprocess.CalledProcessError(1, ["multidoc"])
+
+            with patch.object(server, "run_command", side_effect=fail_with_billing):
+                with self.assertRaises(server_mod.BridgeError):
+                    server.run_stage(job["job_id"], "multidoc")
+
+            failed = server.load_job(job["job_id"])
+
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["stages"]["multidoc"]["status"], "failed")
+        self.assertEqual(failed["stages"]["multidoc"]["failure"]["kind"], "permanent_billing")
+        self.assertEqual(failed["stages"]["multidoc"]["failure"]["status_code"], 402)
+        self.assertEqual(failed["runner"]["error"], "Insufficient Balance")
+        self.assertFalse(failed["stages"]["multidoc"].get("soft_failed", False))
+
+    def test_mark_stage_queued_clears_stale_wait_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            loaded["runner"] = {
+                "status": "queued",
+                "current_stage": "analyze-core",
+                "queued_for": "core",
+                "wait_reason": "waiting for core: 1/1 slot(s) in use",
+            }
+
+            server.mark_stage_queued(loaded, "multidoc", "multidoc")
+            refreshed = server.load_job(job["job_id"])
+
+        self.assertEqual(refreshed["runner"]["queued_for"], "multidoc")
+        self.assertNotIn("wait_reason", refreshed["runner"])
+
+    def test_runner_stops_when_stage_does_not_converge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "auto_start": False})
+
+            with patch.object(server, "run_stage", return_value=server.load_job(job["job_id"])):
+                server._run_remaining_stages(job["job_id"])
+
+            failed = server.load_job(job["job_id"])
+
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn("state_machine_invariant_violation", failed["runner"]["error"])
+
+    def test_rerun_from_stage_resets_downstream_outputs_and_starts_runner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video", "run_name": "operation-manual"})
+            loaded = server.load_job(job["job_id"])
+            loaded["stages"].update(
+                {
+                    "probe": {"status": "succeeded"},
+                    "prepare": {"status": "succeeded"},
+                    "analyze-core": {"status": "succeeded"},
+                    "verify-core": {"status": "succeeded"},
+                    "study-guide": {"status": "succeeded"},
+                    "multidoc": {"status": "succeeded"},
+                    "deep-v2": {"status": "succeeded"},
+                    "evidence-review": {"status": "succeeded"},
+                    "final-publish": {"status": "succeeded"},
+                }
+            )
+            loaded["artifacts"] = {
+                "docs_analysis": {"value": "old"},
+                "chapter_deep_report": {"value": "old"},
+                "evidence_review": {"value": "old"},
+                "exports": {"value": "old"},
+            }
+            loaded["warnings"] = [
+                {"stage": "multidoc", "message": "old warning"},
+                {"stage": "verify-core", "message": "keep"},
+            ]
+            server.save_job(loaded)
+
+            with patch.object(server, "_run_remaining_stages") as run_remaining:
+                result = server.rerun_from_stage(job["job_id"], "multidoc")
+
+            self.assertEqual(result["runner"]["current_stage"], "multidoc")
+            refreshed = server.load_job(job["job_id"])
+            self.assertEqual(refreshed["stages"]["study-guide"]["status"], "succeeded")
+            self.assertNotIn("multidoc", refreshed["stages"])
+            self.assertNotIn("final-publish", refreshed["stages"])
+            self.assertNotIn("docs_analysis", refreshed["artifacts"])
+            self.assertNotIn("exports", refreshed["artifacts"])
+            self.assertEqual(refreshed["warnings"], [{"stage": "verify-core", "message": "keep"}])
+            run_remaining.assert_called_once()
+
+    def test_final_publish_command_skips_pdfs_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            loaded["run_dir"] = str(run_dir)
+
+            command = server.final_publish_command(loaded)
+
+        self.assertIn("--skip-pdf", command)
+        self.assertIn("--finalize-only", command)
+
+    def test_core_stage_starts_jetson_ray_before_ray_frame_extraction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            command = [
+                "tools/run_operation_manual_from_url.sh",
+                "https://example.com/video",
+                "--jetson-frame-backend",
+                "ray",
+            ]
+            log_path = Path(tmp) / "analyze-core.log"
+
+            completed = subprocess.CompletedProcess(["tools/start_jetson_frame_ray.sh"], 0, stdout="cluster ready", stderr="")
+            with patch("tools.video_link_status_server.subprocess.run", return_value=completed) as run:
+                result = server.ensure_jetson_ray_ready(command, str(log_path))
+            log_text = log_path.read_text(encoding="utf-8")
+
+        self.assertEqual(result["command"], [str(REPO_ROOT / "tools" / "start_jetson_frame_ray.sh")])
+        self.assertIn("cluster ready", log_text)
+        self.assertEqual(run.call_args.args[0], [str(REPO_ROOT / "tools" / "start_jetson_frame_ray.sh")])
+
+    def test_core_stage_skips_ray_preflight_for_ssh_backend(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            command = ["tools/run_operation_manual_from_url.sh", "https://example.com/video", "--jetson-frame-backend", "ssh"]
+
+            with patch("tools.video_link_status_server.subprocess.run") as run:
+                result = server.ensure_jetson_ray_ready(command, str(Path(tmp) / "analyze-core.log"))
+
+        self.assertIsNone(result)
+        run.assert_not_called()
 
     def test_public_job_hides_resolved_and_audio_only_visual_warnings(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1899,6 +2960,10 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             run_dir = Path(tmp) / "run"
             run_dir.mkdir(parents=True)
             (run_dir / "final_publish_summary.json").write_text("{}", encoding="utf-8")
+            for relative in server_mod.EXPECTED_FINAL_DOCUMENTS:
+                path = run_dir / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("# Final\n", encoding="utf-8")
             job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
             loaded = server.load_job(job["job_id"])
             loaded["run_dir"] = str(run_dir)
@@ -2039,7 +3104,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "fast"})
             server.run_stage(job["job_id"], "probe")
 
-            def fake_run(command, log_path, on_start=None):
+            def fake_run(command, log_path, on_start=None, append_log=False, env_overrides=None):
                 Path(log_path).parent.mkdir(parents=True, exist_ok=True)
                 Path(log_path).write_text(f"[done] run_dir: {run_dir}\n", encoding="utf-8")
                 return {"stdout_tail": ["ok"]}

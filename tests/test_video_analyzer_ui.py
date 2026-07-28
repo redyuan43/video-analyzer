@@ -2,6 +2,7 @@ import importlib.util
 import io
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -24,9 +25,209 @@ def load_ui_module():
 
 ui_mod = load_ui_module()
 from tools import video_link_status_server as status_server
+from video_analyzer_ui.runtime_identity import RuntimeIdentity
 
 
 class VideoAnalyzerUITests(unittest.TestCase):
+    def test_runtime_identity_detects_loaded_source_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            source = repo_root / "video_analyzer" / "sample_runtime.py"
+            source.parent.mkdir()
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            module_name = "_video_analyzer_runtime_identity_test"
+            module = types.ModuleType(module_name)
+            module.__file__ = str(source)
+            sys.modules[module_name] = module
+            try:
+                runtime = RuntimeIdentity(repo_root)
+                initial = runtime.payload()
+                source.write_text("VALUE = 2\n", encoding="utf-8")
+                changed = runtime.payload()
+            finally:
+                sys.modules.pop(module_name, None)
+
+        self.assertFalse(initial["source_stale"])
+        self.assertTrue(changed["source_stale"])
+        self.assertIn("video_analyzer/sample_runtime.py", changed["stale_files"])
+
+    def test_health_exposes_runtime_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp), video_link_auto_resume=False)
+            response = ui.app.test_client().get("/api/video-link/health")
+
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("runtime", payload)
+        self.assertIn("runtime_id", payload["runtime"])
+        self.assertIn("current_fingerprint", payload["runtime"])
+
+    def test_mobile_audio_upload_route_uses_dedicated_pipeline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(
+                jobs_dir=Path(tmp) / "jobs",
+                video_link_auto_resume=False,
+            )
+            expected = {
+                "job_id": "a" * 32,
+                "status": "queued",
+                "external_attempt_id": "attempt-1",
+            }
+            with patch.object(
+                ui.video_link,
+                "create_mobile_audio_job",
+                return_value=expected,
+            ) as create:
+                response = ui.app.test_client().post(
+                    "/api/mobile/audio-jobs/upload",
+                    data={
+                        "media": (io.BytesIO(b"fake audio"), "sample.mp3"),
+                        "external_attempt_id": "attempt-1",
+                    },
+                    content_type="multipart/form-data",
+                )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json(), expected)
+        self.assertEqual(create.call_args.args[2], "sample.mp3")
+
+    def test_mobile_transcript_route_accepts_multipart_without_audio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(
+                jobs_dir=Path(tmp) / "jobs",
+                video_link_auto_resume=False,
+            )
+            expected = {
+                "job_id": "c" * 32,
+                "status": "queued",
+                "external_attempt_id": "provided-1",
+                "provided_transcript": True,
+            }
+            with patch.object(
+                ui.video_link,
+                "create_mobile_transcript_job",
+                return_value=expected,
+            ) as create:
+                response = ui.app.test_client().post(
+                    "/api/mobile/audio-jobs/from-transcript",
+                    data={
+                        "transcript": (io.BytesIO(b'{"text":"hello"}'), "transcript.json"),
+                        "external_attempt_id": "provided-1",
+                        "source_sha256": "a" * 64,
+                        "source_transcription_id": "tx-1",
+                        "source_transcript_sha256": "b" * 64,
+                        "template_id": "tmpl-1",
+                        "focus_prompt": "focus",
+                        "profile": "deepseek_v4_pro",
+                    },
+                    content_type="multipart/form-data",
+                )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json(), expected)
+        self.assertEqual(create.call_args.args[2], "transcript.json")
+        self.assertEqual(create.call_args.args[0]["source_transcription_id"], "tx-1")
+
+    def test_mobile_audio_transcription_upload_uses_transcription_pipeline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(
+                jobs_dir=Path(tmp) / "jobs",
+                video_link_auto_resume=False,
+            )
+            expected = {
+                "job_id": "b" * 32,
+                "status": "queued",
+                "external_attempt_id": "transcription-1",
+                "pipeline_kind": "transcription",
+            }
+            with patch.object(
+                ui.video_link,
+                "create_mobile_audio_job",
+                return_value=expected,
+            ) as create:
+                response = ui.app.test_client().post(
+                    "/api/mobile/audio-transcriptions/upload",
+                    data={
+                        "media": (io.BytesIO(b"fake audio"), "sample.mp3"),
+                        "external_attempt_id": "transcription-1",
+                    },
+                    content_type="multipart/form-data",
+                )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json(), expected)
+        self.assertEqual(create.call_args.args[2], "sample.mp3")
+        self.assertEqual(
+            create.call_args.kwargs["pipeline_kind"],
+            "transcription",
+        )
+
+    def test_mobile_audio_attempt_lookup_uses_dedicated_pipeline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(
+                jobs_dir=Path(tmp) / "jobs",
+                video_link_auto_resume=False,
+            )
+            expected = {
+                "job_id": "a" * 32,
+                "status": "running",
+                "external_attempt_id": "attempt-1",
+            }
+            with patch.object(
+                ui.video_link,
+                "get_mobile_audio_job_by_attempt",
+                return_value=expected,
+            ) as lookup:
+                response = ui.app.test_client().get(
+                    "/api/mobile/audio-jobs/by-attempt/attempt-1"
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), expected)
+        lookup.assert_called_once_with("attempt-1")
+
+    def test_mobile_audio_routes_honor_pipeline_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(
+                "os.environ",
+                {"VIDEO_ANALYZER_AUDIO_PIPELINE_TOKEN": "secret"},
+            ):
+                ui = ui_mod.VideoAnalyzerUI(
+                    jobs_dir=Path(tmp),
+                    video_link_auto_resume=False,
+                )
+                denied = ui.app.test_client().get("/api/mobile/audio-templates")
+                allowed = ui.app.test_client().get(
+                    "/api/mobile/audio-templates",
+                    headers={"X-Audio-Pipeline-Token": "secret"},
+                )
+
+        self.assertEqual(denied.status_code, 401)
+        self.assertEqual(allowed.status_code, 200)
+        payload = allowed.get_json()
+        self.assertEqual(payload["total"], 382)
+        self.assertNotIn("prompt_original", payload["templates"][0])
+        self.assertNotIn("prompt", payload["templates"][0])
+
+    def test_stale_runtime_rejects_new_job_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp), video_link_auto_resume=False)
+            stale_runtime = {
+                "runtime_id": "old-runtime",
+                "source_stale": True,
+                "stale_files": ["tools/video_link_status_server.py"],
+            }
+            with patch.object(ui.runtime_identity, "payload", return_value=stale_runtime):
+                with patch.object(ui.video_link, "create_job") as create_job:
+                    response = ui.app.test_client().post(
+                        "/api/video-link/jobs",
+                        json={"video_url": "https://example.com/video"},
+                    )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertTrue(response.get_json()["runtime"]["source_stale"])
+        create_job.assert_not_called()
+
     def test_debug_console_context_falls_back_for_external_run_dir(self):
         with tempfile.TemporaryDirectory() as tmp:
             ui = ui_mod.VideoAnalyzerUI(
@@ -94,9 +295,12 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn('id="globalSummary"', html)
         self.assertIn('id="resourceLanes"', html)
         self.assertIn('id="jobList"', html)
+        self.assertIn('id="showNonRerunFailures"', html)
         self.assertIn('id="copyLogButton"', html)
         self.assertIn("copyText", (UI_ROOT / "video_analyzer_ui" / "static" / "js" / "main.js").read_text(encoding="utf-8"))
         self.assertIn("document.execCommand('copy')", (UI_ROOT / "video_analyzer_ui" / "static" / "js" / "main.js").read_text(encoding="utf-8"))
+        self.assertIn("failure_disposition?.rerun_recommended", main_js)
+        self.assertIn("recommended_profile", main_js)
         self.assertIn('id="stageDurationSummary"', html)
         self.assertIn('id="coreDiagnosticsPanel"', html)
         self.assertNotIn('id="previewView"', html)
@@ -234,6 +438,20 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertEqual(result["created"], 2)
         self.assertEqual(result["failed"], 1)
         self.assertEqual(list_response.get_json()["total"], 2)
+
+    def test_video_link_rerun_stage_route_restarts_from_requested_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp), video_link_auto_resume=False)
+            client = ui.app.test_client()
+            job_id = "0123456789abcdef0123456789abcdef"
+            expected = {"job_id": job_id, "runner": {"current_stage": "deep-v2"}}
+
+            with patch.object(ui.video_link, "rerun_from_stage", return_value=expected) as rerun:
+                response = client.post(f"/api/video-link/jobs/{job_id}/stages/deep-v2/rerun", json={})
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.get_json(), expected)
+        rerun.assert_called_once_with(job_id, "deep-v2")
 
     def test_video_link_api_upload_media_create(self):
         with tempfile.TemporaryDirectory() as tmp:
