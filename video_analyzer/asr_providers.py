@@ -21,6 +21,7 @@ from .config import Config, normalize_string_list
 logger = logging.getLogger(__name__)
 
 FALLBACK_CAPSWRITER_URL = "http://spark-31d6.taild500c8.ts.net:8001/api/asr/transcribe"
+FALLBACK_FIRERED_3DSPEAKER_URL = "http://127.0.0.1:8013/api/firered-3dspeaker/transcribe"
 FALLBACK_REMOTE_VIBEVOICE_URLS = [
     "http://edge.taild500c8.ts.net:8012/api/asr/transcribe",
     "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
@@ -43,6 +44,16 @@ def default_capswriter_url(config: Optional[Dict[str, object]] = None) -> str:
 
 def default_vibevoice_urls(config: Optional[Dict[str, object]] = None) -> list[str]:
     return normalize_string_list(default_endpoint_service("vibevoice_urls", FALLBACK_REMOTE_VIBEVOICE_URLS, config))
+
+
+def default_firered_3dspeaker_url(config: Optional[Dict[str, object]] = None) -> str:
+    return str(
+        default_endpoint_service(
+            "firered_3dspeaker_url",
+            FALLBACK_FIRERED_3DSPEAKER_URL,
+            config,
+        )
+    )
 
 
 CAPSWRITER_URL = default_capswriter_url()
@@ -197,6 +208,17 @@ def transcribe_with_http_asr(
 
 def transcribe_with_capswriter(audio_path: Path, hotword: str = "", url: Optional[str] = None) -> Optional[AudioTranscript]:
     return transcribe_with_http_asr(audio_path, url or default_capswriter_url(), hotword=hotword)
+
+
+def transcribe_with_firered_3dspeaker(
+    audio_path: Path,
+    url: Optional[str] = None,
+) -> Optional[AudioTranscript]:
+    return transcribe_with_http_asr(
+        audio_path,
+        url or default_firered_3dspeaker_url(),
+        timeout=_http_timeout_for_audio(_wav_duration(audio_path)),
+    )
 
 
 def transcribe_with_remote_http(audio_path: Path, urls: Optional[list[str]] = None) -> Optional[AudioTranscript]:
@@ -375,6 +397,15 @@ def transcribe_with_provider_result(
                 result,
                 candidate,
                 lambda: transcribe_with_capswriter(audio_path, url=str(vibevoice_config.get("capswriter_url") or "")),
+            )
+        elif candidate == "firered_3dspeaker":
+            transcript = _timed_transcribe(
+                result,
+                candidate,
+                lambda: transcribe_with_firered_3dspeaker(
+                    audio_path,
+                    url=str(vibevoice_config.get("firered_3dspeaker_url") or ""),
+                ),
             )
         elif candidate == "vibevoice":
             transcript = _timed_transcribe(result, candidate, lambda: transcribe_with_vibevoice(audio_path, vibevoice_config))

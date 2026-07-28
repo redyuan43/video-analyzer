@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -26,6 +27,7 @@ DEFAULT_SAMPLE_SECONDS = 90.0
 DEFAULT_MAX_WINDOWS = 2
 DEFAULT_TIMEOUT_SECONDS = 240.0
 DEFAULT_MERGE_MIN_SCORE = 0.78
+DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS = 900.0
 
 
 @dataclass(frozen=True)
@@ -46,6 +48,186 @@ class SpeakerEstimate:
             "detail": self.detail,
             "skipped": self.skipped,
         }
+
+
+def process_transcript_speakers(
+    audio_path: Path,
+    transcript: AudioTranscript,
+    config: dict[str, Any] | None = None,
+) -> tuple[AudioTranscript, dict[str, Any]]:
+    """Assign missing speaker labels, or refine labels supplied by the ASR."""
+    config = config or {}
+    if not _truthy(config.get("enabled"), default=True):
+        return transcript, {"enabled": False, "reason": "disabled"}
+
+    current_speakers = _speaker_ids(transcript.segments or [])
+    if current_speakers:
+        return refine_transcript_speakers(audio_path, transcript, config)
+
+    report: dict[str, Any] = {
+        "enabled": True,
+        "mode": "assignment",
+        "backend": "3dspeaker",
+        "original_speaker_count": 0,
+        "original_speakers": [],
+        "notes": [],
+    }
+    if not _truthy(config.get("assignment_enabled"), default=True):
+        report["notes"].append("speaker assignment disabled")
+        transcript.metadata = _with_hybrid_metadata(transcript.metadata, report)
+        return transcript, report
+
+    turns, assignment_report = run_3dspeaker_assignment(audio_path, config)
+    report.update(assignment_report)
+    if not turns:
+        report["notes"].append("no diarization turns produced")
+        transcript.metadata = _with_hybrid_metadata(transcript.metadata, report)
+        return transcript, report
+
+    assigned, assignment_stats = assign_speakers_by_overlap(transcript, turns)
+    report.update(assignment_stats)
+    assigned.metadata = _with_hybrid_metadata(assigned.metadata, report)
+    return assigned, report
+
+
+def run_3dspeaker_assignment(
+    audio_path: Path,
+    config: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    config = config or {}
+    external_python = Path(
+        str(
+            config.get("external_python")
+            or os.environ.get("VIDEO_ANALYZER_DIARIZATION_PYTHON")
+            or DEFAULT_EXTERNAL_PYTHON
+        )
+    )
+    project_root_value = (
+        config.get("diarization_project_root")
+        or os.environ.get("VIDEO_ANALYZER_DIARIZATION_ROOT")
+    )
+    report: dict[str, Any] = {
+        "external_python": str(external_python),
+        "diarization_project_root": str(project_root_value or ""),
+    }
+    if not external_python.is_file():
+        report["error"] = f"missing external python: {external_python}"
+        return [], report
+    if not project_root_value:
+        report["error"] = "missing diarization_project_root"
+        return [], report
+
+    project_root = Path(str(project_root_value)).expanduser().resolve()
+    helper_path = Path(__file__).resolve().parents[1] / "tools" / "run_3dspeaker_turns.py"
+    if not project_root.is_dir():
+        report["error"] = f"missing diarization project root: {project_root}"
+        return [], report
+    if not helper_path.is_file():
+        report["error"] = f"missing diarization helper: {helper_path}"
+        return [], report
+
+    command = [
+        str(external_python),
+        str(helper_path),
+        str(audio_path),
+        "--project-root",
+        str(project_root),
+        "--device",
+        str(config.get("assignment_device") or "cuda"),
+    ]
+    speaker_num = config.get("speaker_num")
+    if speaker_num not in (None, "", 0, "0"):
+        command.extend(["--speaker-num", str(int(speaker_num))])
+
+    started = time.perf_counter()
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=float(config.get("assignment_timeout_seconds") or DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS),
+        )
+    except subprocess.TimeoutExpired:
+        report["error"] = "3D-Speaker assignment timed out"
+        report["elapsed_seconds"] = round(time.perf_counter() - started, 3)
+        return [], report
+
+    report["elapsed_seconds"] = round(time.perf_counter() - started, 3)
+    if completed.returncode != 0:
+        report["error"] = (completed.stderr or completed.stdout or "3D-Speaker assignment failed")[-2000:]
+        return [], report
+    try:
+        output = completed.stdout.strip()
+        marker = "__3DSPEAKER_JSON__"
+        if marker in output:
+            output = output.rsplit(marker, 1)[1].strip()
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        report["error"] = f"invalid 3D-Speaker output: {completed.stdout[-1000:]}"
+        return [], report
+    turns = payload.get("turns") if isinstance(payload, dict) else None
+    if not isinstance(turns, list):
+        report["error"] = "3D-Speaker output is missing turns"
+        return [], report
+    report["turn_count"] = len(turns)
+    report["detected_speakers"] = sorted(
+        {str(turn.get("speaker")) for turn in turns if isinstance(turn, dict) and turn.get("speaker")}
+    )
+    report["detected_speaker_count"] = len(report["detected_speakers"])
+    return [turn for turn in turns if isinstance(turn, dict)], report
+
+
+def assign_speakers_by_overlap(
+    transcript: AudioTranscript,
+    turns: list[dict[str, Any]],
+) -> tuple[AudioTranscript, dict[str, Any]]:
+    normalized_turns = []
+    for turn in turns:
+        start = _float_value(turn.get("start", turn.get("start_sec")))
+        end = _float_value(turn.get("end", turn.get("end_sec")))
+        speaker = str(turn.get("speaker") or turn.get("speaker_id") or "").strip()
+        if speaker and end > start:
+            normalized_turns.append((start, end, speaker))
+
+    assigned_count = 0
+    unassigned_count = 0
+    segments: list[dict[str, Any]] = []
+    for segment in transcript.segments or []:
+        updated = dict(segment)
+        start = _float_value(first_present_value(segment, ("start", "start_time", "Start")))
+        end = _float_value(first_present_value(segment, ("end", "end_time", "End")))
+        if end <= start:
+            end = start + 0.001
+        overlaps: dict[str, float] = defaultdict(float)
+        for turn_start, turn_end, speaker in normalized_turns:
+            overlap = min(end, turn_end) - max(start, turn_start)
+            if overlap > 0:
+                overlaps[speaker] += overlap
+        if overlaps:
+            speaker = _display_speaker_label(max(overlaps.items(), key=lambda item: (item[1], item[0]))[0])
+            updated["speaker"] = speaker
+            updated["Speaker"] = speaker
+            updated["speaker_id"] = speaker
+            assigned_count += 1
+        else:
+            unassigned_count += 1
+        segments.append(updated)
+
+    return (
+        AudioTranscript(
+            text=transcript.text,
+            segments=segments,
+            language=transcript.language,
+            metadata=dict(transcript.metadata or {}),
+        ),
+        {
+            "assigned_segment_count": assigned_count,
+            "unassigned_segment_count": unassigned_count,
+            "final_speaker_count": len(_speaker_ids(segments)),
+            "final_speakers": _speaker_ids(segments),
+        },
+    )
 
 
 def refine_transcript_speakers(
@@ -729,6 +911,27 @@ def _truthy(value: Any, default: bool = False) -> bool:
     if isinstance(value, str):
         return value.strip().lower() not in {"", "0", "false", "no", "off"}
     return bool(value)
+
+
+def _float_value(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def first_present_value(values: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in values and values[key] not in (None, ""):
+            return values[key]
+    return None
+
+
+def _display_speaker_label(value: str) -> str:
+    match = re.fullmatch(r"spk[_ -]?0*(\d+)", value.strip(), flags=re.IGNORECASE)
+    if match:
+        return f"说话人 {int(match.group(1))}"
+    return value
 
 
 def _strong_consensus(target: int, estimates: list[SpeakerEstimate]) -> bool:
