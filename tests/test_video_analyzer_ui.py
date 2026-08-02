@@ -313,6 +313,19 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn('id="docPreviewBody"', html)
         self.assertIn('id="generateSkillButton"', html)
         self.assertIn('id="enableSkillButton"', html)
+        self.assertIn('id="skillLiveActivity"', html)
+        self.assertIn('id="skillStageRail"', html)
+        self.assertIn('id="resourceSkillsView"', html)
+        self.assertIn('id="resourceSkillsTab"', html)
+        self.assertIn('id="skillsResourceDocsTab"', html)
+        self.assertIn('id="skillsResourceSkillsTab"', html)
+        self.assertIn('id="toggleSkillsFocusButton"', html)
+        self.assertIn('id="currentSkillsWorkspace"', html)
+        self.assertIn('id="skillLibraryWorkspace"', html)
+        self.assertIn('id="skillEditor"', html)
+        self.assertIn('id="openSkillsWorkspaceButton"', html)
+        qa_html = html[html.index('id="qaView"'):html.index('id="vscodeView"')]
+        self.assertNotIn('id="skillSummary"', qa_html)
         self.assertIn('id="qaSourcePlayerBody"', html)
         self.assertIn('id="qaSourcePlayerSummary"', html)
         self.assertIn('id="qaSourcePlayerStopButton"', html)
@@ -324,6 +337,12 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn('id="toggleSourcePlayerPanel"', html)
         self.assertIn('data-resize-pane="study"', html)
         self.assertIn('data-resize-pane="doc-list"', html)
+        self.assertIn('data-resize-pane="skills-current-left"', html)
+        self.assertIn('data-resize-pane="skills-current-right"', html)
+        self.assertIn('data-resize-pane="skills-current-height"', html)
+        self.assertIn('data-resize-pane="skills-library-left"', html)
+        self.assertIn('data-resize-pane="skills-library-right"', html)
+        self.assertIn('data-resize-pane="skills-library-height"', html)
         self.assertIn("vendor/markdown-it/markdown-it.min.js", html)
         self.assertIn("vendor/dompurify/purify.min.js", html)
         self.assertIn("vendor/katex/katex.min.css", html)
@@ -345,6 +364,13 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn("bindImageViewer", main_js)
         self.assertIn("bindPaneResizers", main_js)
         self.assertIn("videoAnalyzerPaneLayout", main_js)
+        self.assertIn("resizeSkillsPane", main_js)
+        self.assertIn("adjustSkillsPaneHeight", main_js)
+        self.assertIn("skillsCurrentLeft", main_js)
+        self.assertIn("skillsLibraryHeight", main_js)
+        self.assertIn("videoAnalyzerSkillsFocusMode", main_js)
+        self.assertIn("toggleSkillsFocusMode", main_js)
+        self.assertNotIn("videoAnalyzerChromeCollapse", main_js)
         self.assertIn("data-image-viewer-src", main_js)
         self.assertIn("const changed = selectedJobId !== jobId", main_js)
         self.assertIn("if (changed) resetQaMessages()", main_js)
@@ -357,11 +383,27 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn("==>", main_js)
         self.assertIn("generateSkillCandidate", main_js)
         self.assertIn("enableSkillCandidate", main_js)
+        self.assertIn("loadCurrentSkillsWorkspace", main_js)
+        self.assertIn("saveCurrentLibrarySkill", main_js)
+        self.assertIn("restoreSkillVersion", main_js)
+        self.assertIn("const skillCandidateDrafts = new Map()", main_js)
+        self.assertIn("updateSkillCandidateDraft", main_js)
+        self.assertIn("draft.selected.add(input.value)", main_js)
+        self.assertIn("nodes.skillCandidateList.scrollTop = scrollTop", main_js)
+        self.assertIn("generating_tests: '生成压力测试题'", main_js)
+        self.assertIn("已运行 ${elapsedSeconds} 秒", main_js)
+        self.assertIn("renderSkillLiveActivity", main_js)
+        self.assertIn("updateSkillLiveClock", main_js)
+        self.assertIn("skillActivityMessage", main_js)
         self.assertIn("study-node", styles_css)
         self.assertIn("study-frame", styles_css)
         self.assertIn(".image-viewer-stage", styles_css)
         self.assertIn(".pane-resizer", styles_css)
         self.assertIn(".qa-saved-at", styles_css)
+        self.assertIn("#resourceDocsView", styles_css)
+        self.assertIn("grid-template-rows: minmax(0, 1fr) auto", styles_css)
+        self.assertIn("#resourceSkillsView", styles_css)
+        self.assertIn("height: var(--skills-pane-height, 100%)", styles_css)
         self.assertLess(html.index('id="jobList"'), html.index('id="globalSummary"'))
 
     def test_video_link_api_create_list_get_and_log(self):
@@ -394,29 +436,100 @@ class VideoAnalyzerUITests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp) / "jobs", video_link_auto_resume=False)
             client = ui.app.test_client()
-            repo_root = Path(tmp) / "repo"
             run_dir = Path(tmp) / "run"
-            repo_root.mkdir()
             run_dir.mkdir()
-            ui.video_link.repo_root = repo_root
-            (run_dir / "operation_manual.md").write_text("# Demo Tool Setup\n\n1. 填写 API Token。\n", encoding="utf-8")
-            (run_dir / "manual_evidence.md").write_text("# Evidence\n\nframe_001 显示 API Token。\n", encoding="utf-8")
             create = client.post("/api/video-link/jobs", json={"video_url": "https://example.com/video"})
             job = create.get_json()
             loaded = ui.video_link.load_job(job["job_id"])
             loaded["run_dir"] = str(run_dir)
             ui.video_link.save_job(loaded)
 
-            before = client.get(f"/api/video-link/jobs/{job['job_id']}/skill-candidate")
-            generated = client.post(f"/api/video-link/jobs/{job['job_id']}/skill-candidate/generate", json={})
-            enabled = client.post(f"/api/video-link/jobs/{job['job_id']}/skill-candidate/enable", json={})
+            started_payload = {
+                "available": False,
+                "status": "running",
+                "profile": "deepseek_v4_pro",
+            }
+            enabled_payload = {
+                "available": True,
+                "status": "succeeded",
+                "enabled": True,
+            }
+            with (
+                patch.object(
+                    ui.video_link,
+                    "start_skill_distillation",
+                    return_value=started_payload,
+                ) as start,
+                patch.object(
+                    ui.video_link,
+                    "enable_skill_distillation",
+                    return_value=enabled_payload,
+                ) as enable,
+            ):
+                before = client.get(f"/api/video-link/jobs/{job['job_id']}/skill-distillation")
+                generated = client.post(
+                    f"/api/video-link/jobs/{job['job_id']}/skill-distillation/start",
+                    json={"profile": "deepseek_v4_pro"},
+                )
+                enabled = client.post(
+                    f"/api/video-link/jobs/{job['job_id']}/skill-distillation/enable",
+                    json={"overwrite": False},
+                )
 
         self.assertEqual(before.status_code, 200)
         self.assertFalse(before.get_json()["available"])
-        self.assertEqual(generated.status_code, 200)
-        self.assertTrue(generated.get_json()["available"])
+        self.assertEqual(generated.status_code, 202)
+        self.assertEqual(generated.get_json()["profile"], "deepseek_v4_pro")
         self.assertEqual(enabled.status_code, 200)
         self.assertTrue(enabled.get_json()["enabled"])
+        start.assert_called_once_with(job["job_id"], {"profile": "deepseek_v4_pro"})
+        enable.assert_called_once_with(job["job_id"], {"overwrite": False})
+
+    def test_skill_library_routes_cover_edit_and_state_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(
+                jobs_dir=Path(tmp) / "jobs",
+                video_link_auto_resume=False,
+            )
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            ui.video_link.repo_root = repo_root
+            skill_dir = repo_root / ".codex" / "skills" / "route-test-skill"
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            skill_dir.joinpath("SKILL.md").write_text(
+                "---\nname: route-test-skill\ndescription: route test\n---\n\n# Route Test\n",
+                encoding="utf-8",
+            )
+            client = ui.app.test_client()
+
+            listed = client.get("/api/skills?state=enabled&query=route-test")
+            detail = client.get("/api/skills/enabled/route-test-skill")
+            original = detail.get_json()
+            updated = client.put(
+                "/api/skills/enabled/route-test-skill",
+                json={
+                    "revision": original["revision"],
+                    "markdown": original["markdown"] + "\nUpdated.\n",
+                },
+            )
+            disabled = client.post("/api/skills/enabled/route-test-skill/disable")
+            restored = client.post("/api/skills/disabled/route-test-skill/restore")
+            trashed = client.delete("/api/skills/enabled/route-test-skill", json={})
+            trash_payload = trashed.get_json()
+            permanent = client.delete(
+                f"/api/skills/trash/{trash_payload['id']}",
+                json={"confirmation": "route-test-skill"},
+            )
+
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(listed.get_json()["count"], 1)
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(len(updated.get_json()["versions"]), 1)
+        self.assertEqual(disabled.get_json()["state"], "disabled")
+        self.assertEqual(restored.get_json()["state"], "enabled")
+        self.assertEqual(trashed.get_json()["state"], "trash")
+        self.assertEqual(permanent.get_json()["status"], "deleted")
 
     def test_video_link_api_batch_create(self):
         with tempfile.TemporaryDirectory() as tmp:

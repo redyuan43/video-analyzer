@@ -12,15 +12,40 @@ const stageNames = {
     'final-publish': '最终定稿/发布'
 };
 
+const skillStageNames = {
+    source: '整理原始证据',
+    overview: '整体理解',
+    extract: '五路提取',
+    verify: '三重验证',
+    build: '构造 Skills',
+    link: '关联整理',
+    test: '压力测试',
+    deliver: '生成交付包'
+};
+
+const skillTestPhaseNames = {
+    preparing: '准备测试',
+    generating_tests: '生成压力测试题',
+    blind_judging: '执行盲测',
+    repairing: '修订 Skill',
+    skill_completed: '单个 Skill 测试完成',
+    completed: '压力测试完成'
+};
+
 const initialParams = new URLSearchParams(window.location.search);
 let selectedJobId = initialParams.get('job') || document.querySelector('.app-shell')?.dataset.initialJob || null;
 let selectedLogStage = null;
 let refreshTimer = null;
 let currentJob = null;
 let latestJobs = [];
+let showNonRerunFailures = false;
 let currentView = ['qa', 'vscode'].includes(initialParams.get('view'))
     ? initialParams.get('view')
     : 'console';
+let currentResourceView = initialParams.get('resource') === 'skills' ? 'skills' : 'docs';
+let currentSkillsScope = ['enabled', 'disabled', 'trash'].includes(initialParams.get('scope'))
+    ? initialParams.get('scope')
+    : 'current';
 let pendingUrls = [];
 let sourceMode = 'url';
 let activeIntent = 'smart';
@@ -32,6 +57,16 @@ let renderedDocListKey = '';
 let loadedDocPreviewKey = '';
 let loadedStudyKey = '';
 let loadedQaHistoryKey = '';
+let loadedSkillsWorkspaceKey = '';
+let selectedCurrentSkillItemId = '';
+let currentSkillWorkspace = null;
+let currentSkillItemDetail = null;
+let currentSkillDetailTab = 'evidence';
+let selectedLibrarySkillId = '';
+let currentLibrarySkill = null;
+let currentSkillEditorTab = 'edit';
+let skillLibrarySearchTimer = null;
+const skillCandidateDrafts = new Map();
 const frameTimeMaps = {};
 const sourcePlayerState = {
     jobId: '',
@@ -53,6 +88,8 @@ const paneResizeState = {
 };
 const paneLayoutStorageKey = 'videoAnalyzerPaneLayout';
 const panelVisibilityStorageKey = 'videoAnalyzerLearningPanels';
+const skillsFocusStorageKey = 'videoAnalyzerSkillsFocusMode';
+let skillsFocusEnabled = false;
 const learningPanelVisibility = {
     docList: true,
     study: true,
@@ -61,6 +98,8 @@ const learningPanelVisibility = {
 };
 
 const nodes = {
+    appShell: document.querySelector('.app-shell'),
+    appTopbar: document.getElementById('appTopbar'),
     consoleTab: document.getElementById('consoleTab'),
     qaTab: document.getElementById('qaTab'),
     vscodeTab: document.getElementById('vscodeTab'),
@@ -93,6 +132,7 @@ const nodes = {
     globalSummary: document.getElementById('globalSummary'),
     resourceLanes: document.getElementById('resourceLanes'),
     refreshJobsButton: document.getElementById('refreshJobsButton'),
+    showNonRerunFailures: document.getElementById('showNonRerunFailures'),
     jobList: document.getElementById('jobList'),
     runButton: document.getElementById('runButton'),
     selectedTitle: document.getElementById('selectedTitle'),
@@ -121,6 +161,8 @@ const nodes = {
     coreDiagnosticsMetrics: document.getElementById('coreDiagnosticsMetrics'),
     coreDiagnosticsIssues: document.getElementById('coreDiagnosticsIssues'),
     artifactSummary: document.getElementById('artifactSummary'),
+    consoleSkillSummary: document.getElementById('consoleSkillSummary'),
+    openSkillsWorkspaceButton: document.getElementById('openSkillsWorkspaceButton'),
     logHint: document.getElementById('logHint'),
     logText: document.getElementById('logText'),
     copyLogButton: document.getElementById('copyLogButton'),
@@ -142,9 +184,33 @@ const nodes = {
     qaSourceHeightResizer: document.querySelector('.qa-source-height-resizer'),
     skillSummary: document.getElementById('skillSummary'),
     skillWarnings: document.getElementById('skillWarnings'),
+    skillProfile: document.getElementById('skillProfile'),
+    skillProgress: document.getElementById('skillProgress'),
+    skillProgressBar: document.getElementById('skillProgressBar'),
+    skillLiveActivity: document.getElementById('skillLiveActivity'),
+    skillStageRail: document.getElementById('skillStageRail'),
+    skillOverviewReview: document.getElementById('skillOverviewReview'),
+    skillOverviewPreview: document.getElementById('skillOverviewPreview'),
+    skillOverviewFeedback: document.getElementById('skillOverviewFeedback'),
+    regenerateSkillOverviewButton: document.getElementById('regenerateSkillOverviewButton'),
+    confirmSkillOverviewButton: document.getElementById('confirmSkillOverviewButton'),
+    skillCandidateReview: document.getElementById('skillCandidateReview'),
+    skillCandidateList: document.getElementById('skillCandidateList'),
+    confirmSkillCandidatesButton: document.getElementById('confirmSkillCandidatesButton'),
     generateSkillButton: document.getElementById('generateSkillButton'),
+    resumeSkillButton: document.getElementById('resumeSkillButton'),
+    cancelSkillButton: document.getElementById('cancelSkillButton'),
     enableSkillButton: document.getElementById('enableSkillButton'),
     vscodeSummary: document.getElementById('vscodeSummary'),
+    resourceToolbar: document.getElementById('resourceToolbar'),
+    resourceDocsTab: document.getElementById('resourceDocsTab'),
+    resourceSkillsTab: document.getElementById('resourceSkillsTab'),
+    skillsResourceDocsTab: document.getElementById('skillsResourceDocsTab'),
+    skillsResourceSkillsTab: document.getElementById('skillsResourceSkillsTab'),
+    toggleSkillsFocusButton: document.getElementById('toggleSkillsFocusButton'),
+    docsToolbarActions: document.getElementById('docsToolbarActions'),
+    resourceDocsView: document.getElementById('resourceDocsView'),
+    resourceSkillsView: document.getElementById('resourceSkillsView'),
     startVscodeButton: document.getElementById('startVscodeButton'),
     openVscodeLink: document.getElementById('openVscodeLink'),
     restartVscodeButton: document.getElementById('restartVscodeButton'),
@@ -175,7 +241,37 @@ const nodes = {
     docPreviewBody: document.getElementById('docPreviewBody'),
     studySummary: document.getElementById('studySummary'),
     studyDecision: document.getElementById('studyDecision'),
-    studyBody: document.getElementById('studyBody')
+    studyBody: document.getElementById('studyBody'),
+    skillsScopeTabs: Array.from(document.querySelectorAll('.skills-scope-tab')),
+    skillLibrarySearchLabel: document.getElementById('skillLibrarySearchLabel'),
+    skillLibrarySearch: document.getElementById('skillLibrarySearch'),
+    currentSkillsWorkspace: document.getElementById('currentSkillsWorkspace'),
+    currentSkillsGrid: document.querySelector('.skills-current-grid'),
+    skillLibraryWorkspace: document.getElementById('skillLibraryWorkspace'),
+    skillLibraryGrid: document.getElementById('skillLibraryGrid'),
+    skillsCurrentCount: document.getElementById('skillsCurrentCount'),
+    skillsCurrentList: document.getElementById('skillsCurrentList'),
+    skillsDetailTitle: document.getElementById('skillsDetailTitle'),
+    skillsDetailMeta: document.getElementById('skillsDetailMeta'),
+    skillsDetailPreview: document.getElementById('skillsDetailPreview'),
+    skillsDetailTabs: Array.from(document.querySelectorAll('.skills-detail-tab')),
+    skillsInspectorBody: document.getElementById('skillsInspectorBody'),
+    skillLibraryTitle: document.getElementById('skillLibraryTitle'),
+    skillLibraryCount: document.getElementById('skillLibraryCount'),
+    skillLibraryList: document.getElementById('skillLibraryList'),
+    skillEditorTitle: document.getElementById('skillEditorTitle'),
+    skillEditorMeta: document.getElementById('skillEditorMeta'),
+    saveSkillButton: document.getElementById('saveSkillButton'),
+    disableSkillButton: document.getElementById('disableSkillButton'),
+    restoreSkillButton: document.getElementById('restoreSkillButton'),
+    deleteSkillButton: document.getElementById('deleteSkillButton'),
+    permanentDeleteSkillButton: document.getElementById('permanentDeleteSkillButton'),
+    skillEditorTabs: Array.from(document.querySelectorAll('.skill-editor-tab')),
+    skillEditor: document.getElementById('skillEditor'),
+    skillRenderedPreview: document.getElementById('skillRenderedPreview'),
+    skillEditorMessage: document.getElementById('skillEditorMessage'),
+    skillAuxiliaryFiles: document.getElementById('skillAuxiliaryFiles'),
+    skillVersionList: document.getElementById('skillVersionList')
 };
 
 const jobStatusPriority = {
@@ -188,8 +284,65 @@ const jobStatusPriority = {
     skipped: 3
 };
 
+function ensureSkillActivityNodes() {
+    if (!nodes.skillProgress && nodes.skillProgressBar?.parentElement) {
+        nodes.skillProgress = nodes.skillProgressBar.parentElement;
+        nodes.skillProgress.id = 'skillProgress';
+    }
+    if (!nodes.skillProgress) return;
+    if (!nodes.skillLiveActivity) {
+        nodes.skillLiveActivity = document.createElement('div');
+        nodes.skillLiveActivity.id = 'skillLiveActivity';
+        nodes.skillLiveActivity.className = 'skill-live-activity';
+        nodes.skillLiveActivity.hidden = true;
+        nodes.skillProgress.insertAdjacentElement('afterend', nodes.skillLiveActivity);
+    }
+    if (!nodes.skillStageRail) {
+        nodes.skillStageRail = document.createElement('div');
+        nodes.skillStageRail.id = 'skillStageRail';
+        nodes.skillStageRail.className = 'skill-stage-rail';
+        nodes.skillStageRail.setAttribute('aria-label', 'Skills 蒸馏阶段');
+        nodes.skillStageRail.hidden = true;
+        nodes.skillLiveActivity.insertAdjacentElement('afterend', nodes.skillStageRail);
+    }
+}
+
 function setText(node, value) {
     node.textContent = value || '-';
+}
+
+function loadSkillsFocusMode() {
+    try {
+        skillsFocusEnabled = localStorage.getItem(skillsFocusStorageKey) === 'true';
+    } catch (_error) {
+        skillsFocusEnabled = false;
+    }
+    applySkillsFocusMode();
+}
+
+function applySkillsFocusMode() {
+    const active = Boolean(
+        skillsFocusEnabled
+        && currentView === 'vscode'
+        && currentResourceView === 'skills'
+    );
+    nodes.appShell?.classList.toggle('skills-focus-mode', active);
+    if (!nodes.toggleSkillsFocusButton) return;
+    nodes.toggleSkillsFocusButton.setAttribute('aria-pressed', String(active));
+    nodes.toggleSkillsFocusButton.setAttribute(
+        'aria-label',
+        active ? '退出 Skills 专注模式' : '进入 Skills 专注模式'
+    );
+    nodes.toggleSkillsFocusButton.title = active ? '退出 Skills 专注模式（Esc）' : '进入 Skills 专注模式';
+    const icon = nodes.toggleSkillsFocusButton.querySelector('span');
+    if (icon) icon.textContent = active ? '↙' : '⛶';
+}
+
+function toggleSkillsFocusMode(force) {
+    skillsFocusEnabled = typeof force === 'boolean' ? force : !skillsFocusEnabled;
+    localStorage.setItem(skillsFocusStorageKey, String(skillsFocusEnabled));
+    applySkillsFocusMode();
+    window.requestAnimationFrame(constrainSkillsLayouts);
 }
 
 function duration(value) {
@@ -448,6 +601,14 @@ function fillSelect(id, values, selected) {
     node.value = selected || '';
 }
 
+function fillObjectSelect(node, values, selected) {
+    if (!node) return;
+    node.innerHTML = (values || []).map(item => (
+        `<option value="${escapeHtml(item.value)}">${escapeHtml(item.label || item.value)}</option>`
+    )).join('');
+    node.value = selected || '';
+}
+
 function splitUrlInput(value) {
     return String(value || '').split(/[\s,]+/).map(item => item.trim()).filter(Boolean);
 }
@@ -532,6 +693,11 @@ async function loadOptions() {
     fillSelect('profile', choices.profiles, defaults.profile);
     fillSelect('cookieBrowser', choices.cookie_browsers, defaults.cookies_from_browser);
     fillSelect('downloadDevice', choices.download_devices, defaults.download_device);
+    fillObjectSelect(
+        nodes.skillProfile,
+        choices.skill_distillation_profiles,
+        defaults.skill_distillation_profile || 'deepseek_v4_pro'
+    );
     document.getElementById('runName').value = defaults.run_name || 'operation-manual';
     document.getElementById('skipImages').checked = Boolean(defaults.skip_images);
     document.getElementById('keepExisting').checked = Boolean(defaults.keep_existing);
@@ -672,6 +838,63 @@ function setView(view, updateUrl = true) {
     }
     renderQaPanel(currentJob);
     renderVscodePanel(currentJob);
+    applySkillsFocusMode();
+}
+
+function setResourceView(view, updateUrl = true) {
+    currentResourceView = view === 'skills' ? 'skills' : 'docs';
+    nodes.resourceDocsView.hidden = currentResourceView !== 'docs';
+    nodes.resourceSkillsView.hidden = currentResourceView !== 'skills';
+    nodes.resourceToolbar.hidden = currentResourceView === 'skills';
+    nodes.docsToolbarActions.hidden = currentResourceView !== 'docs';
+    nodes.resourceDocsTab.classList.toggle('active', currentResourceView === 'docs');
+    nodes.resourceSkillsTab.classList.toggle('active', currentResourceView === 'skills');
+    nodes.skillsResourceDocsTab.classList.toggle('active', currentResourceView === 'docs');
+    nodes.skillsResourceSkillsTab.classList.toggle('active', currentResourceView === 'skills');
+    if (updateUrl) {
+        const url = new URL(window.location.href);
+        url.searchParams.set('view', 'vscode');
+        url.searchParams.set('resource', currentResourceView);
+        if (currentResourceView === 'skills') {
+            url.searchParams.set('scope', currentSkillsScope);
+        } else {
+            url.searchParams.delete('scope');
+        }
+        window.history.replaceState({}, '', url);
+    }
+    if (currentResourceView === 'skills') {
+        renderSkillsWorkspace(currentJob);
+    } else {
+        renderDocPreviewPanel(currentJob);
+        updateLearningDocsLayout();
+    }
+    applySkillsFocusMode();
+}
+
+function setSkillsScope(scope, updateUrl = true) {
+    currentSkillsScope = ['enabled', 'disabled', 'trash'].includes(scope) ? scope : 'current';
+    nodes.skillsScopeTabs.forEach(button => {
+        button.classList.toggle('active', button.dataset.skillsScope === currentSkillsScope);
+    });
+    nodes.currentSkillsWorkspace.hidden = currentSkillsScope !== 'current';
+    nodes.skillLibraryWorkspace.hidden = currentSkillsScope === 'current';
+    nodes.skillLibrarySearchLabel.hidden = currentSkillsScope === 'current';
+    if (updateUrl) {
+        const url = new URL(window.location.href);
+        url.searchParams.set('view', 'vscode');
+        url.searchParams.set('resource', 'skills');
+        url.searchParams.set('scope', currentSkillsScope);
+        window.history.replaceState({}, '', url);
+    }
+    if (currentSkillsScope === 'current') {
+        renderSkillsWorkspace(currentJob);
+    } else {
+        window.requestAnimationFrame(constrainSkillsLayouts);
+        selectedLibrarySkillId = '';
+        currentLibrarySkill = null;
+        resetSkillEditor();
+        loadSkillLibrary();
+    }
 }
 
 function jobTimeValue(job) {
@@ -702,22 +925,30 @@ function jobSourceLabel(job) {
 }
 
 function renderJobList(jobs) {
-    const orderedJobs = sortJobsForAttention(jobs);
+    const visibleJobs = jobs.filter(job => (
+        showNonRerunFailures
+        || job.status !== 'failed'
+        || job.failure_disposition?.rerun_recommended
+    ));
+    const orderedJobs = sortJobsForAttention(visibleJobs);
     nodes.jobList.innerHTML = orderedJobs.length ? orderedJobs.map(job => {
         const selected = job.job_id === selectedJobId ? ' selected' : '';
         const statusClass = job.status ? ` ${job.status}` : '';
         const title = escapeHtml(jobDisplayTitle(job));
         const url = escapeHtml(jobSourceLabel(job));
         const stage = job.current_stage || job.error_summary?.stage || job.next_stage || '-';
+        const statusLabel = job.status === 'failed' && job.failure_disposition?.label
+            ? job.failure_disposition.label
+            : (job.status || '-');
         return `<div class="job-item${selected}${statusClass}" data-job-id="${escapeHtml(job.job_id)}">
             <button class="job-select" type="button" data-job-id="${escapeHtml(job.job_id)}">
                 <strong title="${title}">${title}</strong>
                 <span class="job-url" title="${url}">${url}</span>
-                <span class="job-status-line">${escapeHtml(job.status || '-')} · ${escapeHtml(stageNames[stage] || stage)}</span>
+                <span class="job-status-line">${escapeHtml(statusLabel)} · ${escapeHtml(stageNames[stage] || stage)}</span>
             </button>
             <button class="icon-button light delete-job" type="button" data-job-id="${escapeHtml(job.job_id)}" title="删除任务" aria-label="删除任务">×</button>
         </div>`;
-    }).join('') : '<div class="empty">暂无任务</div>';
+    }).join('') : '<div class="empty">当前没有需要续跑的失败任务</div>';
     bindJobButtons();
 }
 
@@ -789,7 +1020,8 @@ function renderGlobal(data) {
         ['运行中', counts.running || 0],
         ['排队中', counts.queued || 0],
         ['成功', counts.succeeded || 0],
-        ['失败', counts.failed || 0],
+        ['待续跑', summary.rerun_required || 0],
+        ['全部失败', counts.failed || 0],
         ['平均进度', `${summary.average_progress || 0}%`]
     ];
     nodes.globalSummary.innerHTML = cells.map(([label, value]) => `
@@ -921,18 +1153,32 @@ function renderJob(job) {
     const runDir = job.summary?.run_dir || job.run_dir;
     const isSucceeded = job.status === 'succeeded';
     const isActive = jobIsActive(job);
+    const failureDisposition = job.failure_disposition || {};
+    const shouldOpenExisting = job.status === 'failed' && !failureDisposition.rerun_recommended && Boolean(runDir);
     const missingRunDir = isSucceeded && !runDir;
     nodes.selectedTitle.textContent = jobDisplayTitle(job);
     const subtitleReason = missingRunDir ? '资源目录不可用' : reason;
     const subtitleBase = `任务 ID: ${job.job_id} · ${jobSourceLabel(job)}`;
     nodes.selectedSubtitle.textContent = subtitleReason ? `${subtitleBase} · ${subtitleReason}` : subtitleBase;
-    nodes.runButton.disabled = Boolean(missingRunDir);
-    nodes.runButton.dataset.action = isActive ? 'stop' : (isSucceeded ? 'open-run-dir' : 'run');
+    nodes.runButton.disabled = Boolean(missingRunDir || (job.status === 'failed' && !failureDisposition.rerun_recommended && !runDir));
+    nodes.runButton.dataset.action = isActive
+        ? 'stop'
+        : ((isSucceeded || shouldOpenExisting) ? 'open-run-dir' : 'run');
     nodes.runButton.classList.toggle('success-action', isSucceeded && !isActive);
     nodes.runButton.classList.toggle('play-action', !isSucceeded && !isActive);
     nodes.runButton.classList.toggle('stop-action', isActive);
-    nodes.runButton.textContent = isActive ? '停止' : (isSucceeded ? '成功' : (job.status === 'failed' ? '重试失败阶段' : '继续运行'));
-    nodes.runButton.title = isActive ? '停止当前运行任务' : (isSucceeded && runDir ? `打开资源目录：${runDir}` : '继续运行任务');
+    nodes.runButton.textContent = isActive
+        ? '停止'
+        : (isSucceeded
+            ? '成功'
+            : (shouldOpenExisting
+                ? (failureDisposition.category === 'review_required' ? '打开产物复核' : '查看已有产物')
+                : (job.status === 'failed' ? '用 Flash 继续' : '继续运行')));
+    nodes.runButton.title = isActive
+        ? '停止当前运行任务'
+        : ((isSucceeded || shouldOpenExisting) && runDir
+            ? `打开资源目录：${runDir}`
+            : (failureDisposition.action || '继续运行任务'));
     setText(nodes.statusValue, job.status);
     setText(nodes.currentStageValue, stageNames[job.current_stage] || job.current_stage);
     setText(nodes.nextStageValue, stageNames[job.next_stage] || job.next_stage);
@@ -950,8 +1196,14 @@ function renderJob(job) {
 
     if (job.error_summary) {
         nodes.errorPanel.hidden = false;
-        nodes.errorTitle.textContent = `流程失败：${job.error_summary.stage_label || job.error_summary.stage || '未知阶段'}`;
-        nodes.errorMessage.textContent = job.error_summary.message || '未提供错误信息';
+        nodes.errorTitle.textContent = failureDisposition.label
+            ? `流程状态：${failureDisposition.label}`
+            : `流程失败：${job.error_summary.stage_label || job.error_summary.stage || '未知阶段'}`;
+        nodes.errorMessage.textContent = [
+            failureDisposition.reason,
+            failureDisposition.action,
+            job.error_summary.message
+        ].filter(Boolean).join('；') || '未提供错误信息';
     } else if ((job.warnings || []).length) {
         nodes.errorPanel.hidden = false;
         nodes.errorTitle.textContent = '已生成，部分环节有警告';
@@ -966,6 +1218,7 @@ function renderJob(job) {
     renderStageProgress(stageProgress);
     renderCoreDiagnostics(job.core_diagnostics);
     renderArtifacts(job.summary || {});
+    renderConsoleSkillPanel(job);
     renderQaPanel(job);
     renderVscodePanel(job);
     loadSelectedLog(job);
@@ -1139,6 +1392,30 @@ function renderArtifacts(summary) {
     ].join('<br>');
 }
 
+function renderConsoleSkillPanel(job) {
+    if (!nodes.consoleSkillSummary) return;
+    const skill = job?.summary?.skill_distillation || job?.summary?.skill_candidate || {};
+    const status = skill.status || 'not_started';
+    const statusLabels = {
+        not_started: '尚未开始',
+        running: '蒸馏运行中',
+        waiting_overview_review: '等待骨架确认',
+        waiting_candidate_review: '等待候选确认',
+        succeeded: skill.enabled ? '已完成并启用' : '蒸馏完成',
+        completed_no_skills: '未生成可交付 Skill',
+        failed: '蒸馏失败',
+        interrupted: '蒸馏中断',
+        cancelled: '蒸馏已取消',
+        ready: '等待继续'
+    };
+    const progress = Number(skill.progress?.percent || 0);
+    const passed = Number(skill.skills?.passed || 0);
+    nodes.consoleSkillSummary.textContent = job
+        ? `${statusLabels[status] || status} · ${progress}% · 通过 ${passed} 个`
+        : '选择任务后查看蒸馏状态';
+    nodes.openSkillsWorkspaceButton.disabled = !job;
+}
+
 function renderQaPanel(job) {
     if (!nodes.qaView) return;
     const qa = job?.summary?.qa || {};
@@ -1151,14 +1428,12 @@ function renderQaPanel(job) {
         nodes.qaSummary.textContent = '选择一个已生成问答索引的任务';
         nodes.qaWarnings.textContent = '等待问答索引';
         resetQaMessages();
-        renderSkillCandidatePanel(null);
         return;
     }
     if (!available) {
         nodes.qaSummary.textContent = runDir ? '问答索引尚未生成' : '资源目录尚未生成';
         nodes.qaWarnings.textContent = '等待“问答证据索引”阶段完成';
         resetQaMessages();
-        renderSkillCandidatePanel(job);
         return;
     }
     nodes.qaSummary.textContent = `已索引 ${chunkCount} 个证据片段 · ${runDir}`;
@@ -1168,7 +1443,6 @@ function renderQaPanel(job) {
         : '<div class="qa-ok">未发现明显证据边界警告</div>';
     loadFrameTimeMap(job.job_id);
     loadQaHistory(job.job_id);
-    renderSkillCandidatePanel(job);
 }
 
 function resetQaMessages() {
@@ -1182,31 +1456,730 @@ function clearQaMessages() {
     nodes.qaMessages.innerHTML = '<div class="qa-empty">暂无对话</div>';
 }
 
+function skillActivityMessage(skill) {
+    const stage = skill.current_stage || '';
+    if (stage === 'source') return '正在整理 transcript、OCR、视觉和页面证据';
+    if (stage === 'overview') return '正在调用模型生成内容整体理解';
+    if (stage === 'extract') return '五路提取器正在并行生成候选';
+    if (stage === 'verify') return '正在执行独立语境、迁移性和多模态验证';
+    if (stage === 'build') {
+        const current = skill.skills?.test_progress?.current_skill;
+        return current ? `正在构造 ${current}` : '正在调用模型构造 Skill 定义';
+    }
+    if (stage === 'link') return '正在整理 Skill 关系和触发边界';
+    if (stage === 'test') {
+        const testProgress = skill.skills?.test_progress || {};
+        const phase = skillTestPhaseNames[testProgress.phase] || '模型调用中';
+        return testProgress.current_skill ? `${phase} · ${testProgress.current_skill}` : phase;
+    }
+    if (stage === 'deliver') return '正在生成索引、摘要和最终交付包';
+    return '蒸馏任务正在运行';
+}
+
+function skillActivityStartedAt(skill) {
+    const current = skill.current_stage || '';
+    return skill.progress?.stages?.[current]?.started_at || skill.updated_at || skill.created_at || '';
+}
+
+function renderSkillStageRail(skill) {
+    if (!nodes.skillStageRail) return;
+    const status = skill.status || 'not_started';
+    if (status === 'not_started') {
+        nodes.skillStageRail.hidden = true;
+        nodes.skillStageRail.innerHTML = '';
+        return;
+    }
+    const stages = skill.progress?.stages || {};
+    nodes.skillStageRail.hidden = false;
+    nodes.skillStageRail.innerHTML = Object.entries(skillStageNames).map(([name, label]) => {
+        const stageStatus = stages[name]?.status || (name === skill.current_stage ? 'running' : 'pending');
+        const normalized = ['succeeded', 'running', 'failed'].includes(stageStatus) ? stageStatus : 'pending';
+        return `<div class="skill-stage-marker ${normalized}${name === skill.current_stage ? ' current' : ''}">
+            <span aria-hidden="true"></span>
+            <em>${escapeHtml(label)}</em>
+        </div>`;
+    }).join('');
+}
+
+function renderSkillLiveActivity(skill) {
+    ensureSkillActivityNodes();
+    if (!nodes.skillLiveActivity || !nodes.skillProgress) return;
+    const status = skill.status || 'not_started';
+    const active = status === 'running';
+    const waiting = status === 'waiting_overview_review' || status === 'waiting_candidate_review';
+    nodes.skillProgress.classList.toggle('running', active);
+    nodes.skillProgress.classList.toggle('waiting', waiting);
+    renderSkillStageRail(skill);
+    if (!active && !waiting) {
+        nodes.skillLiveActivity.hidden = true;
+        nodes.skillLiveActivity.innerHTML = '';
+        return;
+    }
+    const stageLabel = skillStageNames[skill.current_stage] || skill.current_stage || '准备中';
+    const title = waiting
+        ? (status === 'waiting_overview_review' ? '等待确认整体理解' : '等待确认候选')
+        : `正在${stageLabel}`;
+    const detail = waiting
+        ? '模型任务已暂停，确认后继续执行'
+        : skillActivityMessage(skill);
+    nodes.skillLiveActivity.hidden = false;
+    nodes.skillLiveActivity.className = `skill-live-activity ${active ? 'running' : 'waiting'}`;
+    nodes.skillLiveActivity.dataset.startedAt = active ? skillActivityStartedAt(skill) : '';
+    nodes.skillLiveActivity.dataset.updatedAt = skill.updated_at || '';
+    nodes.skillLiveActivity.innerHTML = `<div class="skill-activity-signal" aria-hidden="true">
+        <span></span><span></span><span></span>
+    </div>
+    <div class="skill-activity-copy">
+        <strong>${escapeHtml(title)}</strong>
+        <span>${escapeHtml(detail)}</span>
+    </div>
+    <div class="skill-activity-time">
+        <strong data-skill-elapsed>${active ? '已运行 --' : '等待操作'}</strong>
+        <span data-skill-heartbeat>状态刚刚更新</span>
+    </div>`;
+    updateSkillLiveClock();
+}
+
+function formatSkillElapsed(totalSeconds) {
+    const seconds = Math.max(0, Math.floor(totalSeconds));
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const remainder = seconds % 60;
+    if (hours > 0) return `${hours}小时 ${minutes}分 ${remainder}秒`;
+    if (minutes > 0) return `${minutes}分 ${remainder}秒`;
+    return `${remainder}秒`;
+}
+
+function updateSkillLiveClock() {
+    const activity = nodes.skillLiveActivity;
+    if (!activity || activity.hidden) return;
+    const now = Date.now();
+    const elapsedNode = activity.querySelector('[data-skill-elapsed]');
+    const heartbeatNode = activity.querySelector('[data-skill-heartbeat]');
+    const startedAt = Date.parse(activity.dataset.startedAt || '');
+    const updatedAt = Date.parse(activity.dataset.updatedAt || '');
+    if (elapsedNode && Number.isFinite(startedAt)) {
+        elapsedNode.textContent = `已运行 ${formatSkillElapsed((now - startedAt) / 1000)}`;
+    }
+    if (heartbeatNode && Number.isFinite(updatedAt)) {
+        const ageSeconds = Math.max(0, Math.floor((now - updatedAt) / 1000));
+        heartbeatNode.textContent = ageSeconds < 5
+            ? '状态刚刚更新'
+            : ageSeconds < 60
+                ? `${ageSeconds} 秒前更新`
+                : `${Math.floor(ageSeconds / 60)} 分钟前更新`;
+    }
+}
+
 function renderSkillCandidatePanel(job) {
     if (!nodes.skillSummary) return;
-    const skill = job?.summary?.skill_candidate || {};
+    const skill = job?.summary?.skill_distillation || job?.summary?.skill_candidate || {};
     const runDir = job?.summary?.run_dir || job?.run_dir || '';
-    const available = Boolean(skill.available);
+    const status = skill.status || 'not_started';
+    const active = status === 'running';
+    const waitingOverview = status === 'waiting_overview_review';
+    const waitingCandidates = status === 'waiting_candidate_review';
+    const resumable = ['failed', 'interrupted', 'cancelled', 'ready'].includes(status);
+    const completed = ['succeeded', 'completed_no_skills'].includes(status);
+    const passedSkills = Number(skill.skills?.passed || 0);
     const enabled = Boolean(skill.enabled);
-    nodes.generateSkillButton.disabled = !job || !runDir;
-    nodes.enableSkillButton.disabled = !job || !available || enabled;
+    const progress = Number(skill.progress?.percent || 0);
+    nodes.skillProgressBar.style.width = `${Math.max(0, Math.min(progress, 100))}%`;
+    renderSkillLiveActivity(skill);
+    nodes.generateSkillButton.disabled = !job || !runDir || active || waitingOverview || waitingCandidates;
+    nodes.generateSkillButton.textContent = completed ? '重新蒸馏' : '开始蒸馏';
+    nodes.resumeSkillButton.hidden = !resumable;
+    nodes.resumeSkillButton.disabled = !job || active;
+    nodes.cancelSkillButton.hidden = !active;
+    nodes.cancelSkillButton.disabled = !active;
+    nodes.enableSkillButton.disabled = !job || status !== 'succeeded' || passedSkills <= 0 || enabled;
+    nodes.skillProfile.disabled = status !== 'not_started';
+    if (skill.profile && nodes.skillProfile.querySelector(`option[value="${CSS.escape(skill.profile)}"]`)) {
+        nodes.skillProfile.value = skill.profile;
+    }
+    nodes.skillOverviewReview.hidden = !waitingOverview;
+    nodes.skillCandidateReview.hidden = !waitingCandidates;
+    if (!waitingCandidates && job?.job_id) {
+        skillCandidateDrafts.delete(job.job_id);
+    }
     if (!job) {
-        nodes.skillSummary.textContent = '选择一个任务后生成工具 Skill 草稿';
+        nodes.skillSummary.textContent = '选择一个任务后开始蒸馏';
+        nodes.skillWarnings.innerHTML = '';
+        nodes.skillOverviewReview.hidden = true;
+        nodes.skillCandidateReview.hidden = true;
+        renderSkillLiveActivity({ status: 'not_started' });
+        return;
+    }
+    if (status === 'not_started') {
+        nodes.skillSummary.textContent = runDir ? '尚未开始 · 默认 DeepSeek V4 Pro' : '资源目录尚未生成';
         nodes.skillWarnings.innerHTML = '';
         return;
     }
-    if (!available) {
-        nodes.skillSummary.textContent = runDir ? '尚未生成草稿' : '资源目录尚未生成';
-        nodes.skillWarnings.innerHTML = '';
-        return;
-    }
-    nodes.skillSummary.textContent = enabled
-        ? `已启用 · ${skill.skill_name || '-'}`
-        : `待审核 · ${skill.skill_name || '-'}`;
+    const stageLabel = skillStageNames[skill.current_stage] || skill.current_stage || '-';
+    const model = skill.review_model && skill.review_model !== skill.generation_model
+        ? `${skill.generation_model || '-'} / ${skill.review_model}`
+        : (skill.generation_model || '-');
+    const modelSummary = skill.vision_model
+        ? `${model} · 视觉复核 ${skill.vision_model}`
+        : model;
+    const statusLabels = {
+        running: '运行中',
+        waiting_overview_review: '等待骨架确认',
+        waiting_candidate_review: '等待候选确认',
+        succeeded: enabled ? '已启用' : '蒸馏完成',
+        completed_no_skills: '未发现可交付 Skill',
+        failed: '失败',
+        interrupted: '已中断',
+        cancelled: '已取消',
+        ready: '等待继续'
+    };
+    nodes.skillSummary.textContent = `${statusLabels[status] || status} · ${stageLabel} · ${modelSummary}`;
     const warnings = skill.warnings || [];
-    nodes.skillWarnings.innerHTML = warnings.length
-        ? warnings.map(item => `<div class="skill-warning">${escapeHtml(item.message || item.code || item)}</div>`).join('')
-        : '<div class="skill-ok">草稿已生成，启用前请人工复核内容。</div>';
+    const messages = [
+        ...(skill.error ? [skill.error] : []),
+        ...warnings.map(item => item.message || item.code || item)
+    ];
+    if (completed) {
+        messages.push(`Skills ${skill.skills?.count || 0} · 通过 ${passedSkills} · 未通过 ${skill.skills?.failed || 0}`);
+    }
+    if (active && skill.current_stage === 'test') {
+        const testProgress = skill.skills?.test_progress || {};
+        const testStartedAt = skill.progress?.stages?.test?.started_at;
+        const elapsedSeconds = testStartedAt
+            ? Math.max(0, Math.floor((Date.now() - new Date(testStartedAt).getTime()) / 1000))
+            : null;
+        const parts = [
+            `压力测试 ${testProgress.completed || 0}/${testProgress.total || skill.skills?.count || 0}`,
+            skillTestPhaseNames[testProgress.phase] || '模型调用中'
+        ];
+        if (testProgress.current_skill) parts.push(testProgress.current_skill);
+        if (Number.isInteger(testProgress.repair_round) && testProgress.repair_round > 0) {
+            parts.push(`修订轮次 ${testProgress.repair_round}`);
+        }
+        if (elapsedSeconds != null) parts.push(`已运行 ${elapsedSeconds} 秒`);
+        messages.push(parts.join(' · '));
+    }
+    if (waitingCandidates || completed) {
+        messages.push(
+            `候选：已验证 ${skill.candidates?.accepted_count || 0} · `
+            + `单案例 ${skill.candidates?.single_case_count || 0} · `
+            + `拒绝 ${skill.candidates?.rejected_count || 0} · `
+            + `术语 ${skill.candidates?.glossary_count || 0}`
+        );
+    }
+    nodes.skillWarnings.innerHTML = messages.length
+        ? messages.map(item => `<div class="skill-warning">${escapeHtml(item)}</div>`).join('')
+        : '<div class="skill-ok">证据与 checkpoint 正常。</div>';
+    if (waitingOverview) {
+        nodes.skillOverviewPreview.innerHTML = renderMarkdown([
+            `# ${skill.overview?.title || '整体理解'}`,
+            '',
+            skill.overview?.summary || '',
+            '',
+            `证据分块：${skill.overview?.chunk_count || 0}`
+        ].join('\n'));
+    }
+    if (waitingCandidates) {
+        renderSkillCandidates(skill.candidates || {}, job.job_id);
+    }
+}
+
+function renderSkillCandidates(candidates, jobId) {
+    const rows = [
+        ...(candidates.accepted || []).map(item => ({ ...item, tier: 'verified' })),
+        ...(candidates.single_case || []).map(item => ({ ...item, tier: 'single-case' })),
+        ...(candidates.rejected || []).map(item => ({ ...item, tier: 'rejected' }))
+    ];
+    const candidateKey = rows.map(item => item.id).sort().join('|');
+    let draft = skillCandidateDrafts.get(jobId);
+    if (!draft || draft.candidateKey !== candidateKey) {
+        draft = {
+            candidateKey,
+            selected: new Set(candidates.selected_ids || [])
+        };
+        skillCandidateDrafts.set(jobId, draft);
+    }
+    const selected = draft.selected;
+    const scrollTop = nodes.skillCandidateList.scrollTop;
+    nodes.skillCandidateList.innerHTML = rows.length
+        ? rows.map(item => {
+            const reason = item.tier === 'verified'
+                ? `已验证 · 独立案例 ${item.v1?.independent_context_count || 0}`
+                : item.tier === 'single-case'
+                    ? `单案例 · ${item.reason || '需要人工确认'}`
+                    : (item.reason || `未通过 ${item.failed_checks?.join(', ') || '验证'}`);
+            return `<label class="skill-candidate-choice ${item.tier}">
+                <input type="checkbox" value="${escapeHtml(item.id)}" ${selected.has(item.id) ? 'checked' : ''}>
+                <span>
+                    <strong>${escapeHtml(item.title || item.id)}</strong>
+                    <small>${escapeHtml(reason)} · ${escapeHtml((item.source_ids || []).join(', ') || '无证据 ID')}</small>
+                </span>
+            </label>`;
+        }).join('')
+        : '<div class="qa-empty">没有候选</div>';
+    nodes.skillCandidateList.scrollTop = scrollTop;
+}
+
+function updateSkillCandidateDraft(event) {
+    const input = event.target.closest('input[type="checkbox"]');
+    if (!input || !selectedJobId) return;
+    const draft = skillCandidateDrafts.get(selectedJobId);
+    if (!draft) return;
+    if (input.checked) {
+        draft.selected.add(input.value);
+    } else {
+        draft.selected.delete(input.value);
+    }
+}
+
+function renderSkillsWorkspace(job) {
+    renderSkillCandidatePanel(job);
+    if (currentResourceView !== 'skills') return;
+    nodes.skillsScopeTabs.forEach(button => {
+        button.classList.toggle('active', button.dataset.skillsScope === currentSkillsScope);
+    });
+    nodes.currentSkillsWorkspace.hidden = currentSkillsScope !== 'current';
+    nodes.skillLibraryWorkspace.hidden = currentSkillsScope === 'current';
+    nodes.skillLibrarySearchLabel.hidden = currentSkillsScope === 'current';
+    window.requestAnimationFrame(constrainSkillsLayouts);
+    if (currentSkillsScope !== 'current') return;
+    if (!job?.job_id || !(job.summary?.run_dir || job.run_dir)) {
+        loadedSkillsWorkspaceKey = '';
+        currentSkillWorkspace = null;
+        nodes.skillsCurrentCount.textContent = '0 项';
+        nodes.skillsCurrentList.innerHTML = '<div class="skills-empty">选择一个已有运行目录的任务</div>';
+        resetCurrentSkillDetail();
+        return;
+    }
+    const skill = job.summary?.skill_distillation || job.summary?.skill_candidate || {};
+    const workspaceKey = `${job.job_id}|${skill.updated_at || skill.status || 'not_started'}|${skill.progress?.percent || 0}`;
+    if (workspaceKey !== loadedSkillsWorkspaceKey) {
+        loadCurrentSkillsWorkspace(job.job_id, workspaceKey);
+    }
+}
+
+async function loadCurrentSkillsWorkspace(jobId, workspaceKey) {
+    loadedSkillsWorkspaceKey = workspaceKey;
+    nodes.skillsCurrentList.innerHTML = '<div class="skills-empty">正在加载候选与成品...</div>';
+    try {
+        const workspace = await getJson(`/api/video-link/jobs/${jobId}/skill-distillation/workspace`);
+        if (selectedJobId !== jobId || currentSkillsScope !== 'current') return;
+        currentSkillWorkspace = workspace;
+        renderCurrentSkillsList();
+    } catch (error) {
+        if (loadedSkillsWorkspaceKey === workspaceKey) loadedSkillsWorkspaceKey = '';
+        nodes.skillsCurrentList.innerHTML = `<div class="skills-empty error-text">加载失败：${escapeHtml(error.message)}</div>`;
+    }
+}
+
+function renderCurrentSkillsList() {
+    const generated = currentSkillWorkspace?.generated_skills || [];
+    const candidates = currentSkillWorkspace?.candidates || [];
+    const items = [...generated, ...candidates];
+    nodes.skillsCurrentCount.textContent = `${items.length} 项`;
+    if (!items.length) {
+        nodes.skillsCurrentList.innerHTML = '<div class="skills-empty">蒸馏尚未产生候选或成品</div>';
+        resetCurrentSkillDetail();
+        return;
+    }
+    if (!selectedCurrentSkillItemId || !items.some(item => item.item_id === selectedCurrentSkillItemId)) {
+        selectedCurrentSkillItemId = generated[0]?.item_id || candidates[0]?.item_id || '';
+        currentSkillItemDetail = null;
+    }
+    const groupLabels = {
+        accepted: '已验证',
+        single_case: '单案例',
+        rejected: '已拒绝',
+        glossary: '术语'
+    };
+    nodes.skillsCurrentList.innerHTML = [
+        generated.length ? `<section class="skills-item-group">
+            <h4>生成的 Skills</h4>
+            ${generated.map(item => `<button class="skills-item${item.item_id === selectedCurrentSkillItemId ? ' active' : ''}" type="button" data-current-skill-item="${escapeHtml(item.item_id)}">
+                <strong>${escapeHtml(item.title || item.name)}</strong>
+                <span>${escapeHtml(item.name)} · 通过率 ${formatPercent(item.pass_rate)}</span>
+            </button>`).join('')}
+        </section>` : '',
+        candidates.length ? `<section class="skills-item-group">
+            <h4>候选</h4>
+            ${candidates.map(item => `<button class="skills-item ${escapeHtml(item.group || '')}${item.item_id === selectedCurrentSkillItemId ? ' active' : ''}" type="button" data-current-skill-item="${escapeHtml(item.item_id)}">
+                <strong>${escapeHtml(item.title || item.id)}</strong>
+                <span>${escapeHtml(groupLabels[item.group] || item.group)} · ${item.source_count || 0} 条证据</span>
+            </button>`).join('')}
+        </section>` : ''
+    ].join('');
+    nodes.skillsCurrentList.querySelectorAll('[data-current-skill-item]').forEach(button => {
+        button.addEventListener('click', () => selectCurrentSkillItem(button.dataset.currentSkillItem || ''));
+    });
+    if (!currentSkillItemDetail || currentSkillItemDetail.item_id !== selectedCurrentSkillItemId) {
+        selectCurrentSkillItem(selectedCurrentSkillItemId);
+    }
+}
+
+function formatPercent(value) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return '-';
+    return `${Math.round(number * 100)}%`;
+}
+
+async function selectCurrentSkillItem(itemId) {
+    if (!selectedJobId || !itemId) return;
+    selectedCurrentSkillItemId = itemId;
+    nodes.skillsCurrentList.querySelectorAll('[data-current-skill-item]').forEach(button => {
+        button.classList.toggle('active', button.dataset.currentSkillItem === itemId);
+    });
+    nodes.skillsDetailTitle.textContent = '加载中...';
+    nodes.skillsDetailPreview.textContent = '';
+    nodes.skillsInspectorBody.textContent = '正在读取详情...';
+    try {
+        const detail = await getJson(
+            `/api/video-link/jobs/${selectedJobId}/skill-distillation/items/${encodeURIComponent(itemId)}`
+        );
+        if (selectedCurrentSkillItemId !== itemId) return;
+        currentSkillItemDetail = detail;
+        renderCurrentSkillDetail();
+    } catch (error) {
+        nodes.skillsDetailTitle.textContent = '加载失败';
+        nodes.skillsInspectorBody.textContent = error.message;
+    }
+}
+
+function resetCurrentSkillDetail() {
+    selectedCurrentSkillItemId = '';
+    currentSkillItemDetail = null;
+    nodes.skillsDetailTitle.textContent = '选择一个候选或 Skill';
+    nodes.skillsDetailMeta.textContent = '证据、审计和测试结果会显示在这里';
+    nodes.skillsDetailPreview.textContent = '暂无预览';
+    nodes.skillsInspectorBody.textContent = '选择左侧项目查看详情';
+}
+
+function renderCurrentSkillDetail() {
+    const detail = currentSkillItemDetail;
+    if (!detail) {
+        resetCurrentSkillDetail();
+        return;
+    }
+    if (detail.kind === 'skill') {
+        nodes.skillsDetailTitle.textContent = detail.skill?.title || detail.name;
+        nodes.skillsDetailMeta.textContent = `${detail.name} · ${detail.skill?.status || '-'} · 通过率 ${formatPercent(detail.skill?.pass_rate)}`;
+        nodes.skillsDetailPreview.innerHTML = renderMarkdown(stripSkillFrontmatter(detail.markdown || ''), selectedJobId);
+        renderMarkdownMath(nodes.skillsDetailPreview);
+    } else {
+        const candidate = detail.candidate || {};
+        nodes.skillsDetailTitle.textContent = candidate.title || candidate.id || '候选';
+        nodes.skillsDetailMeta.textContent = `${detail.group || '-'} · ${(candidate.source_ids || []).length} 条证据`;
+        nodes.skillsDetailPreview.innerHTML = renderCandidatePreview(candidate);
+    }
+    renderCurrentSkillInspector();
+}
+
+function renderCandidatePreview(candidate) {
+    const sections = [
+        candidate.summary ? `<h3>摘要</h3><p>${escapeHtml(candidate.summary)}</p>` : '',
+        candidate.reason ? `<h3>判定</h3><p>${escapeHtml(candidate.reason)}</p>` : '',
+        candidate.source_quote ? `<h3>原始摘录</h3><blockquote>${escapeHtml(candidate.source_quote)}</blockquote>` : '',
+        (candidate.boundaries || []).length
+            ? `<h3>边界</h3><ul>${candidate.boundaries.map(item => `<li>${escapeHtml(item)}</li>`).join('')}</ul>`
+            : '',
+        candidate.execution_hint ? `<h3>执行提示</h3><p>${escapeHtml(candidate.execution_hint)}</p>` : ''
+    ];
+    return `<article class="candidate-preview">${sections.join('')}</article>`;
+}
+
+function setCurrentSkillDetailTab(tab) {
+    currentSkillDetailTab = ['audit', 'tests', 'raw'].includes(tab) ? tab : 'evidence';
+    nodes.skillsDetailTabs.forEach(button => {
+        button.classList.toggle('active', button.dataset.skillDetailTab === currentSkillDetailTab);
+    });
+    renderCurrentSkillInspector();
+}
+
+function renderCurrentSkillInspector() {
+    const detail = currentSkillItemDetail;
+    if (!detail) return;
+    if (currentSkillDetailTab === 'raw') {
+        nodes.skillsInspectorBody.innerHTML = `<pre>${escapeHtml(JSON.stringify(detail, null, 2))}</pre>`;
+        return;
+    }
+    if (detail.kind === 'skill') {
+        const files = detail.files || {};
+        if (currentSkillDetailTab === 'tests') {
+            const prompts = files['test-prompts.json'] || {};
+            const results = files['test-results.json'] || {};
+            nodes.skillsInspectorBody.innerHTML = renderSkillTests(prompts, results);
+            return;
+        }
+        if (currentSkillDetailTab === 'audit') {
+            nodes.skillsInspectorBody.innerHTML = '<div class="skills-empty">最终 Skill 的多模态审计请从对应候选查看。</div>';
+            return;
+        }
+        nodes.skillsInspectorBody.innerHTML = files['skill.json']
+            ? `<pre>${escapeHtml(JSON.stringify(files['skill.json'], null, 2))}</pre>`
+            : '<div class="skills-empty">暂无结构化 Skill 元数据</div>';
+        return;
+    }
+    if (currentSkillDetailTab === 'audit') {
+        nodes.skillsInspectorBody.innerHTML = renderMultimodalAudit(detail);
+        return;
+    }
+    if (currentSkillDetailTab === 'tests') {
+        nodes.skillsInspectorBody.innerHTML = '<div class="skills-empty">候选通过构建后才会生成压力测试。</div>';
+        return;
+    }
+    nodes.skillsInspectorBody.innerHTML = renderCandidateEvidence(detail);
+}
+
+function renderCandidateEvidence(detail) {
+    const records = detail.evidence || [];
+    const frames = detail.frames || [];
+    const frameHtml = frames.length
+        ? `<div class="skill-frame-grid">${frames.map(frame => `<button type="button" class="skill-frame-button" data-image-viewer-src="${escapeHtml(frame.url)}" data-image-viewer-alt="${escapeHtml(frame.path)}">
+            <img src="${escapeHtml(frame.url)}" alt="${escapeHtml(frame.path)}" loading="lazy">
+            <span>${escapeHtml(frame.path)}</span>
+        </button>`).join('')}</div>`
+        : '';
+    const evidenceHtml = records.length
+        ? records.map(record => `<article class="skill-evidence-record">
+            <strong>${escapeHtml(record.id || '-')}</strong>
+            <span>${escapeHtml(record.kind || record.source_type || '-')} · ${escapeHtml(record.timestamp_label || record.timestamp || '')}</span>
+            <p>${escapeHtml(record.text || record.content || record.quote || '')}</p>
+        </article>`).join('')
+        : '<div class="skills-empty">未找到对应证据记录</div>';
+    return `${frameHtml}${evidenceHtml}`;
+}
+
+function renderMultimodalAudit(detail) {
+    const audit = detail.multimodal_audit || {};
+    if (!Object.keys(audit).length) return '<div class="skills-empty">暂无多模态审计</div>';
+    const unsupported = audit.unsupported_details || [];
+    return `<div class="skill-audit-summary">
+        <div><span>声明支持</span><strong>${audit.claim_supported ? '是' : '否'}</strong></div>
+        <div><span>执行支持</span><strong>${audit.execution_supported ? '是' : '否'}</strong></div>
+        <div><span>教学价值</span><strong>${escapeHtml(audit.instructional_value || '-')}</strong></div>
+        <div><span>置信度</span><strong>${escapeHtml(audit.confidence ?? '-')}</strong></div>
+    </div>
+    <h4>口播支持</h4><p>${escapeHtml(audit.transcript_support || '无')}</p>
+    <h4>视觉支持</h4><p>${escapeHtml(audit.visual_support || '无')}</p>
+    <h4>未证实细节</h4>${unsupported.length
+        ? `<ul>${unsupported.map(item => `<li>${escapeHtml(item)}</li>`).join('')}</ul>`
+        : '<p>无</p>'}`;
+}
+
+function renderSkillTests(prompts, results) {
+    const cases = prompts.test_cases || [];
+    const resultMap = new Map((results.results || []).map(item => [item.id, item]));
+    if (!cases.length) return '<div class="skills-empty">暂无压力测试</div>';
+    return `<div class="skill-test-summary">
+        <strong>${results.passed ? '通过' : '未通过'}</strong>
+        <span>${results.passed_count || 0}/${results.total || cases.length} · ${formatPercent(results.pass_rate)}</span>
+    </div>${cases.map(testCase => {
+        const result = resultMap.get(testCase.id) || {};
+        return `<article class="skill-test-case ${result.passed ? 'passed' : 'failed'}">
+            <strong>${escapeHtml(testCase.id)} · ${escapeHtml(testCase.type)}</strong>
+            <p>${escapeHtml(testCase.prompt || '')}</p>
+            <span>期望 ${escapeHtml(testCase.expected_skill || '不触发')} · 实际 ${escapeHtml(result.selected_skill || '不触发')}</span>
+        </article>`;
+    }).join('')}`;
+}
+
+async function loadSkillLibrary() {
+    if (currentResourceView !== 'skills' || currentSkillsScope === 'current') return;
+    const query = nodes.skillLibrarySearch.value.trim();
+    const labels = { enabled: '已启用 Skills', disabled: '已禁用 Skills', trash: '回收站' };
+    nodes.skillLibraryTitle.textContent = labels[currentSkillsScope] || '项目 Skills';
+    nodes.skillLibraryList.innerHTML = '<div class="skills-empty">正在加载...</div>';
+    try {
+        const data = await getJson(`/api/skills?state=${encodeURIComponent(currentSkillsScope)}&query=${encodeURIComponent(query)}`);
+        if (data.state !== currentSkillsScope) return;
+        nodes.skillLibraryCount.textContent = `${data.count || 0} 项`;
+        renderSkillLibraryList(data.items || []);
+    } catch (error) {
+        nodes.skillLibraryList.innerHTML = `<div class="skills-empty error-text">加载失败：${escapeHtml(error.message)}</div>`;
+    }
+}
+
+function renderSkillLibraryList(items) {
+    if (!items.length) {
+        nodes.skillLibraryList.innerHTML = '<div class="skills-empty">这里还没有 Skill</div>';
+        resetSkillEditor();
+        return;
+    }
+    nodes.skillLibraryList.innerHTML = items.map(item => `<button class="skills-item${item.id === selectedLibrarySkillId ? ' active' : ''}" type="button" data-library-skill="${escapeHtml(item.id)}">
+        <strong>${escapeHtml(item.title || item.name)}</strong>
+        <span>${escapeHtml(item.name)} · ${escapeHtml(item.updated_at || '')}</span>
+        <small>${escapeHtml(item.description || '')}</small>
+    </button>`).join('');
+    nodes.skillLibraryList.querySelectorAll('[data-library-skill]').forEach(button => {
+        button.addEventListener('click', () => loadLibrarySkill(button.dataset.librarySkill || ''));
+    });
+    if (!selectedLibrarySkillId || !items.some(item => item.id === selectedLibrarySkillId)) {
+        loadLibrarySkill(items[0].id);
+    }
+}
+
+async function loadLibrarySkill(skillId) {
+    if (!skillId || currentSkillsScope === 'current') return;
+    selectedLibrarySkillId = skillId;
+    nodes.skillEditorTitle.textContent = '加载中...';
+    try {
+        const detail = await getJson(`/api/skills/${encodeURIComponent(currentSkillsScope)}/${encodeURIComponent(skillId)}`);
+        if (selectedLibrarySkillId !== skillId) return;
+        currentLibrarySkill = detail;
+        renderLibrarySkillDetail();
+        loadSkillLibrary();
+    } catch (error) {
+        nodes.skillEditorTitle.textContent = '加载失败';
+        nodes.skillEditorMessage.textContent = error.message;
+    }
+}
+
+function resetSkillEditor() {
+    currentLibrarySkill = null;
+    selectedLibrarySkillId = '';
+    nodes.skillEditorTitle.textContent = '选择一个 Skill';
+    nodes.skillEditorMeta.textContent = '仅 SKILL.md 可编辑';
+    nodes.skillEditor.value = '';
+    nodes.skillEditor.disabled = true;
+    nodes.skillRenderedPreview.innerHTML = '暂无预览';
+    nodes.saveSkillButton.disabled = true;
+    nodes.disableSkillButton.hidden = true;
+    nodes.restoreSkillButton.hidden = true;
+    nodes.deleteSkillButton.hidden = true;
+    nodes.permanentDeleteSkillButton.hidden = true;
+    nodes.skillAuxiliaryFiles.textContent = '暂无文件';
+    nodes.skillVersionList.textContent = '暂无版本';
+    nodes.skillEditorMessage.textContent = '';
+}
+
+function renderLibrarySkillDetail() {
+    const skill = currentLibrarySkill;
+    if (!skill) {
+        resetSkillEditor();
+        return;
+    }
+    nodes.skillEditorTitle.textContent = skill.title || skill.name;
+    nodes.skillEditorMeta.textContent = `${skill.name} · ${skill.state} · ${skill.revision.slice(0, 10)}`;
+    nodes.skillEditor.value = skill.markdown || '';
+    nodes.skillEditor.disabled = !['enabled', 'disabled'].includes(skill.state);
+    nodes.saveSkillButton.disabled = nodes.skillEditor.disabled;
+    nodes.disableSkillButton.hidden = skill.state !== 'enabled';
+    nodes.restoreSkillButton.hidden = !['disabled', 'trash'].includes(skill.state);
+    nodes.deleteSkillButton.hidden = !['enabled', 'disabled'].includes(skill.state);
+    nodes.permanentDeleteSkillButton.hidden = skill.state !== 'trash';
+    nodes.skillRenderedPreview.innerHTML = renderMarkdown(stripSkillFrontmatter(skill.markdown || ''));
+    renderMarkdownMath(nodes.skillRenderedPreview);
+    nodes.skillAuxiliaryFiles.innerHTML = (skill.auxiliary_files || []).length
+        ? skill.auxiliary_files.map(file => `<details class="skill-auxiliary-file">
+            <summary>${escapeHtml(file.path)} · ${formatBytes(file.size_bytes)}</summary>
+            ${file.content == null ? '<p>二进制或文件过大，界面不展开。</p>' : `<pre>${escapeHtml(file.content)}</pre>`}
+        </details>`).join('')
+        : '<div class="skills-empty">无辅助文件</div>';
+    nodes.skillVersionList.innerHTML = (skill.versions || []).length
+        ? skill.versions.map(version => `<div class="skill-version-item">
+            <span>${escapeHtml(version.id)}</span>
+            <button class="secondary tiny" type="button" data-restore-version="${escapeHtml(version.id)}">恢复</button>
+        </div>`).join('')
+        : '<div class="skills-empty">保存后会自动生成版本快照</div>';
+    nodes.skillVersionList.querySelectorAll('[data-restore-version]').forEach(button => {
+        button.addEventListener('click', () => restoreSkillVersion(button.dataset.restoreVersion || ''));
+    });
+    nodes.skillEditorMessage.textContent = '';
+    setSkillEditorTab(currentSkillEditorTab);
+}
+
+function setSkillEditorTab(tab) {
+    currentSkillEditorTab = tab === 'preview' ? 'preview' : 'edit';
+    nodes.skillEditorTabs.forEach(button => {
+        button.classList.toggle('active', button.dataset.skillEditorTab === currentSkillEditorTab);
+    });
+    nodes.skillEditor.hidden = currentSkillEditorTab !== 'edit';
+    nodes.skillRenderedPreview.hidden = currentSkillEditorTab !== 'preview';
+    if (currentSkillEditorTab === 'preview') {
+        nodes.skillRenderedPreview.innerHTML = renderMarkdown(stripSkillFrontmatter(nodes.skillEditor.value || ''));
+        renderMarkdownMath(nodes.skillRenderedPreview);
+    }
+}
+
+async function saveCurrentLibrarySkill() {
+    if (!currentLibrarySkill || nodes.saveSkillButton.disabled) return;
+    nodes.saveSkillButton.disabled = true;
+    nodes.skillEditorMessage.textContent = '正在保存...';
+    try {
+        currentLibrarySkill = await getJson(
+            `/api/skills/${encodeURIComponent(currentLibrarySkill.state)}/${encodeURIComponent(currentLibrarySkill.id)}`,
+            {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    markdown: nodes.skillEditor.value,
+                    revision: currentLibrarySkill.revision
+                })
+            }
+        );
+        renderLibrarySkillDetail();
+        nodes.skillEditorMessage.textContent = '已保存并创建版本快照';
+        loadSkillLibrary();
+    } catch (error) {
+        nodes.skillEditorMessage.textContent = `保存失败：${error.message}`;
+        nodes.saveSkillButton.disabled = false;
+    }
+}
+
+async function changeLibrarySkillState(action) {
+    const skill = currentLibrarySkill;
+    if (!skill) return;
+    let url = '';
+    let method = 'POST';
+    let body = null;
+    if (action === 'disable') {
+        if (!window.confirm(`禁用 ${skill.name}？`)) return;
+        url = `/api/skills/enabled/${encodeURIComponent(skill.name)}/disable`;
+    } else if (action === 'restore') {
+        url = skill.state === 'trash'
+            ? `/api/skills/trash/${encodeURIComponent(skill.id)}/restore`
+            : `/api/skills/disabled/${encodeURIComponent(skill.name)}/restore`;
+    } else if (action === 'delete') {
+        if (!window.confirm(`将 ${skill.name} 移入回收站？`)) return;
+        url = `/api/skills/${encodeURIComponent(skill.state)}/${encodeURIComponent(skill.id)}`;
+        method = 'DELETE';
+        body = {};
+    } else if (action === 'permanent-delete') {
+        const confirmation = window.prompt(`永久删除无法恢复。请输入 Skill 名称：${skill.name}`);
+        if (confirmation !== skill.name) return;
+        url = `/api/skills/trash/${encodeURIComponent(skill.id)}`;
+        method = 'DELETE';
+        body = { confirmation };
+    }
+    try {
+        await getJson(url, {
+            method,
+            headers: { 'Content-Type': 'application/json' },
+            body: body == null ? undefined : JSON.stringify(body)
+        });
+        resetSkillEditor();
+        await loadSkillLibrary();
+    } catch (error) {
+        nodes.skillEditorMessage.textContent = `操作失败：${error.message}`;
+    }
+}
+
+async function restoreSkillVersion(versionId) {
+    if (!currentLibrarySkill || !versionId) return;
+    if (!window.confirm(`恢复版本 ${versionId}？当前内容会先创建快照。`)) return;
+    try {
+        currentLibrarySkill = await getJson(
+            `/api/skills/${encodeURIComponent(currentLibrarySkill.state)}/${encodeURIComponent(currentLibrarySkill.id)}/versions/${encodeURIComponent(versionId)}/restore`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ revision: currentLibrarySkill.revision })
+            }
+        );
+        renderLibrarySkillDetail();
+        nodes.skillEditorMessage.textContent = `已恢复版本 ${versionId}`;
+    } catch (error) {
+        nodes.skillEditorMessage.textContent = `恢复失败：${error.message}`;
+    }
 }
 
 function appendQaMessage(role, html) {
@@ -1322,42 +2295,143 @@ function formatDateTime(value) {
 
 async function generateSkillCandidate() {
     if (!selectedJobId || nodes.generateSkillButton.disabled) return;
+    const skill = currentJob?.summary?.skill_distillation || currentJob?.summary?.skill_candidate || {};
+    const force = ['succeeded', 'completed_no_skills'].includes(skill.status);
+    if (force && !window.confirm('重新蒸馏会清空当前蒸馏包和 checkpoint。确认继续？')) return;
     nodes.generateSkillButton.disabled = true;
-    nodes.skillSummary.textContent = '正在生成草稿...';
+    nodes.skillSummary.textContent = '正在启动蒸馏...';
     try {
-        const result = await getJson(`/api/video-link/jobs/${selectedJobId}/skill-candidate/generate`, {
+        const result = await getJson(`/api/video-link/jobs/${selectedJobId}/skill-distillation/start`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                profile: nodes.skillProfile.value || 'deepseek_v4_pro',
+                force
+            })
+        });
+        if (currentJob?.summary) {
+            currentJob.summary.skill_candidate = result;
+            currentJob.summary.skill_distillation = result;
+        }
+        renderSkillCandidatePanel(currentJob);
+        await refreshSelectedJob();
+    } catch (error) {
+        nodes.skillSummary.textContent = `启动失败：${error.message}`;
+        renderSkillCandidatePanel(currentJob);
+    }
+}
+
+async function reviewSkillOverview(action) {
+    if (!selectedJobId) return;
+    const buttons = [nodes.regenerateSkillOverviewButton, nodes.confirmSkillOverviewButton];
+    buttons.forEach(button => { button.disabled = true; });
+    try {
+        await getJson(`/api/video-link/jobs/${selectedJobId}/skill-distillation/review-overview`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                action,
+                feedback: nodes.skillOverviewFeedback.value.trim()
+            })
+        });
+        nodes.skillOverviewFeedback.value = '';
+        await refreshSelectedJob();
+    } catch (error) {
+        nodes.skillSummary.textContent = `审核失败：${error.message}`;
+    } finally {
+        buttons.forEach(button => { button.disabled = false; });
+    }
+}
+
+async function confirmSkillCandidates() {
+    if (!selectedJobId) return;
+    const selectedIds = Array.from(
+        nodes.skillCandidateList.querySelectorAll('input[type="checkbox"]:checked')
+    ).map(input => input.value);
+    nodes.confirmSkillCandidatesButton.disabled = true;
+    try {
+        await getJson(`/api/video-link/jobs/${selectedJobId}/skill-distillation/review-candidates`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ selected_ids: selectedIds })
+        });
+        skillCandidateDrafts.delete(selectedJobId);
+        await refreshSelectedJob();
+    } catch (error) {
+        nodes.skillSummary.textContent = `候选确认失败：${error.message}`;
+    } finally {
+        nodes.confirmSkillCandidatesButton.disabled = false;
+    }
+}
+
+async function resumeSkillDistillation() {
+    if (!selectedJobId || nodes.resumeSkillButton.disabled) return;
+    nodes.resumeSkillButton.disabled = true;
+    try {
+        await getJson(`/api/video-link/jobs/${selectedJobId}/skill-distillation/resume`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: '{}'
         });
-        if (currentJob?.summary) currentJob.summary.skill_candidate = result;
-        renderSkillCandidatePanel(currentJob);
         await refreshSelectedJob();
     } catch (error) {
-        nodes.skillSummary.textContent = `生成失败：${error.message}`;
-        renderSkillCandidatePanel(currentJob);
+        nodes.skillSummary.textContent = `继续失败：${error.message}`;
+        nodes.resumeSkillButton.disabled = false;
+    }
+}
+
+async function cancelSkillDistillation() {
+    if (!selectedJobId || nodes.cancelSkillButton.disabled) return;
+    nodes.cancelSkillButton.disabled = true;
+    try {
+        await getJson(`/api/video-link/jobs/${selectedJobId}/skill-distillation/cancel`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}'
+        });
+        await refreshSelectedJob();
+    } catch (error) {
+        nodes.skillSummary.textContent = `取消失败：${error.message}`;
+        nodes.cancelSkillButton.disabled = false;
     }
 }
 
 async function enableSkillCandidate() {
     if (!selectedJobId || nodes.enableSkillButton.disabled) return;
-    const skill = currentJob?.summary?.skill_candidate || {};
-    const name = skill.skill_name || 'tool skill';
-    if (!window.confirm(`审核并启用这个 Skill？\n\n${name}\n\n启用后会写入项目 .codex/skills，后续 agent 可能自动触发使用。`)) return;
+    const skill = currentJob?.summary?.skill_distillation || currentJob?.summary?.skill_candidate || {};
+    const count = skill.skills?.passed || 0;
+    if (!window.confirm(`启用 ${count} 个已通过压力测试的 Skills？\n\n将写入项目 .codex/skills。`)) return;
     nodes.enableSkillButton.disabled = true;
     nodes.skillSummary.textContent = '正在启用...';
     try {
-        const result = await getJson(`/api/video-link/jobs/${selectedJobId}/skill-candidate/enable`, {
+        const result = await getJson(`/api/video-link/jobs/${selectedJobId}/skill-distillation/enable`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: '{}'
+            body: JSON.stringify({ overwrite: false })
         });
-        if (currentJob?.summary) currentJob.summary.skill_candidate = result;
+        if (currentJob?.summary) {
+            currentJob.summary.skill_candidate = result;
+            currentJob.summary.skill_distillation = result;
+        }
         renderSkillCandidatePanel(currentJob);
         await refreshSelectedJob();
     } catch (error) {
-        nodes.skillSummary.textContent = `启用失败：${error.message}`;
-        renderSkillCandidatePanel(currentJob);
+        if (/already exist|already exists|已存在/i.test(error.message)
+            && window.confirm(`${error.message}\n\n覆盖这些现有 Skills？`)) {
+            try {
+                await getJson(`/api/video-link/jobs/${selectedJobId}/skill-distillation/enable`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ overwrite: true })
+                });
+                await refreshSelectedJob();
+                return;
+            } catch (overwriteError) {
+                nodes.skillSummary.textContent = `覆盖失败：${overwriteError.message}`;
+            }
+        } else {
+            nodes.skillSummary.textContent = `启用失败：${error.message}`;
+        }
     }
 }
 
@@ -1381,6 +2455,7 @@ function renderVscodePanel(job) {
         renderSourcePlayer(job);
         renderStudyPanel(job);
         renderDocPreviewPanel(job);
+        renderSkillsWorkspace(job);
         return;
     }
     if (!runDir) {
@@ -1389,6 +2464,7 @@ function renderVscodePanel(job) {
         renderSourcePlayer(job);
         renderStudyPanel(job);
         renderDocPreviewPanel(job);
+        renderSkillsWorkspace(job);
         return;
     }
     nodes.vscodeSummary.textContent = ready
@@ -1398,6 +2474,7 @@ function renderVscodePanel(job) {
     renderSourcePlayer(job);
     renderStudyPanel(job);
     renderDocPreviewPanel(job);
+    renderSkillsWorkspace(job);
 }
 
 function resetVscodeShell() {
@@ -2348,6 +3425,13 @@ function renderMarkdown(markdown, jobId = '', docPath = '') {
     });
 }
 
+function stripSkillFrontmatter(markdown) {
+    const value = String(markdown || '');
+    if (!value.startsWith('---')) return value;
+    const match = value.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/);
+    return match ? value.slice(match[0].length) : value;
+}
+
 function normalizeMarkdownForPreview(markdown) {
     const lines = String(markdown || '').split(/\r?\n/);
     const normalized = [];
@@ -3123,11 +4207,17 @@ function loadPaneLayout() {
     } catch (_error) {
         layout = {};
     }
-    applyPaneWidth('study', Number(layout.study));
-    applyPaneWidth('doc-list', Number(layout.docList));
-    applyPaneWidth('source-player', Number(layout.sourcePlayer));
-    applyPaneWidth('qa-source', Number(layout.qaSource));
-    applySourcePlayerHeight(Number(layout.qaSourceHeight));
+    applyPaneWidth('study', savedPaneSize(layout.study));
+    applyPaneWidth('doc-list', savedPaneSize(layout.docList));
+    applyPaneWidth('source-player', savedPaneSize(layout.sourcePlayer));
+    applyPaneWidth('qa-source', savedPaneSize(layout.qaSource));
+    applySourcePlayerHeight(savedPaneSize(layout.qaSourceHeight));
+    applySkillsPaneWidth('skills-current-left', savedPaneSize(layout.skillsCurrentLeft));
+    applySkillsPaneWidth('skills-current-right', savedPaneSize(layout.skillsCurrentRight));
+    applySkillsPaneHeight('skills-current-height', savedPaneSize(layout.skillsCurrentHeight));
+    applySkillsPaneWidth('skills-library-left', savedPaneSize(layout.skillsLibraryLeft));
+    applySkillsPaneWidth('skills-library-right', savedPaneSize(layout.skillsLibraryRight));
+    applySkillsPaneHeight('skills-library-height', savedPaneSize(layout.skillsLibraryHeight));
 }
 
 function savePaneLayout() {
@@ -3138,7 +4228,13 @@ function savePaneLayout() {
         docList: parsePanePixels(vscodeStyle?.getPropertyValue('--doc-list-pane-width')),
         sourcePlayer: parsePanePixels(vscodeStyle?.getPropertyValue('--source-player-pane-width')),
         qaSource: parsePanePixels(qaStyle?.getPropertyValue('--qa-source-pane-width')),
-        qaSourceHeight: parsePanePixels(nodes.qaSourcePlayerPanel?.style.getPropertyValue('--qa-source-player-height'))
+        qaSourceHeight: parsePanePixels(nodes.qaSourcePlayerPanel?.style.getPropertyValue('--qa-source-player-height')),
+        skillsCurrentLeft: parsePanePixels(nodes.currentSkillsGrid?.style.getPropertyValue('--skills-left-pane-width')),
+        skillsCurrentRight: parsePanePixels(nodes.currentSkillsGrid?.style.getPropertyValue('--skills-right-pane-width')),
+        skillsCurrentHeight: parsePanePixels(nodes.currentSkillsGrid?.style.getPropertyValue('--skills-pane-height')),
+        skillsLibraryLeft: parsePanePixels(nodes.skillLibraryGrid?.style.getPropertyValue('--skills-left-pane-width')),
+        skillsLibraryRight: parsePanePixels(nodes.skillLibraryGrid?.style.getPropertyValue('--skills-right-pane-width')),
+        skillsLibraryHeight: parsePanePixels(nodes.skillLibraryGrid?.style.getPropertyValue('--skills-pane-height'))
     };
     localStorage.setItem(paneLayoutStorageKey, JSON.stringify(layout));
 }
@@ -3146,6 +4242,11 @@ function savePaneLayout() {
 function parsePanePixels(value) {
     const number = Number.parseFloat(String(value || '').replace('px', ''));
     return Number.isFinite(number) ? Math.round(number) : null;
+}
+
+function savedPaneSize(value) {
+    if (value === null || value === undefined || value === '') return Number.NaN;
+    return Number(value);
 }
 
 function applyPaneWidth(pane, width) {
@@ -3239,6 +4340,10 @@ function resizeSourcePlayerPane(clientX) {
 }
 
 function resizePaneFromPointer(pane, clientX) {
+    if (pane?.startsWith('skills-')) {
+        resizeSkillsPane(pane, clientX);
+        return;
+    }
     if (pane === 'qa-source') {
         resizeQaSourcePane(clientX);
         return;
@@ -3253,6 +4358,10 @@ function resizePaneFromPointer(pane, clientX) {
 }
 
 function adjustPaneWidth(pane, delta) {
+    if (pane?.startsWith('skills-')) {
+        adjustSkillsPaneWidth(pane, delta);
+        return;
+    }
     if (pane === 'qa-source') {
         const rect = nodes.qaLayout?.getBoundingClientRect();
         if (!rect) return;
@@ -3317,16 +4426,149 @@ function adjustSourcePlayerHeight(delta) {
     applySourcePlayerHeight(clamp(sourcePlayerHeight() + delta, 180, max));
 }
 
+function skillsGridForPane(pane) {
+    return pane?.startsWith('skills-library-') ? nodes.skillLibraryGrid : nodes.currentSkillsGrid;
+}
+
+function skillsPaneProperty(pane) {
+    return pane?.endsWith('-right') ? '--skills-right-pane-width' : '--skills-left-pane-width';
+}
+
+function skillsPaneWidth(pane) {
+    const grid = skillsGridForPane(pane);
+    if (!grid) return 0;
+    const property = skillsPaneProperty(pane);
+    const explicit = parsePanePixels(grid.style.getPropertyValue(property));
+    if (explicit) return explicit;
+    const selector = pane.endsWith('-right')
+        ? '.skills-inspector-pane'
+        : '.skills-item-pane';
+    return grid.querySelector(selector)?.getBoundingClientRect().width || 0;
+}
+
+function applySkillsPaneWidth(pane, width) {
+    const grid = skillsGridForPane(pane);
+    if (!grid || !Number.isFinite(width)) return;
+    grid.style.setProperty(skillsPaneProperty(pane), `${Math.round(width)}px`);
+}
+
+function skillsPaneLimits(pane) {
+    const grid = skillsGridForPane(pane);
+    if (!grid) return null;
+    const rect = grid.getBoundingClientRect();
+    const isLibrary = pane.startsWith('skills-library-');
+    const leftMin = 210;
+    const rightMin = 250;
+    const centerMin = isLibrary ? 420 : 360;
+    const handles = 20;
+    return { grid, rect, leftMin, rightMin, centerMin, handles };
+}
+
+function resizeSkillsPane(pane, clientX) {
+    if (pane.endsWith('-height')) return;
+    const limits = skillsPaneLimits(pane);
+    if (!limits) return;
+    const { rect, leftMin, rightMin, centerMin, handles } = limits;
+    if (pane.endsWith('-left')) {
+        const right = skillsPaneWidth(pane.replace(/-left$/, '-right')) || 340;
+        const max = Math.max(leftMin, rect.width - right - centerMin - handles);
+        applySkillsPaneWidth(pane, clamp(clientX - rect.left, leftMin, max));
+        return;
+    }
+    const left = skillsPaneWidth(pane.replace(/-right$/, '-left')) || 270;
+    const max = Math.max(rightMin, rect.width - left - centerMin - handles);
+    applySkillsPaneWidth(pane, clamp(rect.right - clientX, rightMin, max));
+}
+
+function adjustSkillsPaneWidth(pane, delta) {
+    if (pane.endsWith('-height')) return;
+    const limits = skillsPaneLimits(pane);
+    if (!limits) return;
+    const { rect, leftMin, rightMin, centerMin, handles } = limits;
+    if (pane.endsWith('-left')) {
+        const right = skillsPaneWidth(pane.replace(/-left$/, '-right')) || 340;
+        const max = Math.max(leftMin, rect.width - right - centerMin - handles);
+        applySkillsPaneWidth(pane, clamp(skillsPaneWidth(pane) + delta, leftMin, max));
+        return;
+    }
+    const left = skillsPaneWidth(pane.replace(/-right$/, '-left')) || 270;
+    const max = Math.max(rightMin, rect.width - left - centerMin - handles);
+    applySkillsPaneWidth(pane, clamp(skillsPaneWidth(pane) - delta, rightMin, max));
+}
+
+function skillsPaneHeight(pane) {
+    const grid = skillsGridForPane(pane);
+    if (!grid) return 0;
+    const explicit = parsePanePixels(grid.style.getPropertyValue('--skills-pane-height'));
+    return explicit || grid.getBoundingClientRect().height || 520;
+}
+
+function applySkillsPaneHeight(pane, height) {
+    const grid = skillsGridForPane(pane);
+    if (!grid || !Number.isFinite(height)) return;
+    grid.style.setProperty('--skills-pane-height', `${Math.round(height)}px`);
+}
+
+function resizeSkillsPaneHeight(pane, clientY) {
+    const grid = skillsGridForPane(pane);
+    if (!grid) return;
+    const rect = grid.getBoundingClientRect();
+    applySkillsPaneHeight(pane, clamp(clientY - rect.top, 360, 1200));
+}
+
+function adjustSkillsPaneHeight(pane, delta) {
+    applySkillsPaneHeight(pane, clamp(skillsPaneHeight(pane) + delta, 360, 1200));
+}
+
+function constrainSkillsGrid(grid, centerMin) {
+    if (!grid || grid.hidden || window.innerWidth <= 980) return;
+    const rect = grid.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    const leftMin = 210;
+    const rightMin = 250;
+    const available = Math.max(leftMin + rightMin, rect.width - centerMin - 20);
+    let left = parsePanePixels(grid.style.getPropertyValue('--skills-left-pane-width')) || 280;
+    let right = parsePanePixels(grid.style.getPropertyValue('--skills-right-pane-width')) || 360;
+    left = Math.max(leftMin, left);
+    right = Math.max(rightMin, right);
+    const excess = left + right - available;
+    if (excess > 0) {
+        const leftRoom = left - leftMin;
+        const rightRoom = right - rightMin;
+        const room = leftRoom + rightRoom;
+        if (room > 0) {
+            left -= excess * (leftRoom / room);
+            right -= excess * (rightRoom / room);
+        }
+    }
+    grid.style.setProperty('--skills-left-pane-width', `${Math.round(Math.max(leftMin, left))}px`);
+    grid.style.setProperty('--skills-right-pane-width', `${Math.round(Math.max(rightMin, right))}px`);
+}
+
+function constrainSkillsLayouts() {
+    constrainSkillsGrid(nodes.currentSkillsGrid, 360);
+    constrainSkillsGrid(nodes.skillLibraryGrid, 420);
+}
+
+function isHorizontalPane(pane) {
+    return pane === 'qa-source-height' || pane?.endsWith('-height');
+}
+
 function bindPaneResizers() {
     loadPaneLayout();
+    window.addEventListener('resize', constrainSkillsLayouts);
     document.querySelectorAll('.pane-resizer').forEach(handle => {
         handle.addEventListener('pointerdown', event => {
             paneResizeState.active = handle.dataset.resizePane || 'study';
             paneResizeState.pointerId = event.pointerId;
             handle.setPointerCapture?.(event.pointerId);
             resizerContainer(paneResizeState.active)?.classList.add('resizing');
-            if (paneResizeState.active === 'qa-source-height') {
-                resizeSourcePlayerHeight(event.clientY);
+            if (isHorizontalPane(paneResizeState.active)) {
+                if (paneResizeState.active === 'qa-source-height') {
+                    resizeSourcePlayerHeight(event.clientY);
+                } else {
+                    resizeSkillsPaneHeight(paneResizeState.active, event.clientY);
+                }
             } else {
                 resizePaneFromPointer(paneResizeState.active, event.clientX);
             }
@@ -3334,9 +4576,14 @@ function bindPaneResizers() {
         });
         handle.addEventListener('keydown', event => {
             const pane = handle.dataset.resizePane || 'study';
-            if (pane === 'qa-source-height') {
+            if (isHorizontalPane(pane)) {
                 if (!['ArrowUp', 'ArrowDown'].includes(event.key)) return;
-                adjustSourcePlayerHeight(event.key === 'ArrowDown' ? 24 : -24);
+                const delta = event.key === 'ArrowDown' ? 24 : -24;
+                if (pane === 'qa-source-height') {
+                    adjustSourcePlayerHeight(delta);
+                } else {
+                    adjustSkillsPaneHeight(pane, delta);
+                }
             } else {
                 if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
                 const delta = event.key === 'ArrowRight' ? 24 : -24;
@@ -3348,8 +4595,12 @@ function bindPaneResizers() {
     });
     document.addEventListener('pointermove', event => {
         if (!paneResizeState.active) return;
-        if (paneResizeState.active === 'qa-source-height') {
-            resizeSourcePlayerHeight(event.clientY);
+        if (isHorizontalPane(paneResizeState.active)) {
+            if (paneResizeState.active === 'qa-source-height') {
+                resizeSourcePlayerHeight(event.clientY);
+            } else {
+                resizeSkillsPaneHeight(paneResizeState.active, event.clientY);
+            }
         } else {
             resizePaneFromPointer(paneResizeState.active, event.clientX);
         }
@@ -3365,7 +4616,12 @@ function bindPaneResizers() {
 }
 
 function resizerContainer(pane) {
-    return pane?.startsWith('qa-source') ? nodes.qaLayout : nodes.vscodeDocs;
+    if (pane?.startsWith('qa-source')) return nodes.qaLayout;
+    if (pane === 'skills-library-height') return nodes.skillLibraryWorkspace;
+    if (pane === 'skills-current-height') return nodes.currentSkillsWorkspace;
+    if (pane?.startsWith('skills-library-')) return nodes.skillLibraryGrid;
+    if (pane?.startsWith('skills-current-')) return nodes.currentSkillsGrid;
+    return nodes.vscodeDocs;
 }
 
 async function runSelectedJob() {
@@ -3373,10 +4629,11 @@ async function runSelectedJob() {
     nodes.runButton.disabled = true;
     try {
         const action = nodes.runButton.dataset.action || (currentJob?.status === 'succeeded' ? 'open-run-dir' : 'run');
+        const resumeProfile = action === 'run' ? currentJob?.failure_disposition?.recommended_profile : null;
         await getJson(`/api/video-link/jobs/${selectedJobId}/${action}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: '{}'
+            body: JSON.stringify(resumeProfile ? { profile: resumeProfile } : {})
         });
         if (action === 'run' || action === 'stop') {
             await refreshSelectedJob();
@@ -3390,9 +4647,50 @@ async function runSelectedJob() {
 }
 
 async function boot() {
+    ensureSkillActivityNodes();
     nodes.consoleTab.addEventListener('click', () => setView('console'));
     nodes.qaTab.addEventListener('click', () => setView('qa'));
     nodes.vscodeTab.addEventListener('click', () => setView('vscode'));
+    nodes.resourceDocsTab.addEventListener('click', () => setResourceView('docs'));
+    nodes.resourceSkillsTab.addEventListener('click', () => setResourceView('skills'));
+    nodes.skillsResourceDocsTab.addEventListener('click', () => setResourceView('docs'));
+    nodes.skillsResourceSkillsTab.addEventListener('click', () => setResourceView('skills'));
+    nodes.toggleSkillsFocusButton.addEventListener('click', () => toggleSkillsFocusMode());
+    document.addEventListener('keydown', event => {
+        if (event.key !== 'Escape' || !nodes.appShell?.classList.contains('skills-focus-mode')) return;
+        toggleSkillsFocusMode(false);
+    });
+    nodes.openSkillsWorkspaceButton.addEventListener('click', () => {
+        setView('vscode', false);
+        setResourceView('skills', false);
+        setSkillsScope('current', true);
+    });
+    nodes.skillsScopeTabs.forEach(button => {
+        button.addEventListener('click', () => setSkillsScope(button.dataset.skillsScope || 'current'));
+    });
+    nodes.skillsDetailTabs.forEach(button => {
+        button.addEventListener('click', () => setCurrentSkillDetailTab(button.dataset.skillDetailTab || 'evidence'));
+    });
+    nodes.skillEditorTabs.forEach(button => {
+        button.addEventListener('click', () => setSkillEditorTab(button.dataset.skillEditorTab || 'edit'));
+    });
+    nodes.skillLibrarySearch.addEventListener('input', () => {
+        window.clearTimeout(skillLibrarySearchTimer);
+        skillLibrarySearchTimer = window.setTimeout(loadSkillLibrary, 180);
+    });
+    nodes.skillEditor.addEventListener('input', () => {
+        if (!currentLibrarySkill) return;
+        nodes.saveSkillButton.disabled = nodes.skillEditor.disabled;
+        nodes.skillEditorMessage.textContent = nodes.skillEditor.value === currentLibrarySkill.markdown
+            ? ''
+            : '有未保存的修改';
+        if (currentSkillEditorTab === 'preview') setSkillEditorTab('preview');
+    });
+    nodes.saveSkillButton.addEventListener('click', saveCurrentLibrarySkill);
+    nodes.disableSkillButton.addEventListener('click', () => changeLibrarySkillState('disable'));
+    nodes.restoreSkillButton.addEventListener('click', () => changeLibrarySkillState('restore'));
+    nodes.deleteSkillButton.addEventListener('click', () => changeLibrarySkillState('delete'));
+    nodes.permanentDeleteSkillButton.addEventListener('click', () => changeLibrarySkillState('permanent-delete'));
     nodes.jobForm.addEventListener('submit', createJob);
     nodes.urlSourceTab?.addEventListener('click', () => setSourceMode('url'));
     nodes.fileSourceTab?.addEventListener('click', () => setSourceMode('file'));
@@ -3409,8 +4707,18 @@ async function boot() {
     });
     renderUrlList();
     nodes.refreshJobsButton.addEventListener('click', refreshJobs);
+    nodes.showNonRerunFailures?.addEventListener('change', event => {
+        showNonRerunFailures = Boolean(event.target.checked);
+        renderJobList(latestJobs);
+    });
     nodes.qaForm.addEventListener('submit', askQa);
     nodes.generateSkillButton.addEventListener('click', generateSkillCandidate);
+    nodes.resumeSkillButton.addEventListener('click', resumeSkillDistillation);
+    nodes.cancelSkillButton.addEventListener('click', cancelSkillDistillation);
+    nodes.regenerateSkillOverviewButton.addEventListener('click', () => reviewSkillOverview('regenerate'));
+    nodes.confirmSkillOverviewButton.addEventListener('click', () => reviewSkillOverview('confirm'));
+    nodes.skillCandidateList.addEventListener('change', updateSkillCandidateDraft);
+    nodes.confirmSkillCandidatesButton.addEventListener('click', confirmSkillCandidates);
     nodes.enableSkillButton.addEventListener('click', enableSkillCandidate);
     nodes.startVscodeButton.addEventListener('click', () => ensureVscodeSession(false));
     nodes.restartVscodeButton.addEventListener('click', () => ensureVscodeSession(true));
@@ -3424,13 +4732,17 @@ async function boot() {
     bindVideoTimeLinks();
     bindLearningPanelToggles();
     bindPaneResizers();
+    loadSkillsFocusMode();
     await loadOptions();
     await loadPromptTemplates();
     applyIntent(activeIntent);
     setSourceMode(sourceMode);
     setView(currentView, true);
+    setResourceView(currentResourceView, currentView === 'vscode');
+    setSkillsScope(currentSkillsScope, false);
     await refreshJobs();
     if (selectedJobId) await refreshSelectedJob();
+    window.setInterval(updateSkillLiveClock, 1000);
     refreshTimer = setInterval(() => {
         if (selectedJobId) {
             refreshSelectedJob();

@@ -30,14 +30,25 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient
-from video_analyzer.config import Config, build_openai_extra_body, resolve_api_key, resolve_temperature
+from video_analyzer.config import (
+    Config,
+    build_openai_extra_body,
+    deep_merge,
+    resolve_api_key,
+    resolve_temperature,
+)
 from video_analyzer.doc_chat import ask_video_docs_result
 from video_analyzer.failures import FAILURE_FILE_ENV, read_failure_envelope
 from video_analyzer.qa_index import ANSWER_INDEX_NAME, CHUNKS_NAME, QA_DIR_NAME
-from video_analyzer.skill_candidate import (
-    build_tool_skill_candidate,
-    candidate_summary,
-    enable_tool_skill_candidate,
+from video_analyzer.skill_distillation import (
+    DEFAULT_DISTILLATION_PROFILE,
+    DistillationError,
+    SkillDistillationPipeline,
+    distillation_summary,
+    enable_distilled_skills,
+    initialize_distillation,
+    load_state as load_distillation_state,
+    save_state as save_distillation_state,
 )
 from video_analyzer.resource_locks import DEFAULT_LOCK_DIR
 from video_analyzer.url_context import (
@@ -77,6 +88,15 @@ DEFAULT_FRAME_EXTRACTOR = "jetson"
 DEFAULT_JETSON_FRAME_HOSTS = "agx,agx"
 DEFAULT_JETSON_FRAME_BACKEND = "ray"
 DEFAULT_JETSON_SAMPLE_FPS = "0.5"
+SKILL_LIBRARY_DIRS = {
+    "enabled": "skills",
+    "disabled": "skills-disabled",
+    "trash": "skills-trash",
+}
+SKILL_HISTORY_DIR = "skills-history"
+SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+SKILL_TRASH_ID_PATTERN = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[a-z0-9][a-z0-9-]{0,63}$")
+MAX_SKILL_MARKDOWN_BYTES = 1_000_000
 BAOYU_IMAGE_GENERATION_ENABLED = os.environ.get("VIDEO_LINK_ENABLE_BAOYU_IMAGES", "").strip().lower() in {"1", "true", "yes", "on"}
 CORE_ANALYSIS_ERROR_PATTERNS = (
     "Error analyzing frame",
@@ -486,6 +506,9 @@ class VideoLinkStatusServer:
         self.repo_root = repo_root
         self.runner_lock = threading.Lock()
         self.active_runners: dict[str, threading.Thread] = {}
+        self.skill_distillation_lock = threading.Lock()
+        self.active_skill_distillations: dict[str, threading.Thread] = {}
+        self.skill_distillation_cancel_events: dict[str, threading.Event] = {}
         self.vscode_sessions: dict[str, dict[str, Any]] = {}
         self.vscode_lock = threading.Lock()
         self.auto_retry_stop = threading.Event()
@@ -496,6 +519,7 @@ class VideoLinkStatusServer:
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         if auto_resume:
             self.recover_interrupted_jobs(auto_start=True)
+            self.recover_interrupted_skill_distillations()
             self.start_auto_retry_loop()
 
     def options(self) -> dict[str, Any]:
@@ -506,6 +530,7 @@ class VideoLinkStatusServer:
                 "analysis_mode": "auto",
                 "analysis_depth": "full",
                 "profile": default_profile,
+                "skill_distillation_profile": DEFAULT_DISTILLATION_PROFILE,
                 "run_name": DEFAULT_RUN_NAME,
                 "cookies_from_browser": "none",
                 "download_device": "local",
@@ -523,6 +548,7 @@ class VideoLinkStatusServer:
                 "analysis_modes": list(ALLOWED_ANALYSIS_MODES),
                 "analysis_depths": list(ALLOWED_ANALYSIS_DEPTHS),
                 "profiles": profiles,
+                "skill_distillation_profiles": runtime_profile_choices(),
                 "cookie_browsers": [item for item in ALLOWED_COOKIE_BROWSERS if item],
                 "download_devices": list(ALLOWED_DOWNLOAD_DEVICES),
             },
@@ -3039,6 +3065,7 @@ class VideoLinkStatusServer:
             "qa": qa_summary,
             "qa_index": qa_summary.get("answer_index"),
             "skill_candidate": self.skill_candidate_summary(run_dir),
+            "skill_distillation": self.skill_candidate_summary(run_dir),
             "markdown_files": sorted(str(path.relative_to(run_dir)) for path in run_dir.glob("**/*.md") if path.is_file()),
             "export_files": sorted(str(path.relative_to(run_dir)) for path in (run_dir / "exports").glob("*") if path.is_file())
             if (run_dir / "exports").is_dir()
@@ -3103,7 +3130,7 @@ class VideoLinkStatusServer:
 
     def skill_candidate_summary(self, run_dir: Path) -> dict[str, Any]:
         try:
-            return candidate_summary(run_dir)
+            return distillation_summary(run_dir)
         except Exception as exc:
             return {"available": False, "error": str(exc), "warnings": []}
 
@@ -3389,31 +3416,642 @@ class VideoLinkStatusServer:
         run_dir = self.require_run_dir(job)
         return self.skill_candidate_summary(run_dir)
 
-    def generate_skill_candidate(self, job_id: str) -> dict[str, Any]:
+    def skill_distillation_workspace(self, job_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        summary = self.skill_candidate_summary(run_dir)
+        state = load_distillation_state(run_dir) or {}
+        pack_root = run_dir / "skills" / "cangjie_pack"
+        verified = self._read_json_file(pack_root / "verified.json", default={})
+        candidates = []
+        for group in ("accepted", "single_case", "rejected", "glossary"):
+            for item in verified.get(group) or []:
+                if not isinstance(item, dict):
+                    continue
+                candidate_id = str(item.get("id") or "").strip()
+                if not candidate_id:
+                    continue
+                candidates.append(
+                    {
+                        "item_id": f"candidate:{candidate_id}",
+                        "kind": "candidate",
+                        "group": group,
+                        "id": candidate_id,
+                        "title": item.get("title") or candidate_id,
+                        "summary": item.get("summary") or "",
+                        "reason": item.get("reason") or "",
+                        "source_count": len(item.get("source_ids") or []),
+                        "evidence_level": item.get("evidence_level") or group,
+                        "selected": candidate_id in set((state.get("candidates") or {}).get("selected_ids") or []),
+                    }
+                )
+        generated = []
+        for item in (state.get("skills") or {}).get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not SKILL_NAME_PATTERN.fullmatch(name):
+                continue
+            skill_dir = pack_root / "distilled_skills" / name
+            skill_md = skill_dir / "SKILL.md"
+            if not skill_md.is_file():
+                continue
+            generated.append(
+                {
+                    "item_id": f"skill:{name}",
+                    "kind": "skill",
+                    "name": name,
+                    "title": item.get("title") or name,
+                    "candidate_id": item.get("candidate_id"),
+                    "status": item.get("status"),
+                    "pass_rate": item.get("pass_rate"),
+                    "path": str(skill_md.relative_to(run_dir)),
+                }
+            )
+        artifacts = []
+        for key, value in (state.get("artifacts") or {}).items():
+            if not value:
+                continue
+            path = run_dir / str(value)
+            artifacts.append(
+                {
+                    "name": key,
+                    "path": str(value),
+                    "available": path.exists(),
+                    "url": self._job_resource_url(job_id, str(value)) if path.is_file() else None,
+                }
+            )
+        return {
+            "job_id": job_id,
+            "run_dir": str(run_dir),
+            "summary": summary,
+            "candidates": candidates,
+            "generated_skills": generated,
+            "artifacts": artifacts,
+        }
+
+    def skill_distillation_item(self, job_id: str, item_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        pack_root = run_dir / "skills" / "cangjie_pack"
+        if item_id.startswith("candidate:"):
+            candidate_id = item_id.split(":", 1)[1]
+            verified = self._read_json_file(pack_root / "verified.json", default={})
+            candidate = None
+            group = ""
+            for candidate_group in ("accepted", "single_case", "rejected", "glossary"):
+                for item in verified.get(candidate_group) or []:
+                    if isinstance(item, dict) and str(item.get("id") or "") == candidate_id:
+                        candidate = item
+                        group = candidate_group
+                        break
+                if candidate:
+                    break
+            if not candidate:
+                raise BridgeError(HTTPStatus.NOT_FOUND, "Skill candidate is not available")
+            source_ids = set(str(value) for value in candidate.get("source_ids") or [])
+            evidence = []
+            records_path = pack_root / "evidence_records.jsonl"
+            if records_path.is_file():
+                for line in records_path.read_text(encoding="utf-8").splitlines():
+                    if not line.strip():
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if str(record.get("id") or "") in source_ids:
+                        evidence.append(record)
+            audit = candidate.get("multimodal_audit") or {}
+            frames = []
+            for path in audit.get("image_paths") or []:
+                value = str(path)
+                try:
+                    frame_path = (run_dir / value).resolve()
+                    frame_path.relative_to(run_dir)
+                except (OSError, ValueError):
+                    continue
+                if frame_path.is_file():
+                    frames.append({"path": value, "url": self._job_resource_url(job_id, value)})
+            return {
+                "item_id": item_id,
+                "kind": "candidate",
+                "group": group,
+                "candidate": candidate,
+                "evidence": evidence,
+                "multimodal_audit": audit,
+                "frames": frames,
+            }
+        if item_id.startswith("skill:"):
+            name = item_id.split(":", 1)[1]
+            self._validate_skill_name(name)
+            state = load_distillation_state(run_dir) or {}
+            state_item = next(
+                (
+                    item
+                    for item in (state.get("skills") or {}).get("items") or []
+                    if isinstance(item, dict) and item.get("name") == name
+                ),
+                None,
+            )
+            if not state_item:
+                raise BridgeError(HTTPStatus.NOT_FOUND, "Generated Skill is not in the active task state")
+            skill_dir = pack_root / "distilled_skills" / name
+            skill_md = skill_dir / "SKILL.md"
+            if not skill_md.is_file():
+                raise BridgeError(HTTPStatus.NOT_FOUND, "Generated SKILL.md is not available")
+            files = {}
+            for filename in ("skill.json", "test-prompts.json", "test-results.json", "test-results.md"):
+                path = skill_dir / filename
+                if not path.is_file():
+                    continue
+                if path.suffix == ".json":
+                    files[filename] = self._read_json_file(path, default={})
+                else:
+                    files[filename] = path.read_text(encoding="utf-8")
+            return {
+                "item_id": item_id,
+                "kind": "skill",
+                "skill": state_item,
+                "name": name,
+                "markdown": skill_md.read_text(encoding="utf-8"),
+                "revision": self._skill_revision(skill_md.read_bytes()),
+                "files": files,
+            }
+        raise BridgeError(HTTPStatus.BAD_REQUEST, "item_id must start with candidate: or skill:")
+
+    def list_skills(self, state: str = "enabled", query: str = "") -> dict[str, Any]:
+        root = self._skill_library_root(state)
+        query_value = str(query or "").strip().lower()
+        items = []
+        if root.is_dir():
+            for path in sorted(root.iterdir(), key=lambda item: item.name):
+                if not path.is_dir() or path.is_symlink():
+                    continue
+                try:
+                    detail = self._skill_library_detail(state, path.name, include_content=False)
+                except BridgeError:
+                    continue
+                haystack = " ".join(
+                    str(detail.get(key) or "") for key in ("id", "name", "title", "description")
+                ).lower()
+                if query_value and query_value not in haystack:
+                    continue
+                items.append(detail)
+        return {"state": state, "query": query_value, "count": len(items), "items": items}
+
+    def get_skill(self, state: str, skill_id: str) -> dict[str, Any]:
+        return self._skill_library_detail(state, skill_id, include_content=True)
+
+    def update_skill(self, state: str, skill_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if state not in {"enabled", "disabled"}:
+            raise BridgeError(HTTPStatus.CONFLICT, "Only enabled or disabled Skills can be edited")
+        detail = self._skill_library_detail(state, skill_id, include_content=True)
+        markdown = payload.get("markdown")
+        if not isinstance(markdown, str):
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "markdown must be a string")
+        encoded = markdown.encode("utf-8")
+        if len(encoded) > MAX_SKILL_MARKDOWN_BYTES:
+            raise BridgeError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "SKILL.md is too large")
+        expected_revision = str(payload.get("revision") or "")
+        if not expected_revision:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "revision is required")
+        if expected_revision != detail["revision"]:
+            raise BridgeError(HTTPStatus.CONFLICT, "SKILL.md changed since it was loaded")
+        metadata = self._parse_skill_frontmatter(markdown)
+        if metadata.get("name") != detail["name"]:
+            raise BridgeError(HTTPStatus.CONFLICT, "frontmatter name is immutable")
+        skill_path = Path(detail["path"]) / "SKILL.md"
+        self._snapshot_skill(detail["name"], skill_path)
+        self._atomic_write_bytes(skill_path, encoded)
+        return self._skill_library_detail(state, skill_id, include_content=True)
+
+    def disable_skill(self, name: str) -> dict[str, Any]:
+        self._validate_skill_name(name)
+        source = self._skill_library_path("enabled", name)
+        target = self._skill_library_path("disabled", name, require_existing=False)
+        self._move_skill_directory(source, target)
+        return self._skill_library_detail("disabled", name, include_content=True)
+
+    def restore_disabled_skill(self, name: str) -> dict[str, Any]:
+        self._validate_skill_name(name)
+        source = self._skill_library_path("disabled", name)
+        target = self._skill_library_path("enabled", name, require_existing=False)
+        self._move_skill_directory(source, target)
+        return self._skill_library_detail("enabled", name, include_content=True)
+
+    def delete_skill(self, state: str, skill_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if state == "trash":
+            detail = self._skill_library_detail("trash", skill_id, include_content=False)
+            confirmation = str(payload.get("confirmation") or "")
+            if confirmation != detail["name"]:
+                raise BridgeError(HTTPStatus.CONFLICT, "Permanent deletion requires the exact Skill name")
+            path = self._skill_library_path("trash", skill_id)
+            shutil.rmtree(path)
+            return {"status": "deleted", "state": "trash", "id": skill_id, "name": detail["name"]}
+        if state not in {"enabled", "disabled"}:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "state must be enabled, disabled, or trash")
+        detail = self._skill_library_detail(state, skill_id, include_content=False)
+        source = self._skill_library_path(state, skill_id)
+        timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        trash_id = f"{timestamp}-{detail['name']}"
+        target = self._skill_library_path("trash", trash_id, require_existing=False)
+        self._move_skill_directory(source, target)
+        self._atomic_write_bytes(
+            target / ".skill-trash.json",
+            json.dumps(
+                {
+                    "name": detail["name"],
+                    "previous_state": state,
+                    "deleted_at": iso_now(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ).encode("utf-8"),
+        )
+        return self._skill_library_detail("trash", trash_id, include_content=True)
+
+    def restore_trash_skill(self, skill_id: str) -> dict[str, Any]:
+        detail = self._skill_library_detail("trash", skill_id, include_content=False)
+        metadata = self._read_json_file(Path(detail["path"]) / ".skill-trash.json", default={})
+        target_state = str(metadata.get("previous_state") or "disabled")
+        if target_state not in {"enabled", "disabled"}:
+            target_state = "disabled"
+        source = self._skill_library_path("trash", skill_id)
+        target = self._skill_library_path(target_state, detail["name"], require_existing=False)
+        self._move_skill_directory(source, target)
+        metadata_path = target / ".skill-trash.json"
+        if metadata_path.is_file():
+            metadata_path.unlink()
+        return self._skill_library_detail(target_state, detail["name"], include_content=True)
+
+    def skill_versions(self, state: str, skill_id: str) -> dict[str, Any]:
+        detail = self._skill_library_detail(state, skill_id, include_content=False)
+        versions = self._skill_version_items(detail["name"])
+        return {"state": state, "id": skill_id, "name": detail["name"], "versions": versions}
+
+    def restore_skill_version(
+        self,
+        state: str,
+        skill_id: str,
+        version_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        if state not in {"enabled", "disabled"}:
+            raise BridgeError(HTTPStatus.CONFLICT, "Only enabled or disabled Skills can restore versions")
+        detail = self._skill_library_detail(state, skill_id, include_content=True)
+        expected_revision = str(payload.get("revision") or "")
+        if expected_revision != detail["revision"]:
+            raise BridgeError(HTTPStatus.CONFLICT, "SKILL.md changed since it was loaded")
+        if not re.fullmatch(r"[0-9]{8}T[0-9]{6}(?:[0-9]{6})?Z", version_id):
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "Invalid version id")
+        version_path = self.repo_root / ".codex" / SKILL_HISTORY_DIR / detail["name"] / version_id / "SKILL.md"
+        if version_path.is_symlink() or not version_path.is_file():
+            raise BridgeError(HTTPStatus.NOT_FOUND, "Skill version is not available")
+        markdown = version_path.read_text(encoding="utf-8")
+        metadata = self._parse_skill_frontmatter(markdown)
+        if metadata.get("name") != detail["name"]:
+            raise BridgeError(HTTPStatus.CONFLICT, "Version frontmatter name does not match")
+        skill_path = Path(detail["path"]) / "SKILL.md"
+        self._snapshot_skill(detail["name"], skill_path)
+        self._atomic_write_bytes(skill_path, markdown.encode("utf-8"))
+        return self._skill_library_detail(state, skill_id, include_content=True)
+
+    def _skill_library_root(self, state: str) -> Path:
+        if state not in SKILL_LIBRARY_DIRS:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "Invalid Skill library state")
+        root = self.repo_root / ".codex" / SKILL_LIBRARY_DIRS[state]
+        root.mkdir(parents=True, exist_ok=True)
+        if root.is_symlink():
+            raise BridgeError(HTTPStatus.FORBIDDEN, "Skill library root cannot be a symlink")
+        return root.resolve()
+
+    def _validate_skill_name(self, name: str) -> str:
+        value = str(name or "").strip()
+        if not SKILL_NAME_PATTERN.fullmatch(value):
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "Invalid Skill name")
+        return value
+
+    def _skill_library_path(self, state: str, skill_id: str, *, require_existing: bool = True) -> Path:
+        root = self._skill_library_root(state)
+        value = str(skill_id or "").strip()
+        pattern = SKILL_TRASH_ID_PATTERN if state == "trash" else SKILL_NAME_PATTERN
+        if not pattern.fullmatch(value):
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "Invalid Skill id")
+        path = root / value
+        if path.is_symlink():
+            raise BridgeError(HTTPStatus.FORBIDDEN, "Skill directories cannot be symlinks")
+        resolved = path.resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError as exc:
+            raise BridgeError(HTTPStatus.FORBIDDEN, "Skill path escapes the library") from exc
+        if require_existing and not resolved.is_dir():
+            raise BridgeError(HTTPStatus.NOT_FOUND, "Skill is not available")
+        return resolved
+
+    def _skill_library_detail(
+        self,
+        state: str,
+        skill_id: str,
+        *,
+        include_content: bool,
+    ) -> dict[str, Any]:
+        path = self._skill_library_path(state, skill_id)
+        skill_path = path / "SKILL.md"
+        if skill_path.is_symlink() or not skill_path.is_file():
+            raise BridgeError(HTTPStatus.NOT_FOUND, "SKILL.md is not available")
+        content = skill_path.read_text(encoding="utf-8")
+        metadata = self._parse_skill_frontmatter(content)
+        name = str(metadata.get("name") or "")
+        self._validate_skill_name(name)
+        if state != "trash" and name != skill_id:
+            raise BridgeError(HTTPStatus.CONFLICT, "Skill directory and frontmatter name do not match")
+        files = []
+        for file_path in sorted(path.rglob("*")):
+            if not file_path.is_file() or file_path.is_symlink():
+                continue
+            relative = file_path.relative_to(path).as_posix()
+            if relative == ".skill-trash.json":
+                continue
+            files.append(
+                {
+                    "path": relative,
+                    "size_bytes": file_path.stat().st_size,
+                    "editable": relative == "SKILL.md" and state in {"enabled", "disabled"},
+                }
+            )
+        title_match = re.search(r"^#\s+(.+?)\s*$", content, flags=re.MULTILINE)
+        result = {
+            "state": state,
+            "id": skill_id,
+            "name": name,
+            "title": title_match.group(1).strip() if title_match else name,
+            "description": str(metadata.get("description") or ""),
+            "path": str(path),
+            "revision": self._skill_revision(content.encode("utf-8")),
+            "updated_at": datetime.fromtimestamp(skill_path.stat().st_mtime).astimezone().isoformat(),
+            "files": files,
+            "versions": self._skill_version_items(name),
+        }
+        if include_content:
+            result["markdown"] = content
+            result["auxiliary_files"] = self._read_auxiliary_skill_files(path)
+        return result
+
+    def _parse_skill_frontmatter(self, content: str) -> dict[str, str]:
+        lines = str(content or "").splitlines()
+        if not lines or lines[0].strip() != "---":
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "SKILL.md must start with frontmatter")
+        try:
+            end = next(index for index in range(1, len(lines)) if lines[index].strip() == "---")
+        except StopIteration as exc:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "SKILL.md frontmatter is not closed") from exc
+        metadata: dict[str, str] = {}
+        for line in lines[1:end]:
+            if not line.strip() or line.lstrip().startswith("#") or ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            key = key.strip()
+            if key not in {"name", "description"}:
+                continue
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+                value = value[1:-1]
+            metadata[key] = value
+        if not metadata.get("name"):
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "SKILL.md frontmatter requires name")
+        return metadata
+
+    def _read_auxiliary_skill_files(self, root: Path) -> list[dict[str, Any]]:
+        items = []
+        for path in sorted(root.rglob("*")):
+            if not path.is_file() or path.is_symlink():
+                continue
+            relative = path.relative_to(root).as_posix()
+            if relative in {"SKILL.md", ".skill-trash.json"}:
+                continue
+            size = path.stat().st_size
+            item = {"path": relative, "size_bytes": size, "content": None}
+            if size <= 200_000:
+                try:
+                    item["content"] = path.read_text(encoding="utf-8")
+                except (UnicodeDecodeError, OSError):
+                    pass
+            items.append(item)
+        return items
+
+    def _skill_version_items(self, name: str) -> list[dict[str, Any]]:
+        root = self.repo_root / ".codex" / SKILL_HISTORY_DIR / name
+        if not root.is_dir() or root.is_symlink():
+            return []
+        versions = []
+        for path in sorted(root.iterdir(), key=lambda item: item.name, reverse=True):
+            skill_path = path / "SKILL.md"
+            if not path.is_dir() or path.is_symlink() or skill_path.is_symlink() or not skill_path.is_file():
+                continue
+            versions.append(
+                {
+                    "id": path.name,
+                    "revision": self._skill_revision(skill_path.read_bytes()),
+                    "created_at": datetime.fromtimestamp(skill_path.stat().st_mtime).astimezone().isoformat(),
+                }
+            )
+        return versions
+
+    def _snapshot_skill(self, name: str, skill_path: Path) -> str:
+        timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
+        target = self.repo_root / ".codex" / SKILL_HISTORY_DIR / name / timestamp / "SKILL.md"
+        target.parent.mkdir(parents=True, exist_ok=False)
+        self._atomic_write_bytes(target, skill_path.read_bytes())
+        return timestamp
+
+    def _move_skill_directory(self, source: Path, target: Path) -> None:
+        if target.exists():
+            raise BridgeError(HTTPStatus.CONFLICT, f"Target Skill already exists: {target.name}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source), str(target))
+
+    def _atomic_write_bytes(self, path: Path, content: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, path)
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
+
+    @staticmethod
+    def _skill_revision(content: bytes) -> str:
+        return hashlib.sha256(content).hexdigest()
+
+    @staticmethod
+    def _read_json_file(path: Path, *, default: Any) -> Any:
+        if not path.is_file():
+            return default
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return default
+
+    @staticmethod
+    def _job_resource_url(job_id: str, relative_path: str) -> str:
+        return f"/api/video-link/jobs/{job_id}/resource?{urlencode({'path': relative_path})}"
+
+    def start_skill_distillation(self, job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        profile = str(payload.get("profile") or DEFAULT_DISTILLATION_PROFILE).strip()
+        if profile not in runtime_profile_names():
+            raise BridgeError(HTTPStatus.BAD_REQUEST, f"profile must be one of {runtime_profile_names()}")
+        force = parse_bool(payload.get("force", False))
+        try:
+            initialize_distillation(run_dir, profile_name=profile, force=force)
+        except FileNotFoundError as exc:
+            raise BridgeError(HTTPStatus.CONFLICT, str(exc)) from exc
+        except FileExistsError as exc:
+            raise BridgeError(HTTPStatus.CONFLICT, str(exc)) from exc
+        except (DistillationError, ValueError) as exc:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+        self.start_skill_distillation_runner(job_id)
+        return self.skill_candidate_summary(run_dir)
+
+    def review_skill_distillation_overview(self, job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         job = self.load_job(job_id)
         run_dir = self.require_run_dir(job)
         try:
-            summary = build_tool_skill_candidate(run_dir)
+            pipeline = SkillDistillationPipeline(run_dir)
+            pipeline.review_overview(
+                str(payload.get("action") or "confirm"),
+                str(payload.get("feedback") or ""),
+            )
+        except (DistillationError, ValueError) as exc:
+            raise BridgeError(HTTPStatus.CONFLICT, str(exc)) from exc
+        self.start_skill_distillation_runner(job_id)
+        return self.skill_candidate_summary(run_dir)
+
+    def review_skill_distillation_candidates(self, job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        selected_ids = payload.get("selected_ids")
+        if not isinstance(selected_ids, list):
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "selected_ids must be a list")
+        try:
+            pipeline = SkillDistillationPipeline(run_dir)
+            pipeline.review_candidates(selected_ids)
+        except ValueError as exc:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+        except DistillationError as exc:
+            raise BridgeError(HTTPStatus.CONFLICT, str(exc)) from exc
+        self.start_skill_distillation_runner(job_id)
+        return self.skill_candidate_summary(run_dir)
+
+    def resume_skill_distillation(self, job_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        state = load_distillation_state(run_dir)
+        if not state:
+            raise BridgeError(HTTPStatus.NOT_FOUND, "Skill distillation is not initialized")
+        if state.get("status") in {"waiting_overview_review", "waiting_candidate_review"}:
+            raise BridgeError(HTTPStatus.CONFLICT, "Skill distillation is waiting for review")
+        if state.get("status") in {"succeeded", "completed_no_skills"}:
+            return self.skill_candidate_summary(run_dir)
+        self.start_skill_distillation_runner(job_id)
+        return self.skill_candidate_summary(run_dir)
+
+    def cancel_skill_distillation(self, job_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        with self.skill_distillation_lock:
+            event = self.skill_distillation_cancel_events.get(job_id)
+            thread = self.active_skill_distillations.get(job_id)
+            if event:
+                event.set()
+        state = load_distillation_state(run_dir)
+        if state and not thread:
+            state["status"] = "cancelled"
+            state["retryable"] = True
+            state["error"] = "distillation cancelled"
+            state["updated_at"] = iso_now()
+            save_distillation_state(run_dir, state)
+        return self.skill_candidate_summary(run_dir)
+
+    def enable_skill_distillation(self, job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        overwrite = parse_bool(payload.get("overwrite", False))
+        try:
+            summary = enable_distilled_skills(run_dir, self.repo_root, overwrite=overwrite)
         except FileNotFoundError as exc:
+            raise BridgeError(HTTPStatus.NOT_FOUND, str(exc)) from exc
+        except FileExistsError as exc:
+            conflicts = getattr(exc, "conflicts", [])
+            message = str(exc)
+            if conflicts:
+                message = f"{message}: {', '.join(conflicts)}"
+            raise BridgeError(HTTPStatus.CONFLICT, message) from exc
+        except ValueError as exc:
             raise BridgeError(HTTPStatus.CONFLICT, str(exc)) from exc
         job["summary"] = self.collect_summary(job)
         job["updated_at"] = iso_now()
         self.save_job(job)
         return summary
 
-    def enable_skill_candidate(self, job_id: str) -> dict[str, Any]:
-        job = self.load_job(job_id)
-        run_dir = self.require_run_dir(job)
+    def start_skill_distillation_runner(self, job_id: str) -> None:
+        with self.skill_distillation_lock:
+            existing = self.active_skill_distillations.get(job_id)
+            if existing and existing.is_alive():
+                raise BridgeError(HTTPStatus.CONFLICT, "Skill distillation is already running")
+            cancel_event = threading.Event()
+            thread = threading.Thread(
+                target=self._run_skill_distillation,
+                args=(job_id, cancel_event),
+                name=f"skill-distillation-{job_id[:8]}",
+                daemon=True,
+            )
+            self.skill_distillation_cancel_events[job_id] = cancel_event
+            self.active_skill_distillations[job_id] = thread
+            thread.start()
+
+    def _run_skill_distillation(self, job_id: str, cancel_event: threading.Event) -> None:
         try:
-            summary = enable_tool_skill_candidate(run_dir, self.repo_root)
-        except FileNotFoundError as exc:
-            raise BridgeError(HTTPStatus.NOT_FOUND, str(exc)) from exc
-        except (FileExistsError, ValueError) as exc:
-            raise BridgeError(HTTPStatus.CONFLICT, str(exc)) from exc
-        job["summary"] = self.collect_summary(job)
-        job["updated_at"] = iso_now()
-        self.save_job(job)
-        return summary
+            job = self.load_job(job_id)
+            run_dir = self.require_run_dir(job)
+            SkillDistillationPipeline(run_dir).run_until_pause(cancel_event=cancel_event)
+            job = self.load_job(job_id)
+            job["summary"] = self.collect_summary(job)
+            job["updated_at"] = iso_now()
+            self.save_job(job)
+        except Exception:
+            # The pipeline persists its own failure envelope and log.
+            pass
+        finally:
+            with self.skill_distillation_lock:
+                self.active_skill_distillations.pop(job_id, None)
+                self.skill_distillation_cancel_events.pop(job_id, None)
+
+    def recover_interrupted_skill_distillations(self) -> None:
+        for job_path in self.jobs_dir.glob("*/job.json"):
+            try:
+                job = self.load_job(job_path.parent.name)
+                run_dir_value = str(job.get("run_dir") or "")
+                if not run_dir_value:
+                    continue
+                state = load_distillation_state(Path(run_dir_value))
+                if state and state.get("status") == "running":
+                    SkillDistillationPipeline(Path(run_dir_value)).mark_interrupted()
+            except Exception:
+                continue
+
+    def generate_skill_candidate(self, job_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self.start_skill_distillation(job_id, payload or {})
+
+    def enable_skill_candidate(self, job_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self.enable_skill_distillation(job_id, payload or {})
 
     def ask_qa(self, job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         job = self.load_job(job_id)
@@ -5925,13 +6563,37 @@ def runtime_config() -> dict[str, Any]:
             merged["active_runtime_profile"] = data["active_runtime_profile"]
         profiles = data.get("runtime_profiles")
         if isinstance(profiles, dict):
-            merged.setdefault("runtime_profiles", {}).update(profiles)
+            merged["runtime_profiles"] = deep_merge(
+                merged.get("runtime_profiles") or {},
+                profiles,
+            )
     return merged
 
 
 def runtime_profile_names() -> list[str]:
     profiles = runtime_config().get("runtime_profiles") or {}
     return sorted(profiles)
+
+
+def runtime_profile_choices() -> list[dict[str, Any]]:
+    profiles = runtime_config().get("runtime_profiles") or {}
+    choices = []
+    for name in sorted(profiles):
+        profile = profiles.get(name) or {}
+        text_model = str(profile.get("text_model") or "")
+        review_model = str(profile.get("review_model") or text_model)
+        label = f"{name} · {text_model}"
+        if review_model and review_model != text_model:
+            label += f" / {review_model}"
+        choices.append(
+            {
+                "value": name,
+                "label": label,
+                "text_model": text_model,
+                "review_model": review_model,
+            }
+        )
+    return choices
 
 
 def active_runtime_profile(profiles: list[str]) -> str:
@@ -6677,6 +7339,44 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             if match:
                 self.write_json(self.server_app.skill_candidate(match.group(1)))
                 return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/skill-distillation", path)
+            if match:
+                self.write_json(self.server_app.skill_candidate(match.group(1)))
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/skill-distillation/workspace", path)
+            if match:
+                self.write_json(self.server_app.skill_distillation_workspace(match.group(1)))
+                return
+            match = re.fullmatch(
+                r"/api/video-link/jobs/([a-f0-9]{32})/skill-distillation/items/(.+)",
+                path,
+            )
+            if match:
+                self.write_json(
+                    self.server_app.skill_distillation_item(match.group(1), unquote(match.group(2)))
+                )
+                return
+            if path == "/api/skills":
+                query = parse_qs(parsed.query)
+                self.write_json(
+                    self.server_app.list_skills(
+                        query.get("state", ["enabled"])[0],
+                        query.get("query", [""])[0],
+                    )
+                )
+                return
+            match = re.fullmatch(r"/api/skills/(enabled|disabled|trash)/([^/]+)/versions", path)
+            if match:
+                self.write_json(
+                    self.server_app.skill_versions(match.group(1), unquote(match.group(2)))
+                )
+                return
+            match = re.fullmatch(r"/api/skills/(enabled|disabled|trash)/([^/]+)", path)
+            if match:
+                self.write_json(
+                    self.server_app.get_skill(match.group(1), unquote(match.group(2)))
+                )
+                return
             match = re.fullmatch(r"/video-link/jobs/([a-f0-9]{32})", path)
             if match:
                 self.write_redirect(f"/?job={match.group(1)}")
@@ -6739,11 +7439,85 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
                 return
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/skill-candidate/generate", path)
             if match:
-                self.write_json(self.server_app.generate_skill_candidate(match.group(1)))
+                self.write_json(
+                    self.server_app.generate_skill_candidate(match.group(1), payload),
+                    HTTPStatus.ACCEPTED,
+                )
                 return
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/skill-candidate/enable", path)
             if match:
-                self.write_json(self.server_app.enable_skill_candidate(match.group(1)))
+                self.write_json(self.server_app.enable_skill_candidate(match.group(1), payload))
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/skill-distillation/start", path)
+            if match:
+                self.write_json(
+                    self.server_app.start_skill_distillation(match.group(1), payload),
+                    HTTPStatus.ACCEPTED,
+                )
+                return
+            match = re.fullmatch(
+                r"/api/video-link/jobs/([a-f0-9]{32})/skill-distillation/review-overview",
+                path,
+            )
+            if match:
+                self.write_json(
+                    self.server_app.review_skill_distillation_overview(match.group(1), payload),
+                    HTTPStatus.ACCEPTED,
+                )
+                return
+            match = re.fullmatch(
+                r"/api/video-link/jobs/([a-f0-9]{32})/skill-distillation/review-candidates",
+                path,
+            )
+            if match:
+                self.write_json(
+                    self.server_app.review_skill_distillation_candidates(match.group(1), payload),
+                    HTTPStatus.ACCEPTED,
+                )
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/skill-distillation/resume", path)
+            if match:
+                self.write_json(
+                    self.server_app.resume_skill_distillation(match.group(1)),
+                    HTTPStatus.ACCEPTED,
+                )
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/skill-distillation/cancel", path)
+            if match:
+                self.write_json(
+                    self.server_app.cancel_skill_distillation(match.group(1)),
+                    HTTPStatus.ACCEPTED,
+                )
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/skill-distillation/enable", path)
+            if match:
+                self.write_json(self.server_app.enable_skill_distillation(match.group(1), payload))
+                return
+            match = re.fullmatch(r"/api/skills/enabled/([^/]+)/disable", path)
+            if match:
+                self.write_json(self.server_app.disable_skill(unquote(match.group(1))))
+                return
+            match = re.fullmatch(r"/api/skills/disabled/([^/]+)/restore", path)
+            if match:
+                self.write_json(self.server_app.restore_disabled_skill(unquote(match.group(1))))
+                return
+            match = re.fullmatch(r"/api/skills/trash/([^/]+)/restore", path)
+            if match:
+                self.write_json(self.server_app.restore_trash_skill(unquote(match.group(1))))
+                return
+            match = re.fullmatch(
+                r"/api/skills/(enabled|disabled)/([^/]+)/versions/([^/]+)/restore",
+                path,
+            )
+            if match:
+                self.write_json(
+                    self.server_app.restore_skill_version(
+                        match.group(1),
+                        unquote(match.group(2)),
+                        unquote(match.group(3)),
+                        payload,
+                    )
+                )
                 return
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/stages/([a-z0-9-]+)", path)
             if match:
@@ -6760,6 +7534,7 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:
         try:
             path = urlparse(self.path).path
+            payload = self.read_json_body()
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})", path)
             if match:
                 self.write_json(self.server_app.delete_job(match.group(1)))
@@ -6767,6 +7542,34 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/vscode-session", path)
             if match:
                 self.write_json(self.server_app.stop_vscode_session(match.group(1)))
+                return
+            match = re.fullmatch(r"/api/skills/(enabled|disabled|trash)/([^/]+)", path)
+            if match:
+                self.write_json(
+                    self.server_app.delete_skill(
+                        match.group(1),
+                        unquote(match.group(2)),
+                        payload,
+                    )
+                )
+                return
+            raise BridgeError(HTTPStatus.NOT_FOUND, "not found")
+        except BridgeError as exc:
+            self.write_json({"error": exc.message}, exc.status)
+
+    def do_PUT(self) -> None:
+        try:
+            path = urlparse(self.path).path
+            payload = self.read_json_body()
+            match = re.fullmatch(r"/api/skills/(enabled|disabled)/([^/]+)", path)
+            if match:
+                self.write_json(
+                    self.server_app.update_skill(
+                        match.group(1),
+                        unquote(match.group(2)),
+                        payload,
+                    )
+                )
                 return
             raise BridgeError(HTTPStatus.NOT_FOUND, "not found")
         except BridgeError as exc:

@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 from video_analyzer import cli as cli_mod
 from video_analyzer import douyin_browser as douyin_browser_mod
+from video_analyzer import skill_distillation as skill_distill
 from video_analyzer.frame import Frame
 from video_analyzer.frame_manifest import write_frame_manifest
 
@@ -34,6 +35,7 @@ def load_module(path: Path, name: str):
 
 server_mod = load_module(SERVER_PATH, "video_link_status_server")
 url_context_mod = load_module(URL_CONTEXT_PATH, "video_analyzer_url_context")
+REAL_RUNTIME_CONFIG = server_mod.runtime_config
 
 
 class VideoLinkStatusServerTests(unittest.TestCase):
@@ -65,6 +67,46 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             self.assertIn("重点关注 CLI 参数", text)
             self.assertIn("不能覆盖视频", text)
             self.assertEqual((focused.parent / "user_focus_prompt.md").read_text(encoding="utf-8"), "重点关注 CLI 参数\n")
+
+    def test_runtime_config_deep_merges_partial_profile_overrides(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "video_analyzer" / "config").mkdir(parents=True)
+            (root / "config").mkdir()
+            (root / "video_analyzer" / "config" / "default_config.json").write_text(
+                json.dumps(
+                    {
+                        "active_runtime_profile": "deepseek_v4_pro",
+                        "runtime_profiles": {
+                            "deepseek_v4_pro": {
+                                "text_model": "deepseek-v4-pro",
+                                "review_model": "deepseek-v4-pro",
+                                "ocr_concurrency": 5,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / "config" / "config.json").write_text(
+                json.dumps(
+                    {
+                        "runtime_profiles": {
+                            "deepseek_v4_pro": {
+                                "ocr_concurrency": 6,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(server_mod, "REPO_ROOT", root):
+                merged = REAL_RUNTIME_CONFIG()
+
+        profile = merged["runtime_profiles"]["deepseek_v4_pro"]
+        self.assertEqual(profile["text_model"], "deepseek-v4-pro")
+        self.assertEqual(profile["review_model"], "deepseek-v4-pro")
+        self.assertEqual(profile["ocr_concurrency"], 6)
 
     def test_ytdlp_runtime_args_forward_extractor_args(self):
         args = type(
@@ -1636,6 +1678,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             loaded = server.load_job(job["job_id"])
             run_dir = Path(tmp) / "run"
             run_dir.mkdir()
+            (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
             loaded["run_dir"] = str(run_dir)
 
             command = server.final_publish_command(loaded)
@@ -1650,6 +1693,54 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(command[command.index("--profile") + 1], "deepseek_v4_flash")
         self.assertIn("--skip-images", command)
 
+    def test_final_publish_stage_reports_quality_failed_manual(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            quality_failed = run_dir / "operation_manual.quality_failed.md"
+            quality_failed.write_text("# Review artifact\n", encoding="utf-8")
+            loaded["run_dir"] = str(run_dir)
+
+            with self.assertRaises(server_mod.BridgeError) as caught:
+                server.final_publish_command(loaded)
+
+        self.assertEqual(caught.exception.status, server_mod.HTTPStatus.CONFLICT)
+        self.assertIn("failed quality gate", caught.exception.message)
+        self.assertIn(str(quality_failed), caught.exception.message)
+
+    def test_final_publish_updates_operation_manual_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            manual_path = run_dir / "operation_manual.md"
+            manual_path.write_text("# Manual\n", encoding="utf-8")
+            loaded["run_dir"] = str(run_dir)
+            loaded["artifacts"]["operation_manual"] = {
+                "value": str(run_dir / "operation_manual.quality_failed.md"),
+                "module": "analyze-core",
+                "updated_at": "old",
+            }
+            warning = {"message": "operation manual failed quality gate; review artifact: old"}
+            loaded["warnings"] = [warning]
+            loaded["stages"] = {
+                "analyze-core": {"artifacts": {"warnings": [warning]}},
+                "verify-core": {"artifacts": {"warnings": [warning]}},
+            }
+
+            server.update_job_artifacts(loaded, "final-publish", {})
+
+        self.assertEqual(loaded["artifacts"]["operation_manual"]["value"], str(manual_path))
+        self.assertEqual(loaded["artifacts"]["operation_manual"]["module"], "final-publish")
+        self.assertEqual(loaded["warnings"], [])
+        self.assertEqual(loaded["stages"]["analyze-core"]["artifacts"]["warnings"], [])
+        self.assertEqual(loaded["stages"]["verify-core"]["artifacts"]["warnings"], [])
+
     def test_final_publish_stage_respects_skip_images_option(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
@@ -1657,6 +1748,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             loaded = server.load_job(job["job_id"])
             run_dir = Path(tmp) / "run"
             run_dir.mkdir()
+            (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
             loaded["run_dir"] = str(run_dir)
 
             command = server.final_publish_command(loaded)
@@ -1736,6 +1828,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             loaded = server.load_job(job["job_id"])
             run_dir = Path(tmp) / "run"
             run_dir.mkdir()
+            (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
             loaded["run_dir"] = str(run_dir)
 
             command = server.final_publish_command(loaded)
@@ -1749,6 +1842,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             loaded = server.load_job(job["job_id"])
             run_dir = Path(tmp) / "run"
             run_dir.mkdir()
+            (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
             loaded["run_dir"] = str(run_dir)
 
             command = server.final_publish_command(loaded)
@@ -2254,6 +2348,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             loaded = server.load_job(job["job_id"])
             run_dir = Path(tmp) / "run"
             run_dir.mkdir()
+            (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
             loaded["run_dir"] = str(run_dir)
 
             command = server.final_publish_command(loaded)
@@ -2436,33 +2531,182 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             run_dir = Path(tmp) / "run"
             repo_root.mkdir()
             run_dir.mkdir()
-            (run_dir / "operation_manual.md").write_text("# Demo Tool Setup\n\n1. 填写 API Token。\n", encoding="utf-8")
-            (run_dir / "manual_evidence.md").write_text("# Evidence\n\nframe_001 显示 API Token 输入框。\n", encoding="utf-8")
-            (run_dir / "transcript.md").write_text("- [00:00:01 - 00:00:05] 填写 API Token。\n", encoding="utf-8")
-            (run_dir / "study_guide.json").write_text(
-                json.dumps(
-                    {
-                        "title": "Demo Tool Setup",
-                        "overview": {"summary": "配置 Demo Tool 的 API Token。"},
-                        "chapters": [{"index": 1, "title": "填写 Token", "summary": "在设置页填写 API Token。"}],
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
             server = server_mod.VideoLinkStatusServer(jobs_dir, repo_root)
             job = server.create_job({"video_url": "https://example.com/video"})
             loaded = server.load_job(job["job_id"])
             loaded["run_dir"] = str(run_dir)
             server.save_job(loaded)
 
-            generated = server.generate_skill_candidate(job["job_id"])
+            def initialize(path, profile_name, force):
+                write_skill_distillation_state(path, status="ready")
+                return skill_distill.load_state(path)
+
+            with (
+                patch.object(server_mod, "initialize_distillation", side_effect=initialize) as init,
+                patch.object(server, "start_skill_distillation_runner") as start,
+            ):
+                generated = server.generate_skill_candidate(job["job_id"])
+
+            self.assertEqual(generated["profile"], "deepseek_v4_pro")
+            init.assert_called_once_with(
+                run_dir.resolve(),
+                profile_name="deepseek_v4_pro",
+                force=False,
+            )
+            start.assert_called_once_with(job["job_id"])
+
+            write_completed_skill_pack(run_dir)
             enabled = server.enable_skill_candidate(job["job_id"])
 
-            self.assertTrue(generated["available"])
-            self.assertEqual(generated["status"], "needs_review")
+            self.assertEqual(enabled["status"], "succeeded")
             self.assertTrue(enabled["enabled"])
-            self.assertTrue((repo_root / ".codex" / "skills" / enabled["skill_name"] / "SKILL.md").is_file())
+            self.assertTrue(
+                (repo_root / ".codex" / "skills" / "define-done-criteria" / "SKILL.md").is_file()
+            )
+
+    def test_skill_library_lifecycle_and_version_conflicts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            skill_dir = repo_root / ".codex" / "skills" / "demo-skill"
+            skill_dir.mkdir(parents=True)
+            skill_dir.joinpath("SKILL.md").write_text(
+                "---\nname: demo-skill\ndescription: Demo skill\n---\n\n# Demo Skill\n",
+                encoding="utf-8",
+            )
+            skill_dir.joinpath("notes.txt").write_text("read only", encoding="utf-8")
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", repo_root)
+
+            listed = server.list_skills("enabled")
+            original = server.get_skill("enabled", "demo-skill")
+            updated = server.update_skill(
+                "enabled",
+                "demo-skill",
+                {
+                    "revision": original["revision"],
+                    "markdown": original["markdown"] + "\nUpdated.\n",
+                },
+            )
+
+            self.assertEqual(listed["count"], 1)
+            self.assertEqual(updated["name"], "demo-skill")
+            self.assertEqual(len(updated["versions"]), 1)
+            self.assertEqual(updated["auxiliary_files"][0]["path"], "notes.txt")
+            with self.assertRaises(server_mod.BridgeError) as stale:
+                server.update_skill(
+                    "enabled",
+                    "demo-skill",
+                    {
+                        "revision": original["revision"],
+                        "markdown": updated["markdown"] + "\nStale.\n",
+                    },
+                )
+            self.assertEqual(stale.exception.status, server_mod.HTTPStatus.CONFLICT)
+            with self.assertRaises(server_mod.BridgeError) as renamed:
+                server.update_skill(
+                    "enabled",
+                    "demo-skill",
+                    {
+                        "revision": updated["revision"],
+                        "markdown": updated["markdown"].replace(
+                            "name: demo-skill",
+                            "name: renamed-skill",
+                        ),
+                    },
+                )
+            self.assertEqual(renamed.exception.status, server_mod.HTTPStatus.CONFLICT)
+
+            disabled = server.disable_skill("demo-skill")
+            restored = server.restore_disabled_skill("demo-skill")
+            trashed = server.delete_skill("enabled", "demo-skill", {})
+            restored_from_trash = server.restore_trash_skill(trashed["id"])
+            trashed_again = server.delete_skill("enabled", "demo-skill", {})
+
+            self.assertEqual(disabled["state"], "disabled")
+            self.assertEqual(restored["state"], "enabled")
+            self.assertEqual(restored_from_trash["state"], "enabled")
+            with self.assertRaises(server_mod.BridgeError):
+                server.delete_skill(
+                    "trash",
+                    trashed_again["id"],
+                    {"confirmation": "wrong-name"},
+                )
+            deleted = server.delete_skill(
+                "trash",
+                trashed_again["id"],
+                {"confirmation": "demo-skill"},
+            )
+            self.assertEqual(deleted["status"], "deleted")
+
+    def test_skill_distillation_workspace_uses_active_state_items(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            jobs_dir = Path(tmp) / "jobs"
+            run_dir = Path(tmp) / "run"
+            repo_root.mkdir()
+            run_dir.mkdir()
+            server = server_mod.VideoLinkStatusServer(jobs_dir, repo_root)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            loaded["run_dir"] = str(run_dir)
+            server.save_job(loaded)
+            write_completed_skill_pack(run_dir)
+            pack_root = skill_distill.pack_dir(run_dir)
+            pack_root.joinpath("verified.json").write_text(
+                json.dumps(
+                    {
+                        "accepted": [],
+                        "single_case": [
+                            {
+                                "id": "p001",
+                                "title": "Candidate",
+                                "summary": "Candidate summary",
+                                "source_ids": ["transcript:0001"],
+                                "multimodal_audit": {
+                                    "claim_supported": True,
+                                    "image_paths": ["manual_assets/frame_001.jpg"],
+                                },
+                            }
+                        ],
+                        "rejected": [],
+                        "glossary": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            pack_root.joinpath("evidence_records.jsonl").write_text(
+                json.dumps(
+                    {
+                        "id": "transcript:0001",
+                        "kind": "transcript",
+                        "text": "Evidence text",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            frame = run_dir / "manual_assets" / "frame_001.jpg"
+            frame.parent.mkdir()
+            frame.write_bytes(b"jpg")
+            stale_dir = pack_root / "distilled_skills" / "stale-skill"
+            stale_dir.mkdir()
+            stale_dir.joinpath("SKILL.md").write_text(
+                "---\nname: stale-skill\ndescription: stale\n---\n",
+                encoding="utf-8",
+            )
+
+            workspace = server.skill_distillation_workspace(job["job_id"])
+            candidate = server.skill_distillation_item(job["job_id"], "candidate:p001")
+            generated = server.skill_distillation_item(
+                job["job_id"],
+                "skill:define-done-criteria",
+            )
+
+            self.assertEqual(len(workspace["generated_skills"]), 1)
+            self.assertEqual(workspace["generated_skills"][0]["name"], "define-done-criteria")
+            self.assertEqual(len(workspace["candidates"]), 1)
+            self.assertEqual(len(candidate["evidence"]), 1)
+            self.assertEqual(len(candidate["frames"]), 1)
+            self.assertIn("# Test", generated["markdown"])
 
     def test_backfilled_qa_index_on_completed_job_keeps_job_succeeded(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3727,6 +3971,51 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertIn("copyText", html)
         self.assertIn('document.execCommand("copy")', html)
         self.assertIn("查看日志", html)
+
+
+def write_skill_distillation_state(run_dir: Path, *, status: str) -> None:
+    state = {
+        "version": 1,
+        "method": skill_distill.METHOD_NAME,
+        "run_dir": str(run_dir),
+        "status": status,
+        "current_stage": "source" if status == "ready" else None,
+        "profile": "deepseek_v4_pro",
+        "generation_model": "deepseek-v4-pro",
+        "review_model": "deepseek-v4-pro",
+        "created_at": skill_distill.utc_now(),
+        "updated_at": skill_distill.utc_now(),
+        "stages": {name: {"status": "pending"} for name in skill_distill.PIPELINE_STAGES},
+        "warnings": [],
+        "overview": {"reviewed": False},
+        "candidates": {"reviewed": False, "selected_ids": []},
+        "skills": {"count": 0, "passed": 0, "failed": 0, "items": []},
+        "installed": {"paths": []},
+        "artifacts": {},
+    }
+    skill_distill.save_state(run_dir, state)
+
+
+def write_completed_skill_pack(run_dir: Path) -> None:
+    write_skill_distillation_state(run_dir, status="succeeded")
+    root = skill_distill.pack_dir(run_dir)
+    skill_dir = root / "distilled_skills" / "define-done-criteria"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: define-done-criteria\ndescription: test\n---\n\n# Test\n",
+        encoding="utf-8",
+    )
+    state = skill_distill.load_state(run_dir)
+    state["skills"] = {
+        "count": 1,
+        "passed": 1,
+        "failed": 0,
+        "items": [{"name": "define-done-criteria", "status": "passed"}],
+    }
+    state["stages"] = {
+        name: {"status": "succeeded"} for name in skill_distill.PIPELINE_STAGES
+    }
+    skill_distill.save_state(run_dir, state)
 
 
 if __name__ == "__main__":

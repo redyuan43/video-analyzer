@@ -81,6 +81,7 @@ class VideoAnalyzerUI:
             if not request.path.startswith(
                 (
                     '/api/video-link/',
+                    '/api/skills',
                     '/api/mobile/audio-jobs',
                     '/api/mobile/audio-transcriptions',
                 )
@@ -518,17 +519,204 @@ class VideoAnalyzerUI:
             except BridgeError as exc:
                 return jsonify({'error': exc.message}), int(exc.status)
 
+        @self.app.route('/api/video-link/jobs/<job_id>/skill-distillation')
+        def video_link_skill_distillation(job_id):
+            try:
+                return jsonify(self.video_link.skill_candidate(job_id))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>/skill-distillation/workspace')
+        def video_link_skill_distillation_workspace(job_id):
+            try:
+                return jsonify(self.video_link.skill_distillation_workspace(job_id))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>/skill-distillation/items/<path:item_id>')
+        def video_link_skill_distillation_item(job_id, item_id):
+            try:
+                return jsonify(self.video_link.skill_distillation_item(job_id, item_id))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>/skill-distillation/start', methods=['POST'])
+        def video_link_start_skill_distillation(job_id):
+            try:
+                return jsonify(
+                    self.video_link.start_skill_distillation(
+                        job_id,
+                        request.get_json(silent=True) or {},
+                    )
+                ), int(HTTPStatus.ACCEPTED)
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>/skill-distillation/review-overview', methods=['POST'])
+        def video_link_review_skill_overview(job_id):
+            try:
+                return jsonify(
+                    self.video_link.review_skill_distillation_overview(
+                        job_id,
+                        request.get_json(silent=True) or {},
+                    )
+                ), int(HTTPStatus.ACCEPTED)
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>/skill-distillation/review-candidates', methods=['POST'])
+        def video_link_review_skill_candidates(job_id):
+            try:
+                return jsonify(
+                    self.video_link.review_skill_distillation_candidates(
+                        job_id,
+                        request.get_json(silent=True) or {},
+                    )
+                ), int(HTTPStatus.ACCEPTED)
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>/skill-distillation/resume', methods=['POST'])
+        def video_link_resume_skill_distillation(job_id):
+            try:
+                return jsonify(
+                    self.video_link.resume_skill_distillation(job_id)
+                ), int(HTTPStatus.ACCEPTED)
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>/skill-distillation/cancel', methods=['POST'])
+        def video_link_cancel_skill_distillation(job_id):
+            try:
+                return jsonify(
+                    self.video_link.cancel_skill_distillation(job_id)
+                ), int(HTTPStatus.ACCEPTED)
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>/skill-distillation/enable', methods=['POST'])
+        def video_link_enable_skill_distillation(job_id):
+            try:
+                return jsonify(
+                    self.video_link.enable_skill_distillation(
+                        job_id,
+                        request.get_json(silent=True) or {},
+                    )
+                )
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
         @self.app.route('/api/video-link/jobs/<job_id>/skill-candidate/generate', methods=['POST'])
         def video_link_generate_skill_candidate(job_id):
             try:
-                return jsonify(self.video_link.generate_skill_candidate(job_id))
+                return jsonify(
+                    self.video_link.generate_skill_candidate(
+                        job_id,
+                        request.get_json(silent=True) or {},
+                    )
+                ), int(HTTPStatus.ACCEPTED)
             except BridgeError as exc:
                 return jsonify({'error': exc.message}), int(exc.status)
 
         @self.app.route('/api/video-link/jobs/<job_id>/skill-candidate/enable', methods=['POST'])
         def video_link_enable_skill_candidate(job_id):
             try:
-                return jsonify(self.video_link.enable_skill_candidate(job_id))
+                return jsonify(
+                    self.video_link.enable_skill_candidate(
+                        job_id,
+                        request.get_json(silent=True) or {},
+                    )
+                )
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/skills')
+        def skills_list():
+            try:
+                return jsonify(
+                    self.video_link.list_skills(
+                        request.args.get('state', 'enabled'),
+                        request.args.get('query', ''),
+                    )
+                )
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/skills/<state>/<skill_id>')
+        def skills_detail(state, skill_id):
+            try:
+                return jsonify(self.video_link.get_skill(state, skill_id))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/skills/<state>/<skill_id>', methods=['PUT'])
+        def skills_update(state, skill_id):
+            try:
+                return jsonify(
+                    self.video_link.update_skill(
+                        state,
+                        skill_id,
+                        request.get_json(silent=True) or {},
+                    )
+                )
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/skills/enabled/<name>/disable', methods=['POST'])
+        def skills_disable(name):
+            try:
+                return jsonify(self.video_link.disable_skill(name))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/skills/disabled/<name>/restore', methods=['POST'])
+        def skills_restore_disabled(name):
+            try:
+                return jsonify(self.video_link.restore_disabled_skill(name))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/skills/trash/<skill_id>/restore', methods=['POST'])
+        def skills_restore_trash(skill_id):
+            try:
+                return jsonify(self.video_link.restore_trash_skill(skill_id))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/skills/<state>/<skill_id>', methods=['DELETE'])
+        def skills_delete(state, skill_id):
+            try:
+                return jsonify(
+                    self.video_link.delete_skill(
+                        state,
+                        skill_id,
+                        request.get_json(silent=True) or {},
+                    )
+                )
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/skills/<state>/<skill_id>/versions')
+        def skills_versions(state, skill_id):
+            try:
+                return jsonify(self.video_link.skill_versions(state, skill_id))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route(
+            '/api/skills/<state>/<skill_id>/versions/<version_id>/restore',
+            methods=['POST'],
+        )
+        def skills_restore_version(state, skill_id, version_id):
+            try:
+                return jsonify(
+                    self.video_link.restore_skill_version(
+                        state,
+                        skill_id,
+                        version_id,
+                        request.get_json(silent=True) or {},
+                    )
+                )
             except BridgeError as exc:
                 return jsonify({'error': exc.message}), int(exc.status)
             
