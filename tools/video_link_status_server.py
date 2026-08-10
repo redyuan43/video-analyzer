@@ -112,7 +112,8 @@ ALLOWED_COOKIE_BROWSERS = ("", "chrome", "none", "edge", "firefox", "chromium", 
 ALLOWED_DOWNLOAD_DEVICES = ("local", "mi")
 DEFAULT_COOKIE_BROWSER = ""
 DEFAULT_PROFILE = "deepseek_v4_flash"
-DEFAULT_FRAME_EXTRACTOR = "jetson"
+DEFAULT_FRAME_EXTRACTOR = "local_gpu"
+DEFAULT_LOCAL_FRAME_GPUS = "auto"
 DEFAULT_JETSON_FRAME_HOSTS = "agx,agx"
 DEFAULT_JETSON_FRAME_BACKEND = "ray"
 DEFAULT_JETSON_SAMPLE_FPS = "0.5"
@@ -538,6 +539,8 @@ class VideoLinkStatusServer:
         self.skill_distillation_lock = threading.Lock()
         self.active_skill_distillations: dict[str, threading.Thread] = {}
         self.skill_distillation_cancel_events: dict[str, threading.Event] = {}
+        self.skill_project_runner_leases: dict[str, int] = {}
+        self.active_skill_project_processes: dict[str, subprocess.Popen[Any]] = {}
         self.skill_projects = SkillProjectStore(self.repo_root / "var" / "skill-projects")
         self.runtime_settings = RuntimeSettingsStore(self.repo_root)
         self.vscode_sessions: dict[str, dict[str, Any]] = {}
@@ -553,6 +556,33 @@ class VideoLinkStatusServer:
             self.recover_interrupted_skill_distillations()
             self.recover_interrupted_skill_projects()
             self.start_auto_retry_loop()
+
+    def runtime_activity(self) -> dict[str, Any]:
+        with self.runner_lock:
+            video_jobs = sorted(
+                job_id
+                for job_id, thread in self.active_runners.items()
+                if thread.is_alive()
+            )
+        with self.skill_distillation_lock:
+            skill_distillations = sorted(
+                job_id
+                for job_id, thread in self.active_skill_distillations.items()
+                if thread.is_alive()
+            )
+            skill_projects = sorted(
+                key
+                for key, process in self.active_skill_project_processes.items()
+                if process.poll() is None
+            )
+        active_count = len(video_jobs) + len(skill_distillations) + len(skill_projects)
+        return {
+            "busy": active_count > 0,
+            "active_count": active_count,
+            "video_jobs": video_jobs,
+            "skill_distillations": skill_distillations,
+            "skill_projects": skill_projects,
+        }
 
     def options(self) -> dict[str, Any]:
         profiles = runtime_profile_names(VIDEO_WORKFLOW_ID)
@@ -2330,6 +2360,11 @@ class VideoLinkStatusServer:
         return {"artifacts": artifacts, "stdout_tail": result["stdout_tail"]}
 
     def ensure_jetson_ray_ready(self, command: list[str], log_path: str) -> dict[str, Any] | None:
+        if "--frame-extractor" not in command:
+            return None
+        extractor_index = command.index("--frame-extractor") + 1
+        if extractor_index >= len(command) or command[extractor_index] != "jetson":
+            return None
         if "--jetson-frame-backend" not in command:
             return None
         backend_index = command.index("--jetson-frame-backend") + 1
@@ -2676,6 +2711,8 @@ class VideoLinkStatusServer:
             [
                 "--frame-extractor",
                 str(profile.get("frame_extractor") or os.environ.get("VIDEO_LINK_FRAME_EXTRACTOR", DEFAULT_FRAME_EXTRACTOR)),
+                "--local-frame-gpus",
+                str(profile.get("local_frame_gpus") or os.environ.get("VIDEO_LINK_LOCAL_FRAME_GPUS", DEFAULT_LOCAL_FRAME_GPUS)),
                 "--jetson-frame-hosts",
                 str(
                     profile.get("jetson_frame_hosts")

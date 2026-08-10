@@ -25,6 +25,7 @@ def load_ui_module():
 
 ui_mod = load_ui_module()
 from tools import video_link_status_server as status_server
+from tools.video_link_status_supervisor import Supervisor
 from video_analyzer_ui.runtime_identity import RuntimeIdentity
 
 
@@ -61,6 +62,30 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn("runtime", payload)
         self.assertIn("runtime_id", payload["runtime"])
         self.assertIn("current_fingerprint", payload["runtime"])
+        self.assertEqual(
+            payload["activity"],
+            {
+                "busy": False,
+                "active_count": 0,
+                "video_jobs": [],
+                "skill_distillations": [],
+                "skill_projects": [],
+            },
+        )
+
+    def test_supervisor_defers_source_reload_while_background_work_is_active(self):
+        self.assertTrue(
+            Supervisor.runtime_has_active_work(
+                {"activity": {"busy": True, "active_count": 1}}
+            )
+        )
+        self.assertTrue(
+            Supervisor.runtime_has_active_work(
+                {"activity": {"busy": False, "active_count": 2}}
+            )
+        )
+        self.assertFalse(Supervisor.runtime_has_active_work({"activity": {}}))
+        self.assertFalse(Supervisor.runtime_has_active_work({}))
 
     def test_settings_routes_expose_and_update_runtime_models(self):
         with tempfile.TemporaryDirectory() as tmp:

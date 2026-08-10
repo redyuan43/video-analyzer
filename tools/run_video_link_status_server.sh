@@ -68,15 +68,27 @@ start_server() {
     export JETSON_AGX_LAN_HOST="$AGX_LAN_HOST"
   fi
   PYTHONPATH="$ROOT_DIR/video-analyzer-ui:$ROOT_DIR:${PYTHONPATH:-}" \
-    setsid env JETSON_AGX_LAN_HOST="${JETSON_AGX_LAN_HOST:-}" "$PYTHON_BIN" tools/video_link_status_supervisor.py \
+    setsid --fork env JETSON_AGX_LAN_HOST="${JETSON_AGX_LAN_HOST:-}" "$PYTHON_BIN" tools/video_link_status_supervisor.py \
       --repo-root "$ROOT_DIR" \
       --python "$PYTHON_BIN" \
       --host "$BIND_HOST" \
       --port "$PORT" \
       --jobs-dir "$RUNTIME_DIR/jobs" \
       --status-file "$STATUS_FILE" \
-    >"$LOG_FILE" 2>&1 < /dev/null &
-  echo "$!" >"$PID_FILE"
+    >"$LOG_FILE" 2>&1 < /dev/null
+  local supervisor_pid=""
+  for _ in $(seq 1 40); do
+    supervisor_pid="$(pgrep -n -f "video_link_status_supervisor.py.*--repo-root $ROOT_DIR.*--port $PORT.*--jobs-dir $RUNTIME_DIR/jobs" || true)"
+    if [[ -n "$supervisor_pid" ]] && kill -0 "$supervisor_pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+  done
+  if [[ -z "$supervisor_pid" ]]; then
+    echo "video-link status supervisor did not stay running; inspect $LOG_FILE" >&2
+    return 1
+  fi
+  echo "$supervisor_pid" >"$PID_FILE"
   echo "video-link status server started: http://$PUBLIC_HOST:$PORT/ (bind: $BIND_HOST)"
   if [[ -n "${JETSON_AGX_LAN_HOST:-}" ]]; then
     echo "AGX LAN host: $JETSON_AGX_LAN_HOST"

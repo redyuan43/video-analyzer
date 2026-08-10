@@ -32,6 +32,7 @@ class Supervisor:
         signal.signal(signal.SIGTERM, self.request_stop)
         signal.signal(signal.SIGINT, self.request_stop)
         stale_since: float | None = None
+        reload_deferred = False
         while not self.stop_requested:
             if self.child is None or self.child.poll() is not None:
                 if self.child is not None:
@@ -53,6 +54,21 @@ class Supervisor:
                 self.write_status(runtime)
                 if runtime.get("source_stale"):
                     stale_since = stale_since or time.monotonic()
+                    if self.runtime_has_active_work(health):
+                        if not reload_deferred:
+                            activity = health.get("activity") or {}
+                            print(
+                                "[supervisor] runtime source is stale; deferring restart while "
+                                f"{activity.get('active_count') or 1} background task(s) remain active",
+                                flush=True,
+                            )
+                        reload_deferred = True
+                        if self.wait(self.args.poll_seconds):
+                            break
+                        continue
+                    if reload_deferred:
+                        print("[supervisor] background work drained; applying deferred restart", flush=True)
+                        reload_deferred = False
                     if time.monotonic() - stale_since >= self.args.reload_debounce_seconds:
                         print(
                             f"[supervisor] runtime {runtime.get('runtime_id')} is stale; restarting process group",
@@ -64,6 +80,7 @@ class Supervisor:
                         continue
                 else:
                     stale_since = None
+                    reload_deferred = False
             if self.wait(self.args.poll_seconds):
                 break
         self.stop_child()
@@ -136,6 +153,13 @@ class Supervisor:
         except (OSError, urllib.error.URLError, json.JSONDecodeError):
             return None
         return payload if isinstance(payload, dict) else None
+
+    @staticmethod
+    def runtime_has_active_work(health: dict[str, Any]) -> bool:
+        activity = health.get("activity")
+        if not isinstance(activity, dict):
+            return False
+        return bool(activity.get("busy") or int(activity.get("active_count") or 0) > 0)
 
     def write_status(self, runtime: dict[str, Any]) -> None:
         payload = {

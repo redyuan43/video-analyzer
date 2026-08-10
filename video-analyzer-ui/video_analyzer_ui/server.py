@@ -137,7 +137,14 @@ class VideoAnalyzerUI:
         @self.app.route('/api/video-link/health')
         def video_link_health():
             runtime = self.runtime_identity.payload()
-            return jsonify({'ok': not runtime['source_stale'], 'stages': STAGE_ORDER, 'runtime': runtime})
+            return jsonify(
+                {
+                    'ok': not runtime['source_stale'],
+                    'stages': STAGE_ORDER,
+                    'runtime': runtime,
+                    'activity': self.video_link.runtime_activity(),
+                }
+            )
 
         @self.app.route('/api/video-link/options')
         def video_link_options():

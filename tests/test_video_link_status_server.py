@@ -55,6 +55,31 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def test_runtime_activity_reports_only_live_background_threads(self):
+        class ThreadState:
+            def __init__(self, alive):
+                self.alive = alive
+
+            def is_alive(self):
+                return self.alive
+
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", Path(tmp))
+            server.active_runners = {
+                "video-live": ThreadState(True),
+                "video-finished": ThreadState(False),
+            }
+            server.active_skill_distillations = {
+                "skill-live": ThreadState(True),
+            }
+
+            activity = server.runtime_activity()
+
+        self.assertTrue(activity["busy"])
+        self.assertEqual(activity["active_count"], 2)
+        self.assertEqual(activity["video_jobs"], ["video-live"])
+        self.assertEqual(activity["skill_distillations"], ["skill-live"])
+
     def test_focus_prompt_materializes_analysis_context(self):
         with tempfile.TemporaryDirectory() as tmp:
             context = Path(tmp) / "page_context.md"
@@ -1667,7 +1692,8 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertIn("--download-device", command)
         self.assertIn("mi", command)
         self.assertIn("--frame-extractor", command)
-        self.assertEqual(command[command.index("--frame-extractor") + 1], "jetson")
+        self.assertEqual(command[command.index("--frame-extractor") + 1], "local_gpu")
+        self.assertEqual(command[command.index("--local-frame-gpus") + 1], "auto")
         self.assertIn("--jetson-frame-hosts", command)
         self.assertEqual(command[command.index("--jetson-frame-hosts") + 1], "agx,agx")
         self.assertIn("--jetson-frame-backend", command)
@@ -1677,7 +1703,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertIn("--jetson-require-hwdec", command)
         self.assertIn("--resume-existing-core", command)
 
-    def test_deep_operation_uses_agx_frame_extractor(self):
+    def test_deep_operation_uses_local_p40_frame_extractor(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
             job = server.create_job({"video_url": "https://example.com/video", "analysis_mode": "deep"})
@@ -1688,7 +1714,8 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
         self.assertEqual(command[0], "tools/run_operation_manual_from_url.sh")
         self.assertEqual(command[command.index("--pipeline-mode") + 1], "deep")
-        self.assertEqual(command[command.index("--frame-extractor") + 1], "jetson")
+        self.assertEqual(command[command.index("--frame-extractor") + 1], "local_gpu")
+        self.assertEqual(command[command.index("--local-frame-gpus") + 1], "auto")
         self.assertEqual(command[command.index("--jetson-frame-hosts") + 1], "agx,agx")
         self.assertEqual(command[command.index("--jetson-frame-backend") + 1], "ray")
         self.assertIn("--jetson-require-hwdec", command)
@@ -1914,13 +1941,16 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
         self.assertEqual(command[command.index("--jetson-frame-hosts") + 1], "nx2,nx2")
         self.assertEqual(command[command.index("--jetson-frame-backend") + 1], "ssh")
+        self.assertEqual(command[command.index("--frame-extractor") + 1], "jetson")
 
-    def test_long_talk_wrapper_defaults_to_agx_dual_worker(self):
+    def test_long_talk_wrapper_defaults_to_local_gpu_and_keeps_jetson_override(self):
         text = (REPO_ROOT / "tools" / "run_long_talk_fast_from_url.sh").read_text(encoding="utf-8")
 
+        self.assertIn('FRAME_EXTRACTOR="${VIDEO_LINK_FRAME_EXTRACTOR:-local_gpu}"', text)
         self.assertIn('JETSON_FRAME_HOSTS="${JETSON_FRAME_HOSTS:-agx,agx}"', text)
         self.assertIn('JETSON_FRAME_BACKEND="${JETSON_FRAME_BACKEND:-ray}"', text)
-        self.assertIn('if [[ "$JETSON_FRAME_BACKEND" == "ray" ]]', text)
+        self.assertIn('if [[ "$FRAME_EXTRACTOR" == "jetson" && "$JETSON_FRAME_BACKEND" == "ray" ]]', text)
+        self.assertIn('--frame-extractor "$FRAME_EXTRACTOR"', text)
         self.assertIn('--jetson-frame-backend "$JETSON_FRAME_BACKEND"', text)
         self.assertNotIn("nx1,nx2,nx3,nx4", text)
 
@@ -2615,6 +2645,8 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             command = [
                 "tools/run_operation_manual_from_url.sh",
                 "https://example.com/video",
+                "--frame-extractor",
+                "jetson",
                 "--jetson-frame-backend",
                 "ray",
             ]
@@ -2636,6 +2668,27 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
             with patch("tools.video_link_status_server.subprocess.run") as run:
                 result = server.ensure_jetson_ray_ready(command, str(Path(tmp) / "analyze-core.log"))
+
+        self.assertIsNone(result)
+        run.assert_not_called()
+
+    def test_core_stage_skips_ray_preflight_for_local_gpu_extractor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            command = [
+                "tools/run_operation_manual_from_url.sh",
+                "https://example.com/video",
+                "--frame-extractor",
+                "local_gpu",
+                "--jetson-frame-backend",
+                "ray",
+            ]
+
+            with patch("tools.video_link_status_server.subprocess.run") as run:
+                result = server.ensure_jetson_ray_ready(
+                    command,
+                    str(Path(tmp) / "analyze-core.log"),
+                )
 
         self.assertIsNone(result)
         run.assert_not_called()
