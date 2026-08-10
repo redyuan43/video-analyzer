@@ -210,8 +210,13 @@ def prepare_local_model_stage(stage: str, config: dict, logger: logging.Logger) 
         if provider == "qwen3_asr":
             options = vibevoice.get("qwen3_asr_options") or {}
             env["QWEN3_ASR_WORKER_COUNT"] = str(options.get("worker_count") or 5)
-            if vibevoice.get("qwen3_asr_model"):
-                env["QWEN3_ASR_MODEL"] = str(vibevoice["qwen3_asr_model"])
+            configured_model_path = options.get("model_path")
+            if not configured_model_path:
+                candidate = str(vibevoice.get("qwen3_asr_model") or "").strip()
+                if candidate and Path(candidate).expanduser().is_dir():
+                    configured_model_path = candidate
+            if configured_model_path:
+                env["QWEN3_ASR_MODEL"] = str(Path(configured_model_path).expanduser())
         elif provider == "firered_asr2":
             options = vibevoice.get("firered_asr2_options") or {}
             env["FIRERED_ASR2_WORKER_COUNT"] = str(options.get("worker_count") or 5)

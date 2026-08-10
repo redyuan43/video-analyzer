@@ -290,7 +290,15 @@ def resolve_endpoint_config(config: dict[str, Any]) -> dict[str, Any]:
     """Resolve endpoint placeholders in configuration sections that contain URLs."""
     resolved = copy.deepcopy(config)
     registry = build_endpoint_registry(resolved)
-    for key in ("clients", "operation_manual", "runtime_profiles", "ocr", "asr", "study_cards"):
+    for key in (
+        "clients",
+        "operation_manual",
+        "runtime_profiles",
+        "model_catalog",
+        "ocr",
+        "asr",
+        "study_cards",
+    ):
         if key in resolved:
             resolved[key] = resolve_endpoint_refs(resolved[key], registry)
     if "endpoints" in resolved:

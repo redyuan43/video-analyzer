@@ -36,6 +36,14 @@
         "services": {
             "amd_fast_base_url": "http://{amd_fast}:18081/v1",
             "minicpm_v100_base_url": "http://{minicpm_v100}:18082/v1",
+            "minicpm_local_base_url": "http://127.0.0.1:18082/v1",
+            "qwen3_vl_base_url": "http://127.0.0.1:18082/v1",
+            "unlimited_ocr_base_urls": [
+                "http://127.0.0.1:18088/v1"
+            ],
+            "dots_ocr_base_urls": [
+                "http://127.0.0.1:18088/v1"
+            ],
             "capswriter_url": "http://{spark}:8001/api/asr/transcribe",
             "firered_3dspeaker_url": "http://127.0.0.1:8013/api/firered-3dspeaker/transcribe",
             "vibevoice_urls": [

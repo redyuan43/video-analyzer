@@ -49,8 +49,8 @@ configure_model() {
       MODEL_ALIAS="${MINICPM_MODEL_ALIAS:-minicpm-v-4.5-v100}"
       ;;
     qwen3_vl_4b|qwen3-vl-4b)
-      MODEL_PATH="${QWEN3_VL_MODEL_PATH:-/home/ai/.lmstudio/models/Qwen/Qwen3-VL-4B-Instruct-GGUF/Qwen3-VL-4B-Instruct-Q4_K_M.gguf}"
-      MMPROJ_PATH="${QWEN3_VL_MMPROJ_PATH:-/home/ai/.lmstudio/models/Qwen/Qwen3-VL-4B-Instruct-GGUF/mmproj-Qwen3-VL-4B-Instruct-f16.gguf}"
+      MODEL_PATH="${QWEN3_VL_MODEL_PATH:-/home/ai/.lmstudio/models/Qwen/Qwen3-VL-4B-Instruct-GGUF/Qwen3VL-4B-Instruct-Q4_K_M.gguf}"
+      MMPROJ_PATH="${QWEN3_VL_MMPROJ_PATH:-/home/ai/.lmstudio/models/Qwen/Qwen3-VL-4B-Instruct-GGUF/mmproj-Qwen3VL-4B-Instruct-Q8_0.gguf}"
       MODEL_ALIAS="${QWEN3_VL_MODEL_ALIAS:-qwen3-vl-4b-instruct}"
       ;;
     *)
@@ -172,7 +172,7 @@ start_minicpm() {
 
   for _ in $(seq 1 30); do
     if curl --noproxy "*" -fsS "http://127.0.0.1:${PROXY_PORT}/api/health" >/dev/null 2>&1; then
-      echo "MiniCPM proxy ready: http://127.0.0.1:${PROXY_PORT}/v1"
+      echo "Vision proxy ready (${VISION_ENGINE}): http://127.0.0.1:${PROXY_PORT}/v1"
       curl --noproxy "*" -sS "http://127.0.0.1:${PROXY_PORT}/api/health"
       echo
       return 0
@@ -180,14 +180,14 @@ start_minicpm() {
     sleep 1
   done
 
-  echo "MiniCPM proxy did not become ready. Check ${LOG_DIR}/launcher.log and ${LOG_DIR}/proxy.log" >&2
+  echo "Vision proxy (${VISION_ENGINE}) did not become ready. Check ${LOG_DIR}/launcher.log and ${LOG_DIR}/proxy.log" >&2
   exit 1
 }
 
 status_minicpm() {
   clear_stale_pid
   if is_running; then
-    echo "running: pid=$(cat "${PID_FILE}") http://127.0.0.1:${PROXY_PORT}/v1"
+    echo "running: engine=${VISION_ENGINE} pid=$(cat "${PID_FILE}") http://127.0.0.1:${PROXY_PORT}/v1"
   else
     echo "not running"
   fi
@@ -201,7 +201,7 @@ case "${1:-}" in
     ;;
   stop)
     stop_minicpm
-    echo "MiniCPM proxy stopped"
+    echo "Vision proxy stopped"
     ;;
   restart)
     stop_minicpm

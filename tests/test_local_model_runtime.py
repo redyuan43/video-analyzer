@@ -90,6 +90,51 @@ class LocalModelRuntimeTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["timeout"], 7)
 
     @patch("video_analyzer.local_model_runtime.subprocess.run")
+    def test_qwen3_asr_model_id_does_not_override_local_model_path(self, run):
+        config = {
+            "asr": {
+                "provider": "qwen3_asr",
+                "vibevoice": {
+                    "qwen3_asr_url": "http://127.0.0.1:18013/api/asr/transcribe",
+                    "qwen3_asr_model": "Qwen/Qwen3-ASR-1.7B",
+                    "qwen3_asr_options": {"worker_count": 5},
+                },
+            },
+            "local_model_runtime": {
+                "stage_commands": {"asr": ["/bin/echo", "asr"]},
+            },
+        }
+
+        prepare_local_model_stage("asr", config, logger=__import__("logging").getLogger(__name__))
+
+        self.assertNotIn("QWEN3_ASR_MODEL", run.call_args.kwargs["env"])
+        self.assertEqual(run.call_args.kwargs["env"]["QWEN3_ASR_WORKER_COUNT"], "5")
+
+    @patch("video_analyzer.local_model_runtime.subprocess.run")
+    def test_qwen3_asr_explicit_local_model_path_is_forwarded(self, run):
+        with TemporaryDirectory() as tmp:
+            config = {
+                "asr": {
+                    "provider": "qwen3_asr",
+                    "vibevoice": {
+                        "qwen3_asr_url": "http://127.0.0.1:18013/api/asr/transcribe",
+                        "qwen3_asr_model": "Qwen/Qwen3-ASR-1.7B",
+                        "qwen3_asr_options": {
+                            "worker_count": 5,
+                            "model_path": tmp,
+                        },
+                    },
+                },
+                "local_model_runtime": {
+                    "stage_commands": {"asr": ["/bin/echo", "asr"]},
+                },
+            }
+
+            prepare_local_model_stage("asr", config, logger=__import__("logging").getLogger(__name__))
+
+        self.assertEqual(run.call_args.kwargs["env"]["QWEN3_ASR_MODEL"], tmp)
+
+    @patch("video_analyzer.local_model_runtime.subprocess.run")
     def test_local_model_stage_serializes_loopback_stages(self, run):
         with TemporaryDirectory() as tmp:
             config = {

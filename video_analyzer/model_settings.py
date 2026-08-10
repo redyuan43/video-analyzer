@@ -417,7 +417,6 @@ def _add_builtin_model_resources(
     config: dict[str, Any],
 ) -> None:
     services = (config.get("endpoints") or {}).get("services") or {}
-    global_ocr = config.get("ocr") or {}
     resources = {
         "asr-vibevoice-local": {
             "name": "VibeVoice ASR（本地 P40）",
@@ -500,8 +499,7 @@ def _add_builtin_model_resources(
             "protocol": "unlimited_ocr_openai",
             "model": "baidu/Unlimited-OCR",
             "endpoints": normalize_string_list(
-                global_ocr.get("base_urls")
-                or services.get("ocr_base_urls")
+                services.get("unlimited_ocr_base_urls")
                 or "http://127.0.0.1:18088/v1"
             ),
             "options": {
@@ -520,7 +518,6 @@ def _add_builtin_model_resources(
             "model": "rednote-hilab/dots.ocr",
             "endpoints": normalize_string_list(
                 services.get("dots_ocr_base_urls")
-                or global_ocr.get("base_urls")
                 or "http://127.0.0.1:18088/v1"
             ),
             "options": {
@@ -538,7 +535,7 @@ def _add_builtin_model_resources(
             "protocol": "openai_compatible",
             "model": "minicpm-v-4.5-v100",
             "endpoints": normalize_string_list(
-                services.get("minicpm_v100_base_url")
+                services.get("minicpm_local_base_url")
                 or "http://127.0.0.1:18082/v1"
             ),
             "options": {
@@ -555,7 +552,6 @@ def _add_builtin_model_resources(
             "model": "qwen3-vl-4b-instruct",
             "endpoints": normalize_string_list(
                 services.get("qwen3_vl_base_url")
-                or services.get("minicpm_v100_base_url")
                 or "http://127.0.0.1:18082/v1"
             ),
             "options": {
@@ -1223,9 +1219,108 @@ class RuntimeSettingsStore:
         return data
 
     def load(self) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-        defaults = self._read(self.default_path)
+        raw_defaults = self._read(self.default_path)
         user = self._read(self.user_path)
-        return defaults, user, apply_disabled_runtime_profiles(deep_merge(defaults, user))
+        from .config import resolve_endpoint_config
+
+        defaults = resolve_endpoint_config(raw_defaults)
+        merged = resolve_endpoint_config(
+            apply_disabled_runtime_profiles(deep_merge(raw_defaults, user))
+        )
+        return defaults, user, merged
+
+    def _profile_test_runtime_config(
+        self,
+        merged: dict[str, Any],
+        profile_name: str,
+        workflow: dict[str, Any],
+        refs: dict[str, Any],
+    ) -> dict[str, Any]:
+        profiles = merged.get("runtime_profiles") or {}
+        profile = copy.deepcopy(profiles.get(profile_name) or {})
+        profile["workflow_id"] = workflow["id"]
+        for slot, spec in workflow["model_fields"].items():
+            profile[spec["field"]] = str(refs.get(slot) or "").strip()
+        expanded = expand_runtime_profile(merged, profile)
+
+        runtime_config = copy.deepcopy(merged)
+        asr = runtime_config.setdefault("asr", {})
+        vibevoice = asr.setdefault("vibevoice", {})
+        asr["provider"] = expanded.get("asr_provider")
+        for key in (
+            "vibevoice_url",
+            "vibevoice_urls",
+            "qwen3_asr_url",
+            "qwen3_asr_model",
+            "qwen3_asr_options",
+            "firered_asr2_url",
+            "firered_asr2_options",
+        ):
+            if key in expanded:
+                vibevoice[key] = copy.deepcopy(expanded[key])
+
+        ocr = runtime_config.setdefault("ocr", {})
+        ocr["provider"] = expanded.get("ocr_provider")
+        ocr["base_url"] = expanded.get("ocr_base_url")
+        ocr["base_urls"] = copy.deepcopy(expanded.get("ocr_base_urls") or [])
+        ocr["engine"] = expanded.get("ocr_engine")
+        ocr["worker_count"] = expanded.get("ocr_worker_count")
+
+        manual = runtime_config.setdefault("operation_manual", {})
+        manual["vision_base_url"] = expanded.get("vision_base_url")
+        manual["vision_model"] = expanded.get("vision_model")
+        manual["vision_runtime"] = copy.deepcopy(expanded.get("vision_runtime") or {})
+        return runtime_config
+
+    def _model_test_runtime_config(
+        self,
+        merged: dict[str, Any],
+        item: dict[str, Any],
+    ) -> dict[str, Any]:
+        runtime_config = copy.deepcopy(merged)
+        kind = str(item.get("kind") or "")
+        protocol = str(item.get("protocol") or "")
+        endpoints = normalize_string_list(item.get("endpoints"))
+        options = copy.deepcopy(item.get("options") or {})
+
+        if kind == "asr":
+            asr = runtime_config.setdefault("asr", {})
+            vibevoice = asr.setdefault("vibevoice", {})
+            asr["provider"] = {
+                "vibevoice_http": "vibevoice",
+                "qwen3_asr_http": "qwen3_asr",
+                "firered_asr2_http": "firered_asr2",
+                "generic_http": "remote_http",
+            }.get(protocol, protocol)
+            if protocol == "vibevoice_http":
+                vibevoice["deep_remote_urls"] = endpoints
+            elif protocol == "qwen3_asr_http":
+                vibevoice["qwen3_asr_url"] = endpoints[0] if endpoints else ""
+                vibevoice["qwen3_asr_model"] = item.get("model")
+                vibevoice["qwen3_asr_options"] = options
+            elif protocol == "firered_asr2_http":
+                vibevoice["firered_asr2_url"] = endpoints[0] if endpoints else ""
+                vibevoice["firered_asr2_options"] = options
+            elif protocol == "generic_http":
+                vibevoice["remote_urls"] = endpoints
+        elif kind == "ocr":
+            ocr = runtime_config.setdefault("ocr", {})
+            ocr["provider"] = {
+                "unlimited_ocr_openai": "unlimited_ocr",
+                "dots_ocr_openai": "dots_ocr",
+                "dots_mocr_openai": "dots_mocr_vllm",
+                "openai_vision": "openai_vision",
+            }.get(protocol, protocol)
+            ocr["base_url"] = endpoints[0] if endpoints else ""
+            ocr["base_urls"] = endpoints
+            ocr["engine"] = options.get("engine")
+            ocr["worker_count"] = options.get("worker_count")
+        elif kind == "vision":
+            manual = runtime_config.setdefault("operation_manual", {})
+            manual["vision_base_url"] = endpoints[0] if endpoints else ""
+            manual["vision_model"] = item.get("model")
+            manual["vision_runtime"] = options
+        return runtime_config
 
     def public_settings(self) -> dict[str, Any]:
         defaults, user, merged = self.load()
@@ -1370,28 +1465,48 @@ class RuntimeSettingsStore:
 
         _defaults, _user, merged = self.load()
         endpoints = normalize_string_list(item.get("endpoints"))
-        needs_lock = (
+        needs_local_stage = (
             _acquire_lock
             and mode != "quick"
             and any(_is_local_url(endpoint) for endpoint in endpoints)
         )
         lock_context = contextlib.nullcontext()
-        if needs_lock:
-            from .local_model_runtime import local_model_runtime_lock
+        if needs_local_stage:
+            stage = {"asr": "asr", "ocr": "ocr", "vision": "vl"}.get(
+                str(item.get("kind") or "")
+            )
+            if stage:
+                from .local_model_runtime import local_model_stage
 
-            lock_context = local_model_runtime_lock(
-                merged,
-                logger,
-                f"settings-model-test:{model_id}",
-                stage=str(item.get("kind") or "text"),
-            )
+                lock_context = local_model_stage(
+                    stage,
+                    self._model_test_runtime_config(merged, item),
+                    logger,
+                    f"settings-model-test:{model_id}",
+                )
+            else:
+                from .local_model_runtime import local_model_runtime_lock
+
+                lock_context = local_model_runtime_lock(
+                    merged,
+                    logger,
+                    f"settings-model-test:{model_id}",
+                    stage=str(item.get("kind") or "text"),
+                )
         started = time.monotonic()
-        with lock_context:
-            result = (
-                self._quick_test_resource(item)
-                if mode == "quick"
-                else self._inference_test_resource(item, context=context)
-            )
+        try:
+            with lock_context:
+                result = (
+                    self._quick_test_resource(item)
+                    if mode == "quick"
+                    else self._inference_test_resource(item, context=context)
+                )
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "status": "failed",
+                "detail": f"本地模型阶段启动失败：{_friendly_test_error(exc)}",
+            }
         result.update(
             {
                 "model_id": model_id,
@@ -1462,6 +1577,16 @@ class RuntimeSettingsStore:
                     }
             return {"ok": True, "status": "reachable", "detail": f"HTTP {response.status_code}"}
         except Exception as exc:
+            host = urlparse(target).hostname or ""
+            if (
+                isinstance(exc, requests.exceptions.ConnectionError)
+                and host in {"127.0.0.1", "localhost", "::1"}
+            ):
+                return {
+                    "ok": True,
+                    "status": "sleeping",
+                    "detail": "本地按需服务当前未启动；最小推理会自动冷启动",
+                }
             return {"ok": False, "status": "unreachable", "detail": _friendly_test_error(exc)}
 
     def _inference_test_resource(self, item: dict[str, Any], *, context: str = "") -> dict[str, Any]:
@@ -1611,6 +1736,12 @@ class RuntimeSettingsStore:
         results: dict[str, dict[str, Any]] = {}
         context_parts: list[str] = []
         _defaults, _user, merged = self.load()
+        runtime_config = self._profile_test_runtime_config(
+            merged,
+            str(payload.get("profile_name") or ""),
+            workflow,
+            refs,
+        )
         needs_lock = mode != "quick" and any(
             _is_local_url(endpoint)
             for item in selected.values()
@@ -1618,13 +1749,12 @@ class RuntimeSettingsStore:
         )
         lock_context = contextlib.nullcontext()
         if needs_lock:
-            from .local_model_runtime import local_model_runtime_lock
+            from .local_model_runtime import local_model_runtime_session
 
-            lock_context = local_model_runtime_lock(
-                merged,
+            lock_context = local_model_runtime_session(
+                runtime_config,
                 logger,
                 f"settings-profile-test:{payload.get('profile_name') or 'draft'}",
-                stage="profile-smoke",
             )
         with lock_context:
             for node in sorted(flow["nodes"], key=lambda item: item["mobile_order"]):
@@ -1632,13 +1762,40 @@ class RuntimeSettingsStore:
                 if not slot:
                     continue
                 item = selected[slot]
-                result = self.test_model(
-                    item["id"],
-                    "quick" if mode == "quick" else "inference",
-                    force=force or mode == "pathway",
-                    context="\n".join(context_parts) if mode == "pathway" else "",
-                    _acquire_lock=False,
+                stage = {"asr": "asr", "ocr": "ocr", "vision": "vl"}.get(
+                    str(item.get("kind") or "")
                 )
+                stage_context = contextlib.nullcontext()
+                if stage and mode != "quick":
+                    from .local_model_runtime import local_model_stage
+
+                    stage_context = local_model_stage(
+                        stage,
+                        runtime_config,
+                        logger,
+                        f"settings-profile-test:{payload.get('profile_name') or 'draft'}:{stage}",
+                    )
+                try:
+                    with stage_context:
+                        result = self.test_model(
+                            item["id"],
+                            "quick" if mode == "quick" else "inference",
+                            force=force or mode == "pathway",
+                            context="\n".join(context_parts) if mode == "pathway" else "",
+                            _acquire_lock=False,
+                        )
+                except Exception as exc:
+                    result = {
+                        "ok": False,
+                        "status": "failed",
+                        "detail": f"本地模型阶段启动失败：{_friendly_test_error(exc)}",
+                        "model_id": item["id"],
+                        "kind": item.get("kind"),
+                        "mode": "inference",
+                        "elapsed_ms": 0,
+                        "checked_at": _test_timestamp(),
+                        "cached": False,
+                    }
                 result["node_id"] = node["id"]
                 results[node["id"]] = result
                 sample = str(result.get("sample") or "").strip()

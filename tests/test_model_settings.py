@@ -1,8 +1,11 @@
+import contextlib
 import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import requests
 
 from video_analyzer.config import Config, get_runtime_profile
 from video_analyzer.model_settings import RuntimeSettingsStore, SettingsValidationError
@@ -76,6 +79,32 @@ class ModelSettingsTests(unittest.TestCase):
         self.assertEqual(stored["api_key_env"], "CLOUD_API_KEY")
         self.assertNotIn("api_key", stored)
         self.assertNotIn("must-not-be-saved", json.dumps(user_config))
+
+    def test_model_catalog_endpoint_placeholders_are_resolved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_repo(root)
+            default_path = root / "video_analyzer" / "config" / "default_config.json"
+            defaults = json.loads(default_path.read_text(encoding="utf-8"))
+            defaults["endpoints"] = {
+                "hosts": {"local_gpu": "127.0.0.1"},
+                "services": {"local_vl": "http://{local_gpu}:18082/v1"},
+            }
+            defaults["model_catalog"] = {
+                "vision-local": {
+                    "name": "Local Vision",
+                    "kind": "vision",
+                    "protocol": "openai_compatible",
+                    "model": "vision-model",
+                    "endpoints": ["{local_vl}"],
+                }
+            }
+            default_path.write_text(json.dumps(defaults), encoding="utf-8")
+
+            settings = store.public_settings()
+
+        model = next(item for item in settings["models"] if item["id"] == "vision-local")
+        self.assertEqual(model["endpoints"], ["http://127.0.0.1:18082/v1"])
 
     def test_profile_refs_expand_to_existing_runtime_fields(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -344,6 +373,49 @@ class ModelSettingsTests(unittest.TestCase):
         self.assertEqual(result["status"], "sleeping")
         self.assertIn("模型休眠", result["detail"])
 
+    def test_quick_test_treats_stopped_local_on_demand_service_as_sleeping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.make_repo(Path(tmp))
+            settings = store.public_settings()
+            vision_id = settings["profiles"][0]["vision_model_id"]
+            session = MagicMock()
+            session.get.side_effect = requests.exceptions.ConnectionError("connection refused")
+            with patch("video_analyzer.model_settings._test_session", return_value=session):
+                result = store.test_model(vision_id, "quick", force=True)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "sleeping")
+        self.assertIn("最小推理会自动冷启动", result["detail"])
+
+    def test_model_inference_prepares_selected_local_ocr_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.make_repo(Path(tmp))
+            settings = store.public_settings()
+            ocr_id = settings["profiles"][0]["ocr_model_id"]
+            captured = {}
+
+            def stage_context(stage, config, *_args, **_kwargs):
+                captured["stage"] = stage
+                captured["config"] = config
+                return contextlib.nullcontext()
+
+            with (
+                patch(
+                    "video_analyzer.local_model_runtime.local_model_stage",
+                    side_effect=stage_context,
+                ),
+                patch.object(
+                    store,
+                    "_inference_test_resource",
+                    return_value={"ok": True, "status": "passed", "detail": "test"},
+                ),
+            ):
+                result = store.test_model(ocr_id, "inference", force=True)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(captured["stage"], "ocr")
+        self.assertEqual(captured["config"]["ocr"]["base_urls"], ["http://127.0.0.1:18088/v1"])
+
     def test_profile_test_returns_status_for_every_flow_node(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = self.make_repo(Path(tmp))
@@ -374,6 +446,104 @@ class ModelSettingsTests(unittest.TestCase):
         self.assertEqual(set(result["results"]), {item["id"] for item in settings["schema"]["profile_flow"]["nodes"]})
         self.assertEqual(result["results"]["input"]["status"], "configured")
         self.assertEqual(result["results"]["text"]["status"], "reachable")
+
+    def test_pathway_profile_test_prepares_local_model_stages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.make_repo(Path(tmp))
+            settings = store.public_settings()
+            profile = settings["profiles"][0]
+            models = {
+                kind: profile[field]
+                for kind, field in settings["schema"]["profile_model_fields"].items()
+            }
+
+            def fake_test(model_id, mode="quick", **_kwargs):
+                model = next(item for item in settings["models"] if item["id"] == model_id)
+                return {
+                    "ok": True,
+                    "status": "passed",
+                    "detail": "test",
+                    "model_id": model_id,
+                    "kind": model["kind"],
+                    "mode": mode,
+                    "elapsed_ms": 1,
+                }
+
+            with (
+                patch.object(store, "test_model", side_effect=fake_test),
+                patch(
+                    "video_analyzer.local_model_runtime.local_model_runtime_session",
+                    side_effect=lambda *_args, **_kwargs: contextlib.nullcontext(),
+                ) as runtime_session,
+                patch(
+                    "video_analyzer.local_model_runtime.local_model_stage",
+                    side_effect=lambda *_args, **_kwargs: contextlib.nullcontext(),
+                ) as model_stage,
+            ):
+                result = store.test_profile(
+                    {
+                        "profile_name": "default",
+                        "mode": "pathway",
+                        "models": models,
+                    }
+                )
+
+        self.assertTrue(result["ok"])
+        runtime_session.assert_called_once()
+        self.assertEqual(
+            [call.args[0] for call in model_stage.call_args_list],
+            ["asr", "ocr", "vl"],
+        )
+
+    def test_pathway_profile_test_reports_local_stage_start_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.make_repo(Path(tmp))
+            settings = store.public_settings()
+            profile = settings["profiles"][0]
+            models = {
+                kind: profile[field]
+                for kind, field in settings["schema"]["profile_model_fields"].items()
+            }
+
+            @contextlib.contextmanager
+            def failed_stage():
+                raise RuntimeError("vision files missing")
+                yield
+
+            def stage_context(stage, *_args, **_kwargs):
+                return failed_stage() if stage == "vl" else contextlib.nullcontext()
+
+            with (
+                patch.object(
+                    store,
+                    "test_model",
+                    return_value={
+                        "ok": True,
+                        "status": "passed",
+                        "detail": "test",
+                        "elapsed_ms": 1,
+                    },
+                ),
+                patch(
+                    "video_analyzer.local_model_runtime.local_model_runtime_session",
+                    side_effect=lambda *_args, **_kwargs: contextlib.nullcontext(),
+                ),
+                patch(
+                    "video_analyzer.local_model_runtime.local_model_stage",
+                    side_effect=stage_context,
+                ),
+            ):
+                result = store.test_profile(
+                    {
+                        "profile_name": "default",
+                        "mode": "pathway",
+                        "models": models,
+                    }
+                )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["results"]["vision"]["status"], "failed")
+        self.assertIn("vision files missing", result["results"]["vision"]["detail"])
 
     def test_deleting_built_in_profile_disables_it_locally_and_save_restores_it(self):
         with tempfile.TemporaryDirectory() as tmp:
