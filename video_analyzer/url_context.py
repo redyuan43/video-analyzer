@@ -133,7 +133,8 @@ def parse_args() -> argparse.Namespace:
         help="Use downloaded author/automatic subtitles as transcript and skip audio ASR when available",
     )
     parser.add_argument("--transcript-file", help="Existing transcript markdown file passed through to the analyzer")
-    parser.add_argument("--frame-extractor", choices=["local", "jetson", "auto"])
+    parser.add_argument("--frame-extractor", choices=["local", "local_gpu", "jetson", "auto"])
+    parser.add_argument("--local-frame-gpus")
     parser.add_argument("--jetson-frame-hosts")
     parser.add_argument("--jetson-frame-backend", choices=["auto", "ssh", "ray"])
     parser.add_argument("--jetson-sample-fps")
@@ -1196,6 +1197,8 @@ def build_analyzer_command(args: argparse.Namespace, video_path: Path, context_p
         [
             "--frame-extractor",
             getattr(args, "frame_extractor", "local"),
+            "--local-frame-gpus",
+            getattr(args, "local_frame_gpus", "auto"),
             "--jetson-frame-hosts",
             getattr(args, "jetson_frame_hosts", "nx2,nx3"),
             "--jetson-frame-backend",

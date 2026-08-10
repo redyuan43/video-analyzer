@@ -1,21 +1,82 @@
 import os
+import subprocess
 import tempfile
 from pathlib import Path
 from unittest import TestCase
+from unittest.mock import patch
 from PIL import Image
 
 from video_analyzer.jetson_frames import (
     JetsonFrameWorker,
     REMOTE_WORKER_SCRIPT,
     _candidate_observation_metrics_from_items,
+    _pull_remote_candidates,
     _rsync_host,
     _rsync_ssh_args,
     _select_jetson_candidate_metadata,
     _ssh_host_args,
+    resolve_local_frame_gpu_indices,
 )
 
 
 class JetsonFrameSelectionTests(TestCase):
+    def test_local_gpu_auto_selects_only_p40_devices(self):
+        inventory = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=(
+                "0, Tesla P40\n"
+                "1, Tesla P40\n"
+                "2, Tesla P40\n"
+                "3, Tesla V100-SXM2-16GB\n"
+                "4, Tesla P40\n"
+                "5, Tesla P40\n"
+            ),
+            stderr="",
+        )
+        with patch("video_analyzer.jetson_frames.subprocess.run", return_value=inventory):
+            self.assertEqual(
+                resolve_local_frame_gpu_indices("auto"),
+                [0, 1, 2, 4, 5],
+            )
+
+    def test_remote_worker_selects_cuvid_on_local_nvidia_host(self):
+        namespace = {}
+        exec(REMOTE_WORKER_SCRIPT, namespace)
+        namespace["has_command"] = lambda name: name in {"ffmpeg", "ffprobe"}
+        namespace["has_module"] = lambda _name: False
+        namespace["has_gst_plugin"] = lambda _name: False
+        namespace["has_ffmpeg_decoder"] = lambda name: name == "h264_cuvid"
+
+        status = namespace["health"]()
+
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["decode_backend"], "ffmpeg-cuvid")
+
+    def test_candidate_pullback_uses_one_rsync_for_a_worker_directory(self):
+        manifest = {
+            "candidates": [
+                {"path": ".cache/video-analyzer/frame-worker/runs/jetson_00_agx/final/candidates/candidate_000000.jpg"},
+                {"path": ".cache/video-analyzer/frame-worker/runs/jetson_00_agx/final/candidates/candidate_000001.jpg"},
+            ]
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("video_analyzer.jetson_frames._rsync_host", return_value="agx"), \
+                patch("video_analyzer.jetson_frames._rsync_ssh_args", return_value=[]), \
+                patch("video_analyzer.jetson_frames.subprocess.run") as run:
+                _pull_remote_candidates("agx", manifest, Path(temp_dir))
+
+        run.assert_called_once_with(
+            [
+                "rsync",
+                "-a",
+                "agx:.cache/video-analyzer/frame-worker/runs/jetson_00_agx/final/candidates/",
+                f"{temp_dir}/",
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+        )
+
     def test_agx_default_uses_control_host_instead_of_stale_lan_ip(self):
         old_value = os.environ.pop("JETSON_AGX_LAN_HOST", None)
         try:
@@ -90,13 +151,13 @@ class JetsonFrameSelectionTests(TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir) / "out"
 
-            def fake_extract(_video, _timestamp, output_path):
+            def fake_extract(_video, _timestamp, output_path, _decode_backend):
                 if _timestamp < 10.0:
                     output_path.write_bytes(b"jpg")
                 return "ffmpeg-nvdec"
 
             namespace["extract_highres_candidate"] = fake_extract
-            materialized, backends, missing = namespace["materialize_highres_candidates"](
+            materialized, backends, missing, stats = namespace["materialize_highres_candidates"](
                 Path(temp_dir) / "video.mp4",
                 output_dir,
                 [
@@ -109,6 +170,80 @@ class JetsonFrameSelectionTests(TestCase):
         self.assertEqual(backends, ["ffmpeg-nvdec"])
         self.assertEqual(len(missing), 1)
         self.assertEqual(missing[0]["index"], 1)
+        self.assertEqual(stats["mode"], "per_frame")
+        self.assertEqual(stats["ffmpeg_invocations"], 2)
+
+    def test_materialize_batches_cuvid_candidates_in_one_ffmpeg_process(self):
+        namespace = {}
+        exec(REMOTE_WORKER_SCRIPT, namespace)
+
+        class SubprocessStub:
+            def __init__(self):
+                self.calls = []
+
+            def run(self, command, **_kwargs):
+                self.calls.append(command)
+                for item in command:
+                    path = Path(str(item))
+                    if path.suffix == ".jpg":
+                        path.write_bytes(b"jpg")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+        subprocess_stub = SubprocessStub()
+        namespace["subprocess"] = subprocess_stub
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "out"
+            materialized, backends, missing, stats = namespace["materialize_highres_candidates"](
+                Path(temp_dir) / "video.mp4",
+                output_dir,
+                [
+                    {"path": "preview_000000.jpg", "timestamp": 10.0, "score": 1.0},
+                    {"path": "preview_000001.jpg", "timestamp": 20.0, "score": 2.0},
+                ],
+                "ffmpeg-cuvid",
+            )
+
+        self.assertEqual(len(subprocess_stub.calls), 1)
+        self.assertEqual(len(materialized), 2)
+        self.assertEqual(backends, ["ffmpeg-cuvid-batch"])
+        self.assertEqual(missing, [])
+        self.assertEqual(stats["mode"], "batch")
+        self.assertEqual(stats["ffmpeg_invocations"], 1)
+        filter_complex = subprocess_stub.calls[0][
+            subprocess_stub.calls[0].index("-filter_complex") + 1
+        ]
+        self.assertIn("split=2", filter_complex)
+
+    def test_materialize_falls_back_per_frame_when_batch_fails(self):
+        namespace = {}
+        exec(REMOTE_WORKER_SCRIPT, namespace)
+        namespace["extract_highres_candidates_batch"] = (
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("batch failed"))
+        )
+
+        def fake_extract(_video, _timestamp, output_path, _decode_backend):
+            output_path.write_bytes(b"jpg")
+            return "ffmpeg-cuvid"
+
+        namespace["extract_highres_candidate"] = fake_extract
+        with tempfile.TemporaryDirectory() as temp_dir:
+            materialized, backends, missing, stats = namespace["materialize_highres_candidates"](
+                Path(temp_dir) / "video.mp4",
+                Path(temp_dir) / "out",
+                [
+                    {"path": "preview_000000.jpg", "timestamp": 10.0, "score": 1.0},
+                    {"path": "preview_000001.jpg", "timestamp": 20.0, "score": 2.0},
+                ],
+                "ffmpeg-cuvid",
+            )
+
+        self.assertEqual(len(materialized), 2)
+        self.assertEqual(backends, ["ffmpeg-cuvid"])
+        self.assertEqual(missing, [])
+        self.assertEqual(stats["mode"], "per_frame_fallback")
+        self.assertEqual(stats["ffmpeg_invocations"], 3)
+        self.assertEqual(stats["fallback_candidate_count"], 2)
+        self.assertEqual(stats["fallback_reason"], "batch failed")
 
     def make_worker(self, name: str) -> JetsonFrameWorker:
         return JetsonFrameWorker(

@@ -30,7 +30,11 @@ from .frame_selection import (
     select_vl_frames,
 )
 from .frame_manifest import MANIFEST_NAME, read_frames_from_manifest, write_frame_manifest
-from .jetson_frames import extract_frames_with_jetson_workers, extract_local_screen_keyframes
+from .jetson_frames import (
+    extract_frames_with_jetson_workers,
+    extract_frames_with_local_gpu_workers,
+    extract_local_screen_keyframes,
+)
 from .prompt import PromptLoader
 from .analyzer import VideoAnalyzer
 from .audio_processor import AudioTranscript
@@ -582,6 +586,8 @@ def frame_manifest_matches_request(metadata: dict, frame_extractor: str) -> bool
         return manifest_source == "jetson"
     if requested == "local":
         return manifest_source in {"local", "local_keyframes", "audio_only"}
+    if requested == "local_gpu":
+        return manifest_source == "local_gpu"
     return bool(manifest_source)
 
 
@@ -761,7 +767,17 @@ def main():
         default="auto",
         help="Internal candidate frame strategy: auto, legacy, generic, lecture, or operation",
     )
-    parser.add_argument("--frame-extractor", choices=["local", "jetson", "auto"], default="local", help="Candidate frame extraction backend")
+    parser.add_argument(
+        "--frame-extractor",
+        choices=["local", "local_gpu", "jetson", "auto"],
+        default="local",
+        help="Candidate frame extraction backend",
+    )
+    parser.add_argument(
+        "--local-frame-gpus",
+        default="auto",
+        help="Comma-separated local P40 GPU indices for local_gpu extraction, or auto",
+    )
     parser.add_argument("--jetson-frame-hosts", default="nx2,nx3", help="Comma-separated Jetson SSH hosts for frame extraction")
     parser.add_argument("--jetson-frame-backend", choices=["auto", "ssh", "ray"], default="auto", help="Jetson frame worker transport")
     parser.add_argument("--jetson-sample-fps", default="auto", help="auto or preview sample fps used by Jetson frame workers")
@@ -1033,7 +1049,22 @@ def main():
                     candidate_frames=args.candidate_frames,
                     explicit_max_frames=args.max_frames,
                 )
-                if args.frame_extractor in {"jetson", "auto"}:
+                if args.frame_extractor == "local_gpu":
+                    extraction = extract_frames_with_local_gpu_workers(
+                        video_path=video_path,
+                        output_dir=output_dir / "frames",
+                        video_duration_seconds=video_duration,
+                        pipeline_mode=args.pipeline_mode,
+                        candidate_budget=candidate_budget,
+                        candidate_strategy=args.candidate_frame_strategy,
+                        transcript=transcript,
+                        sample_fps=args.jetson_sample_fps,
+                        overlap_seconds=args.jetson_chunk_overlap_seconds,
+                        gpu_indices=args.local_frame_gpus,
+                    )
+                    frames = extraction.frames
+                    frame_extraction_metadata = extraction.metadata
+                elif args.frame_extractor in {"jetson", "auto"}:
                     hosts = [host.strip() for host in args.jetson_frame_hosts.split(",") if host.strip()]
                     jetson_sample_fps = args.jetson_sample_fps
                     if str(jetson_sample_fps).strip().lower() == OCR_AUTO and str(args.ocr_scan_sample_fps).strip().lower() != OCR_AUTO:

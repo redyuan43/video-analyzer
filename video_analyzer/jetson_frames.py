@@ -7,6 +7,7 @@ import ipaddress
 import os
 import shlex
 import subprocess
+import sys
 import tempfile
 import textwrap
 import time
@@ -97,6 +98,7 @@ def health():
         "ffmpeg": has_command("ffmpeg"),
         "ffprobe": has_command("ffprobe"),
         "ffmpeg_h264_nvv4l2dec": has_ffmpeg_decoder("h264_nvv4l2dec"),
+        "ffmpeg_h264_cuvid": has_ffmpeg_decoder("h264_cuvid"),
         "gst-launch-1.0": has_command("gst-launch-1.0"),
         "gst-inspect-1.0": has_command("gst-inspect-1.0"),
         "h264parse": has_gst_plugin("h264parse"),
@@ -116,7 +118,7 @@ def health():
         and tools["multifilesink"]
         and (tools["nvjpegenc"] or tools["jpegenc"])
     )
-    has_decode_path = tools["ffmpeg_h264_nvv4l2dec"] or has_gstreamer_nvdec or tools["ffmpeg"] or (
+    has_decode_path = tools["ffmpeg_h264_nvv4l2dec"] or tools["ffmpeg_h264_cuvid"] or has_gstreamer_nvdec or tools["ffmpeg"] or (
         tools["gst-launch-1.0"]
         and tools["h264parse"]
         and (tools["nvv4l2decoder"] or tools["avdec_h264"])
@@ -125,6 +127,8 @@ def health():
     )
     if tools["ffmpeg_h264_nvv4l2dec"]:
         decode_backend = "ffmpeg-nvdec"
+    elif tools["ffmpeg_h264_cuvid"]:
+        decode_backend = "ffmpeg-cuvid"
     elif has_gstreamer_nvdec:
         decode_backend = "gstreamer-nvdec"
     elif tools["ffmpeg"]:
@@ -333,6 +337,37 @@ def extract_with_ffmpeg_nvdec(video, output_dir, start, duration, sample_fps):
     return "ffmpeg-nvdec"
 
 
+def extract_with_ffmpeg_cuvid(video, output_dir, start, duration, sample_fps):
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-hwaccel",
+        "cuda",
+        "-hwaccel_device",
+        os.environ.get("VIDEO_ANALYZER_CUDA_DEVICE", "0"),
+        "-c:v",
+        "h264_cuvid",
+        "-resize",
+        "320x180",
+        "-ss",
+        f"{start:.3f}",
+        "-t",
+        f"{duration:.3f}",
+        "-i",
+        str(video),
+        "-vf",
+        f"fps={sample_fps},format=gray",
+        "-q:v",
+        "8",
+        str(output_dir / "preview_%06d.jpg"),
+    ]
+    subprocess.run(command, check=True, capture_output=True)
+    return "ffmpeg-cuvid"
+
+
 def copy_h264_segment(video, output_dir, start, duration):
     segment = output_dir / "segment.h264"
     command = [
@@ -430,6 +465,8 @@ def extract_gray_preview_with_gstreamer(video, output_dir, start, duration, samp
 def extract_frames(video, output_dir, start, duration, sample_fps, backend):
     if backend == "ffmpeg-nvdec":
         return extract_with_ffmpeg_nvdec(video, output_dir, start, duration, sample_fps)
+    if backend == "ffmpeg-cuvid":
+        return extract_with_ffmpeg_cuvid(video, output_dir, start, duration, sample_fps)
     if backend in {"gstreamer-nvdec", "gstreamer"}:
         return extract_with_gstreamer(video, output_dir, start, duration, sample_fps)
     return extract_with_ffmpeg(video, output_dir, start, duration, sample_fps)
@@ -452,14 +489,26 @@ def extract_preview_frames(video, output_dir, start, duration, sample_fps, statu
     return extract_frames(video, output_dir, start, duration, sample_fps, status["decode_backend"]), None
 
 
-def extract_highres_candidate(video, timestamp, output_path):
+def extract_highres_candidate(video, timestamp, output_path, decode_backend="ffmpeg-nvdec"):
+    decoder_args = []
+    if decode_backend == "ffmpeg-nvdec":
+        decoder_args = ["-c:v", "h264_nvv4l2dec"]
+    elif decode_backend == "ffmpeg-cuvid":
+        decoder_args = [
+            "-hwaccel",
+            "cuda",
+            "-hwaccel_device",
+            os.environ.get("VIDEO_ANALYZER_CUDA_DEVICE", "0"),
+            "-c:v",
+            "h264_cuvid",
+        ]
     command = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel",
         "error",
-        "-c:v",
-        "h264_nvv4l2dec",
+        "-y",
+        *decoder_args,
         "-ss",
         f"{timestamp:.3f}",
         "-i",
@@ -472,7 +521,7 @@ def extract_highres_candidate(video, timestamp, output_path):
     ]
     try:
         subprocess.run(command, check=True, capture_output=True)
-        return "ffmpeg-nvdec"
+        return decode_backend
     except Exception:
         fallback = [
             "ffmpeg",
@@ -491,6 +540,70 @@ def extract_highres_candidate(video, timestamp, output_path):
         ]
         subprocess.run(fallback, check=True, capture_output=True)
         return "ffmpeg"
+
+
+def extract_highres_candidates_batch(video, output_paths, candidates, decode_backend):
+    if decode_backend != "ffmpeg-cuvid":
+        raise RuntimeError(f"Batch candidate extraction is unsupported for {decode_backend}")
+    if not candidates:
+        return decode_backend
+
+    timestamps = [float(item["timestamp"]) for item in candidates]
+    decode_start = max(min(timestamps) - 1.0, 0.0)
+    decode_duration = max(max(timestamps) - decode_start + 1.0, 1.0)
+    decoder_args = [
+        "-hwaccel",
+        "cuda",
+        "-hwaccel_device",
+        os.environ.get("VIDEO_ANALYZER_CUDA_DEVICE", "0"),
+        "-c:v",
+        "h264_cuvid",
+    ]
+
+    filters = []
+    if len(candidates) == 1:
+        input_labels = ["[0:v]"]
+    else:
+        split_labels = [f"[split_{index}]" for index in range(len(candidates))]
+        filters.append(f"[0:v]split={len(candidates)}{''.join(split_labels)}")
+        input_labels = split_labels
+    for index, (input_label, timestamp) in enumerate(zip(input_labels, timestamps)):
+        relative_timestamp = max(timestamp - decode_start, 0.0)
+        filters.append(
+            f"{input_label}select='gte(t\\,{relative_timestamp:.6f})',"
+            f"trim=end_frame=1,setpts=PTS-STARTPTS[out_{index}]"
+        )
+
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        *decoder_args,
+        "-ss",
+        f"{decode_start:.6f}",
+        "-t",
+        f"{decode_duration:.6f}",
+        "-i",
+        str(video),
+        "-filter_complex",
+        ";".join(filters),
+    ]
+    for index, output_path in enumerate(output_paths):
+        command.extend(
+            [
+                "-map",
+                f"[out_{index}]",
+                "-frames:v",
+                "1",
+                "-q:v",
+                "3",
+                str(output_path),
+            ]
+        )
+    subprocess.run(command, check=True, capture_output=True)
+    return "ffmpeg-cuvid-batch"
 
 
 def extract_probe_candidate(video, timestamp, output_path):
@@ -598,21 +711,58 @@ def probe_static_segment(video, output_dir, segment_start, segment_duration, max
     }
 
 
-def materialize_highres_candidates(video, output_dir, candidates):
+def materialize_highres_candidates(video, output_dir, candidates, decode_backend="ffmpeg-nvdec"):
     highres_dir = output_dir / "candidates"
     highres_dir.mkdir(parents=True, exist_ok=True)
     materialized = []
     missing = []
     still_backends = set()
-    for index, item in enumerate(candidates):
-        timestamp = float(item["timestamp"])
-        highres_path = highres_dir / f"candidate_{index:06d}.jpg"
-        still_backends.add(extract_highres_candidate(video, timestamp, highres_path))
+    output_paths = [
+        highres_dir / f"candidate_{index:06d}.jpg"
+        for index in range(len(candidates))
+    ]
+    stats = {
+        "mode": "per_frame",
+        "ffmpeg_invocations": 0,
+        "batch_candidate_count": len(candidates),
+        "fallback_candidate_count": 0,
+        "fallback_reason": None,
+    }
+
+    if candidates and decode_backend == "ffmpeg-cuvid":
+        stats["ffmpeg_invocations"] = 1
+        try:
+            still_backends.add(
+                extract_highres_candidates_batch(
+                    video,
+                    output_paths,
+                    candidates,
+                    decode_backend,
+                )
+            )
+            stats["mode"] = "batch"
+        except Exception as exc:
+            stats["mode"] = "per_frame_fallback"
+            stats["fallback_reason"] = str(exc)[:500]
+
+    for index, (item, highres_path) in enumerate(zip(candidates, output_paths)):
+        if not highres_path.is_file() or highres_path.stat().st_size <= 0:
+            still_backends.add(
+                extract_highres_candidate(
+                    video,
+                    float(item["timestamp"]),
+                    highres_path,
+                    decode_backend,
+                )
+            )
+            stats["ffmpeg_invocations"] += 1
+            stats["fallback_candidate_count"] += 1
+
         if not highres_path.is_file() or highres_path.stat().st_size <= 0:
             missing.append(
                 {
                     "index": index,
-                    "timestamp": timestamp,
+                    "timestamp": float(item["timestamp"]),
                     "path": str(highres_path),
                     "preview_path": item.get("path", ""),
                 }
@@ -625,7 +775,9 @@ def materialize_highres_candidates(video, output_dir, candidates):
                 "path": str(highres_path),
             }
         )
-    return materialized, sorted(still_backends), missing
+    if stats["mode"] == "batch" and stats["fallback_candidate_count"]:
+        stats["mode"] = "batch_partial_fallback"
+    return materialized, sorted(still_backends), missing, stats
 
 
 def read_candidates_json(value):
@@ -797,7 +949,12 @@ def main():
         video = Path(args.video)
         candidates = read_candidates_json(args.materialize_candidates_json)
         materialize_started = time.perf_counter()
-        candidates, still_backends, missing_candidates = materialize_highres_candidates(video, output_dir, candidates)
+        candidates, still_backends, missing_candidates, materialization = materialize_highres_candidates(
+            video,
+            output_dir,
+            candidates,
+            status["decode_backend"],
+        )
         materialize_seconds = round(time.perf_counter() - materialize_started, 3)
         manifest = {
             "success": True,
@@ -805,6 +962,7 @@ def main():
             "candidate_still_backends": still_backends,
             "candidate_frames": len(candidates),
             "missing_materialized_candidates": missing_candidates,
+            "materialization": materialization,
             "candidates": candidates,
             "timings": {
                 "preview_seconds": 0.0,
@@ -840,9 +998,21 @@ def main():
         }
         still_backends = []
         materialize_seconds = 0.0
+        materialization = {
+            "mode": "skipped",
+            "ffmpeg_invocations": 0,
+            "batch_candidate_count": len(candidates),
+            "fallback_candidate_count": 0,
+            "fallback_reason": None,
+        }
         if not args.metadata_only:
             materialize_started = time.perf_counter()
-            candidates, still_backends, missing_candidates = materialize_highres_candidates(video, output_dir, candidates)
+            candidates, still_backends, missing_candidates, materialization = materialize_highres_candidates(
+                video,
+                output_dir,
+                candidates,
+                status["decode_backend"],
+            )
             materialize_seconds = round(time.perf_counter() - materialize_started, 3)
         else:
             missing_candidates = []
@@ -852,6 +1022,7 @@ def main():
             "preview_fallback": None,
             "candidate_still_backends": still_backends,
             "missing_materialized_candidates": missing_candidates,
+            "materialization": materialization,
             "metadata_only": args.metadata_only,
             "paper_backends": paper_backends,
             "segment_start": args.start,
@@ -905,9 +1076,21 @@ def main():
     selection_seconds = round(time.perf_counter() - selection_started, 3)
     still_backends = []
     materialize_seconds = 0.0
+    materialization = {
+        "mode": "skipped",
+        "ffmpeg_invocations": 0,
+        "batch_candidate_count": len(candidates),
+        "fallback_candidate_count": 0,
+        "fallback_reason": None,
+    }
     if not args.metadata_only:
         materialize_started = time.perf_counter()
-        candidates, still_backends, missing_candidates = materialize_highres_candidates(video, output_dir, candidates)
+        candidates, still_backends, missing_candidates, materialization = materialize_highres_candidates(
+            video,
+            output_dir,
+            candidates,
+            backend,
+        )
         materialize_seconds = round(time.perf_counter() - materialize_started, 3)
     else:
         missing_candidates = []
@@ -917,6 +1100,7 @@ def main():
         "preview_fallback": preview_fallback,
         "candidate_still_backends": still_backends,
         "missing_materialized_candidates": missing_candidates,
+        "materialization": materialization,
         "metadata_only": args.metadata_only,
         "paper_backends": paper_backends,
         "segment_start": args.start,
@@ -950,6 +1134,53 @@ def resolve_jetson_sample_fps(value: str | float, pipeline_mode: str) -> float:
     return max(float(value), 0.2)
 
 
+def local_frame_gpu_inventory() -> list[dict[str, Any]]:
+    result = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,name",
+            "--format=csv,noheader",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    inventory = []
+    for line in result.stdout.splitlines():
+        index_text, separator, name = line.partition(",")
+        if not separator:
+            continue
+        try:
+            index = int(index_text.strip())
+        except ValueError:
+            continue
+        inventory.append({"index": index, "name": name.strip()})
+    return inventory
+
+
+def resolve_local_frame_gpu_indices(value: str | Iterable[int] = "auto") -> list[int]:
+    inventory = local_frame_gpu_inventory()
+    p40_indices = {
+        int(item["index"])
+        for item in inventory
+        if "P40" in str(item.get("name") or "").upper()
+    }
+    if value == "auto":
+        selected = sorted(p40_indices)
+    elif isinstance(value, str):
+        selected = [int(item.strip()) for item in value.split(",") if item.strip()]
+    else:
+        selected = [int(item) for item in value]
+    if not selected:
+        raise RuntimeError("No local P40 GPU is available for candidate frame extraction")
+    invalid = [index for index in selected if index not in p40_indices]
+    if invalid:
+        raise RuntimeError(
+            f"Local frame extraction only supports current P40 GPUs; rejected indices: {invalid}"
+        )
+    return list(dict.fromkeys(selected))
+
+
 def split_jetson_workers(
     hosts: Iterable[str],
     video_duration_seconds: float,
@@ -979,6 +1210,294 @@ def split_jetson_workers(
             )
         )
     return workers
+
+
+def _local_gpu_worker_env(gpu_index: int) -> dict[str, str]:
+    env = os.environ.copy()
+    env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+    env["VIDEO_ANALYZER_CUDA_DEVICE"] = "0"
+    return env
+
+
+def _run_local_gpu_worker(
+    script_path: Path,
+    worker: JetsonFrameWorker,
+    gpu_index: int,
+    video_path: Path,
+    sample_fps: float,
+    max_frames: int,
+    metadata_only: bool,
+) -> dict[str, Any]:
+    command = [
+        sys.executable,
+        str(script_path),
+        "--video",
+        str(video_path),
+        "--output",
+        str(worker.output_dir),
+        "--start",
+        f"{worker.start_seconds:.3f}",
+        "--duration",
+        f"{worker.duration_seconds:.3f}",
+        "--sample-fps",
+        f"{sample_fps:.3f}",
+        "--max-frames",
+        str(max_frames),
+    ]
+    if metadata_only:
+        command.append("--metadata-only")
+    result = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=_local_gpu_worker_env(gpu_index),
+        timeout=1800,
+    )
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def _run_local_gpu_materialization(
+    script_path: Path,
+    worker: JetsonFrameWorker,
+    gpu_index: int,
+    video_path: Path,
+    candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    output_dir = worker.output_dir / "final"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    payload_path = output_dir / "selected_candidates.json"
+    payload_path.write_text(json.dumps(candidates, ensure_ascii=False), encoding="utf-8")
+    command = [
+        sys.executable,
+        str(script_path),
+        "--video",
+        str(video_path),
+        "--output",
+        str(output_dir),
+        "--materialize-candidates-json",
+        str(payload_path),
+    ]
+    result = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=_local_gpu_worker_env(gpu_index),
+        timeout=1800,
+    )
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def extract_frames_with_local_gpu_workers(
+    video_path: Path,
+    output_dir: Path,
+    video_duration_seconds: float,
+    pipeline_mode: str,
+    candidate_budget: int,
+    candidate_strategy: str = "auto",
+    transcript: AudioTranscript | None = None,
+    sample_fps: str | float = "auto",
+    overlap_seconds: float = 2.0,
+    gpu_indices: str | Iterable[int] = "auto",
+) -> JetsonFrameExtractionResult:
+    started = time.perf_counter()
+    selected_gpus = resolve_local_frame_gpu_indices(gpu_indices)
+    resolved_sample_fps = resolve_jetson_sample_fps(sample_fps, pipeline_mode)
+    video_path = video_path.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="local_gpu_frames_") as temp_root:
+        worker_root = Path(temp_root)
+        script_path = worker_root / "worker.py"
+        script_path.write_text(textwrap.dedent(REMOTE_WORKER_SCRIPT).strip() + "\n", encoding="utf-8")
+        workers = split_jetson_workers(
+            [f"gpu{index}" for index in selected_gpus],
+            video_duration_seconds,
+            worker_root,
+            overlap_seconds,
+        )
+        worker_gpu = {
+            worker.output_dir.name: gpu_index
+            for worker, gpu_index in zip(workers, selected_gpus)
+        }
+        max_frames_per_worker = max(candidate_budget * 2 // max(len(workers), 1), 8)
+        manifests: list[tuple[JetsonFrameWorker, dict[str, Any], Path]] = []
+
+        logger.info(
+            "Extracting candidate frame previews on local P40 GPUs %s",
+            ",".join(str(index) for index in selected_gpus),
+        )
+        preview_started = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=len(workers)) as executor:
+            futures = {
+                executor.submit(
+                    _run_local_gpu_worker,
+                    script_path,
+                    worker,
+                    worker_gpu[worker.output_dir.name],
+                    video_path,
+                    resolved_sample_fps,
+                    max_frames_per_worker,
+                    True,
+                ): worker
+                for worker in workers
+            }
+            for future in as_completed(futures):
+                worker = futures[future]
+                manifest = future.result()
+                if manifest.get("decode_backend") != "ffmpeg-cuvid":
+                    raise RuntimeError(
+                        "Local GPU frame worker "
+                        f"{worker.host} did not use CUDA/NVDEC: {manifest.get('decode_backend')}"
+                    )
+                manifests.append((worker, manifest, worker.output_dir))
+        preview_seconds = round(time.perf_counter() - preview_started, 3)
+        scan_frames_count = sum(
+            int(manifest.get("preview_frames") or 0)
+            for _worker, manifest, _local_dir in manifests
+        )
+        logger.info(
+            "Local P40 preview scan completed: %s frames in %.3fs",
+            scan_frames_count,
+            preview_seconds,
+        )
+
+        selection_started = time.perf_counter()
+        selected_by_worker, selection_observation = _select_jetson_candidate_metadata(
+            manifests,
+            candidate_budget,
+            video_duration_seconds=video_duration_seconds,
+            pipeline_mode=pipeline_mode,
+            candidate_strategy=candidate_strategy,
+            transcript=transcript,
+        )
+        selection_seconds = round(time.perf_counter() - selection_started, 3)
+        selected_candidate_count = sum(
+            len(payload.get("candidates") or [])
+            for payload in selected_by_worker.values()
+        )
+        logger.info(
+            "Local candidate selection completed: %s frames in %.3fs",
+            selected_candidate_count,
+            selection_seconds,
+        )
+
+        materialize_started = time.perf_counter()
+        materialized: dict[str, dict[str, Any]] = {}
+        with ThreadPoolExecutor(max_workers=len(selected_by_worker) or 1) as executor:
+            futures = {}
+            for worker_name, payload in selected_by_worker.items():
+                candidates = payload["candidates"]
+                if not candidates:
+                    continue
+                worker = payload["worker"]
+                future = executor.submit(
+                    _run_local_gpu_materialization,
+                    script_path,
+                    worker,
+                    worker_gpu[worker.output_dir.name],
+                    video_path,
+                    candidates,
+                )
+                futures[future] = worker_name
+            for future in as_completed(futures):
+                materialized[futures[future]] = future.result()
+        materialize_seconds = round(time.perf_counter() - materialize_started, 3)
+        materialize_invocations = sum(
+            int((manifest.get("materialization") or {}).get("ffmpeg_invocations") or 0)
+            for manifest in materialized.values()
+        )
+        logger.info(
+            "Local P40 high-resolution materialization completed: %s frames via %s FFmpeg invocation(s) in %.3fs",
+            selected_candidate_count,
+            materialize_invocations,
+            materialize_seconds,
+        )
+
+        combined_manifests = []
+        for worker, preview_manifest, _ in manifests:
+            final_manifest = materialized.get(worker.output_dir.name) or {}
+            combined_manifest = {
+                **preview_manifest,
+                **final_manifest,
+                "decode_backend": preview_manifest.get("decode_backend"),
+                "preview_fallback": preview_manifest.get("preview_fallback"),
+                "metadata_only": preview_manifest.get("metadata_only"),
+                "raw_candidate_frames": preview_manifest.get("candidate_frames"),
+                "candidate_still_backends": final_manifest.get("candidate_still_backends", []),
+                "candidate_frames": final_manifest.get("candidate_frames", 0),
+                "candidates": final_manifest.get("candidates", []),
+                "materialization": final_manifest.get("materialization", {}),
+                "observation_metrics": preview_manifest.get("observation_metrics", {}),
+                "timings": {
+                    **dict(preview_manifest.get("timings") or {}),
+                    "materialize_seconds": (final_manifest.get("timings") or {}).get("materialize_seconds", 0.0),
+                    "materialize_total_seconds": (final_manifest.get("timings") or {}).get("total_seconds", 0.0),
+                },
+            }
+            combined_manifests.append(
+                (
+                    worker,
+                    combined_manifest,
+                    worker.output_dir / "final" / "candidates",
+                )
+            )
+
+        merge_started = time.perf_counter()
+        merged = _merge_jetson_candidates(combined_manifests, output_dir, candidate_budget)
+        merge_seconds = round(time.perf_counter() - merge_started, 3)
+        total_seconds = round(time.perf_counter() - started, 3)
+        logger.info(
+            "Local P40 candidate frame extraction completed: %s frames in %.3fs "
+            "(preview %.3fs, selection %.3fs, materialization %.3fs, merge %.3fs)",
+            len(merged),
+            total_seconds,
+            preview_seconds,
+            selection_seconds,
+            materialize_seconds,
+            merge_seconds,
+        )
+        metadata = {
+            "backend": "local_gpu",
+            "transport": "local",
+            "gpu_indices": selected_gpus,
+            "sample_fps": resolved_sample_fps,
+            "overlap_seconds": overlap_seconds,
+            "candidate_budget": candidate_budget,
+            "candidate_strategy": candidate_strategy,
+            "scan_frames_count": scan_frames_count,
+            "pullback_seconds": 0.0,
+            "preview_seconds": preview_seconds,
+            "selection_seconds": selection_seconds,
+            "materialize_seconds": materialize_seconds,
+            "materialize_ffmpeg_invocations": materialize_invocations,
+            "merge_seconds": merge_seconds,
+            "observation_metrics": selection_observation,
+            "video_profile": selection_observation.get("video_profile"),
+            "video_profile_confidence": selection_observation.get("video_profile_confidence"),
+            "selected_candidate_strategy": selection_observation.get("selected_candidate_strategy"),
+            "paper_algorithm": selection_observation.get("paper_algorithm"),
+            "paper_algorithm_status": selection_observation.get("paper_algorithm_status"),
+            "paper_backends": _merge_paper_backend_status(combined_manifests),
+            "per_host": [
+                {
+                    "host": worker.host,
+                    "gpu_index": worker_gpu[worker.output_dir.name],
+                    "start_seconds": worker.start_seconds,
+                    "duration_seconds": worker.duration_seconds,
+                    "decode_backend": manifest.get("decode_backend"),
+                    "preview_frames": manifest.get("preview_frames"),
+                    "candidate_frames": manifest.get("candidate_frames"),
+                    "materialization": manifest.get("materialization", {}),
+                    "timings": manifest.get("timings", {}),
+                }
+                for worker, manifest, _local_dir in combined_manifests
+            ],
+            "total_seconds": total_seconds,
+        }
+        return JetsonFrameExtractionResult(frames=merged, metadata=metadata)
 
 
 def extract_frames_with_jetson_workers(
@@ -1119,8 +1638,18 @@ def extract_frames_with_jetson_workers(
             }
             manifests[index] = (worker, combined_manifest, local_worker_dir)
         pullback_started = time.perf_counter()
-        for worker, manifest, local_worker_dir in manifests:
-            _pull_remote_candidates(worker.host, manifest, local_worker_dir)
+        with ThreadPoolExecutor(max_workers=max(len(manifests), 1)) as executor:
+            futures = [
+                executor.submit(
+                    _pull_remote_candidates,
+                    worker.host,
+                    manifest,
+                    local_worker_dir,
+                )
+                for worker, manifest, local_worker_dir in manifests
+            ]
+            for future in as_completed(futures):
+                future.result()
         pullback_seconds = round(time.perf_counter() - pullback_started, 3)
         merged = _merge_jetson_candidates(manifests, output_dir, candidate_budget)
 
@@ -1672,6 +2201,26 @@ def _pull_remote_candidates(host: str, manifest: dict[str, Any], local_dir: Path
     if not paths:
         return
     local_dir.mkdir(parents=True, exist_ok=True)
+    remote_parent = paths[0].parent
+    if all(path.parent == remote_parent for path in paths):
+        logger.info(
+            "Pulling %s candidate frames from Jetson worker %s in one rsync batch",
+            len(paths),
+            host,
+        )
+        subprocess.run(
+            [
+                "rsync",
+                "-a",
+                *_rsync_ssh_args(host),
+                f"{_rsync_host(host)}:{remote_parent.as_posix()}/",
+                str(local_dir) + "/",
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+        )
+        return
+
     for path in paths:
         subprocess.run(
             ["rsync", "-a", *_rsync_ssh_args(host), f"{_rsync_host(host)}:{path.as_posix()}", str(local_dir / path.name)],
