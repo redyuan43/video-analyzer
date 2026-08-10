@@ -11,6 +11,7 @@ import logging
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -30,8 +31,14 @@ from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient  # 
 from video_analyzer.config import Config, build_openai_extra_body, resolve_api_key, resolve_temperature  # noqa: E402
 from video_analyzer.local_model_runtime import local_model_runtime_session, local_model_stage  # noqa: E402
 from video_analyzer.resource_locks import analyzer_resource_lock  # noqa: E402
-from video_analyzer.speaker_diarization import process_transcript_speakers  # noqa: E402
-from video_analyzer.transcription_pipeline import load_provided_transcript  # noqa: E402
+from video_analyzer.speaker_diarization import (  # noqa: E402
+    prepare_speaker_assignment,
+    process_transcript_speakers,
+)
+from video_analyzer.transcription_pipeline import (  # noqa: E402
+    load_provided_transcript,
+    speaker_diarization_can_run_parallel,
+)
 
 
 DEFAULT_TEMPLATE_CATALOG = REPO_ROOT / "video-analyzer-ui" / "video_analyzer_ui" / "static" / "data" / "audio_prompt_templates.json"
@@ -99,10 +106,43 @@ def main() -> int:
         audio_path = extract_audio_to_wav(media_path, output_dir)
         if audio_path is None:
             raise RuntimeError(f"audio extraction produced no audio stream: {media_path}")
-        transcript, asr_result = transcribe_audio(audio_path, output_dir, config)
+        prepared_assignment = None
+        if speaker_diarization_can_run_parallel(config):
+            speaker_config = config.get("speaker_diarization") or {}
+            logger.info(
+                "Starting ASR and speaker diarization in parallel (backend=%s)",
+                speaker_config.get("backend") or "3dspeaker",
+            )
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                diarization_future = executor.submit(
+                    prepare_speaker_assignment,
+                    audio_path,
+                    speaker_config,
+                )
+                transcript, asr_result = transcribe_audio(audio_path, output_dir, config)
+                try:
+                    prepared_assignment = diarization_future.result()
+                except Exception as exc:
+                    logger.warning("parallel speaker diarization failed: %s", exc)
+                    prepared_assignment = (
+                        [],
+                        {
+                            "enabled": True,
+                            "mode": "assignment",
+                            "backend": speaker_config.get("backend") or "3dspeaker",
+                            "notes": ["parallel speaker diarization failed"],
+                            "error": str(exc),
+                        },
+                    )
+        else:
+            transcript, asr_result = transcribe_audio(audio_path, output_dir, config)
         if transcript is not None:
             transcript, speaker_report = refine_audio_speakers(
-                audio_path, transcript, output_dir, config
+                audio_path,
+                transcript,
+                output_dir,
+                config,
+                prepared_assignment=prepared_assignment,
             )
     if transcript is None or not transcript.text.strip():
         raise RuntimeError("Required ASR transcript was not produced for uploaded audio")
@@ -334,10 +374,19 @@ def refine_audio_speakers(
     transcript: AudioTranscript,
     output_dir: Path,
     config: Config,
+    *,
+    prepared_assignment: tuple[list[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> tuple[AudioTranscript, dict[str, Any]]:
     speaker_config = config.get("speaker_diarization") or {}
     try:
-        refined, report = process_transcript_speakers(audio_path, transcript, speaker_config)
+        refined, report = process_transcript_speakers(
+            audio_path,
+            transcript,
+            speaker_config,
+            prepared_assignment=prepared_assignment,
+        )
+        if prepared_assignment is not None:
+            report["parallel_with_asr"] = True
     except Exception as exc:
         logger.warning("speaker diarization refinement failed: %s", exc)
         report = {"enabled": True, "error": str(exc)}
@@ -383,6 +432,14 @@ def build_template_selector_client(config: Config) -> tuple[GenericOpenAIAPIClie
         if inherit_text
         else profile.get("template_selector_api_key_env")
     )
+    if inherit_text:
+        extra_body = build_openai_extra_body(profile, base_url)
+    else:
+        extra_body = build_openai_extra_body(
+            profile,
+            base_url,
+            prefix="template_selector_",
+        ) or build_openai_extra_body(study_config, base_url)
     client = GenericOpenAIAPIClient(
         api_key=resolve_api_key(
             study_config.get("api_key"),
@@ -391,7 +448,7 @@ def build_template_selector_client(config: Config) -> tuple[GenericOpenAIAPIClie
         ),
         api_url=base_url,
         timeout_seconds=int(study_config.get("timeout_seconds", 600)),
-        extra_body=build_openai_extra_body(study_config, base_url, prefix=""),
+        extra_body=extra_body,
     )
     return client, model, base_url, temperature
 

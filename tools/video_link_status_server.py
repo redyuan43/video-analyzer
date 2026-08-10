@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import html
 import json
@@ -1566,13 +1567,30 @@ class VideoLinkStatusServer:
         thread.start()
         return self.public_job(self.load_job(job_id))
 
-    def rerun_from_stage(self, job_id: str, stage: str) -> dict[str, Any]:
+    def rerun_from_stage(
+        self,
+        job_id: str,
+        stage: str,
+        *,
+        profile: str | None = None,
+        refresh_runtime_profile: bool = False,
+    ) -> dict[str, Any]:
         stage = normalize_stage_name(stage)
         job = self.load_job(job_id)
         if stage not in self.stage_order_for_job(job):
             raise BridgeError(HTTPStatus.NOT_FOUND, f"unknown stage: {stage}")
         if self.current_stage(job):
             raise BridgeError(HTTPStatus.CONFLICT, "job already has a running stage")
+
+        if refresh_runtime_profile:
+            profile_name = str(
+                profile
+                or (job.get("options") or {}).get("profile")
+                or (job.get("runtime_profile_snapshot") or {}).get("profile")
+                or DEFAULT_PROFILE
+            ).strip()
+            self.write_runtime_snapshot(job, profile_name)
+            job.setdefault("options", {})["profile"] = profile_name
 
         stage_order = self.stage_order_for_job(job)
         stage_index = stage_order.index(stage)
@@ -5971,6 +5989,11 @@ class VideoLinkStatusServer:
         snapshot_payload = {
             "active_runtime_profile": profile_name,
             "runtime_profiles": {profile_name: resolved_profile},
+            "endpoints": copy.deepcopy(config.get("endpoints") or {}),
+            "local_model_runtime": copy.deepcopy(
+                config.get("local_model_runtime") or {}
+            ),
+            "resource_limits": copy.deepcopy(config.get("resource_limits") or {}),
         }
         encoded = (json.dumps(snapshot_payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
         self._atomic_write_bytes(snapshot_path, encoded)
@@ -8491,7 +8514,17 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
                 return
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/stages/([a-z0-9-]+)/rerun", path)
             if match:
-                self.write_json(self.server_app.rerun_from_stage(match.group(1), match.group(2)), HTTPStatus.ACCEPTED)
+                self.write_json(
+                    self.server_app.rerun_from_stage(
+                        match.group(1),
+                        match.group(2),
+                        profile=payload.get("profile"),
+                        refresh_runtime_profile=parse_bool(
+                            payload.get("refresh_runtime_profile", False)
+                        ),
+                    ),
+                    HTTPStatus.ACCEPTED,
+                )
                 return
             raise BridgeError(HTTPStatus.NOT_FOUND, "not found")
         except BridgeError as exc:

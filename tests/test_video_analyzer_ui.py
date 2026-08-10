@@ -361,6 +361,10 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn("copyText", (UI_ROOT / "video_analyzer_ui" / "static" / "js" / "main.js").read_text(encoding="utf-8"))
         self.assertIn("document.execCommand('copy')", (UI_ROOT / "video_analyzer_ui" / "static" / "js" / "main.js").read_text(encoding="utf-8"))
         self.assertIn("failure_disposition?.rerun_recommended", main_js)
+        self.assertIn("按当前方案重跑核心分析", main_js)
+        self.assertIn("/stages/analyze-core/rerun", main_js)
+        self.assertIn("refresh_runtime_profile: true", main_js)
+        self.assertNotIn("用 Flash 继续", main_js)
         self.assertNotIn("resumeProfile", main_js)
         self.assertIn('id="stageDurationSummary"', html)
         self.assertIn('id="coreDiagnosticsPanel"', html)
@@ -671,7 +675,12 @@ class VideoAnalyzerUITests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 202)
         self.assertEqual(response.get_json(), expected)
-        rerun.assert_called_once_with(job_id, "deep-v2")
+        rerun.assert_called_once_with(
+            job_id,
+            "deep-v2",
+            profile=None,
+            refresh_runtime_profile=False,
+        )
 
     def test_video_link_api_upload_media_create(self):
         with tempfile.TemporaryDirectory() as tmp:

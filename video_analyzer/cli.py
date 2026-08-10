@@ -61,7 +61,10 @@ from .vl_checkpoint import (
     load_vl_checkpoint,
     write_vl_checkpoint,
 )
-from .transcription_pipeline import apply_speaker_diarization, transcribe_configured_audio
+from .transcription_pipeline import (
+    speaker_diarization_can_run_parallel,
+    transcribe_and_diarize_configured_audio,
+)
 
 # Initialize logger at module level
 logger = logging.getLogger(__name__)
@@ -897,17 +900,29 @@ def main():
                     transcript = None
                 else:
                     current_progress_step = "asr"
-                    write_analysis_progress(output_dir, current_progress_step, message="transcribing audio")
-                    logger.info("Transcribing audio...")
+                    parallel_diarization = speaker_diarization_can_run_parallel(config)
+                    progress_message = (
+                        "transcribing audio and diarizing speakers in parallel"
+                        if parallel_diarization
+                        else "transcribing audio"
+                    )
+                    write_analysis_progress(
+                        output_dir,
+                        current_progress_step,
+                        message=progress_message,
+                    )
+                    logger.info("%s...", progress_message.capitalize())
                     asr_config = config.get("asr", {})
                     provider = asr_config.get("provider", "faster_whisper")
                     use_asr_strategy = task == "operation_manual" and args.asr_provider is None and provider == "auto"
-                    transcript, asr_result = transcribe_configured_audio(
-                        audio_path,
-                        output_dir,
-                        config,
-                        use_asr_strategy=use_asr_strategy,
-                        logger=logger,
+                    transcript, asr_result, speaker_diarization_report = (
+                        transcribe_and_diarize_configured_audio(
+                            audio_path,
+                            output_dir,
+                            config,
+                            use_asr_strategy=use_asr_strategy,
+                            logger=logger,
+                        )
                     )
                     if transcript is None:
                         require_transcript = bool(asr_config.get("require_transcript", task == "operation_manual"))
@@ -919,15 +934,6 @@ def main():
                             )
                         logger.warning("Could not generate reliable transcript. Proceeding with video analysis only.")
                     else:
-                        transcript, speaker_diarization_report = apply_speaker_diarization(
-                            audio_path,
-                            transcript,
-                            output_dir,
-                            config,
-                            logger=logger,
-                        )
-                        if asr_result:
-                            asr_result.transcript = transcript
                         transcript_markdown_path = write_transcript_markdown(transcript, output_dir / "transcript.md")
                         current_progress_step = "asr_done"
                         write_analysis_progress(

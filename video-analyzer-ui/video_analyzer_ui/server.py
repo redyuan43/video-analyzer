@@ -512,7 +512,17 @@ class VideoAnalyzerUI:
         @self.app.route('/api/video-link/jobs/<job_id>/stages/<stage>/rerun', methods=['POST'])
         def video_link_rerun_from_stage(job_id, stage):
             try:
-                return jsonify(self.video_link.rerun_from_stage(job_id, stage)), int(HTTPStatus.ACCEPTED)
+                payload = request.get_json(silent=True) or {}
+                return jsonify(
+                    self.video_link.rerun_from_stage(
+                        job_id,
+                        stage,
+                        profile=payload.get('profile'),
+                        refresh_runtime_profile=str(
+                            payload.get('refresh_runtime_profile', 'false')
+                        ).lower() in {'1', 'true', 'yes', 'on'},
+                    )
+                ), int(HTTPStatus.ACCEPTED)
             except BridgeError as exc:
                 return jsonify({'error': exc.message}), int(exc.status)
 

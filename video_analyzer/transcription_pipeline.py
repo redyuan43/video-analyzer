@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +15,15 @@ from .asr_providers import ASRStrategyResult, transcribe_with_provider_result, t
 from .audio_processor import AudioProcessor, AudioTranscript
 from .local_model_runtime import local_model_runtime_lock, local_model_stage, local_model_stage_needed
 from .resource_locks import analyzer_resource_lock
-from .speaker_diarization import process_transcript_speakers
+from .speaker_diarization import prepare_speaker_assignment, process_transcript_speakers
+
+
+ASR_PROVIDERS_WITH_INTERNAL_DIARIZATION = {
+    "auto",
+    "firered_3dspeaker",
+    "vibevoice",
+    "vibevoice_remote",
+}
 
 
 def load_provided_transcript(path: Path) -> tuple[AudioTranscript, ASRStrategyResult]:
@@ -122,6 +131,7 @@ def apply_speaker_diarization(
     config: Any,
     *,
     logger: logging.Logger,
+    prepared_assignment: tuple[list[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> tuple[AudioTranscript, dict[str, Any]]:
     """Run the standard Video Analyzer speaker assignment/refinement step."""
     existing_report = (
@@ -155,12 +165,118 @@ def apply_speaker_diarization(
                 audio_path,
                 transcript,
                 speaker_config,
+                prepared_assignment=prepared_assignment,
             )
     except Exception as exc:
         logger.warning("speaker diarization failed: %s", exc)
         refined = transcript
         report = {"enabled": True, "error": str(exc)}
+    if prepared_assignment is not None:
+        report["parallel_with_asr"] = True
     qa_dir = output_dir / "qa"
     qa_dir.mkdir(parents=True, exist_ok=True)
     write_json(qa_dir / "speaker_diarization_report.json", report)
     return refined, report
+
+
+def transcribe_and_diarize_configured_audio(
+    audio_path: Path,
+    output_dir: Path,
+    config: Any,
+    *,
+    use_asr_strategy: bool,
+    logger: logging.Logger,
+) -> tuple[AudioTranscript | None, ASRStrategyResult, dict[str, Any] | None]:
+    """Run independent speaker-turn detection in parallel with configured ASR."""
+    speaker_config = config.get("speaker_diarization") or {}
+    asr_provider = str((config.get("asr") or {}).get("provider") or "").strip().lower()
+    should_prepare_in_parallel = speaker_diarization_can_run_parallel(config)
+
+    if not should_prepare_in_parallel:
+        transcript, asr_result = transcribe_configured_audio(
+            audio_path,
+            output_dir,
+            config,
+            use_asr_strategy=use_asr_strategy,
+            logger=logger,
+        )
+        if transcript is None:
+            return transcript, asr_result, None
+        transcript, report = apply_speaker_diarization(
+            audio_path,
+            transcript,
+            output_dir,
+            config,
+            logger=logger,
+        )
+        asr_result.transcript = transcript
+        return transcript, asr_result, report
+
+    logger.info(
+        "Starting ASR and speaker diarization in parallel (provider=%s, backend=%s)",
+        asr_provider,
+        speaker_config.get("backend") or "3dspeaker",
+    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        diarization_future = executor.submit(
+            prepare_speaker_assignment,
+            audio_path,
+            speaker_config,
+        )
+        transcript, asr_result = transcribe_configured_audio(
+            audio_path,
+            output_dir,
+            config,
+            use_asr_strategy=use_asr_strategy,
+            logger=logger,
+        )
+        try:
+            prepared_assignment = diarization_future.result()
+        except Exception as exc:
+            logger.warning("parallel speaker diarization failed: %s", exc)
+            prepared_assignment = (
+                [],
+                {
+                    "enabled": True,
+                    "mode": "assignment",
+                    "backend": speaker_config.get("backend") or "3dspeaker",
+                    "notes": ["parallel speaker diarization failed"],
+                    "error": str(exc),
+                },
+            )
+
+    if transcript is None:
+        return transcript, asr_result, None
+    transcript, report = apply_speaker_diarization(
+        audio_path,
+        transcript,
+        output_dir,
+        config,
+        logger=logger,
+        prepared_assignment=prepared_assignment,
+    )
+    asr_result.transcript = transcript
+    return transcript, asr_result, report
+
+
+def speaker_diarization_can_run_parallel(config: Any) -> bool:
+    speaker_config = config.get("speaker_diarization") or {}
+    asr_provider = str((config.get("asr") or {}).get("provider") or "").strip().lower()
+    return (
+        _truthy(speaker_config.get("parallel_with_asr"), default=True)
+        and _truthy(speaker_config.get("enabled"), default=True)
+        and _truthy(speaker_config.get("assignment_enabled"), default=True)
+        and asr_provider not in ASR_PROVIDERS_WITH_INTERNAL_DIARIZATION
+    )
+
+
+def _truthy(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "no", "off"}
+    return bool(value)

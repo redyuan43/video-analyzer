@@ -116,6 +116,10 @@ class ModelSettingsTests(unittest.TestCase):
         self.assertTrue({"asr", "diarization", "ocr", "vision", "evidence_merge", "final_publish"} <= node_ids)
         self.assertIn(("input", "audio_extract"), edges)
         self.assertIn(("input", "frame_extract"), edges)
+        self.assertIn(("audio_extract", "asr"), edges)
+        self.assertIn(("audio_extract", "diarization"), edges)
+        self.assertNotIn(("asr", "diarization"), edges)
+        self.assertIn(("asr", "evidence_merge"), edges)
         self.assertIn(("vision", "evidence_merge"), edges)
         self.assertEqual(models["vision-disabled"]["protocol"], "none")
         self.assertEqual(models["review-inherit-text"]["protocol"], "inherit_text")
@@ -148,6 +152,38 @@ class ModelSettingsTests(unittest.TestCase):
             models["vision-qwen3-vl-4b-local"]["options"]["engine"],
             "qwen3_vl_4b",
         )
+        amd_text = models["text-amd-lmstudio-bonsai-27b"]
+        self.assertEqual(amd_text["protocol"], "openai_compatible")
+        self.assertEqual(amd_text["model"], "prism-ml/bonsai-27b")
+        self.assertEqual(
+            amd_text["endpoints"],
+            ["http://100.90.114.26:18081/v1"],
+        )
+        self.assertEqual(amd_text["options"]["runtime"], "lm_studio")
+        self.assertEqual(amd_text["options"]["reasoning_effort"], "none")
+
+    def test_amd_lmstudio_text_model_expands_to_runtime_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_repo(root)
+            settings = store.public_settings()
+            source = settings["profiles"][0]
+            models = {
+                kind: source[field]
+                for kind, field in settings["schema"]["profile_model_fields"].items()
+            }
+            models["text"] = "text-amd-lmstudio-bonsai-27b"
+            store.save_profile(
+                "amd-lmstudio",
+                {"label": "AMD LM Studio", "models": models, "settings": {}},
+            )
+            _defaults, _user, merged = store.load()
+            profile = get_runtime_profile(merged, "amd-lmstudio")
+
+        self.assertEqual(profile["text_base_url"], "http://100.90.114.26:18081/v1")
+        self.assertEqual(profile["text_model"], "prism-ml/bonsai-27b")
+        self.assertEqual(profile["reasoning_effort"], "none")
+        self.assertEqual(profile["text_timeout_seconds"], 900)
 
     def test_local_firered_profile_expands_to_local_runtime_fields(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -190,6 +226,7 @@ class ModelSettingsTests(unittest.TestCase):
             settings = store.public_settings()
 
         workflow = settings["schema"]["workflows"]["audio_nx1"]
+        edges = {(item["from"], item["to"]) for item in workflow["flow"]["edges"]}
         profile = next(
             item for item in settings["profiles"] if item["name"] == "audio_nx1"
         )
@@ -210,6 +247,11 @@ class ModelSettingsTests(unittest.TestCase):
             profile["diarization_fallback_model_id"],
             "diarization-disabled",
         )
+        self.assertIn(("audio_input", "asr"), edges)
+        self.assertIn(("audio_input", "diarization"), edges)
+        self.assertNotIn(("asr", "diarization"), edges)
+        self.assertIn(("asr", "template_selector"), edges)
+        self.assertIn(("diarization", "template_selector"), edges)
 
     def test_audio_profile_can_be_saved_without_video_models(self):
         with tempfile.TemporaryDirectory() as tmp:

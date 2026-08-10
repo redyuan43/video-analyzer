@@ -88,6 +88,34 @@ class AudioTemplateCatalogTests(unittest.TestCase):
             )
         self.assertEqual(client.prompts, [])
 
+    def test_inherited_text_selector_keeps_lmstudio_reasoning_options(self):
+        class FakeConfig:
+            def get_runtime_profile(self, _profile_name):
+                return {
+                    "template_selector_inherit": "text",
+                    "text_base_url": "http://100.90.114.26:18081/v1",
+                    "text_model": "prism-ml/bonsai-27b",
+                    "reasoning_effort": "none",
+                }
+
+            def get(self, key, default=None):
+                return {} if key == "study_cards" else default
+
+        with patch.object(
+            run_audio_template_analysis,
+            "GenericOpenAIAPIClient",
+        ) as client_class:
+            _client, model, base_url, _temperature = (
+                run_audio_template_analysis.build_template_selector_client(FakeConfig())
+            )
+
+        self.assertEqual(model, "prism-ml/bonsai-27b")
+        self.assertEqual(base_url, "http://100.90.114.26:18081/v1")
+        self.assertEqual(
+            client_class.call_args.kwargs["extra_body"],
+            {"reasoning_effort": "none"},
+        )
+
     def test_invalid_small_model_id_uses_legal_keyword_fallback(self):
         client = FakeClient(
             lambda _prompt, _call: json.dumps(

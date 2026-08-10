@@ -728,10 +728,55 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             self.assertTrue(snapshot_path.is_file())
             snapshot_payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
             self.assertEqual(snapshot_payload["active_runtime_profile"], "deepseek_v4_pro")
+            self.assertIn("endpoints", snapshot_payload)
+            self.assertIn("local_model_runtime", snapshot_payload)
+            self.assertIn("resource_limits", snapshot_payload)
             self.assertEqual(
                 server.job_runtime_env(saved)["VIDEO_ANALYZER_CONFIG_DIR"],
                 snapshot["config_dir"],
             )
+
+    def test_rerun_core_can_refresh_current_runtime_profile_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job = server.create_job(
+                {
+                    "video_url": "https://example.com/video",
+                    "profile": "deepseek_v4_flash",
+                }
+            )
+            loaded = server.load_job(job["job_id"])
+            loaded["runtime_profile_snapshot"]["fingerprint"] = "stale"
+            loaded["status"] = "failed"
+            loaded["stages"] = {
+                "probe": {"status": "succeeded"},
+                "prepare": {"status": "succeeded"},
+                "analyze-core": {"status": "succeeded"},
+                "verify-core": {"status": "failed", "error": "VL failed"},
+            }
+            server.save_job(loaded)
+
+            with patch.object(
+                server,
+                "start_run",
+                side_effect=lambda job_id: server.public_job(server.load_job(job_id)),
+            ) as start_run:
+                result = server.rerun_from_stage(
+                    job["job_id"],
+                    "analyze-core",
+                    profile="deepseek_v4_flash",
+                    refresh_runtime_profile=True,
+                )
+
+            refreshed = server.load_job(job["job_id"])
+
+        start_run.assert_called_once_with(job["job_id"])
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(refreshed["options"]["profile"], "deepseek_v4_flash")
+        self.assertNotIn("analyze-core", refreshed["stages"])
+        self.assertNotIn("verify-core", refreshed["stages"])
+        self.assertEqual(len(refreshed["runtime_profile_snapshot"]["fingerprint"]), 64)
+        self.assertNotEqual(refreshed["runtime_profile_snapshot"]["fingerprint"], "stale")
 
     def test_collect_core_artifacts_includes_review_and_ab_outputs(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -90,8 +90,8 @@ VIDEO_PROFILE_FLOW = {
         {"id": "input", "step": 1, "column": 1, "row": 2, "mobile_order": 1, "lane": "main", "title": "输入与上下文", "subtitle": "视频、字幕、评论与页面信息", "stage": "prepare"},
         {"id": "audio_extract", "step": 2, "column": 2, "row": 1, "mobile_order": 2, "lane": "audio", "title": "音频提取", "subtitle": "生成可转写音轨", "stage": "analyze-core"},
         {"id": "frame_extract", "step": 2, "column": 2, "row": 3, "mobile_order": 5, "lane": "visual", "title": "关键帧提取", "subtitle": "采样并筛选候选帧", "stage": "analyze-core"},
-        {"id": "asr", "step": 3, "column": 3, "row": 1, "mobile_order": 3, "lane": "audio", "title": "语音识别", "subtitle": "生成带时间戳文字稿", "model_kind": "asr", "required": False},
-        {"id": "diarization", "step": 3, "column": 4, "row": 1, "mobile_order": 4, "lane": "audio", "title": "说话人分离", "subtitle": "识别并归属说话人", "model_kind": "diarization", "required": False},
+        {"id": "asr", "step": 3, "column": 3, "row": 1, "mobile_order": 3, "lane": "audio", "title": "语音识别", "subtitle": "与说话人分离并行执行", "model_kind": "asr", "required": False},
+        {"id": "diarization", "step": 3, "column": 3, "row": 2, "mobile_order": 4, "lane": "audio", "title": "说话人分离", "subtitle": "与语音识别并行生成声纹轨", "model_kind": "diarization", "required": False},
         {"id": "ocr", "step": 3, "column": 3, "row": 3, "mobile_order": 6, "lane": "visual", "title": "画面 OCR", "subtitle": "提取画面文字证据", "model_kind": "ocr", "required": False},
         {"id": "vision", "step": 3, "column": 4, "row": 3, "mobile_order": 7, "lane": "visual", "title": "视觉理解", "subtitle": "理解动作、界面和场景", "model_kind": "vision", "required": False},
         {"id": "evidence_merge", "step": 4, "column": 5, "row": 2, "mobile_order": 8, "lane": "main", "title": "证据汇合", "subtitle": "合并音频、视觉与页面证据", "stage": "analyze-core"},
@@ -109,7 +109,8 @@ VIDEO_PROFILE_FLOW = {
         {"from": "input", "to": "audio_extract", "lane": "audio"},
         {"from": "input", "to": "frame_extract", "lane": "visual"},
         {"from": "audio_extract", "to": "asr", "lane": "audio"},
-        {"from": "asr", "to": "diarization", "lane": "audio"},
+        {"from": "audio_extract", "to": "diarization", "lane": "audio"},
+        {"from": "asr", "to": "evidence_merge", "lane": "audio"},
         {"from": "diarization", "to": "evidence_merge", "lane": "audio"},
         {"from": "frame_extract", "to": "ocr", "lane": "visual"},
         {"from": "frame_extract", "to": "vision", "lane": "visual"},
@@ -138,21 +139,23 @@ AUDIO_PROFILE_FLOW = {
     ],
     "nodes": [
         {"id": "audio_input", "step": 1, "column": 1, "row": 2, "mobile_order": 1, "lane": "primary", "title": "NX1 音频输入", "subtitle": "原始文件由 NX1 持久管理", "stage": "prepare"},
-        {"id": "asr", "step": 2, "column": 2, "row": 1, "mobile_order": 2, "lane": "primary", "title": "本地语音识别", "subtitle": "生成带时间戳文字稿", "model_slot": "asr", "model_kind": "asr", "required": True},
-        {"id": "diarization", "step": 3, "column": 3, "row": 1, "mobile_order": 3, "lane": "primary", "title": "本地说话人分离", "subtitle": "识别并归属说话人", "model_slot": "diarization", "model_kind": "diarization", "required": False},
+        {"id": "asr", "step": 2, "column": 2, "row": 1, "mobile_order": 2, "lane": "primary", "title": "本地语音识别", "subtitle": "与说话人分离并行执行", "model_slot": "asr", "model_kind": "asr", "required": True},
+        {"id": "diarization", "step": 2, "column": 2, "row": 2, "mobile_order": 3, "lane": "primary", "title": "本地说话人分离", "subtitle": "并行生成声纹轨后再对齐", "model_slot": "diarization", "model_kind": "diarization", "required": False},
         {"id": "asr_fallback", "step": 2, "column": 2, "row": 3, "mobile_order": 4, "lane": "fallback", "title": "云端 ASR 回退", "subtitle": "仅在本地资源繁忙时启用", "model_slot": "asr_fallback", "model_kind": "asr", "required": False},
-        {"id": "diarization_fallback", "step": 3, "column": 3, "row": 3, "mobile_order": 5, "lane": "fallback", "title": "云端分离回退", "subtitle": "必须与云端 ASR 同时可用", "model_slot": "diarization_fallback", "model_kind": "diarization", "required": False},
-        {"id": "template_selector", "step": 4, "column": 4, "row": 2, "mobile_order": 6, "lane": "analysis", "title": "模板选择", "subtitle": "从动态提示词目录选择模板", "model_slot": "selector", "model_kind": "selector", "required": True},
-        {"id": "text", "step": 5, "column": 5, "row": 2, "mobile_order": 7, "lane": "analysis", "title": "总结与脑图", "subtitle": "按所选模板生成最终内容", "model_slot": "text", "model_kind": "text", "required": True},
-        {"id": "artifact_package", "step": 6, "column": 6, "row": 2, "mobile_order": 8, "lane": "delivery", "title": "产物封装", "subtitle": "整理转写、总结和结构化结果", "stage": "analyze-core"},
-        {"id": "nx1_sync", "step": 7, "column": 7, "row": 2, "mobile_order": 9, "lane": "delivery", "title": "回传 NX1", "subtitle": "镜像资源、发布结果并确认", "stage": "final-publish"},
+        {"id": "diarization_fallback", "step": 2, "column": 2, "row": 4, "mobile_order": 5, "lane": "fallback", "title": "云端分离回退", "subtitle": "与云端 ASR 并行执行", "model_slot": "diarization_fallback", "model_kind": "diarization", "required": False},
+        {"id": "template_selector", "step": 3, "column": 3, "row": 2, "mobile_order": 6, "lane": "analysis", "title": "模板选择", "subtitle": "等待文字稿与声纹轨对齐完成", "model_slot": "selector", "model_kind": "selector", "required": True},
+        {"id": "text", "step": 4, "column": 4, "row": 2, "mobile_order": 7, "lane": "analysis", "title": "总结与脑图", "subtitle": "按所选模板生成最终内容", "model_slot": "text", "model_kind": "text", "required": True},
+        {"id": "artifact_package", "step": 5, "column": 5, "row": 2, "mobile_order": 8, "lane": "delivery", "title": "产物封装", "subtitle": "整理转写、总结和结构化结果", "stage": "analyze-core"},
+        {"id": "nx1_sync", "step": 6, "column": 6, "row": 2, "mobile_order": 9, "lane": "delivery", "title": "回传 NX1", "subtitle": "镜像资源、发布结果并确认", "stage": "final-publish"},
     ],
     "edges": [
         {"from": "audio_input", "to": "asr", "lane": "primary"},
-        {"from": "asr", "to": "diarization", "lane": "primary"},
+        {"from": "audio_input", "to": "diarization", "lane": "primary"},
         {"from": "audio_input", "to": "asr_fallback", "lane": "fallback"},
-        {"from": "asr_fallback", "to": "diarization_fallback", "lane": "fallback"},
+        {"from": "audio_input", "to": "diarization_fallback", "lane": "fallback"},
+        {"from": "asr", "to": "template_selector", "lane": "primary"},
         {"from": "diarization", "to": "template_selector", "lane": "primary"},
+        {"from": "asr_fallback", "to": "template_selector", "lane": "fallback"},
         {"from": "diarization_fallback", "to": "template_selector", "lane": "fallback"},
         {"from": "template_selector", "to": "text", "lane": "analysis"},
         {"from": "text", "to": "artifact_package", "lane": "analysis"},
@@ -400,6 +403,15 @@ def _add_control_resources(catalog: dict[str, dict[str, Any]]) -> None:
         )
 
 
+def _builtin_service_url(config: dict[str, Any], service: str, fallback: str) -> str:
+    endpoints = config.get("endpoints") or {}
+    value = str((endpoints.get("services") or {}).get(service) or fallback)
+    for name, host in (endpoints.get("hosts") or {}).items():
+        value = value.replace(f"{{{name}}}", str(host))
+        value = value.replace(f"{{hosts.{name}}}", str(host))
+    return value
+
+
 def _add_builtin_model_resources(
     catalog: dict[str, dict[str, Any]],
     config: dict[str, Any],
@@ -553,6 +565,29 @@ def _add_builtin_model_resources(
                 "concurrency": 5,
                 "model_path_env": "QWEN3_VL_MODEL_PATH",
                 "mmproj_path_env": "QWEN3_VL_MMPROJ_PATH",
+            },
+        },
+        "text-amd-lmstudio-bonsai-27b": {
+            "name": "LM Studio · Bonsai 27B（AMD）",
+            "kind": "text",
+            "protocol": "openai_compatible",
+            "model": "prism-ml/bonsai-27b",
+            "endpoints": [
+                _builtin_service_url(
+                    config,
+                    "amd_fast_base_url",
+                    "http://100.90.114.26:18081/v1",
+                )
+            ],
+            "options": {
+                "deployment": "remote",
+                "runtime": "lm_studio",
+                "device": "AMD",
+                "quantization": "Q1_0",
+                "context_length": 65792,
+                "reasoning_effort": "none",
+                "text_temperature": 0.2,
+                "text_timeout_seconds": 900,
             },
         },
     }
@@ -1528,6 +1563,9 @@ class RuntimeSettingsStore:
                 "temperature": 0,
                 "max_tokens": 16,
             }
+            reasoning_effort = (item.get("options") or {}).get("reasoning_effort")
+            if reasoning_effort:
+                payload["reasoning_effort"] = reasoning_effort
             request_headers = {**headers, "Content-Type": "application/json"}
             response = session.post(
                 f"{endpoint.rstrip('/')}/chat/completions",

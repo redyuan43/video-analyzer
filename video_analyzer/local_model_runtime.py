@@ -91,6 +91,9 @@ def local_model_runtime_lock(
     stage: str = "text",
 ) -> Iterator[None]:
     """Hold the shared local-model lock without switching model services."""
+    if _SESSION_DEPTH.get() > 0:
+        yield
+        return
     with _local_model_lock(stage, config, logger, owner):
         yield
 

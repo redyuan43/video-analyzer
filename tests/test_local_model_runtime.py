@@ -8,6 +8,7 @@ from unittest.mock import patch
 from video_analyzer.local_model_runtime import (
     has_loopback_endpoint,
     is_loopback_endpoint,
+    local_model_runtime_lock,
     local_model_runtime_session,
     local_model_stage,
     local_model_stage_needed,
@@ -172,6 +173,39 @@ class LocalModelRuntimeTests(unittest.TestCase):
                     "second-core-acquired",
                 ],
             )
+
+    def test_runtime_session_allows_nested_diarization_lock(self):
+        with TemporaryDirectory() as tmp:
+            config = {
+                "operation_manual": {
+                    "vision_base_url": "http://127.0.0.1:18082/v1",
+                },
+                "local_model_runtime": {
+                    "lock_path": str(Path(tmp) / "local.lock"),
+                    "poll_seconds": 0.01,
+                    "log_interval_seconds": 0.01,
+                },
+            }
+            events: list[str] = []
+            logger = __import__("logging").getLogger(__name__)
+
+            def run_nested_lock():
+                with local_model_runtime_session(config, logger, "core-job"):
+                    events.append("core")
+                    with local_model_runtime_lock(
+                        config,
+                        logger,
+                        "speaker-diarization",
+                        stage="diarization",
+                    ):
+                        events.append("diarization")
+
+            thread = threading.Thread(target=run_nested_lock, daemon=True)
+            thread.start()
+            thread.join(timeout=1)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(events, ["core", "diarization"])
 
     @patch("video_analyzer.local_model_runtime.subprocess.run")
     def test_runtime_session_depth_is_thread_local(self, run):

@@ -365,6 +365,8 @@ def build_openai_extra_body(settings: dict[str, Any], api_url: str | None = None
         extra_body["thinking"] = {"type": str(thinking)}
         if reasoning_effort:
             extra_body["reasoning_effort"] = str(reasoning_effort)
+    elif reasoning_effort:
+        extra_body["reasoning_effort"] = str(reasoning_effort)
     return extra_body
 
 

@@ -1,4 +1,5 @@
 from pathlib import Path
+from unittest.mock import patch
 
 from video_analyzer.audio_processor import AudioTranscript
 from video_analyzer.speaker_diarization import (
@@ -7,6 +8,7 @@ from video_analyzer.speaker_diarization import (
     assign_speakers_by_overlap,
     build_speaker_merge_map,
     choose_target_speaker_count,
+    process_transcript_speakers,
     select_dense_windows,
 )
 
@@ -116,6 +118,40 @@ def test_assign_speakers_by_overlap_labels_unlabeled_asr_segments():
     assert report["assigned_segment_count"] == 2
     assert report["unassigned_segment_count"] == 1
     assert report["final_speaker_count"] == 2
+
+
+def test_prepared_assignment_is_reused_after_parallel_asr():
+    transcript = AudioTranscript(
+        text="hello",
+        language="en",
+        segments=[{"start": 0.0, "end": 1.0, "text": "hello"}],
+        metadata={},
+    )
+    prepared = (
+        [{"start": 0.0, "end": 1.0, "speaker": "spk_01"}],
+        {
+            "enabled": True,
+            "mode": "assignment",
+            "backend": "wespeaker",
+            "original_speaker_count": 0,
+            "original_speakers": [],
+            "notes": [],
+        },
+    )
+
+    with patch(
+        "video_analyzer.speaker_diarization.run_diarization_assignment"
+    ) as backend:
+        assigned, report = process_transcript_speakers(
+            Path("/tmp/audio.wav"),
+            transcript,
+            {"enabled": True, "backend": "wespeaker"},
+            prepared_assignment=prepared,
+        )
+
+    backend.assert_not_called()
+    assert assigned.segments[0]["speaker"] == "说话人 1"
+    assert report["final_speaker_count"] == 1
 
 
 def test_select_dense_windows_prefers_multi_speaker_dense_region():

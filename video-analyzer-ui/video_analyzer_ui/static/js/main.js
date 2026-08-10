@@ -2034,6 +2034,7 @@ function renderJob(job) {
     const isSucceeded = job.status === 'succeeded';
     const isActive = jobIsActive(job);
     const failureDisposition = job.failure_disposition || {};
+    const rerunCore = job.status === 'failed' && failureDisposition.category === 'rerun_core';
     const shouldOpenExisting = job.status === 'failed' && !failureDisposition.rerun_recommended && Boolean(runDir);
     const missingRunDir = isSucceeded && !runDir;
     nodes.selectedTitle.textContent = jobDisplayTitle(job);
@@ -2053,7 +2054,9 @@ function renderJob(job) {
             ? '成功'
             : (shouldOpenExisting
                 ? (failureDisposition.category === 'review_required' ? '打开产物复核' : '查看已有产物')
-                : (job.status === 'failed' ? '用 Flash 继续' : '继续运行')));
+                : (rerunCore
+                    ? '按当前方案重跑核心分析'
+                    : '继续运行')));
     nodes.runButton.title = isActive
         ? '停止当前运行任务'
         : ((isSucceeded || shouldOpenExisting) && runDir
@@ -6098,12 +6101,26 @@ async function runSelectedJob() {
     nodes.runButton.disabled = true;
     try {
         const action = nodes.runButton.dataset.action || (currentJob?.status === 'succeeded' ? 'open-run-dir' : 'run');
-        await getJson(`/api/video-link/jobs/${selectedJobId}/${action}`, {
+        const rerunCore = (
+            action === 'run'
+            && currentJob?.status === 'failed'
+            && currentJob?.failure_disposition?.category === 'rerun_core'
+        );
+        const endpoint = rerunCore
+            ? `/api/video-link/jobs/${selectedJobId}/stages/analyze-core/rerun`
+            : `/api/video-link/jobs/${selectedJobId}/${action}`;
+        const payload = rerunCore
+            ? {
+                profile: currentJob?.options?.profile || currentJob?.runtime_profile_snapshot?.profile || '',
+                refresh_runtime_profile: true
+            }
+            : {};
+        await getJson(endpoint, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: '{}'
+            body: JSON.stringify(payload)
         });
-        if (action === 'run' || action === 'stop') {
+        if (action === 'run' || action === 'stop' || rerunCore) {
             await refreshSelectedJob();
         } else {
             nodes.runButton.disabled = false;

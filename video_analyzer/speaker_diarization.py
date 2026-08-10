@@ -54,6 +54,7 @@ def process_transcript_speakers(
     audio_path: Path,
     transcript: AudioTranscript,
     config: dict[str, Any] | None = None,
+    prepared_assignment: tuple[list[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> tuple[AudioTranscript, dict[str, Any]]:
     """Assign missing speaker labels, or refine labels supplied by the ASR."""
     config = config or {}
@@ -64,24 +65,10 @@ def process_transcript_speakers(
     if current_speakers:
         return refine_transcript_speakers(audio_path, transcript, config)
 
-    backend = str(config.get("backend") or "3dspeaker")
-    report: dict[str, Any] = {
-        "enabled": True,
-        "mode": "assignment",
-        "backend": backend,
-        "original_speaker_count": 0,
-        "original_speakers": [],
-        "notes": [],
-    }
-    if not _truthy(config.get("assignment_enabled"), default=True):
-        report["notes"].append("speaker assignment disabled")
-        transcript.metadata = _with_hybrid_metadata(transcript.metadata, report)
-        return transcript, report
-
-    turns, assignment_report = run_diarization_assignment(audio_path, config)
-    report.update(assignment_report)
+    turns, report = prepared_assignment or prepare_speaker_assignment(audio_path, config)
     if not turns:
-        report["notes"].append("no diarization turns produced")
+        if "no diarization turns produced" not in report["notes"]:
+            report["notes"].append("no diarization turns produced")
         transcript.metadata = _with_hybrid_metadata(transcript.metadata, report)
         return transcript, report
 
@@ -89,6 +76,33 @@ def process_transcript_speakers(
     report.update(assignment_stats)
     assigned.metadata = _with_hybrid_metadata(assigned.metadata, report)
     return assigned, report
+
+
+def prepare_speaker_assignment(
+    audio_path: Path,
+    config: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Generate speaker turns independently so ASR can run at the same time."""
+    config = config or {}
+    backend = str(config.get("backend") or "3dspeaker")
+    report: dict[str, Any] = {
+        "enabled": _truthy(config.get("enabled"), default=True),
+        "mode": "assignment",
+        "backend": backend,
+        "original_speaker_count": 0,
+        "original_speakers": [],
+        "notes": [],
+    }
+    if not report["enabled"]:
+        report["reason"] = "disabled"
+        return [], report
+    if not _truthy(config.get("assignment_enabled"), default=True):
+        report["notes"].append("speaker assignment disabled")
+        return [], report
+
+    turns, assignment_report = run_diarization_assignment(audio_path, config)
+    report.update(assignment_report)
+    return turns, report
 
 
 def run_diarization_assignment(

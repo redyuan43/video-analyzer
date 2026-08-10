@@ -143,6 +143,17 @@ class GenericOpenAIAPIClientTests(unittest.TestCase):
 
         self.assertEqual(extra_body, {})
 
+    def test_lmstudio_extra_body_sends_reasoning_effort_without_deepseek_thinking(self):
+        extra_body = build_openai_extra_body(
+            {
+                "deepseek_thinking": "disabled",
+                "reasoning_effort": "none",
+            },
+            "http://100.90.114.26:18081/v1",
+        )
+
+        self.assertEqual(extra_body, {"reasoning_effort": "none"})
+
     def test_text_temperature_uses_profile_value(self):
         self.assertEqual(resolve_temperature({"text_temperature": 1.0}, 0.2), 1.0)
 
