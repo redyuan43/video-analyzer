@@ -22,6 +22,7 @@
                 <button id="consoleTab" class="view-tab active" type="button" data-view="console">控制台</button>
                 <button id="qaTab" class="view-tab" type="button" data-view="qa">问答</button>
                 <button id="vscodeTab" class="view-tab" type="button" data-view="vscode">学习/资源</button>
+                <button id="settingsTab" class="view-tab" type="button" data-view="settings">设置</button>
             </nav>
         </header>
 
@@ -88,7 +89,7 @@
                             <span>分析模式</span>
                             <select id="analysisMode" name="analysis_mode"></select>
                         </label>
-                        <label hidden>
+                        <label>
                             <span>运行配置</span>
                             <select id="profile" name="profile"></select>
                         </label>
@@ -190,6 +191,8 @@
                         <div><span>视频链接</span><strong id="detailUrl">-</strong></div>
                         <div><span>运行目录</span><strong id="detailRunDir">-</strong></div>
                         <div><span>分析模式</span><strong id="detailMode">-</strong></div>
+                        <div><span>运行方案</span><strong id="detailProfile">-</strong></div>
+                        <div class="wide"><span>模型快照</span><strong id="detailModels">-</strong></div>
                         <div><span>更新时间</span><strong id="detailUpdated">-</strong></div>
                     </div>
                 </section>
@@ -303,6 +306,152 @@
             </section>
         </section>
 
+        <section id="settingsView" class="settings-view view-panel" hidden>
+            <header class="settings-toolbar">
+                <div>
+                    <h2>模型设置</h2>
+                    <p id="settingsSummary">正在加载配置</p>
+                </div>
+                <div class="resource-view-tabs" role="tablist" aria-label="模型设置页面">
+                    <button id="settingsModelsTab" class="resource-view-tab active" type="button">模型资源库</button>
+                    <button id="settingsProfilesTab" class="resource-view-tab" type="button">运行方案</button>
+                </div>
+            </header>
+
+            <section id="settingsModelsView" class="settings-layout">
+                <aside class="settings-list-pane">
+                    <div class="settings-list-head">
+                        <select id="settingsModelKindFilter" aria-label="模型类型筛选"></select>
+                        <button id="newModelButton" class="icon-button light" type="button" title="新增模型" aria-label="新增模型">+</button>
+                    </div>
+                    <input id="settingsModelSearch" type="search" placeholder="搜索模型">
+                    <div id="settingsModelList" class="settings-item-list"></div>
+                </aside>
+                <form id="modelSettingsForm" class="settings-editor">
+                    <header>
+                        <div>
+                            <h3 id="modelEditorTitle">新增模型</h3>
+                            <span id="modelEditorMeta">选择类型和协议</span>
+                        </div>
+                        <div class="settings-actions">
+                            <button id="testModelButton" class="secondary" type="button" disabled>测试连接</button>
+                            <button id="deleteModelButton" class="secondary danger" type="button" disabled>删除</button>
+                            <button id="saveModelButton" type="submit">保存</button>
+                        </div>
+                    </header>
+                    <div class="settings-form-grid">
+                        <label><span>ID</span><input id="modelId" required pattern="[a-z][a-z0-9_-]{1,63}"></label>
+                        <label><span>名称</span><input id="modelName" required maxlength="120"></label>
+                        <label><span>类型</span><select id="modelKind"></select></label>
+                        <label><span>协议</span><select id="modelProtocol"></select></label>
+                        <label class="wide"><span>模型名</span><input id="modelNameValue" placeholder="model-id"></label>
+                        <label class="wide"><span>端点，每行一个</span><textarea id="modelEndpoints" rows="4" placeholder="http://127.0.0.1:18012/api/asr/transcribe"></textarea></label>
+                        <label><span>部署位置</span><select id="modelDeployment">
+                            <option value="">自动判断</option>
+                            <option value="local">本机</option>
+                            <option value="cloud">云端</option>
+                            <option value="remote">远程设备</option>
+                        </select></label>
+                        <label><span>Worker 数</span><input id="modelWorkerCount" type="number" min="1" max="64" placeholder="5"></label>
+                        <label><span>并发数</span><input id="modelConcurrency" type="number" min="1" max="256" placeholder="5"></label>
+                        <label><span>API Key 环境变量</span><input id="modelApiKeyEnv" placeholder="DEEPSEEK_API_KEY"></label>
+                        <label><span>健康检查 URL</span><input id="modelHealthUrl" type="url" placeholder="http://127.0.0.1:18012/api/health"></label>
+                        <label class="wide"><span>高级参数 JSON</span><textarea id="modelOptions" rows="9">{}</textarea></label>
+                    </div>
+                    <div id="modelSettingsMessage" class="settings-message"></div>
+                </form>
+            </section>
+
+            <section id="settingsProfilesView" class="settings-layout" hidden>
+                <aside class="settings-list-pane">
+                    <div class="settings-list-head">
+                        <strong>运行方案</strong>
+                        <button id="newProfileButton" class="icon-button light" type="button" title="新增运行方案" aria-label="新增运行方案">+</button>
+                    </div>
+                    <div id="settingsProfileList" class="settings-item-list"></div>
+                </aside>
+                <form id="profileSettingsForm" class="settings-editor">
+                    <header>
+                        <div>
+                            <h3 id="profileEditorTitle">新增运行方案</h3>
+                            <span id="profileEditorMeta">组合各阶段模型</span>
+                        </div>
+                        <div class="settings-actions">
+                            <button id="duplicateProfileButton" class="secondary" type="button" disabled>复制</button>
+                            <button id="activateProfileButton" class="secondary" type="button" disabled>设为默认</button>
+                            <button id="deleteProfileButton" class="secondary danger" type="button" disabled>删除</button>
+                            <button id="saveProfileButton" type="submit">保存</button>
+                        </div>
+                    </header>
+                    <div class="settings-form-grid profile-model-grid">
+                        <label><span>ID</span><input id="profileId" required pattern="[A-Za-z0-9][A-Za-z0-9_.-]{0,63}"></label>
+                        <label><span>显示名称</span><input id="profileLabel" required maxlength="120"></label>
+                        <label><span>工作流</span><select id="profileWorkflow" required></select></label>
+                        <label class="wide"><span>说明</span><input id="profileDescription" maxlength="500"></label>
+                        <section class="profile-flow-section wide" aria-labelledby="profileFlowTitle">
+                            <div class="profile-flow-head">
+                                <div>
+                                    <h4 id="profileFlowTitle">分析流程</h4>
+                                    <span>从左到右配置每个阶段使用的模型，点击节点查看详细参数。</span>
+                                </div>
+                                <div class="profile-flow-head-actions">
+                                    <div id="profileFlowLegend" class="profile-flow-legend" aria-label="流程分支图例"></div>
+                                    <div class="profile-test-controls">
+                                        <select id="profileTestMode" aria-label="通路测试模式">
+                                            <option value="quick">快速检查</option>
+                                            <option value="inference">最小推理</option>
+                                            <option value="pathway">全链路冒烟</option>
+                                        </select>
+                                        <button id="testProfileButton" class="secondary" type="button" disabled>测试通路</button>
+                                    </div>
+                                    <span id="profileTestAvailability" class="profile-test-availability">正在检查后台任务...</span>
+                                </div>
+                            </div>
+                            <div id="profileFlowViewport" class="profile-flow-viewport" tabindex="0" aria-label="运行方案流程图">
+                                <div id="profileFlowCanvas" class="profile-flow-canvas">
+                                    <svg id="profileFlowEdges" class="profile-flow-edges" aria-hidden="true"></svg>
+                                    <div id="profileFlowNodes" class="profile-flow-nodes"></div>
+                                </div>
+                            </div>
+                            <section id="profileFlowInspector" class="profile-flow-inspector" aria-live="polite">
+                                <div>
+                                    <span class="profile-flow-inspector-kicker">节点详情</span>
+                                    <h4 id="profileFlowInspectorTitle">选择一个流程节点</h4>
+                                    <p id="profileFlowInspectorMeta">可查看模型来源、协议、端点和节点参数。</p>
+                                </div>
+                                <div id="profileFlowInspectorBody" class="profile-flow-inspector-body"></div>
+                                <div id="profileFlowInspectorActions" class="profile-flow-inspector-actions"></div>
+                            </section>
+                            <section id="profileTestSummary" class="profile-test-summary" hidden aria-live="polite"></section>
+                        </section>
+                        <div class="profile-model-selects" hidden>
+                            <select id="profileAsrModel"></select>
+                            <select id="profileDiarizationModel"></select>
+                            <select id="profileOcrModel"></select>
+                            <select id="profileVisionModel"></select>
+                            <select id="profileTextModel"></select>
+                            <select id="profileReviewModel"></select>
+                            <select id="profileStudyModel"></select>
+                            <select id="profileTriageModel"></select>
+                            <select id="profileImageModel"></select>
+                        </div>
+                        <label><span>流水线深度</span>
+                            <select id="profilePipelineMode">
+                                <option value="fast">fast</option>
+                                <option value="balanced">balanced</option>
+                                <option value="deep">deep</option>
+                            </select>
+                        </label>
+                        <label><span>VL 并发</span><input id="profileVlConcurrency" type="number" min="1" max="32"></label>
+                        <label><span>OCR 并发</span><input id="profileOcrConcurrency" type="text" placeholder="auto"></label>
+                        <label><span>文本超时秒数</span><input id="profileTextTimeout" type="number" min="1"></label>
+                        <label class="wide"><span>其他运行参数 JSON</span><textarea id="profileSettingsJson" rows="10">{}</textarea></label>
+                    </div>
+                    <div id="profileSettingsMessage" class="settings-message"></div>
+                </form>
+            </section>
+        </section>
+
         <section id="vscodeView" class="vscode-view view-panel" hidden>
             <section id="resourceToolbar" class="panel vscode-toolbar">
                 <div>
@@ -399,6 +548,7 @@
                         </div>
                         <div class="skills-scope-tabs" role="tablist" aria-label="Skills 范围">
                             <button class="skills-scope-tab active" type="button" data-skills-scope="current">当前任务</button>
+                            <button class="skills-scope-tab" type="button" data-skills-scope="projects">Skill 项目</button>
                             <button class="skills-scope-tab" type="button" data-skills-scope="enabled">已启用</button>
                             <button class="skills-scope-tab" type="button" data-skills-scope="disabled">已禁用</button>
                             <button class="skills-scope-tab" type="button" data-skills-scope="trash">回收站</button>
@@ -425,6 +575,7 @@
                             <div id="skillSummary" class="skill-summary">等待启动</div>
                         </div>
                         <div class="skill-actions">
+                            <button id="createTargetedSkillProjectButton" class="secondary" type="button" disabled>指定目标</button>
                             <button id="generateSkillButton" class="secondary" type="button" disabled>开始蒸馏</button>
                             <button id="resumeSkillButton" class="secondary" type="button" hidden>继续</button>
                             <button id="cancelSkillButton" class="secondary" type="button" hidden>取消</button>
@@ -479,6 +630,47 @@
                         </aside>
                     </div>
                     <div class="pane-resizer row-resizer skills-height-resizer" data-resize-pane="skills-current-height" role="separator" aria-orientation="horizontal" aria-label="调整当前任务内容高度" tabindex="0"></div>
+                </section>
+
+                <section id="skillProjectsWorkspace" class="skill-projects-workspace" hidden>
+                    <div class="skill-projects-grid">
+                        <aside class="skills-item-pane">
+                            <div class="skills-pane-heading">
+                                <h3>Skill 项目</h3>
+                                <span id="skillProjectsCount">0 项</span>
+                            </div>
+                            <div id="skillProjectsList" class="skills-item-list"></div>
+                        </aside>
+                        <section class="skill-project-main">
+                            <form id="skillProjectForm" class="skill-project-form">
+                                <input id="skillProjectTitle" type="text" maxlength="160" placeholder="项目名称">
+                                <textarea id="skillProjectGoal" rows="4" placeholder="要沉淀成 Skill 的目标"></textarea>
+                                <div class="skill-actions">
+                                    <button id="createSkillProjectButton" type="submit">新建项目</button>
+                                    <button id="assessSkillProjectButton" class="secondary" type="button" disabled>评估</button>
+                                    <button id="startSkillProjectButton" type="button" disabled>开始蒸馏</button>
+                                </div>
+                            </form>
+                            <section id="skillProjectDetail" class="skill-project-detail">
+                                <div class="skills-empty">创建或选择一个 Skill 项目</div>
+                            </section>
+                        </section>
+                        <aside class="skills-inspector-pane">
+                            <section>
+                                <h3>资料来源</h3>
+                                <div class="skill-actions">
+                                    <button id="addCurrentJobSkillSourceButton" class="secondary" type="button" disabled>关联当前任务</button>
+                                </div>
+                                <div id="skillProjectSources" class="skill-project-sources">暂无资料</div>
+                            </section>
+                            <section>
+                                <h3>导入对话</h3>
+                                <input id="skillProjectImportFile" type="file" accept=".txt,.md,.json,.jsonl">
+                                <textarea id="skillProjectImportText" rows="6" placeholder="粘贴本地对话或案例"></textarea>
+                                <button id="importSkillProjectSourceButton" class="secondary" type="button" disabled>导入</button>
+                            </section>
+                        </aside>
+                    </div>
                 </section>
 
                 <section id="skillLibraryWorkspace" class="skill-library-workspace" hidden>

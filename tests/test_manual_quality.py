@@ -25,6 +25,39 @@ class ManualQualityTests(unittest.TestCase):
         self.assertIn("![Sequencer 时间轴](manual_assets/frame_034.jpg)", normalized)
         self.assertFalse(any(issue["code"] == "raw_asset_path" for issue in issues))
 
+    def test_markdown_asset_link_is_not_reported_as_raw_path(self):
+        manual = (
+            "### 主要物料清单 (BOM)\n\n"
+            "| 组件 | 截图参考 |\n"
+            "| --- | --- |\n"
+            "| 主控板 | [查看](manual_assets/frame_011.jpg) |\n"
+        )
+
+        issues = review_operation_manual_markdown(manual)
+
+        self.assertFalse(any(issue["code"] == "raw_asset_path" for issue in issues))
+
+    def test_step_detection_does_not_cross_from_an_unrelated_heading(self):
+        manual = "\n".join(
+            [
+                "### 硬件工具",
+                "",
+                "| 组件 | 截图参考 |",
+                "| --- | --- |",
+                "| 主控板 | [查看](manual_assets/frame_011.jpg) |",
+                "",
+                "## 4. 图文操作步骤",
+                "",
+                "### 步骤 1: 安装",
+                "",
+                "![安装画面](manual_assets/frame_012.jpg)",
+            ]
+        )
+
+        issues = review_operation_manual_markdown(manual)
+
+        self.assertFalse(any(issue["code"] == "step_asset_not_rendered" for issue in issues))
+
     def test_text_evidence_map_summarizes_frame_evidence_without_generated_image(self):
         frames = [SimpleNamespace(number=0, timestamp=0.0), SimpleNamespace(number=1, timestamp=2.0)]
         ocr_by_frame = {

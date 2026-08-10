@@ -12,7 +12,7 @@ from typing import Any
 from .artifacts import write_json
 from .asr_providers import ASRStrategyResult, transcribe_with_provider_result, transcribe_with_strategy
 from .audio_processor import AudioProcessor, AudioTranscript
-from .local_model_runtime import local_model_stage, local_model_stage_needed
+from .local_model_runtime import local_model_runtime_lock, local_model_stage, local_model_stage_needed
 from .resource_locks import analyzer_resource_lock
 from .speaker_diarization import process_transcript_speakers
 
@@ -145,11 +145,17 @@ def apply_speaker_diarization(
         return transcript, report
     speaker_config = config.get("speaker_diarization") or {}
     try:
-        refined, report = process_transcript_speakers(
-            audio_path,
-            transcript,
-            speaker_config,
-        )
+        with local_model_runtime_lock(
+            config.config,
+            logger,
+            f"speaker-diarization:{output_dir}",
+            stage="diarization",
+        ):
+            refined, report = process_transcript_speakers(
+                audio_path,
+                transcript,
+                speaker_config,
+            )
     except Exception as exc:
         logger.warning("speaker diarization failed: %s", exc)
         refined = transcript

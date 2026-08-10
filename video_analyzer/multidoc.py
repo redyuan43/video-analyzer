@@ -21,6 +21,22 @@ DOC_FILENAMES = {
     "deep_report": "deep_report.md",
     "operation_manual_review": "operation_manual_review.md",
 }
+CHAPTER_ANALYSIS_DIRNAME = "chapters"
+CHAPTER_ANALYSIS_VERSION = 1
+EVIDENCE_SOURCE_PRIORITY = {
+    "ocr": 6,
+    "vl": 5,
+    "subtitle": 4,
+    "asr": 4,
+    "manual": 3,
+    "page_context": 2,
+    "comment": 1,
+}
+DEFAULT_CHAPTER_EVIDENCE_CHARS = 9000
+MAX_CHAPTER_EVIDENCE_CHARS = 18000
+DEFAULT_CHAPTER_OUTPUT_TOKENS = 900
+MAX_CHAPTER_OUTPUT_TOKENS = 1800
+DEFAULT_OVERVIEW_OUTPUT_TOKENS = 1000
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,6 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text-model", default=None)
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--output", help="Output directory; default RUN_DIR/docs_analysis")
+    parser.add_argument("--refresh", action="store_true", help="Regenerate completed chapter checkpoints")
     return parser.parse_args()
 
 
@@ -53,6 +70,7 @@ def main() -> int:
         temperature=args.temperature if args.temperature is not None else resolve_temperature(profile, 0.2),
         api_key_env=profile.get("text_api_key_env") or profile.get("api_key_env"),
         extra_body=build_openai_extra_body(profile, llm_base_url),
+        refresh=args.refresh,
     )
     return 0
 
@@ -68,6 +86,7 @@ def run_multidoc_analysis(
     api_key_env: str | None = None,
     extra_body: dict[str, Any] | None = None,
     client: Any | None = None,
+    refresh: bool = False,
 ) -> dict[str, Any]:
     run_dir = run_dir.expanduser().resolve()
     validate_run_dir(run_dir)
@@ -75,6 +94,8 @@ def run_multidoc_analysis(
     orin_dir = output_dir / "orin"
     output_dir.mkdir(parents=True, exist_ok=True)
     orin_dir.mkdir(parents=True, exist_ok=True)
+    chapter_dir = orin_dir / CHAPTER_ANALYSIS_DIRNAME
+    chapter_dir.mkdir(parents=True, exist_ok=True)
 
     doc_types = doc_types or DEFAULT_DOC_TYPES
     analysis = read_json(run_dir / "analysis.json")
@@ -88,50 +109,102 @@ def run_multidoc_analysis(
     )
 
     evidence = load_evidence(run_dir, analysis)
-    round1 = generate_round(
-        client,
-        model,
-        temperature,
-        build_evidence_map_prompt(evidence, language),
-        orin_dir / "round_01_evidence_map.md",
-    )
-    write_json(orin_dir / "round_01_evidence_map.json", build_evidence_map_json(evidence))
+    chapter_packets = build_generation_chapter_packets(evidence)
+    if not chapter_packets:
+        raise ValueError("No chapter evidence packets available for document generation")
 
-    round2 = generate_round(
-        client,
-        model,
-        temperature,
-        build_chapter_analysis_prompt(evidence, round1, language),
-        orin_dir / "round_02_chapter_analysis.md",
-    )
-    write_json(orin_dir / "round_02_chapter_analysis.json", {"chapters": evidence["chapters"]})
+    generation_metrics = {
+        "model_calls": 0,
+        "checkpoint_hits": 0,
+        "chapter_checkpoint_hits": 0,
+        "overview_checkpoint_hit": False,
+        "prompt_chars_total": 0,
+        "prompt_chars_max": 0,
+        "output_token_budget_total": 0,
+        "planned_prompt_chars_total": 0,
+        "planned_output_token_budget_total": 0,
+    }
+    chapter_results = []
+    for packet in chapter_packets:
+        checkpoint = chapter_dir / f"{packet['chapter_id']}.json"
+        raw_path = chapter_dir / f"{packet['chapter_id']}.raw.md"
+        prompt = build_chapter_generation_prompt(packet, language)
+        output_budget = chapter_output_budget(packet)
+        generation_metrics["planned_prompt_chars_total"] += len(prompt)
+        generation_metrics["planned_output_token_budget_total"] += output_budget
+        cached = read_json_if_exists(checkpoint) if not refresh else None
+        if is_valid_chapter_result(cached, packet["chapter_id"]):
+            result = repair_cached_chapter_result(cached, raw_path, packet)
+            if result != cached:
+                write_json(checkpoint, result)
+            chapter_results.append(result)
+            generation_metrics["checkpoint_hits"] += 1
+            generation_metrics["chapter_checkpoint_hits"] += 1
+            continue
 
-    drafts: dict[str, str] = {}
+        generation_metrics["model_calls"] += 1
+        generation_metrics["prompt_chars_total"] += len(prompt)
+        generation_metrics["prompt_chars_max"] = max(generation_metrics["prompt_chars_max"], len(prompt))
+        generation_metrics["output_token_budget_total"] += output_budget
+        response = client.generate(
+            prompt=prompt,
+            model=model,
+            temperature=temperature,
+            num_predict=output_budget,
+        )
+        raw_text = str(response.get("response") or "").strip()
+        raw_path.write_text(raw_text + "\n", encoding="utf-8")
+        result = normalize_chapter_result(raw_text, packet)
+        write_json(checkpoint, result)
+        chapter_results.append(result)
+
+    overview_path = orin_dir / "overview.json"
+    overview_prompt = build_cross_chapter_overview_prompt(chapter_results, language)
+    overview_budget = overview_output_budget(chapter_results)
+    generation_metrics["planned_prompt_chars_total"] += len(overview_prompt)
+    generation_metrics["planned_output_token_budget_total"] += overview_budget
+    overview_cached = read_json_if_exists(overview_path) if not refresh else None
+    if is_valid_overview(overview_cached):
+        overview = repair_cached_overview(overview_cached, chapter_results)
+        if overview != overview_cached:
+            write_json(overview_path, overview)
+        generation_metrics["checkpoint_hits"] += 1
+        generation_metrics["overview_checkpoint_hit"] = True
+    else:
+        generation_metrics["model_calls"] += 1
+        generation_metrics["prompt_chars_total"] += len(overview_prompt)
+        generation_metrics["prompt_chars_max"] = max(generation_metrics["prompt_chars_max"], len(overview_prompt))
+        generation_metrics["output_token_budget_total"] += overview_budget
+        overview_response = client.generate(
+            prompt=overview_prompt,
+            model=model,
+            temperature=temperature,
+            num_predict=overview_budget,
+        )
+        overview = normalize_overview(str(overview_response.get("response") or ""), chapter_results)
+        write_json(overview_path, overview)
+
+    review = build_deterministic_review(chapter_results, overview)
+    write_json(orin_dir / "round_04_review.json", review)
+
+    rendered_docs = {
+        "knowledge_notes": render_knowledge_notes(chapter_results, overview),
+        "deep_report": render_deep_report(chapter_results, overview),
+        "operation_manual_review": render_operation_manual_review(chapter_results, overview),
+    }
     final_docs: dict[str, str] = {}
     for doc_type in doc_types:
-        draft = generate_round(
-            client,
-            model,
-            temperature,
-            build_document_prompt(doc_type, evidence, round1, round2, language),
-            orin_dir / f"round_03_{doc_type}_draft.md",
-        )
-        drafts[doc_type] = draft
-
-    review = generate_round(
-        client,
-        model,
-        temperature,
-        build_review_prompt(evidence, drafts, language),
-        orin_dir / "round_04_review.md",
-    )
-    write_json(orin_dir / "round_04_review.json", {"review": review, "doc_types": doc_types})
-
-    for doc_type, draft in drafts.items():
-        final_text = render_final_document(draft, review)
         path = output_dir / DOC_FILENAMES[doc_type]
-        path.write_text(final_text, encoding="utf-8")
+        path.write_text(rendered_docs[doc_type], encoding="utf-8")
         final_docs[doc_type] = str(path)
+    chapter_output_dir = run_dir / "docs_analysis_chapters"
+    chapter_output_dir.mkdir(parents=True, exist_ok=True)
+    chapter_outputs = {
+        "knowledge_notes_v2": chapter_output_dir / "knowledge_notes_v2.md",
+        "deep_report_v2": chapter_output_dir / "deep_report_v2.md",
+    }
+    chapter_outputs["knowledge_notes_v2"].write_text(rendered_docs["knowledge_notes"], encoding="utf-8")
+    chapter_outputs["deep_report_v2"].write_text(rendered_docs["deep_report"], encoding="utf-8")
 
     summary = {
         "run_dir": str(run_dir),
@@ -140,16 +213,403 @@ def run_multidoc_analysis(
         "doc_types": doc_types,
         "llm_base_url": base_url,
         "text_model": model,
-        "rounds": {
-            "evidence_map": str(orin_dir / "round_01_evidence_map.md"),
-            "chapter_analysis": str(orin_dir / "round_02_chapter_analysis.md"),
-            "drafts": {doc_type: str(orin_dir / f"round_03_{doc_type}_draft.md") for doc_type in doc_types},
-            "review": str(orin_dir / "round_04_review.md"),
+        "generation": {
+            "version": CHAPTER_ANALYSIS_VERSION,
+            "chapter_count": len(chapter_results),
+            "chapter_checkpoints": str(chapter_dir),
+            "overview": str(overview_path),
+            "review": str(orin_dir / "round_04_review.json"),
+            "resumable": True,
+            "metrics": generation_metrics,
         },
         "outputs": final_docs,
+        "chapter_outputs": {name: str(path) for name, path in chapter_outputs.items()},
     }
     write_json(output_dir / "analysis.json", summary)
     return summary
+
+
+def build_generation_chapter_packets(evidence: dict[str, Any]) -> list[dict[str, Any]]:
+    study_context = evidence.get("study_context") or {}
+    packets = study_context.get("chapter_packets") or []
+    if not packets:
+        packets = [
+            {
+                "chapter_id": f"chapter_{index:02d}",
+                "index": index,
+                **chapter,
+                "summary": "",
+                "key_points": [],
+                "evidence": [],
+            }
+            for index, chapter in enumerate(evidence.get("chapters") or [], start=1)
+        ]
+
+    result = []
+    for index, chapter in enumerate(packets, start=1):
+        chapter_id = str(chapter.get("chapter_id") or f"chapter_{index:02d}")
+        selected_evidence = select_chapter_evidence(chapter.get("evidence") or [])
+        result.append(
+            {
+                "chapter_id": chapter_id,
+                "index": int(chapter.get("index") or index),
+                "title": str(chapter.get("title") or f"章节 {index:02d}").strip(),
+                "start": str(chapter.get("start") or "00:00:00"),
+                "end": str(chapter.get("end") or ""),
+                "summary": str(chapter.get("summary") or "").strip(),
+                "key_points": [str(item).strip() for item in chapter.get("key_points") or [] if str(item).strip()][:10],
+                "review_flags": [str(item).strip() for item in chapter.get("review_flags") or [] if str(item).strip()][:8],
+                "evidence": selected_evidence,
+            }
+        )
+    return result
+
+
+def select_chapter_evidence(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        source_type = str(item.get("source_type") or "").strip().lower()
+        text = str(item.get("text") or "").strip()
+        if not text or source_type == "comment":
+            continue
+        if source_type == "vl" and text.lower().startswith("vl analysis skipped"):
+            continue
+        normalized.append(
+            {
+                "id": str(item.get("id") or ""),
+                "source_type": source_type or "unknown",
+                "timestamp_label": str(item.get("timestamp_label") or ""),
+                "timestamp_sec": float(item.get("timestamp_sec") or 0),
+                "confidence": float(item.get("confidence") or 0),
+                "text": text,
+            }
+        )
+
+    selected: list[dict[str, Any]] = []
+    used_ids: set[str] = set()
+    for source_type in ("ocr", "vl", "subtitle", "asr", "manual", "page_context"):
+        candidate = next((item for item in normalized if item["source_type"] == source_type), None)
+        if candidate:
+            selected.append(candidate)
+            used_ids.add(candidate["id"])
+
+    ranked = sorted(
+        (item for item in normalized if item["id"] not in used_ids),
+        key=lambda item: (
+            EVIDENCE_SOURCE_PRIORITY.get(item["source_type"], 0),
+            item["confidence"],
+            -item["timestamp_sec"],
+        ),
+        reverse=True,
+    )
+    selected.extend(ranked)
+
+    budget = DEFAULT_CHAPTER_EVIDENCE_CHARS
+    used = 0
+    packed = []
+    for item in selected:
+        source_limit = 1200 if item["source_type"] in {"manual", "page_context"} else 900
+        text = trim(item["text"], source_limit)
+        size = len(text)
+        if packed and used + size > budget:
+            continue
+        packed.append({**item, "text": text})
+        used += size
+        if used >= budget:
+            break
+    return packed
+
+
+def chapter_output_budget(packet: dict[str, Any]) -> int:
+    evidence_chars = sum(len(str(item.get("text") or "")) for item in packet.get("evidence") or [])
+    key_point_count = len(packet.get("key_points") or [])
+    return min(
+        MAX_CHAPTER_OUTPUT_TOKENS,
+        max(DEFAULT_CHAPTER_OUTPUT_TOKENS, 700 + evidence_chars // 45 + key_point_count * 25),
+    )
+
+
+def overview_output_budget(chapter_results: list[dict[str, Any]]) -> int:
+    return min(1600, max(DEFAULT_OVERVIEW_OUTPUT_TOKENS, 700 + len(chapter_results) * 60))
+
+
+def build_chapter_generation_prompt(packet: dict[str, Any], language: str) -> str:
+    evidence_lines = [
+        (
+            f"- [{item['id']}] {item['timestamp_label']} {item['source_type']} "
+            f"(confidence={item['confidence']:.2f}): {item['text']}"
+        )
+        for item in packet.get("evidence") or []
+    ]
+    return f"""
+/no_think
+你是视频证据编辑。只分析一个章节，所有事实必须来自给定证据。
+
+章节：{packet['index']}. {packet['title']}（{packet['start']} - {packet['end']}）
+章节摘要：{packet['summary']}
+已有要点：{json.dumps(packet['key_points'], ensure_ascii=False)}
+复核标记：{json.dumps(packet['review_flags'], ensure_ascii=False)}
+
+证据：
+{chr(10).join(evidence_lines)}
+
+请用 {language} 且只输出 JSON：
+{{
+  "chapter_summary": "本章完整但紧凑的总结",
+  "key_facts": [{{"claim": "...", "evidence_ids": ["..."]}}],
+  "analysis": ["解释、对比、适用条件或方法论"],
+  "manual_review": ["手册需补充、修正或明确标注的不确定项"],
+  "cautions": ["证据不足、ASR/OCR 可能错误或不应确定化的内容"],
+  "citations": ["本章最关键的 evidence id"]
+}}
+
+规则：
+- 覆盖本章主题，不引入其他章节结论。
+- 可见文字与界面以 OCR/VL 为优先依据；口播事实以转写为依据。
+- 评论或没有给出的信息不得成为结论。
+- 引用只能使用上方 evidence id。
+""".strip()
+
+
+def normalize_chapter_result(raw_text: str, packet: dict[str, Any]) -> dict[str, Any]:
+    parsed = parse_json_object(raw_text)
+    allowed_ids = {item["id"] for item in packet.get("evidence") or [] if item.get("id")}
+    citations = [
+        str(item)
+        for item in (parsed.get("citations") or [])
+        if str(item) in allowed_ids
+    ] if isinstance(parsed, dict) else []
+    if not citations:
+        citations = [item["id"] for item in packet.get("evidence")[:4] if item.get("id")]
+    key_facts = parsed.get("key_facts") if isinstance(parsed, dict) else []
+    if not isinstance(key_facts, list):
+        key_facts = []
+    normalized_facts = []
+    for fact in key_facts[:12]:
+        if isinstance(fact, dict):
+            evidence_ids = [str(item) for item in fact.get("evidence_ids") or [] if str(item) in allowed_ids]
+            normalized_facts.append(
+                {
+                    "claim": str(fact.get("claim") or "").strip(),
+                    "evidence_ids": evidence_ids or citations[:2],
+                }
+            )
+        elif str(fact).strip():
+            normalized_facts.append({"claim": str(fact).strip(), "evidence_ids": citations[:2]})
+
+    def values(name: str) -> list[str]:
+        source = parsed.get(name) if isinstance(parsed, dict) else []
+        if isinstance(source, str):
+            source = [source]
+        return [str(item).strip() for item in source or [] if str(item).strip()][:12]
+
+    summary = str(parsed.get("chapter_summary") or "").strip() if isinstance(parsed, dict) else ""
+    if not summary:
+        summary = extract_json_string_field(raw_text, "chapter_summary")
+    if not summary:
+        summary = packet.get("summary") or packet.get("title") or "本章未生成有效摘要。"
+    if not normalized_facts:
+        normalized_facts = [
+            {"claim": point, "evidence_ids": citations[:2]}
+            for point in packet.get("key_points") or []
+            if point
+        ][:8]
+    return {
+        "version": CHAPTER_ANALYSIS_VERSION,
+        "chapter_id": packet["chapter_id"],
+        "index": packet["index"],
+        "title": packet["title"],
+        "start": packet["start"],
+        "end": packet["end"],
+        "chapter_summary": summary,
+        "key_facts": normalized_facts,
+        "analysis": values("analysis"),
+        "manual_review": values("manual_review"),
+        "cautions": values("cautions"),
+        "citations": citations,
+        "evidence_count": len(packet.get("evidence") or []),
+    }
+
+
+def repair_cached_chapter_result(
+    cached: dict[str, Any],
+    raw_path: Path,
+    packet: dict[str, Any],
+) -> dict[str, Any]:
+    summary = str(cached.get("chapter_summary") or "").lstrip()
+    if not summary.startswith(("{", "[")):
+        return cached
+    raw_text = read_text_if_exists(raw_path)
+    return normalize_chapter_result(raw_text, packet)
+
+
+def extract_json_string_field(text: str, field: str) -> str:
+    match = re.search(rf'"{re.escape(field)}"\s*:\s*', text or "")
+    if not match:
+        return ""
+    try:
+        value, _ = json.JSONDecoder().raw_decode((text or "")[match.end() :].lstrip())
+    except json.JSONDecodeError:
+        return ""
+    return str(value).strip() if isinstance(value, str) else ""
+
+
+def is_valid_chapter_result(payload: Any, chapter_id: str) -> bool:
+    return bool(
+        isinstance(payload, dict)
+        and payload.get("version") == CHAPTER_ANALYSIS_VERSION
+        and payload.get("chapter_id") == chapter_id
+        and str(payload.get("chapter_summary") or "").strip()
+    )
+
+
+def build_cross_chapter_overview_prompt(chapters: list[dict[str, Any]], language: str) -> str:
+    compact = [
+        {
+            "chapter_id": chapter["chapter_id"],
+            "title": chapter["title"],
+            "time": f"{chapter['start']} - {chapter['end']}".strip(),
+            "summary": chapter["chapter_summary"],
+            "cautions": chapter["cautions"][:3],
+        }
+        for chapter in chapters
+    ]
+    return f"""
+/no_think
+你是视频文档总编辑。根据已完成的章节分析，用 {language} 输出 JSON：
+{{
+  "overview": "覆盖全片的紧凑总览",
+  "cross_chapter_conclusions": ["跨章节结论"],
+  "limitations": ["需要保留的不确定性或限制"]
+}}
+
+章节分析：
+{json.dumps(compact, ensure_ascii=False)}
+
+不得引入章节分析中没有支持的新事实。
+""".strip()
+
+
+def normalize_overview(raw_text: str, chapters: list[dict[str, Any]]) -> dict[str, Any]:
+    parsed = parse_json_object(raw_text)
+    overview = str(parsed.get("overview") or "").strip() if isinstance(parsed, dict) else ""
+    if not overview:
+        overview = extract_json_string_field(raw_text, "overview")
+    if not overview:
+        overview = "\n".join(chapter["chapter_summary"] for chapter in chapters[:3])
+    def values(name: str) -> list[str]:
+        source = parsed.get(name) if isinstance(parsed, dict) else []
+        if isinstance(source, str):
+            source = [source]
+        return [str(item).strip() for item in source or [] if str(item).strip()][:12]
+    return {
+        "version": CHAPTER_ANALYSIS_VERSION,
+        "overview": overview,
+        "cross_chapter_conclusions": values("cross_chapter_conclusions"),
+        "limitations": values("limitations"),
+    }
+
+
+def repair_cached_overview(cached: dict[str, Any], chapters: list[dict[str, Any]]) -> dict[str, Any]:
+    overview = str(cached.get("overview") or "").lstrip()
+    if not overview.startswith(("{", "[")):
+        return cached
+    return normalize_overview(overview, chapters)
+
+
+def is_valid_overview(payload: Any) -> bool:
+    return bool(
+        isinstance(payload, dict)
+        and payload.get("version") == CHAPTER_ANALYSIS_VERSION
+        and str(payload.get("overview") or "").strip()
+    )
+
+
+def build_deterministic_review(chapters: list[dict[str, Any]], overview: dict[str, Any]) -> dict[str, Any]:
+    cautions = [
+        {"chapter_id": chapter["chapter_id"], "title": chapter["title"], "items": chapter["cautions"]}
+        for chapter in chapters
+        if chapter["cautions"]
+    ]
+    return {
+        "version": CHAPTER_ANALYSIS_VERSION,
+        "status": "completed",
+        "chapter_count": len(chapters),
+        "chapters_with_cautions": len(cautions),
+        "cautions": cautions,
+        "overview_limitations": overview.get("limitations") or [],
+    }
+
+
+def render_knowledge_notes(chapters: list[dict[str, Any]], overview: dict[str, Any]) -> str:
+    lines = ["# 知识笔记", "", overview["overview"], ""]
+    for chapter in chapters:
+        lines.extend([f"## {chapter['index']:02d}. {chapter['title']}", f"`{chapter['start']} - {chapter['end']}`", "", chapter["chapter_summary"], ""])
+        if chapter["key_facts"]:
+            lines.append("### 关键事实")
+            lines.extend(
+                f"- {fact['claim']}（证据：{', '.join(fact['evidence_ids'])}）"
+                for fact in chapter["key_facts"] if fact["claim"]
+            )
+            lines.append("")
+        if chapter["analysis"]:
+            lines.append("### 理解与应用")
+            lines.extend(f"- {item}" for item in chapter["analysis"])
+            lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
+def render_deep_report(chapters: list[dict[str, Any]], overview: dict[str, Any]) -> str:
+    lines = ["# 深度报告", "", "## 总览", overview["overview"], ""]
+    if overview["cross_chapter_conclusions"]:
+        lines.append("## 跨章节结论")
+        lines.extend(f"- {item}" for item in overview["cross_chapter_conclusions"])
+        lines.append("")
+    for chapter in chapters:
+        lines.extend([f"## {chapter['index']:02d}. {chapter['title']}", f"`{chapter['start']} - {chapter['end']}`", "", chapter["chapter_summary"], ""])
+        if chapter["analysis"]:
+            lines.extend(f"- {item}" for item in chapter["analysis"])
+            lines.append("")
+        if chapter["cautions"]:
+            lines.append("### 限制与待复核")
+            lines.extend(f"- {item}" for item in chapter["cautions"])
+            lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
+def render_operation_manual_review(chapters: list[dict[str, Any]], overview: dict[str, Any]) -> str:
+    lines = ["# 操作手册复核", "", "本复核按视频章节和已保留证据生成；未被证据支持的内容不应写成确定步骤。", ""]
+    for chapter in chapters:
+        items = chapter["manual_review"] or chapter["cautions"]
+        if not items:
+            continue
+        lines.extend([f"## {chapter['index']:02d}. {chapter['title']}（{chapter['start']} - {chapter['end']}）"])
+        lines.extend(f"- {item}" for item in items)
+        lines.append("")
+    if overview["limitations"]:
+        lines.append("## 全局限制")
+        lines.extend(f"- {item}" for item in overview["limitations"])
+    return "\n".join(lines).strip() + "\n"
+
+
+def parse_json_object(text: str) -> dict[str, Any]:
+    text = (text or "").strip()
+    if not text:
+        return {}
+    try:
+        value = json.loads(text)
+        return value if isinstance(value, dict) else {}
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, flags=re.S)
+        if not match:
+            return {}
+        try:
+            value = json.loads(match.group(0))
+            return value if isinstance(value, dict) else {}
+        except json.JSONDecodeError:
+            return {}
 
 
 def _default_llm_base_url() -> str:

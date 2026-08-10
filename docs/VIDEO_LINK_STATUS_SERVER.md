@@ -51,10 +51,10 @@ tmp/video-link-status/
 - `long-talk-fast` 默认使用 AGX Ray 双 worker（`agx,agx`）抽帧；NX1-NX4 只作为显式手动覆盖，不进入默认路径。
 - `multidoc`、`deep-v2`、`image-prompts`、`final-publish` 各自一次只跑 1 个。
 - 资源忙时阶段会显示 `queued`，而不是返回锁冲突失败。
-- 服务重启后如果发现旧任务停在 `running`/`queued`，会检查记录的阶段进程：进程仍在则保持 `running`，进程已退出且产物不完整则标记 `failed`，最终 PDF 已完整则标记 `succeeded`。
+- 服务重启后如果发现旧任务停在 `running`/`queued`，会检查记录的阶段进程：进程仍在则保持 `running`，进程已退出且产物不完整则标记 `failed`，最终 Markdown 文档和发布摘要完整则标记 `succeeded`。
 - 核心分析完成后，首页摘要必须分开展示扫描帧、OCR 候选帧、实际 OCR 帧、OCR 文本事件和 VL 帧，避免把长视频误读为只抽少量固定帧。
-- 最终发布阶段默认生成 Baoyu 最终图片并插入 Markdown，然后生成手机优先 PDF；不再默认生成长图 PNG。PDF 由 `tools/md_to_mobile_pdf.py` 使用 WeasyPrint 渲染。线性 `flowchart TD` 会转成手机友好的原生 HTML 流程图，其他 Mermaid 图可降级为高分辨率 PNG。
-- 如需连续阅读长图，使用 `tools/run_video_doc_final_publish.sh RUN_DIR --finalize-only --long-png`，会额外生成 `<name>.long.png`，并裁掉 PDF 页间大块空白后纵向拼接。
+- 最终发布阶段默认生成并校验 Markdown，不主动生成 PDF。只有用户明确要求时才使用 `tools/run_video_doc_final_publish.sh RUN_DIR --pdf` 导出 PDF。
+- 如需连续阅读长图，使用 `tools/run_video_doc_final_publish.sh RUN_DIR --pdf --long-png`。
 
 ## API
 

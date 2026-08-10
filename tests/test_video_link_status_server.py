@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from http import HTTPStatus
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
@@ -107,6 +108,66 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(profile["text_model"], "deepseek-v4-pro")
         self.assertEqual(profile["review_model"], "deepseek-v4-pro")
         self.assertEqual(profile["ocr_concurrency"], 6)
+
+    def test_runtime_config_excludes_locally_disabled_built_in_profiles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "video_analyzer" / "config").mkdir(parents=True)
+            (root / "config").mkdir()
+            (root / "video_analyzer" / "config" / "default_config.json").write_text(
+                json.dumps(
+                    {
+                        "active_runtime_profile": "keep",
+                        "runtime_profiles": {
+                            "keep": {"text_model": "keep"},
+                            "legacy": {"text_model": "legacy"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / "config" / "config.json").write_text(
+                json.dumps({"disabled_runtime_profiles": ["legacy"]}),
+                encoding="utf-8",
+            )
+            with patch.object(server_mod, "REPO_ROOT", root):
+                merged = REAL_RUNTIME_CONFIG()
+
+        self.assertEqual(sorted(merged["runtime_profiles"]), ["keep"])
+
+    def test_settings_test_is_rejected_while_background_job_is_active(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(jobs_dir=Path(tmp), auto_resume=False)
+            active = {
+                "jobs": [
+                    {
+                        "job_id": "a" * 32,
+                        "title": "Active analysis",
+                        "status": "running",
+                        "current_stage": "analyze-core",
+                        "runner": {"status": "running", "current_stage": "analyze-core"},
+                    }
+                ]
+            }
+            with patch.object(server, "list_jobs", return_value=active), \
+                patch.object(server.runtime_settings, "test_profile") as test_profile:
+                with self.assertRaises(server_mod.BridgeError) as raised:
+                    server.test_profile_setting({"mode": "quick", "models": {}})
+
+        self.assertEqual(raised.exception.status, HTTPStatus.CONFLICT)
+        self.assertIn("后台有 1 个任务", raised.exception.message)
+        test_profile.assert_not_called()
+
+    def test_settings_test_runs_when_background_is_idle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(jobs_dir=Path(tmp), auto_resume=False)
+            expected = {"ok": True, "mode": "quick"}
+            with patch.object(server, "list_jobs", return_value={"jobs": []}), \
+                patch.object(server.runtime_settings, "test_profile", return_value=expected) as test_profile:
+                result = server.test_profile_setting({"mode": "quick", "models": {}})
+
+        self.assertEqual(result, expected)
+        test_profile.assert_called_once()
 
     def test_ytdlp_runtime_args_forward_extractor_args(self):
         args = type(
@@ -651,27 +712,26 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
         self.assertEqual(next_stage, "multidoc")
 
-    def test_resume_can_switch_legacy_job_to_flash_and_preserve_profile_history(self):
-        class FakeThread:
-            def is_alive(self):
-                return False
-
-            def start(self):
-                return None
-
+    def test_job_runtime_profile_is_locked_to_creation_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
             job = server.create_job({"video_url": "https://example.com/video", "profile": "deepseek_v4_pro"})
-
-            with patch.object(server_mod.threading, "Thread", return_value=FakeThread()):
-                result = server.start_run(job["job_id"], profile="deepseek_v4_flash")
-
             saved = server.load_job(job["job_id"])
+            snapshot = saved["runtime_profile_snapshot"]
+            snapshot_path = Path(snapshot["config_dir"]) / "config.json"
 
-        self.assertEqual(result["options"]["profile"], "deepseek_v4_flash")
-        self.assertEqual(saved["options"]["profile"], "deepseek_v4_flash")
-        self.assertEqual(saved["profile_history"][-1]["profile"], "deepseek_v4_pro")
-        self.assertEqual(saved["profile_history"][-1]["replaced_by"], "deepseek_v4_flash")
+            with self.assertRaises(server_mod.BridgeError) as raised:
+                server.start_run(job["job_id"], profile="deepseek_v4_flash")
+
+            self.assertEqual(raised.exception.status, 409)
+            self.assertEqual(snapshot["profile"], "deepseek_v4_pro")
+            self.assertTrue(snapshot_path.is_file())
+            snapshot_payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            self.assertEqual(snapshot_payload["active_runtime_profile"], "deepseek_v4_pro")
+            self.assertEqual(
+                server.job_runtime_env(saved)["VIDEO_ANALYZER_CONFIG_DIR"],
+                snapshot["config_dir"],
+            )
 
     def test_collect_core_artifacts_includes_review_and_ab_outputs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -829,7 +889,123 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
         self.assertEqual(first["job_id"], second["job_id"])
         self.assertEqual(first["external_attempt_id"], "asset-1-attempt-1")
-        self.assertEqual(first["profile"], "deepseek_v4_pro")
+        self.assertEqual(first["profile"], "audio_nx1")
+        self.assertEqual(first["pipeline_profile"], "audio_nx1")
+        self.assertEqual(first["pipeline_kind"], "audio_nx1")
+
+    def test_video_job_rejects_audio_workflow_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs")
+            with self.assertRaisesRegex(
+                server_mod.BridgeError,
+                "expected video_operation_manual",
+            ):
+                server.create_job(
+                    {
+                        "video_url": "https://example.com/video",
+                        "profile": "audio_nx1",
+                    }
+                )
+
+    def test_audio_job_snapshot_uses_audio_workflow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "demo.mp3"
+            source.write_bytes(b"fake audio")
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs")
+            with patch.object(
+                server,
+                "start_run",
+                side_effect=lambda job_id: server.mobile_audio_job(
+                    server.load_job(job_id),
+                    include_resources=True,
+                ),
+            ):
+                created = server.create_mobile_audio_job({}, source, "demo.mp3")
+            stored = server.load_job(created["job_id"])
+
+        self.assertEqual(created["profile"], "audio_nx1")
+        self.assertEqual(created["workflow_id"], "audio_nx1")
+        self.assertEqual(
+            stored["runtime_profile_snapshot"]["workflow_id"],
+            "audio_nx1",
+        )
+        self.assertFalse(
+            stored["runtime_profile_snapshot"]["audio_cloud_fallback"]["enabled"]
+        )
+
+    def test_audio_cloud_fallback_is_selected_only_while_local_models_are_busy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs")
+            job = {
+                "job_id": "a" * 32,
+                "audio_pipeline_kind": "audio_nx1",
+                "runtime_profile_snapshot": {
+                    "audio_cloud_fallback": {"enabled": True}
+                },
+            }
+            with patch.object(
+                server,
+                "live_resource_users",
+                side_effect=lambda resource, **_kwargs: (
+                    [{"job_id": "busy"}] if resource == "core" else []
+                ),
+            ), patch.object(server, "save_job"):
+                routed = server.select_audio_compute_route(job, "analyze-core")
+
+        self.assertEqual(routed["compute_route"], "cloud_fallback")
+        self.assertEqual(
+            server_mod.job_stage_resource(routed, "analyze-core"),
+            "audio-cloud-analysis",
+        )
+
+    def test_mobile_audio_legacy_analysis_alias_is_normalized_to_audio_nx1(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            source = Path(tmp) / "demo.mp3"
+            source.write_bytes(b"fake audio")
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", repo_root)
+
+            with patch.object(
+                server,
+                "start_run",
+                side_effect=lambda job_id: server.mobile_audio_job(
+                    server.load_job(job_id),
+                    include_resources=True,
+                ),
+            ):
+                created = server.create_mobile_audio_job(
+                    {
+                        "external_attempt_id": "legacy-analysis-1",
+                        "pipeline_kind": "analysis",
+                    },
+                    source,
+                    "demo.mp3",
+                )
+
+            stored = server.load_job(created["job_id"])
+
+        self.assertEqual(created["pipeline_profile"], "audio_nx1")
+        self.assertEqual(stored["audio_pipeline_kind"], "audio_nx1")
+        self.assertEqual(stored["audio_pipeline_profile"], "audio_nx1")
+
+    def test_mobile_audio_rejects_unknown_pipeline_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            source = Path(tmp) / "demo.mp3"
+            source.write_bytes(b"fake audio")
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", repo_root)
+
+            with self.assertRaisesRegex(
+                server_mod.BridgeError,
+                "audio_nx1, transcription",
+            ):
+                server.create_mobile_audio_job(
+                    {"pipeline_profile": "video"},
+                    source,
+                    "demo.mp3",
+                )
 
     def test_transcript_only_mobile_http_command_and_idempotency(self):
         transcript_bytes = json.dumps({"text": "provided words", "segments": []}).encode()
@@ -1316,6 +1492,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         payload = server.mobile_audio_templates()
 
         self.assertEqual(payload["total"], 382)
+        self.assertEqual(payload["pipeline_profile"], "audio_nx1")
         self.assertEqual(len(payload["templates"]), 382)
         self.assertEqual(len(payload["version"]), 64)
         self.assertEqual(
@@ -1325,6 +1502,37 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertNotIn("prompt_original", payload["templates"][0])
         self.assertNotIn("prompt", payload["templates"][0])
         self.assertNotIn("icon_asset", payload["templates"][0])
+
+    def test_mobile_audio_result_uses_original_single_speaker_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(
+                Path(tmp) / "jobs",
+                REPO_ROOT,
+            )
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            (run_dir / "analysis.json").write_text(
+                json.dumps(
+                    {
+                        "pipeline_profile": "audio_nx1",
+                        "speaker_diarization": {
+                            "original_speaker_count": 1,
+                            "original_speakers": ["0"],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = server.mobile_audio_result(
+                {
+                    "run_dir": str(run_dir),
+                    "audio_pipeline": True,
+                    "audio_pipeline_kind": "audio_nx1",
+                }
+            )
+
+        self.assertEqual(result["speaker_count"], 1)
 
     def test_uploaded_media_probe_uses_ffprobe_and_avoids_ytdlp(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2537,7 +2745,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             loaded["run_dir"] = str(run_dir)
             server.save_job(loaded)
 
-            def initialize(path, profile_name, force):
+            def initialize(path, profile_name, config_dir, force):
                 write_skill_distillation_state(path, status="ready")
                 return skill_distill.load_state(path)
 
@@ -2547,10 +2755,12 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             ):
                 generated = server.generate_skill_candidate(job["job_id"])
 
+            snapshot = loaded["runtime_profile_snapshot"]
             self.assertEqual(generated["profile"], "deepseek_v4_pro")
             init.assert_called_once_with(
                 run_dir.resolve(),
-                profile_name="deepseek_v4_pro",
+                profile_name="deepseek_v4_flash",
+                config_dir=snapshot["config_dir"],
                 force=False,
             )
             start.assert_called_once_with(job["job_id"])
@@ -2707,6 +2917,212 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             self.assertEqual(len(candidate["evidence"]), 1)
             self.assertEqual(len(candidate["frames"]), 1)
             self.assertIn("# Test", generated["markdown"])
+
+    def test_skill_project_assessment_freezes_namespaced_sources_and_starts_targeted_distillation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            jobs_dir = Path(tmp) / "jobs"
+            repo_root.mkdir()
+            server = server_mod.VideoLinkStatusServer(jobs_dir, repo_root)
+            job_ids = []
+            for index in range(2):
+                run_dir = Path(tmp) / f"run-{index}"
+                transcript_dir = run_dir / "orin"
+                transcript_dir.mkdir(parents=True)
+                transcript_dir.joinpath("transcript.json").write_text(
+                    json.dumps(
+                        {
+                            "segments": [
+                                {
+                                    "start": 0,
+                                    "end": 4,
+                                    "text": f"独立案例 {index} 的可执行步骤",
+                                }
+                            ]
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                job = server.create_job({"video_url": f"https://example.com/video-{index}"})
+                loaded = server.load_job(job["job_id"])
+                loaded["run_dir"] = str(run_dir)
+                server.save_job(loaded)
+                job_ids.append(job["job_id"])
+
+            project = server.create_skill_project(
+                {
+                    "title": "案例方法",
+                    "goal": "从两个独立案例沉淀可执行排错方法",
+                    "job_id": job_ids[0],
+                }
+            )
+            server.add_skill_project_source(
+                project["id"],
+                {"kind": "job", "job_id": job_ids[1]},
+            )
+            assessed = server.assess_skill_project(project["id"], {})
+
+            self.assertEqual(assessed["assessment"]["verdict"], "ready")
+            self.assertEqual(
+                assessed["assessment"]["source_coverage"]["independent_learning_cases"],
+                2,
+            )
+            with (
+                patch.object(server_mod, "initialize_distillation", return_value={}) as initialize,
+                patch.object(server, "start_skill_project_runner") as start,
+            ):
+                workspace = server.start_skill_project_distillation(
+                    project["id"],
+                    {"profile": "deepseek_v4_pro"},
+                )
+
+            kwargs = initialize.call_args.kwargs
+            self.assertEqual(initialize.call_args.args[0], repo_root / "var" / "skill-projects" / project["id"])
+            self.assertEqual(kwargs["target_brief"]["goal"], "从两个独立案例沉淀可执行排错方法")
+            self.assertTrue(all(item["id"].startswith("job:") for item in kwargs["source_records"]))
+            self.assertTrue(
+                (repo_root / "var" / "skill-projects" / project["id"] / "source_snapshot.json").is_file()
+            )
+            self.assertEqual(workspace["project"]["status"], "distilling")
+            self.assertFalse(workspace["runner"]["active"])
+            start.assert_called_once_with(project["id"])
+
+    def test_skill_project_capability_smoke_requires_current_assessment_confirmation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", repo_root)
+            project = server.create_skill_project(
+                {
+                    "goal": "用命令行工具执行视频处理流程",
+                    "required_capabilities": ["python3"],
+                }
+            )
+            assessed = server.assess_skill_project(project["id"], {})
+            check = assessed["capability_checks"][0]
+
+            with self.assertRaises(server_mod.BridgeError) as missing_confirm:
+                server.run_skill_project_capability_check(
+                    project["id"],
+                    check["id"],
+                    {"assessment_revision": assessed["assessment"]["project_revision"]},
+                )
+            self.assertEqual(missing_confirm.exception.status, server_mod.HTTPStatus.CONFLICT)
+
+            completed = subprocess.CompletedProcess(["python3", "--help"], 0, "help", "")
+            with (
+                patch.object(server_mod.shutil, "which", return_value="/usr/bin/python3"),
+                patch.object(server_mod.subprocess, "run", return_value=completed),
+            ):
+                verified = server.run_skill_project_capability_check(
+                    project["id"],
+                    check["id"],
+                    {
+                        "confirm": True,
+                        "assessment_revision": assessed["assessment"]["project_revision"],
+                    },
+                )
+
+            self.assertEqual(verified["capability_checks"][0]["status"], "verified")
+
+    def test_skill_project_running_state_is_marked_interrupted_after_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", repo_root)
+            project = server.create_skill_project({"goal": "沉淀可执行的排错方法"})
+            root = repo_root / "var" / "skill-projects" / project["id"]
+            write_skill_distillation_state(root, status="running")
+            stored = server.skill_projects.load(project["id"])
+            stored["status"] = "distilling"
+            server.skill_projects.save(stored)
+
+            server.recover_interrupted_skill_projects()
+
+            self.assertEqual(skill_distill.load_state(root)["status"], "interrupted")
+            self.assertEqual(server.skill_projects.load(project["id"])["status"], "interrupted")
+
+    def test_skill_project_candidate_review_exposes_groups_and_rejects_invalid_selection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", repo_root)
+            project = server.create_skill_project({"goal": "沉淀可执行的排错方法"})
+            root = repo_root / "var" / "skill-projects" / project["id"]
+            write_skill_distillation_state(root, status="waiting_candidate_review")
+            pack_root = skill_distill.pack_dir(root)
+            pack_root.joinpath("verified.json").write_text(
+                json.dumps(
+                    {
+                        "accepted": [
+                            {
+                                "id": "a001",
+                                "title": "Verified",
+                                "summary": "Verified summary",
+                                "source_ids": ["transcript:0001", "ocr:0001"],
+                                "v1": {"passed": True},
+                            }
+                        ],
+                        "single_case": [
+                            {
+                                "id": "s001",
+                                "title": "Single case",
+                                "summary": "Single summary",
+                                "source_ids": ["transcript:0002"],
+                                "reason": "需要人工确认",
+                                "v1": {"passed": False},
+                            }
+                        ],
+                        "rejected": [
+                            {
+                                "id": "r001",
+                                "title": "Rejected",
+                                "summary": "Rejected summary",
+                                "source_ids": ["transcript:0003"],
+                                "failed_checks": ["v1"],
+                                "reason": "缺少独立案例",
+                            }
+                        ],
+                        "glossary": [
+                            {
+                                "id": "g001",
+                                "title": "Term",
+                                "summary": "Term summary",
+                                "source_ids": ["transcript:0004"],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            workspace = server.skill_project_workspace(project["id"])
+
+            by_id = {item["id"]: item for item in workspace["candidates"]}
+            self.assertTrue(by_id["a001"]["eligible"])
+            self.assertTrue(by_id["s001"]["eligible"])
+            self.assertFalse(by_id["r001"]["eligible"])
+            self.assertEqual(by_id["a001"]["source_count"], 2)
+            with self.assertRaises(server_mod.BridgeError) as empty:
+                server.review_skill_project_candidates(project["id"], {"selected_ids": []})
+            self.assertEqual(empty.exception.status, server_mod.HTTPStatus.CONFLICT)
+            with self.assertRaises(server_mod.BridgeError) as rejected:
+                server.review_skill_project_candidates(
+                    project["id"],
+                    {"selected_ids": ["r001"]},
+                )
+            self.assertEqual(rejected.exception.status, server_mod.HTTPStatus.BAD_REQUEST)
+            with (
+                patch.object(server_mod, "SkillDistillationPipeline") as pipeline,
+                patch.object(server, "start_skill_project_runner") as start,
+            ):
+                server.review_skill_project_candidates(
+                    project["id"],
+                    {"selected_ids": ["a001", "s001"]},
+                )
+
+            pipeline.return_value.review_candidates.assert_called_once_with(["a001", "s001"])
+            start.assert_called_once_with(project["id"])
 
     def test_backfilled_qa_index_on_completed_job_keeps_job_succeeded(self):
         with tempfile.TemporaryDirectory() as tmp:

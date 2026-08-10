@@ -8,10 +8,14 @@ PID_FILE="${MINICPM_PID_FILE:-${RUNTIME_DIR}/proxy.pid}"
 PROXY_HOST="${MINICPM_PROXY_HOST:-0.0.0.0}"
 PROXY_PORT="${MINICPM_PROXY_PORT:-18082}"
 BASE_BACKEND_PORT="${MINICPM_BASE_BACKEND_PORT:-18182}"
-WORKER_COUNT="${MINICPM_WORKER_COUNT:-6}"
-GPU_IDS="${MINICPM_GPU_IDS:-0,1,2,3,4,5}"
+WORKER_COUNT="${MINICPM_WORKER_COUNT:-5}"
+GPU_IDS="${MINICPM_GPU_IDS:-0,1,2,4,5}"
 PYTHON_BIN="${MINICPM_PYTHON:-${ROOT_DIR}/.venv/bin/python}"
 STOP_CONFLICTS="${MINICPM_STOP_CONFLICTS:-1}"
+VISION_ENGINE="${VISION_ENGINE:-minicpm_v45}"
+MODEL_PATH=""
+MMPROJ_PATH=""
+MODEL_ALIAS=""
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   PYTHON_BIN="$(command -v python3)"
@@ -37,6 +41,31 @@ join_by_comma() {
   echo "$*"
 }
 
+configure_model() {
+  case "${VISION_ENGINE}" in
+    minicpm_v45|minicpm)
+      MODEL_PATH="${MINICPM_MODEL_PATH:-/home/ai/.lmstudio/models/openbmb/MiniCPM-V-4_5-gguf/ggml-model-Q4_K_M.gguf}"
+      MMPROJ_PATH="${MINICPM_MMPROJ_PATH:-/home/ai/.lmstudio/models/openbmb/MiniCPM-V-4_5-gguf/mmproj-model-f16.gguf}"
+      MODEL_ALIAS="${MINICPM_MODEL_ALIAS:-minicpm-v-4.5-v100}"
+      ;;
+    qwen3_vl_4b|qwen3-vl-4b)
+      MODEL_PATH="${QWEN3_VL_MODEL_PATH:-/home/ai/.lmstudio/models/Qwen/Qwen3-VL-4B-Instruct-GGUF/Qwen3-VL-4B-Instruct-Q4_K_M.gguf}"
+      MMPROJ_PATH="${QWEN3_VL_MMPROJ_PATH:-/home/ai/.lmstudio/models/Qwen/Qwen3-VL-4B-Instruct-GGUF/mmproj-Qwen3-VL-4B-Instruct-f16.gguf}"
+      MODEL_ALIAS="${QWEN3_VL_MODEL_ALIAS:-qwen3-vl-4b-instruct}"
+      ;;
+    *)
+      echo "Unknown VISION_ENGINE=${VISION_ENGINE}" >&2
+      exit 2
+      ;;
+  esac
+  if [[ ! -f "${MODEL_PATH}" || ! -f "${MMPROJ_PATH}" ]]; then
+    echo "Vision model files are missing for ${VISION_ENGINE}:" >&2
+    echo "  model=${MODEL_PATH}" >&2
+    echo "  mmproj=${MMPROJ_PATH}" >&2
+    exit 1
+  fi
+}
+
 worker_spec() {
   local count="$1"
   local specs=()
@@ -50,6 +79,10 @@ worker_spec() {
     local gpu="${gpu_ids[index]}"
     if ! [[ "${gpu}" =~ ^[0-9]+$ ]]; then
       echo "invalid GPU id in MINICPM_GPU_IDS: ${gpu}" >&2
+      exit 2
+    fi
+    if [[ "${gpu}" == "3" ]]; then
+      echo "GPU 3 is reserved for the Foundation-Sec security model" >&2
       exit 2
     fi
     specs+=("${gpu}:$((BASE_BACKEND_PORT + index))")
@@ -108,6 +141,7 @@ start_minicpm() {
     return 0
   fi
 
+  configure_model
   mkdir -p "${RUNTIME_DIR}" "${LOG_DIR}"
   if [[ "${STOP_CONFLICTS}" != "0" ]]; then
     stop_conflicting_gpu_services
@@ -117,7 +151,7 @@ start_minicpm() {
   cd "${ROOT_DIR}"
   local workers
   workers="$(worker_spec "${count}")"
-  echo "Starting MiniCPM proxy with ${count} worker(s)."
+  echo "Starting vision proxy (${VISION_ENGINE}) with ${count} worker(s)."
   echo "Configured GPUs: ${GPU_IDS}"
   echo "Worker mapping: ${workers}"
   echo "Proxy URL: http://127.0.0.1:${PROXY_PORT}/v1"
@@ -130,6 +164,9 @@ start_minicpm() {
     --port "${PROXY_PORT}" \
     --workers "${workers}" \
     --log-dir "${LOG_DIR}" \
+    --model-path "${MODEL_PATH}" \
+    --mmproj-path "${MMPROJ_PATH}" \
+    --model-alias "${MODEL_ALIAS}" \
     >"${LOG_DIR}/launcher.log" 2>&1 < /dev/null &
   echo "$!" >"${PID_FILE}"
 

@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STAGE="${1:-}"
 
 usage() {
-  echo "Usage: $0 asr|ocr|vl" >&2
+  echo "Usage: $0 asr|ocr|vl|stop" >&2
 }
 
 stop_pids() {
@@ -49,6 +49,14 @@ stop_vibevoice() {
   stop_matching "[v]llm.entrypoints.openai.api_server --host 127.0.0.1 --port 1800[0-4]"
 }
 
+stop_qwen3_asr() {
+  "${ROOT_DIR}/tools/start_qwen3_asr_p40_service.sh" stop >/dev/null 2>&1 || true
+}
+
+stop_firered_asr2() {
+  "${ROOT_DIR}/tools/start_firered_asr2_p40_service.sh" stop >/dev/null 2>&1 || true
+}
+
 stop_minicpm() {
   "${ROOT_DIR}/tools/start_minicpm_p40_service.sh" stop >/dev/null 2>&1 || true
 }
@@ -62,14 +70,38 @@ start_vibevoice() {
   fi
 }
 
+start_asr() {
+  local engine="${ASR_ENGINE:-vibevoice}"
+  stop_vibevoice
+  stop_qwen3_asr
+  stop_firered_asr2
+  case "${engine}" in
+    vibevoice)
+      start_vibevoice
+      ;;
+    qwen3_asr|qwen3-asr|capswriter)
+      "${ROOT_DIR}/tools/start_qwen3_asr_p40_service.sh" start "${QWEN3_ASR_WORKER_COUNT:-5}"
+      ;;
+    firered_asr2)
+      "${ROOT_DIR}/tools/start_firered_asr2_p40_service.sh" start "${FIRERED_ASR2_WORKER_COUNT:-5}"
+      ;;
+    firered_3dspeaker|none)
+      ;;
+    *)
+      echo "Unknown ASR_ENGINE=${engine}" >&2
+      return 2
+      ;;
+  esac
+}
+
 start_ocr() {
   local engine="${OCR_ENGINE:-unlimited}"
   case "${engine}" in
     unlimited|unlimited-ocr)
-      local workers="${UNLIMITED_OCR_WORKER_COUNT:-6}"
+      local workers="${UNLIMITED_OCR_WORKER_COUNT:-5}"
       local model="${UNLIMITED_OCR_MODEL:-/home/ai/.cache/huggingface/hub/models--baidu--Unlimited-OCR/snapshots/f799a9cb8404eda2deeefee81ac79a46f6a6f447}"
       UNLIMITED_OCR_MODEL="${model}" \
-      UNLIMITED_OCR_GPU_IDS="${UNLIMITED_OCR_GPU_IDS:-0,1,2,4,5,3}" \
+      UNLIMITED_OCR_GPU_IDS="${UNLIMITED_OCR_GPU_IDS:-0,1,2,4,5}" \
       UNLIMITED_OCR_PROXY_PORT="${UNLIMITED_OCR_PROXY_PORT:-18088}" \
         "/home/ai/ocr-deploy/start_unlimited_ocr_p40_service.sh" "${workers}"
       ;;
@@ -86,24 +118,35 @@ start_ocr() {
 }
 
 start_minicpm() {
-  "${ROOT_DIR}/tools/start_minicpm_p40_service.sh" start "${MINICPM_WORKER_COUNT:-6}"
+  "${ROOT_DIR}/tools/start_minicpm_p40_service.sh" start "${MINICPM_WORKER_COUNT:-5}"
 }
 
 case "${STAGE}" in
   asr)
     stop_minicpm
     stop_ocr
-    start_vibevoice
+    start_asr
     ;;
   ocr)
     stop_minicpm
     stop_vibevoice
+    stop_qwen3_asr
+    stop_firered_asr2
     start_ocr
     ;;
   vl)
     stop_ocr
     stop_vibevoice
+    stop_qwen3_asr
+    stop_firered_asr2
     start_minicpm
+    ;;
+  stop)
+    stop_ocr
+    stop_vibevoice
+    stop_qwen3_asr
+    stop_firered_asr2
+    stop_minicpm
     ;;
   *)
     usage

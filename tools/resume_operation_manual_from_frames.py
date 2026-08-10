@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import os
@@ -35,6 +36,7 @@ from video_analyzer.frame_selection import (
     resolve_vl_context_gap_seconds,
     select_vl_frames,
 )
+from video_analyzer.ocr_keyframes import build_ocr_text_events
 from video_analyzer.manual import (
     embed_step_images,
     generate_operation_manual,
@@ -262,6 +264,21 @@ def _extract_timestamp_map(items) -> tuple[dict[int, float], dict[int, float]]:
     return timestamp_map, score_map
 
 
+def load_source_ocr_keyframes(source_analysis: Path | None) -> tuple[set[int], dict]:
+    if source_analysis is None or not source_analysis.is_file():
+        return set(), {}
+    payload = json.loads(source_analysis.read_text(encoding="utf-8"))
+    metadata = copy.deepcopy((payload.get("metadata") or {}).get("ocr_keyframes") or {})
+    selected = {
+        int(item["frame_number"])
+        for item in metadata.get("frames") or []
+        if isinstance(item, dict)
+        and item.get("frame_number") is not None
+        and item.get("selected_for_ocr")
+    }
+    return selected, metadata
+
+
 def configure_runtime(args: argparse.Namespace) -> Config:
     config = Config(args.config)
     config.config["task"] = "operation_manual"
@@ -325,6 +342,17 @@ def main() -> int:
     parser.add_argument("--manual-language", default="zh-CN")
     parser.add_argument("--source-analysis", type=Path, help="Original analysis.json to recover exact frame timestamps")
     parser.add_argument(
+        "--reuse-source-ocr-keyframes",
+        action="store_true",
+        help="Run OCR only for frames selected in source analysis metadata.ocr_keyframes",
+    )
+    parser.add_argument(
+        "--vl-frame-policy",
+        choices=["auto", "none"],
+        default="auto",
+        help="Set to none to preserve an OCR/ASR-only run without starting the VL service",
+    )
+    parser.add_argument(
         "--allow-estimated-frame-timestamps",
         action="store_true",
         help="Allow uniform timestamp estimates when exact frame timestamps are unavailable",
@@ -360,14 +388,28 @@ def main() -> int:
         allow_estimated_timestamps=args.allow_estimated_frame_timestamps,
     )
     frames = frame_load.frames
+    source_ocr_frame_numbers, ocr_keyframe_metadata = load_source_ocr_keyframes(args.source_analysis)
+    if args.reuse_source_ocr_keyframes:
+        if not source_ocr_frame_numbers:
+            raise RuntimeError("--reuse-source-ocr-keyframes requires selected OCR frames in --source-analysis")
+        ocr_frames = [frame for frame in frames if frame.number in source_ocr_frame_numbers]
+        missing = source_ocr_frame_numbers - {frame.number for frame in ocr_frames}
+        if missing:
+            raise RuntimeError(f"Source OCR keyframes are missing from the frame directory: {sorted(missing)}")
+    else:
+        ocr_frames = frames
 
     with local_model_runtime_session(config.config, LOGGER, str(args.run_dir)):
-        LOGGER.info("Resuming from %s frames and transcript.md; starting at OCR", len(frames))
+        LOGGER.info(
+            "Resuming from %s frames and transcript.md; running OCR on %s frame(s)",
+            len(frames),
+            len(ocr_frames),
+        )
         stage_started = time.perf_counter()
         ocr_config = config.get("ocr", {})
         with local_model_stage("ocr", config.config, LOGGER, str(args.run_dir)):
             ocr_events = run_ocr(
-                frames=frames,
+                frames=ocr_frames,
                 provider=ocr_config.get("provider", "auto"),
                 base_url=ocr_config.get("base_url", "auto"),
                 model=ocr_config.get("model", "model"),
@@ -396,6 +438,10 @@ def main() -> int:
             video_duration_seconds=video_duration,
             options=options,
         )
+        if args.vl_frame_policy == "none":
+            selected_frame_numbers = set()
+            frame_selection_metadata["vl_frame_policy"] = "none"
+            frame_selection_metadata["selected_vl_frames"] = []
         timings["frame_selection_seconds"] = round(time.perf_counter() - stage_started, 3)
         vl_started = time.perf_counter()
         analyzer = __import__("video_analyzer.analyzer", fromlist=["VideoAnalyzer"]).VideoAnalyzer(
@@ -407,7 +453,7 @@ def main() -> int:
             frame_num_predict=config.get("response_length", {}).get("frame", 300),
             frame_no_think=True,
         )
-        with local_model_stage("vl", config.config, LOGGER, str(args.run_dir)):
+        if args.vl_frame_policy == "none":
             frame_analyses = analyze_frames_for_vl(
                 analyzer=analyzer,
                 frames=frames,
@@ -419,6 +465,19 @@ def main() -> int:
                 context_after=max(args.vl_context_after, 0),
                 context_max_gap=AUTO,
             )
+        else:
+            with local_model_stage("vl", config.config, LOGGER, str(args.run_dir)):
+                frame_analyses = analyze_frames_for_vl(
+                    analyzer=analyzer,
+                    frames=frames,
+                    ocr_events=ocr_events,
+                    selected_frame_numbers=selected_frame_numbers,
+                    decisions=frame_decisions,
+                    concurrency=max(args.vl_concurrency, 1),
+                    context_before=max(args.vl_context_before, 0),
+                    context_after=max(args.vl_context_after, 0),
+                    context_max_gap=AUTO,
+                )
         timings["vl_seconds"] = round(time.perf_counter() - vl_started, 3)
 
     LOGGER.info("Generating operation manual")
@@ -464,6 +523,28 @@ def main() -> int:
             if event.provider.startswith("dots_mocr_vllm:")
         }
     )
+    ocr_text_events = build_ocr_text_events(ocr_events)
+    if not ocr_keyframe_metadata:
+        ocr_keyframe_metadata = {
+            "strategy": "resume-all-frames",
+            "strategy_resolved": "resume-all-frames",
+            "video_duration_seconds": video_duration,
+            "scan_frames_count": len(frames),
+            "ocr_candidate_frames_count": len(frames),
+            "ocr_frames_count": len(ocr_frames),
+            "ocr_keyframe_budget": len(ocr_frames),
+            "frames": [
+                {
+                    "frame_number": frame.number,
+                    "timestamp": frame.timestamp,
+                    "selected_for_ocr": frame.number in {item.number for item in ocr_frames},
+                }
+                for frame in frames
+            ],
+        }
+    ocr_keyframe_metadata["ocr_frames_count"] = len(ocr_frames)
+    ocr_keyframe_metadata["ocr_text_events_count"] = len(ocr_text_events)
+    ocr_keyframe_metadata["text_events"] = ocr_text_events
     results = {
         "metadata": {
             "task": "operation_manual",
@@ -496,6 +577,7 @@ def main() -> int:
                 "cache_refreshes": sum(1 for event in ocr_events if event.cache_status == "refresh"),
                 "cache_disabled": sum(1 for event in ocr_events if event.cache_status == "disabled"),
             },
+            "ocr_keyframes": ocr_keyframe_metadata,
             "asr_provider": "vibevoice",
             "asr_strategy": "balanced",
             "timings": timings,
@@ -512,6 +594,7 @@ def main() -> int:
         "transcript": {"text": transcript.text, "segments": transcript.segments},
         "asr": {"strategy": "resume_from_transcript_md", "providers_run": ["vibevoice"]},
         "ocr_events": [event.to_dict() for event in ocr_events],
+        "ocr_text_events": ocr_text_events,
         "visual_events": frame_analyses,
         "manual_steps": operation_manual,
         "uncertainties": [event.to_dict() for event in ocr_events if event.status != "ok"],

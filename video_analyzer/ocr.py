@@ -607,8 +607,17 @@ def run_ocr(
 ) -> List[OCREvent]:
     if provider == "none":
         return []
-    if provider not in {"auto", "dots_mocr_vllm", "openai_vision"}:
+    if provider not in {
+        "auto",
+        "unlimited_ocr",
+        "dots_ocr",
+        "dots_mocr_vllm",
+        "openai_vision",
+    }:
         raise ValueError(f"Unknown OCR provider: {provider}")
+    requested_provider = provider
+    if provider in {"unlimited_ocr", "dots_ocr"}:
+        provider = "dots_mocr_vllm"
     if cache_mode not in {"on", "off", "refresh"}:
         raise ValueError(f"Unknown OCR cache mode: {cache_mode}")
     cache_path = Path(cache_dir) if cache_dir and _cache_mode_enabled(cache_mode) else None
@@ -819,4 +828,9 @@ def run_ocr(
             if progress_callback:
                 progress_callback(event)
 
-    return [results[frame.number] for frame in frames]
+    ordered = [results[frame.number] for frame in frames]
+    if requested_provider in {"unlimited_ocr", "dots_ocr"}:
+        for event in ordered:
+            if event.provider.startswith("dots_mocr_vllm"):
+                event.provider = requested_provider + event.provider.removeprefix("dots_mocr_vllm")
+    return ordered

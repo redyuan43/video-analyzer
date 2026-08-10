@@ -17,9 +17,24 @@ DOCS = [
         "操作手册视觉摘要",
         r"^## 1\. 概览\s*$",
         ("01-image-cards-operation-manual.png",),
+        "",
     ),
-    ("docs_analysis_chapters/knowledge_notes_v2.md", "02-infographic-knowledge-notes.png", "逐章知识笔记视觉摘要", r"^## 01\. .+$", ()),
-    ("docs_analysis_chapters/deep_report_v2.md", "03-infographic-deep-report.png", "逐章深度报告视觉摘要", r"^## 逐章分析\s*$", ()),
+    (
+        "docs_analysis_chapters/knowledge_notes_v2.md",
+        "02-infographic-knowledge-notes.png",
+        "逐章知识笔记视觉摘要",
+        r"^# 知识笔记\s*$",
+        (),
+        "02-knowledge-notes-chapter-",
+    ),
+    (
+        "docs_analysis_chapters/deep_report_v2.md",
+        "03-infographic-deep-report.png",
+        "逐章深度报告视觉摘要",
+        r"^## 总览\s*$",
+        (),
+        "03-deep-report-chapter-",
+    ),
 ]
 
 CLEANUP_IMAGE_REFS = [
@@ -45,7 +60,7 @@ def main() -> int:
     chapter_assets = load_chapter_assets(run_dir)
     frame_assets = load_frame_assets(run_dir, args.max_frame_images)
     changed = []
-    for rel, final_name, title, target_heading, deprecated_image_names in DOCS:
+    for rel, final_name, title, target_heading, deprecated_image_names, chapter_image_prefix in DOCS:
         path = run_dir / rel
         if not path.exists():
             print(f"[skip missing] {rel}")
@@ -57,7 +72,17 @@ def main() -> int:
             text = remove_deprecated_image_refs(text, deprecated_image_names + (final_name,))
         else:
             text = ensure_final_image(text, path, final_image, title, target_heading, deprecated_image_names)
-        text = ensure_representative_images(text, path, chapter_assets, frame_assets)
+        if chapter_image_prefix:
+            text = ensure_chapter_images(
+                text,
+                path,
+                chapter_assets,
+                frame_assets,
+                {} if args.skip_final_images else load_generated_chapter_assets(final_dir, chapter_image_prefix),
+                chapter_image_prefix,
+            )
+        else:
+            text = ensure_representative_images(text, path, list(chapter_assets.values()), frame_assets)
         path.write_text(normalize_spacing(text), encoding="utf-8")
         changed.append(rel)
         print(f"[augmented] {rel}")
@@ -74,16 +99,27 @@ def main() -> int:
     return 0
 
 
-def load_chapter_assets(run_dir: Path) -> list[Path]:
+def load_chapter_assets(run_dir: Path) -> dict[int, Path]:
     manifest = run_dir / "docs_analysis_chapters" / "chapter_assets_manifest.json"
     if not manifest.exists():
-        return []
+        return {}
     payload = json.loads(manifest.read_text(encoding="utf-8"))
-    assets = []
+    assets = {}
     for item in payload.get("assets") or []:
         path = Path(str(item.get("path") or ""))
-        if path.exists():
-            assets.append(path.resolve())
+        chapter_index = int(item.get("chapter_index") or 0)
+        if chapter_index > 0 and path.exists():
+            assets[chapter_index] = path.resolve()
+    return assets
+
+
+def load_generated_chapter_assets(final_dir: Path, prefix: str) -> dict[int, Path]:
+    assets = {}
+    pattern = re.compile(rf"^{re.escape(prefix)}(?P<index>\d{{2}})\.png$")
+    for path in final_dir.glob(f"{prefix}*.png"):
+        match = pattern.match(path.name)
+        if match and path.stat().st_size > 0:
+            assets[int(match.group("index"))] = path.resolve()
     return assets
 
 
@@ -171,6 +207,77 @@ def ensure_representative_images(
         rows.append("| " + " | ".join(row) + " |")
     block = "## 视频代表帧\n\n" + "\n".join(rows) + "\n\n"
     return insert_after_visual_summary(text, block)
+
+
+def ensure_chapter_images(
+    text: str,
+    md_path: Path,
+    chapter_assets: dict[int, Path],
+    frame_assets: list[Path],
+    generated_assets: dict[int, Path],
+    generated_prefix: str,
+) -> str:
+    text = remove_representative_frame_section(text)
+    text = remove_chapter_image_refs(text, generated_prefix)
+    headings = list(re.finditer(r"^##\s+(?P<index>\d{2})\.\s+(?P<title>.+?)\s*$", text, flags=re.MULTILINE))
+    if not headings:
+        return ensure_representative_images(text, md_path, list(chapter_assets.values()), frame_assets)
+
+    fallback_assets = spread_assets(frame_assets, len(headings))
+    insertions = []
+    for position, match in enumerate(headings):
+        chapter_index = int(match.group("index"))
+        title = match.group("title").strip()
+        images = []
+        generated = generated_assets.get(chapter_index)
+        if generated:
+            images.append(
+                f"![第 {chapter_index:02d} 章概念图：{title}]({markdown_relpath(md_path, generated)})"
+            )
+        representative = chapter_assets.get(chapter_index)
+        if representative is None and position < len(fallback_assets):
+            representative = fallback_assets[position]
+        if representative and representative.exists():
+            images.append(
+                f"![第 {chapter_index:02d} 章视频画面：{title}]({markdown_relpath(md_path, representative)})"
+            )
+        if images:
+            insertions.append((match.end(), "\n\n".join(images)))
+
+    for insert_at, block in reversed(insertions):
+        text = text[:insert_at].rstrip() + "\n\n" + block + "\n\n" + text[insert_at:].lstrip()
+    return text
+
+
+def remove_representative_frame_section(text: str) -> str:
+    return re.sub(
+        r"(?:^|\n)## 视频代表帧\s*\n.*?(?=\n## |\Z)",
+        "\n",
+        text,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+
+
+def remove_chapter_image_refs(text: str, generated_prefix: str) -> str:
+    patterns = (
+        r"(?:^|\n)\s*!\[第 \d{2} 章(?:概念图|视频画面)[^\]]*\]\([^)]+\)\s*\n*",
+        rf"(?:^|\n)\s*!\[[^\]]*\]\([^)]*{re.escape(generated_prefix)}\d{{2}}\.png\)\s*\n*",
+        r"(?:^|\n)\s*!\[[^\]]*\]\([^)]*chapter_assets/chapter_\d{2}\.jpg\)\s*\n*",
+    )
+    for pattern in patterns:
+        text = re.sub(pattern, "\n", text, flags=re.MULTILINE)
+    return text
+
+
+def spread_assets(assets: list[Path], count: int) -> list[Path]:
+    if not assets or count <= 0:
+        return []
+    if len(assets) <= count:
+        return assets
+    if count == 1:
+        return [assets[len(assets) // 2]]
+    step = (len(assets) - 1) / (count - 1)
+    return [assets[round(index * step)] for index in range(count)]
 
 
 def has_local_image(text: str) -> bool:

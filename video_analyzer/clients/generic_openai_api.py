@@ -1,5 +1,6 @@
 import requests
 import json
+import os
 import time
 import re
 import ipaddress
@@ -7,6 +8,12 @@ from urllib.parse import urlparse
 from typing import Optional, Dict, Any, List
 from .llm_client import LLMClient
 import logging
+
+from video_analyzer.failures import (
+    failure_is_retryable,
+    http_failure_kind,
+    write_failure_envelope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -16,20 +23,53 @@ RATE_LIMIT_WAIT_TIME = 25  # seconds
 DEFAULT_WAIT_TIME = 25  # seconds
 DEFAULT_TIMEOUT_SECONDS = 600
 
+
+class OpenAIAPIError(Exception):
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: str,
+        retryable: bool,
+        status_code: int | None = None,
+        provider_code: str | None = None,
+        retry_after_seconds: float | None = None,
+    ):
+        super().__init__(message)
+        self.kind = kind
+        self.retryable = retryable
+        self.status_code = status_code
+        self.provider_code = provider_code
+        self.retry_after_seconds = retry_after_seconds
+
+    def failure_envelope(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "retryable": self.retryable,
+            "status_code": self.status_code,
+            "provider_code": self.provider_code,
+            "message": str(self),
+        }
+
+
 class GenericOpenAIAPIClient(LLMClient):
     def __init__(
         self,
         api_key: str,
         api_url: str,
         max_retries: int = DEFAULT_MAX_RETRIES,
-        timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+        timeout_seconds: int | None = None,
         extra_body: Optional[Dict[str, Any]] = None,
     ):
         self.api_key = api_key
         self.base_url = api_url.rstrip('/')  # Remove trailing slash if present
         self.generate_url = f"{self.base_url}/chat/completions"
         self.max_retries = max_retries
-        self.timeout_seconds = timeout_seconds
+        self.timeout_seconds = int(
+            timeout_seconds
+            if timeout_seconds is not None
+            else os.environ.get("VIDEO_ANALYZER_TEXT_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS)
+        )
         self.extra_body = dict(extra_body or {})
         self.session = requests.Session()
         if self._should_bypass_env_proxy():
@@ -81,8 +121,8 @@ class GenericOpenAIAPIClient(LLMClient):
             "Content-Type": "application/json"
         }
 
-        # Try request with retries
-        for attempt in range(self.max_retries):
+        attempts = max(1, self.max_retries)
+        for attempt in range(attempts):
             try:
                 response = self.session.post(
                     self.generate_url,
@@ -91,11 +131,7 @@ class GenericOpenAIAPIClient(LLMClient):
                     timeout=self.timeout_seconds,
                 )
                 if response.status_code >= 400:
-                    detail = response.text[:1000]
-                    raise requests.exceptions.HTTPError(
-                        f"{response.status_code} {detail}",
-                        response=response,
-                    )
+                    raise self._http_error(response)
                 
                 # Parse successful response
                 try:
@@ -129,29 +165,61 @@ class GenericOpenAIAPIClient(LLMClient):
                 except json.JSONDecodeError:
                     raise Exception(f"Invalid JSON response: {response.text}")
                     
-            except Exception as e:
-                if attempt == self.max_retries - 1:  # Last attempt
-                    raise Exception(f"An error occurred: {str(e)}")
-                
-                # Get wait time based on error
-                wait_time = RATE_LIMIT_WAIT_TIME
-                if isinstance(e, requests.exceptions.HTTPError) and 400 <= e.response.status_code < 500 and e.response.status_code != 429:
-                    raise Exception(f"An error occurred: {str(e)}")
-
-                if isinstance(e, requests.exceptions.HTTPError) and e.response.status_code == 429:
-                    # Try to get wait time from Retry-After header
-                    if 'Retry-After' in e.response.headers:
-                        try:
-                            wait_time = int(e.response.headers['Retry-After'])
-                            logger.info(f"Using Retry-After header value: {wait_time} seconds")
-                        except (ValueError, TypeError):
-                            logger.warning("Invalid Retry-After header value, using default wait time")
-                else:
-                    wait_time = DEFAULT_WAIT_TIME
-                
-                logger.warning(f"Request failed (attempt {attempt + 1}/{self.max_retries}): {str(e)}")
-                logger.warning(f"Waiting {wait_time} seconds before retry")
+            except OpenAIAPIError as exc:
+                if not exc.retryable or attempt == attempts - 1:
+                    write_failure_envelope(exc.failure_envelope())
+                    raise
+                wait_time = exc.retry_after_seconds or RATE_LIMIT_WAIT_TIME
+                logger.warning("Request failed (attempt %s/%s): %s", attempt + 1, attempts, exc)
+                logger.warning("Waiting %s seconds before retry", wait_time)
                 time.sleep(wait_time)
+            except requests.RequestException as exc:
+                wrapped = OpenAIAPIError(
+                    f"Network request failed: {exc}",
+                    kind="transient_network",
+                    retryable=True,
+                )
+                if attempt == attempts - 1:
+                    write_failure_envelope(wrapped.failure_envelope())
+                    raise wrapped from exc
+                logger.warning("Request failed (attempt %s/%s): %s", attempt + 1, attempts, exc)
+                logger.warning("Waiting %s seconds before retry", DEFAULT_WAIT_TIME)
+                time.sleep(DEFAULT_WAIT_TIME)
+            except Exception as exc:
+                wrapped = OpenAIAPIError(
+                    str(exc),
+                    kind="unknown",
+                    retryable=False,
+                )
+                write_failure_envelope(wrapped.failure_envelope())
+                raise wrapped from exc
+
+    def _http_error(self, response: requests.Response) -> OpenAIAPIError:
+        detail = response.text[:1000]
+        provider_code = None
+        try:
+            payload = response.json()
+            error = payload.get("error") if isinstance(payload, dict) else None
+            if isinstance(error, dict):
+                provider_code = error.get("code") or error.get("type")
+        except (ValueError, TypeError):
+            pass
+        kind = http_failure_kind(response.status_code, provider_code)
+        retry_after_seconds = None
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                retry_after_seconds = float(retry_after)
+            except (TypeError, ValueError):
+                logger.warning("Invalid Retry-After header value, using default wait time")
+        return OpenAIAPIError(
+            f"{response.status_code} {detail}",
+            kind=kind,
+            retryable=failure_is_retryable(kind),
+            status_code=response.status_code,
+            provider_code=str(provider_code) if provider_code is not None else None,
+            retry_after_seconds=retry_after_seconds,
+        )
 
     def _allows_reasoning_content_fallback(self) -> bool:
         parsed = urlparse(self.base_url)

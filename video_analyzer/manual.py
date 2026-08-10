@@ -557,7 +557,7 @@ def review_operation_manual_markdown(manual_text: str) -> List[Dict[str, str]]:
     raw_assets = []
     for match in re.finditer(r"manual_assets/frame_\d+\.(?:jpg|jpeg|png|webp)", manual_text):
         preceding_line = manual_text[manual_text.rfind("\n", 0, match.start()) + 1:match.start()]
-        if not re.search(r"(^|[^`])!\[[^\]]*\]\($", preceding_line):
+        if not re.search(r"(^|[^`])!?\[[^\]]*\]\($", preceding_line):
             raw_assets.append(match.group(0))
     if raw_assets:
         issues.append(
@@ -568,7 +568,7 @@ def review_operation_manual_markdown(manual_text: str) -> List[Dict[str, str]]:
             }
         )
 
-    step_sections = re.findall(r"(?ms)^### .*?步骤.*?(?=^### |^## |\Z)", manual_text)
+    step_sections = re.findall(r"(?ms)^### [^\n]*步骤[^\n]*.*?(?=^### |^## |\Z)", manual_text)
     for index, section in enumerate(step_sections, start=1):
         if "manual_assets/" in section and not _has_rendered_asset_image(section):
             issues.append(

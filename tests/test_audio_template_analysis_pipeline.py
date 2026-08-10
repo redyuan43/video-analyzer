@@ -61,11 +61,18 @@ class AudioTemplateCatalogTests(unittest.TestCase):
                 hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
             )
 
-    def test_catalog_rejects_wrong_count(self):
+    def test_catalog_accepts_valid_subset_without_hard_coded_count(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "catalog.json"
             path.write_text(json.dumps(self.templates[:1], ensure_ascii=False), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "exactly 382"):
+            loaded = run_audio_template_analysis.load_templates(path)
+        self.assertEqual([item["id"] for item in loaded], [self.templates[0]["id"]])
+
+    def test_catalog_rejects_empty_catalog(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "catalog.json"
+            path.write_text("[]", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "must not be empty"):
                 run_audio_template_analysis.load_templates(path)
 
     def test_unknown_explicit_template_id_is_visible_error(self):
@@ -254,6 +261,9 @@ class AudioTemplateStructuredOutputTests(unittest.TestCase):
             )
             analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
             audio_analysis = analysis["audio_template_analysis"]
+            self.assertEqual(analysis["pipeline_profile"], "audio_nx1")
+            self.assertEqual(analysis["metadata"]["pipeline_profile"], "audio_nx1")
+            self.assertEqual(audio_analysis["pipeline_profile"], "audio_nx1")
             self.assertEqual(audio_analysis["summary"], "最终摘要")
             self.assertEqual(audio_analysis["title"], "项目复盘")
             self.assertEqual(audio_analysis["keywords"], ["上线", "复盘"])

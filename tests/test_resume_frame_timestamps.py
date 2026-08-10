@@ -107,6 +107,35 @@ class ResumeFrameTimestampTests(unittest.TestCase):
             self.assertEqual([frame.score for frame in result.frames], [0.1, 0.2, 0.3])
             self.assertEqual(result.metadata["timestamp_source"]["source"], "frames_manifest")
 
+    def test_load_source_ocr_keyframes_preserves_selection_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_analysis = Path(tmp) / "analysis.json"
+            source_analysis.write_text(
+                json.dumps(
+                    {
+                        "metadata": {
+                            "ocr_keyframes": {
+                                "strategy": "scan-text",
+                                "frames": [
+                                    {"frame_number": 1, "selected_for_ocr": True},
+                                    {"frame_number": 2, "selected_for_ocr": False},
+                                    {"frame_number": 7, "selected_for_ocr": True},
+                                ],
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            selected, metadata = resume_module.load_source_ocr_keyframes(source_analysis)
+
+            self.assertEqual(selected, {1, 7})
+            self.assertEqual(metadata["strategy"], "scan-text")
+            metadata["frames"][0]["selected_for_ocr"] = False
+            reloaded = json.loads(source_analysis.read_text(encoding="utf-8"))
+            self.assertTrue(reloaded["metadata"]["ocr_keyframes"]["frames"][0]["selected_for_ocr"])
+
 
 if __name__ == "__main__":
     unittest.main()

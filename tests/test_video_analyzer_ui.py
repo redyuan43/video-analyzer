@@ -62,6 +62,42 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn("runtime_id", payload["runtime"])
         self.assertIn("current_fingerprint", payload["runtime"])
 
+    def test_settings_routes_expose_and_update_runtime_models(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp), video_link_auto_resume=False)
+            model = {
+                "id": "cloud_text",
+                "name": "Cloud Text",
+                "kind": "text",
+                "protocol": "openai_compatible",
+            }
+            with patch.object(ui.video_link, "settings", return_value={"models": [], "profiles": []}), \
+                patch.object(ui.video_link, "save_model_setting", return_value=model) as save:
+                client = ui.app.test_client()
+                listed = client.get("/api/settings")
+                created = client.post("/api/settings/models", json=model)
+
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(created.get_json()["id"], "cloud_text")
+        save.assert_called_once_with("cloud_text", model)
+
+    def test_profile_test_route_forwards_current_model_selection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp), video_link_auto_resume=False)
+            payload = {
+                "profile_name": "draft",
+                "mode": "quick",
+                "models": {"text": "cloud_text"},
+            }
+            expected = {"ok": True, "mode": "quick", "results": {}}
+            with patch.object(ui.video_link, "test_profile_setting", return_value=expected) as test_profile:
+                response = ui.app.test_client().post("/api/settings/profile-test", json=payload)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), expected)
+        test_profile.assert_called_once_with(payload)
+
     def test_mobile_audio_upload_route_uses_dedicated_pipeline(self):
         with tempfile.TemporaryDirectory() as tmp:
             ui = ui_mod.VideoAnalyzerUI(
@@ -278,6 +314,20 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn('data-intent="scene"', html)
         self.assertIn('data-intent="tools"', html)
         self.assertIn('id="templatePanel"', html)
+        self.assertIn('id="settingsTab"', html)
+        self.assertIn('id="settingsView"', html)
+        self.assertIn('id="settingsModelsView"', html)
+        self.assertIn('id="settingsProfilesView"', html)
+        self.assertIn('id="profileFlowViewport"', html)
+        self.assertIn('id="profileFlowEdges"', html)
+        self.assertIn('id="profileFlowNodes"', html)
+        self.assertIn('id="profileFlowInspector"', html)
+        self.assertIn('id="profileWorkflow"', html)
+        self.assertIn('id="profileTestMode"', html)
+        self.assertIn('id="testProfileButton"', html)
+        self.assertIn('id="profileTestAvailability"', html)
+        self.assertIn('id="profileTestSummary"', html)
+        self.assertIn('id="profile"', html)
         self.assertIn('id="templateSearch"', html)
         self.assertIn('id="templateCategory"', html)
         self.assertIn('id="templateList"', html)
@@ -287,11 +337,22 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn("关注重点", main_js)
         self.assertIn("audio_prompt_templates.json", main_js)
         self.assertIn("applyFocusPromptTemplate", main_js)
+        self.assertIn("renderProfileFlow", main_js)
+        self.assertIn("drawProfileFlowEdges", main_js)
+        self.assertIn("data-flow-model-slot", main_js)
+        self.assertIn("selectedWorkflowSchema", main_js)
+        self.assertIn("workflow_id: selectedWorkflowId()", main_js)
+        self.assertIn("/api/settings/profile-test", main_js)
+        self.assertIn("testCurrentProfile", main_js)
+        self.assertIn("updateProfileTestAvailability", main_js)
+        self.assertIn("后台空闲，可以执行通路测试", main_js)
+        self.assertIn("从本机禁用内置运行方案", main_js)
+        self.assertNotIn("恢复内置运行方案并清除本地覆盖", main_js)
         self.assertIn("【模板指令开始】", main_js)
         self.assertTrue((UI_ROOT / "video_analyzer_ui" / "static" / "data" / "audio_prompt_templates.json").is_file())
         self.assertIn("/api/video-link/jobs/upload", main_js)
         self.assertIn("FormData", main_js)
-        self.assertIn('<label hidden>', html)
+        self.assertNotIn('<label hidden>\n                            <span>运行配置</span>', html)
         self.assertIn('id="globalSummary"', html)
         self.assertIn('id="resourceLanes"', html)
         self.assertIn('id="jobList"', html)
@@ -300,7 +361,7 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn("copyText", (UI_ROOT / "video_analyzer_ui" / "static" / "js" / "main.js").read_text(encoding="utf-8"))
         self.assertIn("document.execCommand('copy')", (UI_ROOT / "video_analyzer_ui" / "static" / "js" / "main.js").read_text(encoding="utf-8"))
         self.assertIn("failure_disposition?.rerun_recommended", main_js)
-        self.assertIn("recommended_profile", main_js)
+        self.assertNotIn("resumeProfile", main_js)
         self.assertIn('id="stageDurationSummary"', html)
         self.assertIn('id="coreDiagnosticsPanel"', html)
         self.assertNotIn('id="previewView"', html)
@@ -321,6 +382,9 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn('id="skillsResourceSkillsTab"', html)
         self.assertIn('id="toggleSkillsFocusButton"', html)
         self.assertIn('id="currentSkillsWorkspace"', html)
+        self.assertIn('id="skillProjectsWorkspace"', html)
+        self.assertIn('id="skillProjectForm"', html)
+        self.assertIn('id="createTargetedSkillProjectButton"', html)
         self.assertIn('id="skillLibraryWorkspace"', html)
         self.assertIn('id="skillEditor"', html)
         self.assertIn('id="openSkillsWorkspaceButton"', html)
@@ -384,6 +448,18 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn("generateSkillCandidate", main_js)
         self.assertIn("enableSkillCandidate", main_js)
         self.assertIn("loadCurrentSkillsWorkspace", main_js)
+        self.assertIn("loadSkillProjects", main_js)
+        self.assertIn("startSkillProjectDistillation", main_js)
+        self.assertIn("syncSkillProjectPolling", main_js)
+        self.assertIn("renderSkillProjectCandidateReview", main_js)
+        self.assertIn("skillProjectCandidateDrafts", main_js)
+        self.assertIn("data-project-candidate-confirm", main_js)
+        self.assertIn("loadSkillProjectLog", main_js)
+        self.assertIn("data-skill-project-log-stage", main_js)
+        self.assertIn("skill-project-log-console", styles_css)
+        self.assertIn("skill-project-spinner", styles_css)
+        self.assertIn(".skill-project-candidate-review", styles_css)
+        self.assertIn("/api/skill-projects", main_js)
         self.assertIn("saveCurrentLibrarySkill", main_js)
         self.assertIn("restoreSkillVersion", main_js)
         self.assertIn("const skillCandidateDrafts = new Map()", main_js)
@@ -484,6 +560,37 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertTrue(enabled.get_json()["enabled"])
         start.assert_called_once_with(job["job_id"], {"profile": "deepseek_v4_pro"})
         enable.assert_called_once_with(job["job_id"], {"overwrite": False})
+
+    def test_skill_project_routes_create_assess_and_update(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(
+                jobs_dir=Path(tmp) / "jobs",
+                video_link_auto_resume=False,
+            )
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            ui.video_link.repo_root = repo_root
+            ui.video_link.skill_projects = status_server.SkillProjectStore(
+                repo_root / "var" / "skill-projects"
+            )
+            client = ui.app.test_client()
+
+            created = client.post(
+                "/api/skill-projects",
+                json={"title": "测试项目", "goal": "沉淀一个可执行的排错方法"},
+            )
+            project_id = created.get_json()["id"]
+            listed = client.get("/api/skill-projects")
+            assessed = client.post(f"/api/skill-projects/{project_id}/assess", json={})
+            updated = client.patch(
+                f"/api/skill-projects/{project_id}",
+                json={"expected_output": "给出检查步骤"},
+            )
+
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(listed.get_json()["count"], 1)
+        self.assertEqual(assessed.get_json()["assessment"]["verdict"], "needs_materials")
+        self.assertEqual(updated.get_json()["brief"]["expected_output"], "给出检查步骤")
 
     def test_skill_library_routes_cover_edit_and_state_changes(self):
         with tempfile.TemporaryDirectory() as tmp:

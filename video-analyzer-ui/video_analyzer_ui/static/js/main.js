@@ -39,11 +39,11 @@ let refreshTimer = null;
 let currentJob = null;
 let latestJobs = [];
 let showNonRerunFailures = false;
-let currentView = ['qa', 'vscode'].includes(initialParams.get('view'))
+let currentView = ['qa', 'vscode', 'settings'].includes(initialParams.get('view'))
     ? initialParams.get('view')
     : 'console';
 let currentResourceView = initialParams.get('resource') === 'skills' ? 'skills' : 'docs';
-let currentSkillsScope = ['enabled', 'disabled', 'trash'].includes(initialParams.get('scope'))
+let currentSkillsScope = ['projects', 'enabled', 'disabled', 'trash'].includes(initialParams.get('scope'))
     ? initialParams.get('scope')
     : 'current';
 let pendingUrls = [];
@@ -66,6 +66,25 @@ let selectedLibrarySkillId = '';
 let currentLibrarySkill = null;
 let currentSkillEditorTab = 'edit';
 let skillLibrarySearchTimer = null;
+let selectedSkillProjectId = initialParams.get('project') || '';
+let currentSkillProject = null;
+let currentSkillProjectWorkspace = null;
+let skillProjectPollTimer = null;
+let skillProjectPollInFlight = false;
+let settingsData = null;
+let settingsSection = 'models';
+let selectedSettingsModelId = '';
+let selectedSettingsProfileName = '';
+let selectedProfileFlowNodeId = 'asr';
+let profileModelSelections = {};
+let profileFlowDrawFrame = null;
+let profileFlowResizeObserver = null;
+let profileTestReport = null;
+let profileTestRunning = false;
+let modelTestRunning = false;
+const skillProjectCandidateDrafts = new Map();
+let selectedSkillProjectLogStage = '';
+let skillProjectLogRequestId = 0;
 const skillCandidateDrafts = new Map();
 const frameTimeMaps = {};
 const sourcePlayerState = {
@@ -103,9 +122,81 @@ const nodes = {
     consoleTab: document.getElementById('consoleTab'),
     qaTab: document.getElementById('qaTab'),
     vscodeTab: document.getElementById('vscodeTab'),
+    settingsTab: document.getElementById('settingsTab'),
     consoleView: document.getElementById('consoleView'),
     qaView: document.getElementById('qaView'),
     vscodeView: document.getElementById('vscodeView'),
+    settingsView: document.getElementById('settingsView'),
+    settingsSummary: document.getElementById('settingsSummary'),
+    settingsModelsTab: document.getElementById('settingsModelsTab'),
+    settingsProfilesTab: document.getElementById('settingsProfilesTab'),
+    settingsModelsView: document.getElementById('settingsModelsView'),
+    settingsProfilesView: document.getElementById('settingsProfilesView'),
+    settingsModelKindFilter: document.getElementById('settingsModelKindFilter'),
+    settingsModelSearch: document.getElementById('settingsModelSearch'),
+    settingsModelList: document.getElementById('settingsModelList'),
+    newModelButton: document.getElementById('newModelButton'),
+    modelSettingsForm: document.getElementById('modelSettingsForm'),
+    modelEditorTitle: document.getElementById('modelEditorTitle'),
+    modelEditorMeta: document.getElementById('modelEditorMeta'),
+    modelId: document.getElementById('modelId'),
+    modelName: document.getElementById('modelName'),
+    modelKind: document.getElementById('modelKind'),
+    modelProtocol: document.getElementById('modelProtocol'),
+    modelNameValue: document.getElementById('modelNameValue'),
+    modelEndpoints: document.getElementById('modelEndpoints'),
+    modelDeployment: document.getElementById('modelDeployment'),
+    modelWorkerCount: document.getElementById('modelWorkerCount'),
+    modelConcurrency: document.getElementById('modelConcurrency'),
+    modelApiKeyEnv: document.getElementById('modelApiKeyEnv'),
+    modelHealthUrl: document.getElementById('modelHealthUrl'),
+    modelOptions: document.getElementById('modelOptions'),
+    saveModelButton: document.getElementById('saveModelButton'),
+    testModelButton: document.getElementById('testModelButton'),
+    deleteModelButton: document.getElementById('deleteModelButton'),
+    modelSettingsMessage: document.getElementById('modelSettingsMessage'),
+    settingsProfileList: document.getElementById('settingsProfileList'),
+    newProfileButton: document.getElementById('newProfileButton'),
+    profileSettingsForm: document.getElementById('profileSettingsForm'),
+    profileEditorTitle: document.getElementById('profileEditorTitle'),
+    profileEditorMeta: document.getElementById('profileEditorMeta'),
+    profileId: document.getElementById('profileId'),
+    profileLabel: document.getElementById('profileLabel'),
+    profileWorkflow: document.getElementById('profileWorkflow'),
+    profileDescription: document.getElementById('profileDescription'),
+    profileFlowLegend: document.getElementById('profileFlowLegend'),
+    profileFlowViewport: document.getElementById('profileFlowViewport'),
+    profileFlowCanvas: document.getElementById('profileFlowCanvas'),
+    profileFlowEdges: document.getElementById('profileFlowEdges'),
+    profileFlowNodes: document.getElementById('profileFlowNodes'),
+    profileFlowInspector: document.getElementById('profileFlowInspector'),
+    profileFlowInspectorTitle: document.getElementById('profileFlowInspectorTitle'),
+    profileFlowInspectorMeta: document.getElementById('profileFlowInspectorMeta'),
+    profileFlowInspectorBody: document.getElementById('profileFlowInspectorBody'),
+    profileFlowInspectorActions: document.getElementById('profileFlowInspectorActions'),
+    profileTestMode: document.getElementById('profileTestMode'),
+    testProfileButton: document.getElementById('testProfileButton'),
+    profileTestAvailability: document.getElementById('profileTestAvailability'),
+    profileTestSummary: document.getElementById('profileTestSummary'),
+    profileAsrModel: document.getElementById('profileAsrModel'),
+    profileDiarizationModel: document.getElementById('profileDiarizationModel'),
+    profileOcrModel: document.getElementById('profileOcrModel'),
+    profileVisionModel: document.getElementById('profileVisionModel'),
+    profileTextModel: document.getElementById('profileTextModel'),
+    profileReviewModel: document.getElementById('profileReviewModel'),
+    profileStudyModel: document.getElementById('profileStudyModel'),
+    profileTriageModel: document.getElementById('profileTriageModel'),
+    profileImageModel: document.getElementById('profileImageModel'),
+    profilePipelineMode: document.getElementById('profilePipelineMode'),
+    profileVlConcurrency: document.getElementById('profileVlConcurrency'),
+    profileOcrConcurrency: document.getElementById('profileOcrConcurrency'),
+    profileTextTimeout: document.getElementById('profileTextTimeout'),
+    profileSettingsJson: document.getElementById('profileSettingsJson'),
+    duplicateProfileButton: document.getElementById('duplicateProfileButton'),
+    activateProfileButton: document.getElementById('activateProfileButton'),
+    deleteProfileButton: document.getElementById('deleteProfileButton'),
+    saveProfileButton: document.getElementById('saveProfileButton'),
+    profileSettingsMessage: document.getElementById('profileSettingsMessage'),
     jobForm: document.getElementById('jobForm'),
     formError: document.getElementById('formError'),
     createButton: document.getElementById('createButton'),
@@ -149,6 +240,8 @@ const nodes = {
     detailUrl: document.getElementById('detailUrl'),
     detailRunDir: document.getElementById('detailRunDir'),
     detailMode: document.getElementById('detailMode'),
+    detailProfile: document.getElementById('detailProfile'),
+    detailModels: document.getElementById('detailModels'),
     detailUpdated: document.getElementById('detailUpdated'),
     stageRows: document.getElementById('stageRows'),
     stageDurationSummary: document.getElementById('stageDurationSummary'),
@@ -198,6 +291,7 @@ const nodes = {
     skillCandidateList: document.getElementById('skillCandidateList'),
     confirmSkillCandidatesButton: document.getElementById('confirmSkillCandidatesButton'),
     generateSkillButton: document.getElementById('generateSkillButton'),
+    createTargetedSkillProjectButton: document.getElementById('createTargetedSkillProjectButton'),
     resumeSkillButton: document.getElementById('resumeSkillButton'),
     cancelSkillButton: document.getElementById('cancelSkillButton'),
     enableSkillButton: document.getElementById('enableSkillButton'),
@@ -247,6 +341,21 @@ const nodes = {
     skillLibrarySearch: document.getElementById('skillLibrarySearch'),
     currentSkillsWorkspace: document.getElementById('currentSkillsWorkspace'),
     currentSkillsGrid: document.querySelector('.skills-current-grid'),
+    skillProjectsWorkspace: document.getElementById('skillProjectsWorkspace'),
+    skillProjectsCount: document.getElementById('skillProjectsCount'),
+    skillProjectsList: document.getElementById('skillProjectsList'),
+    skillProjectForm: document.getElementById('skillProjectForm'),
+    skillProjectTitle: document.getElementById('skillProjectTitle'),
+    skillProjectGoal: document.getElementById('skillProjectGoal'),
+    createSkillProjectButton: document.getElementById('createSkillProjectButton'),
+    assessSkillProjectButton: document.getElementById('assessSkillProjectButton'),
+    startSkillProjectButton: document.getElementById('startSkillProjectButton'),
+    skillProjectDetail: document.getElementById('skillProjectDetail'),
+    addCurrentJobSkillSourceButton: document.getElementById('addCurrentJobSkillSourceButton'),
+    skillProjectSources: document.getElementById('skillProjectSources'),
+    skillProjectImportFile: document.getElementById('skillProjectImportFile'),
+    skillProjectImportText: document.getElementById('skillProjectImportText'),
+    importSkillProjectSourceButton: document.getElementById('importSkillProjectSourceButton'),
     skillLibraryWorkspace: document.getElementById('skillLibraryWorkspace'),
     skillLibraryGrid: document.getElementById('skillLibraryGrid'),
     skillsCurrentCount: document.getElementById('skillsCurrentCount'),
@@ -712,6 +821,763 @@ async function loadOptions() {
     document.getElementById('subtitleLangs').value = defaults.subtitle_langs || '';
 }
 
+const profileModelNodes = {
+    asr: () => nodes.profileAsrModel,
+    diarization: () => nodes.profileDiarizationModel,
+    ocr: () => nodes.profileOcrModel,
+    vision: () => nodes.profileVisionModel,
+    text: () => nodes.profileTextModel,
+    review: () => nodes.profileReviewModel,
+    study: () => nodes.profileStudyModel,
+    triage: () => nodes.profileTriageModel,
+    image: () => nodes.profileImageModel
+};
+
+function setSettingsSection(section) {
+    settingsSection = section === 'profiles' ? 'profiles' : 'models';
+    nodes.settingsModelsView.hidden = settingsSection !== 'models';
+    nodes.settingsProfilesView.hidden = settingsSection !== 'profiles';
+    nodes.settingsModelsTab.classList.toggle('active', settingsSection === 'models');
+    nodes.settingsProfilesTab.classList.toggle('active', settingsSection === 'profiles');
+    if (settingsSection === 'profiles') scheduleProfileFlowEdges();
+}
+
+function parseJsonField(node, label) {
+    try {
+        const value = JSON.parse(node.value || '{}');
+        if (!value || Array.isArray(value) || typeof value !== 'object') {
+            throw new Error(`${label}必须是 JSON 对象`);
+        }
+        return value;
+    } catch (error) {
+        if (error.message.includes('必须是')) throw error;
+        throw new Error(`${label} JSON 格式错误：${error.message}`);
+    }
+}
+
+function settingsModels(kind = '') {
+    return (settingsData?.models || []).filter(item => !kind || item.kind === kind);
+}
+
+function syncModelProtocolOptions(selected = '') {
+    const protocols = settingsData?.schema?.kinds?.[nodes.modelKind.value] || [];
+    fillSelect('modelProtocol', protocols, selected || protocols[0] || '');
+}
+
+function renderSettingsModelList() {
+    const kind = nodes.settingsModelKindFilter.value;
+    const query = nodes.settingsModelSearch.value.trim().toLowerCase();
+    const items = settingsModels(kind).filter(item => (
+        !query
+        || `${item.id} ${item.name} ${item.model || ''} ${item.protocol}`.toLowerCase().includes(query)
+    ));
+    nodes.settingsModelList.innerHTML = items.length ? items.map(item => {
+        const selected = item.id === selectedSettingsModelId ? ' selected' : '';
+        const flags = [
+            item.built_in ? '内置' : '自定义',
+            item.overridden ? '已覆盖' : ''
+        ].filter(Boolean).join(' · ');
+        return `<button class="settings-item${selected}" type="button" data-settings-model="${escapeHtml(item.id)}">
+            <strong>${escapeHtml(item.name)}</strong>
+            <span>${escapeHtml(item.kind)} · ${escapeHtml(item.protocol)}</span>
+            <small>${escapeHtml(item.model || flags || item.id)}</small>
+        </button>`;
+    }).join('') : '<div class="empty">没有匹配的模型</div>';
+    nodes.settingsModelList.querySelectorAll('[data-settings-model]').forEach(button => {
+        button.addEventListener('click', () => selectSettingsModel(button.dataset.settingsModel));
+    });
+}
+
+function resetModelEditor(kind = '') {
+    selectedSettingsModelId = '';
+    const selectedKind = kind || nodes.settingsModelKindFilter.value || Object.keys(settingsData?.schema?.kinds || {})[0] || 'asr';
+    nodes.modelSettingsForm.reset();
+    nodes.modelId.disabled = false;
+    nodes.modelKind.disabled = false;
+    nodes.modelId.value = '';
+    nodes.modelName.value = '';
+    nodes.modelKind.value = selectedKind;
+    syncModelProtocolOptions();
+    nodes.modelDeployment.value = '';
+    nodes.modelWorkerCount.value = '';
+    nodes.modelConcurrency.value = '';
+    nodes.modelOptions.value = '{}';
+    nodes.modelEditorTitle.textContent = '新增模型';
+    nodes.modelEditorMeta.textContent = '选择类型和协议';
+    nodes.testModelButton.disabled = true;
+    nodes.deleteModelButton.disabled = true;
+    nodes.modelSettingsMessage.textContent = '';
+    renderSettingsModelList();
+}
+
+function selectSettingsModel(modelId) {
+    const item = (settingsData?.models || []).find(model => model.id === modelId);
+    if (!item) return;
+    selectedSettingsModelId = modelId;
+    nodes.modelId.disabled = true;
+    nodes.modelKind.disabled = true;
+    nodes.modelId.value = item.id;
+    nodes.modelName.value = item.name || item.id;
+    nodes.modelKind.value = item.kind;
+    syncModelProtocolOptions(item.protocol);
+    nodes.modelNameValue.value = item.model || '';
+    nodes.modelEndpoints.value = (item.endpoints || []).join('\n');
+    nodes.modelDeployment.value = item.options?.deployment || '';
+    nodes.modelWorkerCount.value = item.options?.worker_count ?? '';
+    nodes.modelConcurrency.value = item.options?.concurrency ?? '';
+    nodes.modelApiKeyEnv.value = item.api_key_env || '';
+    nodes.modelHealthUrl.value = item.health_url || '';
+    nodes.modelOptions.value = JSON.stringify(item.options || {}, null, 2);
+    nodes.modelEditorTitle.textContent = item.name || item.id;
+    nodes.modelEditorMeta.textContent = `${item.kind} · ${item.protocol}${item.built_in ? ' · 内置资源' : ''}`;
+    nodes.testModelButton.disabled = activeProfileTestJobs().length > 0;
+    nodes.deleteModelButton.disabled = false;
+    nodes.modelSettingsMessage.textContent = '';
+    renderSettingsModelList();
+}
+
+async function saveModelSettings(event) {
+    event.preventDefault();
+    const modelId = nodes.modelId.value.trim();
+    const options = parseJsonField(nodes.modelOptions, '高级参数');
+    const deployment = nodes.modelDeployment.value;
+    const workerCount = Number(nodes.modelWorkerCount.value || 0);
+    const concurrency = Number(nodes.modelConcurrency.value || 0);
+    if (deployment) options.deployment = deployment;
+    else delete options.deployment;
+    if (workerCount > 0) options.worker_count = workerCount;
+    else delete options.worker_count;
+    if (concurrency > 0) options.concurrency = concurrency;
+    else delete options.concurrency;
+    const payload = {
+        id: modelId,
+        name: nodes.modelName.value.trim(),
+        kind: nodes.modelKind.value,
+        protocol: nodes.modelProtocol.value,
+        model: nodes.modelNameValue.value.trim(),
+        endpoints: nodes.modelEndpoints.value.split(/\n+/).map(item => item.trim()).filter(Boolean),
+        api_key_env: nodes.modelApiKeyEnv.value.trim(),
+        health_url: nodes.modelHealthUrl.value.trim(),
+        options
+    };
+    nodes.saveModelButton.disabled = true;
+    try {
+        await getJson(
+            selectedSettingsModelId
+                ? `/api/settings/models/${encodeURIComponent(selectedSettingsModelId)}`
+                : '/api/settings/models',
+            {
+                method: selectedSettingsModelId ? 'PUT' : 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            }
+        );
+        selectedSettingsModelId = modelId;
+        await loadSettings({ modelId });
+        nodes.modelSettingsMessage.textContent = '模型配置已保存';
+    } finally {
+        nodes.saveModelButton.disabled = false;
+    }
+}
+
+async function testSelectedSettingsModel() {
+    if (!selectedSettingsModelId || modelTestRunning || activeProfileTestJobs().length) {
+        updateProfileTestAvailability();
+        return;
+    }
+    modelTestRunning = true;
+    nodes.testModelButton.disabled = true;
+    nodes.modelSettingsMessage.textContent = '正在测试连接...';
+    try {
+        const result = await getJson(`/api/settings/models/${encodeURIComponent(selectedSettingsModelId)}/test`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}'
+        });
+        nodes.modelSettingsMessage.textContent = `${result.ok ? '可用' : '不可用'}：${result.detail || result.status}`;
+        nodes.modelSettingsMessage.classList.toggle('error-text', !result.ok);
+    } finally {
+        modelTestRunning = false;
+        updateProfileTestAvailability();
+    }
+}
+
+async function deleteSelectedSettingsModel() {
+    if (!selectedSettingsModelId) return;
+    const item = (settingsData?.models || []).find(model => model.id === selectedSettingsModelId);
+    if (!window.confirm(`删除模型配置？\n\n${item?.name || selectedSettingsModelId}`)) return;
+    await getJson(`/api/settings/models/${encodeURIComponent(selectedSettingsModelId)}`, { method: 'DELETE' });
+    selectedSettingsModelId = '';
+    await loadSettings();
+}
+
+function profileAdvancedSettings(profile) {
+    const workflowFields = Object.values(settingsData?.schema?.workflows || {})
+        .flatMap(workflow => Object.values(workflow.model_fields || {}).map(spec => spec.field));
+    const omitted = new Set([
+        'name', 'label', 'description', 'workflow_id', 'built_in', 'overridden',
+        ...Object.values(settingsData?.schema?.profile_model_fields || {}),
+        ...workflowFields,
+        'asr_provider', 'vibevoice_url', 'vibevoice_urls', 'remote_asr_url', 'remote_asr_urls',
+        'firered_3dspeaker_url', 'openai_audio_url', 'openai_audio_model', 'asr_api_key_env',
+        'speaker_diarization', 'ocr_provider', 'ocr_base_url', 'ocr_base_urls', 'ocr_model',
+        'vision_base_url', 'vision_model', 'vision_api_key_env',
+        'llm_base_url', 'text_base_url', 'text_model', 'text_api_key_env',
+        'review_base_url', 'review_model', 'review_api_key_env',
+        'study_card_llm_base_url', 'study_card_model', 'study_card_api_key_env',
+        'triage_llm_base_url', 'triage_model', 'triage_api_key_env',
+        'image_provider', 'image_model'
+    ]);
+    return Object.fromEntries(Object.entries(profile || {}).filter(([key]) => !omitted.has(key)));
+}
+
+function fillProfileModelSelect(kind, selected = '') {
+    const node = profileModelNodes[kind]();
+    const items = settingsModels(kind);
+    node.innerHTML = items.map(item => (
+        `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)} · ${escapeHtml(item.protocol)}</option>`
+    )).join('');
+    node.value = selected || items[0]?.id || '';
+}
+
+function profileFlowSchema() {
+    return selectedWorkflowSchema()?.flow
+        || settingsData?.schema?.profile_flow
+        || { lanes: [], nodes: [], edges: [] };
+}
+
+function selectedWorkflowId() {
+    return nodes.profileWorkflow?.value || 'video_operation_manual';
+}
+
+function selectedWorkflowSchema() {
+    return settingsData?.schema?.workflows?.[selectedWorkflowId()] || null;
+}
+
+function workflowModelFields() {
+    return selectedWorkflowSchema()?.model_fields || {};
+}
+
+function setProfileModelSelections(profile = null) {
+    const next = {};
+    Object.entries(workflowModelFields()).forEach(([slot, spec]) => {
+        const items = settingsModels(spec.kind);
+        const requested = profile?.[spec.field] || profileModelSelections[slot] || '';
+        const selected = items.find(item => item.id === requested)
+            || items.find(item => !spec.required || item.protocol !== 'none')
+            || null;
+        next[slot] = selected?.id || '';
+    });
+    profileModelSelections = next;
+}
+
+function profileFlowNode(nodeId) {
+    return profileFlowSchema().nodes.find(item => item.id === nodeId);
+}
+
+function selectedProfileModel(flowNode) {
+    const slot = flowNode?.model_slot || flowNode?.model_kind || '';
+    const kind = flowNode?.model_kind || workflowModelFields()[slot]?.kind || '';
+    const modelId = profileModelSelections[slot] || '';
+    return settingsModels(kind).find(item => item.id === modelId) || null;
+}
+
+function profileFlowSource(model) {
+    if (!model) return '-';
+    const deployment = model.options?.deployment || '';
+    if (deployment === 'local') return '本机服务';
+    if (deployment === 'cloud') return '云端服务';
+    if (deployment === 'remote') return '远程设备';
+    if (model.protocol === 'none') return '已禁用';
+    if (model.protocol.startsWith('inherit_')) return '继承方案模型';
+    if (model.protocol === 'asr_embedded') return 'ASR 内置能力';
+    if (model.protocol === 'codex_imagegen') return '本机 Codex';
+    const endpoint = (model.endpoints || [])[0] || '';
+    if (!endpoint) return '本地运行时';
+    try {
+        const host = new URL(endpoint).hostname;
+        return ['127.0.0.1', 'localhost', '0.0.0.0'].includes(host) ? '本机服务' : `远程服务 · ${host}`;
+    } catch (_error) {
+        return endpoint;
+    }
+}
+
+function profileFlowDisabled(model) {
+    return model?.protocol === 'none';
+}
+
+function profileNodeTestResult(nodeId) {
+    return profileTestReport?.results?.[nodeId] || null;
+}
+
+function profileTestStatusLabel(result) {
+    const labels = {
+        reachable: '可达',
+        sleeping: '休眠',
+        configured: '已配置',
+        passed: '通过',
+        inherited: '继承',
+        disabled: '禁用',
+        auth_only: '鉴权通过',
+        blocked: '阻塞',
+        failed: '失败',
+        unreachable: '不可达',
+        missing: '缺失',
+        missing_credentials: '缺少密钥',
+        model_missing: '模型不存在',
+        invalid: '配置错误'
+    };
+    return labels[result?.status] || result?.status || '';
+}
+
+function profileTestElapsed(milliseconds) {
+    const value = Number(milliseconds);
+    if (!Number.isFinite(value) || value < 0) return '-';
+    if (value < 1000) return `${Math.round(value)}ms`;
+    if (value < 60000) return `${(value / 1000).toFixed(1)}秒`;
+    return durationMinutes(value / 1000);
+}
+
+function renderProfileTestSummary() {
+    if (!nodes.profileTestSummary) return;
+    if (!profileTestReport) {
+        nodes.profileTestSummary.hidden = true;
+        nodes.profileTestSummary.innerHTML = '';
+        return;
+    }
+    const summary = profileTestReport.summary || {};
+    const modeLabels = { quick: '快速检查', inference: '最小推理', pathway: '全链路冒烟' };
+    nodes.profileTestSummary.hidden = false;
+    nodes.profileTestSummary.classList.toggle('failed', !profileTestReport.ok);
+    nodes.profileTestSummary.innerHTML = `
+        <div>
+            <strong>${escapeHtml(modeLabels[profileTestReport.mode] || profileTestReport.mode)}</strong>
+            <span>${escapeHtml(summary.detail || '')}</span>
+        </div>
+        <dl>
+            <div><dt>通过</dt><dd>${escapeHtml(String(summary.passed ?? 0))}</dd></div>
+            <div><dt>失败</dt><dd>${escapeHtml(String(summary.failed ?? 0))}</dd></div>
+            <div><dt>阻塞</dt><dd>${escapeHtml(String(summary.blocked ?? 0))}</dd></div>
+            <div><dt>耗时</dt><dd>${escapeHtml(profileTestElapsed(profileTestReport.elapsed_ms))}</dd></div>
+        </dl>`;
+}
+
+function currentProfileModelRefs() {
+    return { ...profileModelSelections };
+}
+
+function activeProfileTestJobs() {
+    return latestJobs.filter(job => jobIsActive(job));
+}
+
+function updateProfileTestAvailability() {
+    const activeJobs = activeProfileTestJobs();
+    const busy = activeJobs.length > 0;
+    if (nodes.testModelButton) {
+        nodes.testModelButton.disabled = !selectedSettingsModelId || modelTestRunning || busy;
+        nodes.testModelButton.title = busy
+            ? '后台任务运行期间不能测试模型连接'
+            : '测试当前模型连接';
+    }
+    if (!nodes.testProfileButton || !nodes.profileTestAvailability) return;
+    nodes.testProfileButton.disabled = profileTestRunning || busy;
+    if (profileTestRunning) {
+        nodes.profileTestAvailability.textContent = '通路测试正在运行';
+        nodes.testProfileButton.title = '通路测试正在运行';
+        return;
+    }
+    if (busy) {
+        const first = activeJobs[0];
+        const stage = stageNames[first.current_stage] || first.current_stage || first.runner?.current_stage || '后台处理';
+        nodes.profileTestAvailability.textContent = `后台有 ${activeJobs.length} 个任务正在运行或排队，测试暂不可用`;
+        nodes.testProfileButton.title = `${jobDisplayTitle(first)} · ${stage}`;
+        return;
+    }
+    nodes.profileTestAvailability.textContent = '后台空闲，可以执行通路测试';
+    nodes.testProfileButton.title = '测试当前运行方案的模型通路';
+}
+
+async function testCurrentProfile() {
+    if (profileTestRunning || activeProfileTestJobs().length) {
+        updateProfileTestAvailability();
+        return;
+    }
+    profileTestRunning = true;
+    profileTestReport = null;
+    updateProfileTestAvailability();
+    nodes.testProfileButton.textContent = nodes.profileTestMode.value === 'quick' ? '正在检查...' : '正在运行...';
+    nodes.profileTestSummary.hidden = false;
+    nodes.profileTestSummary.classList.remove('failed');
+    nodes.profileTestSummary.innerHTML = '<div><strong>通路测试进行中</strong><span>本地模型冷启动时可能需要等待。</span></div>';
+    try {
+        profileTestReport = await getJson('/api/settings/profile-test', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                profile_name: nodes.profileId.value.trim(),
+                workflow_id: selectedWorkflowId(),
+                mode: nodes.profileTestMode.value,
+                models: currentProfileModelRefs()
+            })
+        });
+        renderProfileFlow();
+        renderProfileTestSummary();
+    } finally {
+        profileTestRunning = false;
+        nodes.testProfileButton.textContent = '测试通路';
+        updateProfileTestAvailability();
+    }
+}
+
+function scheduleProfileFlowEdges() {
+    if (profileFlowDrawFrame) window.cancelAnimationFrame(profileFlowDrawFrame);
+    profileFlowDrawFrame = window.requestAnimationFrame(() => {
+        profileFlowDrawFrame = null;
+        drawProfileFlowEdges();
+    });
+}
+
+function drawProfileFlowEdges() {
+    if (!nodes.profileFlowCanvas || !nodes.profileFlowEdges || window.innerWidth <= 760) return;
+    const canvasRect = nodes.profileFlowCanvas.getBoundingClientRect();
+    if (!canvasRect.width || !canvasRect.height) return;
+    nodes.profileFlowEdges.setAttribute('viewBox', `0 0 ${canvasRect.width} ${canvasRect.height}`);
+    nodes.profileFlowEdges.setAttribute('width', canvasRect.width);
+    nodes.profileFlowEdges.setAttribute('height', canvasRect.height);
+    const paths = profileFlowSchema().edges.map(edge => {
+        const source = nodes.profileFlowNodes.querySelector(`[data-flow-node="${edge.from}"]`);
+        const target = nodes.profileFlowNodes.querySelector(`[data-flow-node="${edge.to}"]`);
+        if (!source || !target) return '';
+        const from = source.getBoundingClientRect();
+        const to = target.getBoundingClientRect();
+        const x1 = from.right - canvasRect.left;
+        const y1 = from.top + from.height / 2 - canvasRect.top;
+        const x2 = to.left - canvasRect.left;
+        const y2 = to.top + to.height / 2 - canvasRect.top;
+        const bend = Math.max(28, Math.abs(x2 - x1) * 0.42);
+        return `<path class="profile-flow-edge lane-${escapeHtml(edge.lane || 'main')}" d="M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}"></path>`;
+    }).join('');
+    nodes.profileFlowEdges.innerHTML = paths;
+}
+
+function profileFlowParameter(node) {
+    if (node.model_kind === 'ocr') {
+        return { label: 'OCR 并发', target: nodes.profileOcrConcurrency, type: 'text', min: '' };
+    }
+    if (node.model_kind === 'vision') {
+        return { label: 'VL 并发', target: nodes.profileVlConcurrency, type: 'number', min: '1' };
+    }
+    if (node.model_kind === 'text') {
+        return { label: '文本超时秒数', target: nodes.profileTextTimeout, type: 'number', min: '1' };
+    }
+    return null;
+}
+
+function renderProfileFlowInspector(nodeId = selectedProfileFlowNodeId) {
+    const flowNode = profileFlowNode(nodeId) || profileFlowSchema().nodes[0];
+    if (!flowNode) return;
+    selectedProfileFlowNodeId = flowNode.id;
+    nodes.profileFlowInspectorTitle.textContent = flowNode.title;
+    nodes.profileFlowInspectorMeta.textContent = flowNode.subtitle || '';
+    if (!flowNode.model_kind) {
+        nodes.profileFlowInspectorBody.innerHTML = `
+            <dl class="profile-flow-details">
+                <div><dt>步骤</dt><dd>${escapeHtml(String(flowNode.step))}</dd></div>
+                <div><dt>阶段</dt><dd>${escapeHtml(stageNames[flowNode.stage] || flowNode.stage || '固定流程')}</dd></div>
+                <div><dt>类型</dt><dd>系统流程节点</dd></div>
+            </dl>`;
+        nodes.profileFlowInspectorActions.innerHTML = '';
+        return;
+    }
+    const model = selectedProfileModel(flowNode);
+    const endpoint = (model?.endpoints || [])[0] || '';
+    const workerCount = model?.options?.worker_count;
+    const concurrency = model?.options?.concurrency;
+    const parameter = profileFlowParameter(flowNode);
+    const testResult = profileNodeTestResult(flowNode.id);
+    nodes.profileFlowInspectorBody.innerHTML = `
+        <dl class="profile-flow-details">
+            <div><dt>当前模型</dt><dd>${escapeHtml(model?.name || '未选择')}</dd></div>
+            <div><dt>协议</dt><dd>${escapeHtml(model?.protocol || '-')}</dd></div>
+            <div><dt>运行位置</dt><dd>${escapeHtml(profileFlowSource(model))}</dd></div>
+            <div><dt>模型名</dt><dd>${escapeHtml(model?.model || '-')}</dd></div>
+            <div><dt>Worker 数</dt><dd>${escapeHtml(workerCount == null ? '-' : String(workerCount))}</dd></div>
+            <div><dt>并发数</dt><dd>${escapeHtml(concurrency == null ? '-' : String(concurrency))}</dd></div>
+            <div class="wide"><dt>端点</dt><dd>${escapeHtml(endpoint || '-')}</dd></div>
+        </dl>
+        ${parameter ? `<label class="profile-flow-parameter">
+            <span>${escapeHtml(parameter.label)}</span>
+            <input data-flow-parameter="${escapeHtml(flowNode.id)}" type="${parameter.type}" min="${parameter.min}" value="${escapeHtml(parameter.target.value)}">
+        </label>` : ''}
+        ${profileFlowDisabled(model) ? '<p class="profile-flow-warning">此节点已禁用，运行时会跳过对应的模型能力。</p>' : ''}
+        ${testResult ? `<p class="profile-flow-node-result ${testResult.ok ? 'passed' : 'failed'}">
+            ${escapeHtml(profileTestStatusLabel(testResult))}：${escapeHtml(testResult.detail || '')}
+            ${testResult.elapsed_ms != null ? ` · ${escapeHtml(String(testResult.elapsed_ms))}ms` : ''}
+        </p>` : ''}`;
+    const controlOnly = model?.source === 'control';
+    nodes.profileFlowInspectorActions.innerHTML = `
+        <button class="secondary" type="button" data-flow-test ${profileFlowDisabled(model) ? 'disabled' : ''}>测试连接</button>
+        <button class="secondary" type="button" data-flow-edit ${controlOnly ? 'disabled' : ''}>编辑模型资源</button>
+        <span class="profile-flow-test-result" data-flow-test-result></span>`;
+    nodes.profileFlowInspectorBody.querySelector('[data-flow-parameter]')?.addEventListener('input', event => {
+        parameter.target.value = event.target.value;
+    });
+    nodes.profileFlowInspectorActions.querySelector('[data-flow-edit]')?.addEventListener('click', () => {
+        if (!model) return;
+        setSettingsSection('models');
+        selectSettingsModel(model.id);
+    });
+    nodes.profileFlowInspectorActions.querySelector('[data-flow-test]')?.addEventListener('click', async event => {
+        if (!model) return;
+        const button = event.currentTarget;
+        const resultNode = nodes.profileFlowInspectorActions.querySelector('[data-flow-test-result]');
+        button.disabled = true;
+        resultNode.textContent = '正在测试...';
+        try {
+            const result = await getJson(`/api/settings/models/${encodeURIComponent(model.id)}/test`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ mode: nodes.profileTestMode.value })
+            });
+            profileTestReport = profileTestReport || { mode: nodes.profileTestMode.value, results: {}, summary: {} };
+            profileTestReport.results[flowNode.id] = result;
+            resultNode.textContent = `${result.ok ? '可用' : '不可用'}：${result.detail || result.status}`;
+            resultNode.classList.toggle('error-text', !result.ok);
+            renderProfileFlow();
+        } catch (error) {
+            resultNode.textContent = error.message;
+            resultNode.classList.add('error-text');
+        } finally {
+            button.disabled = false;
+        }
+    });
+}
+
+function renderProfileFlow() {
+    if (!nodes.profileFlowNodes) return;
+    const schema = profileFlowSchema();
+    const lanes = Object.fromEntries((schema.lanes || []).map(item => [item.id, item.label]));
+    nodes.profileFlowLegend.innerHTML = (schema.lanes || []).map(lane => (
+        `<span class="profile-flow-legend-item lane-${escapeHtml(lane.id)}">${escapeHtml(lane.label)}</span>`
+    )).join('');
+    const flowNodes = [...(schema.nodes || [])].sort((left, right) => left.mobile_order - right.mobile_order);
+    nodes.profileFlowNodes.innerHTML = flowNodes.map(flowNode => {
+        const model = flowNode.model_kind ? selectedProfileModel(flowNode) : null;
+        const disabled = profileFlowDisabled(model);
+        const selected = flowNode.id === selectedProfileFlowNodeId;
+        const testResult = profileNodeTestResult(flowNode.id);
+        const testClass = testResult ? ` test-${escapeHtml(testResult.status || (testResult.ok ? 'passed' : 'failed'))}` : '';
+        const options = flowNode.model_kind ? settingsModels(flowNode.model_kind)
+            .filter(item => !flowNode.required || item.protocol !== 'none')
+            .map(item => `<option value="${escapeHtml(item.id)}" ${item.id === model?.id ? 'selected' : ''}>${escapeHtml(item.name)}</option>`)
+            .join('') : '';
+        return `<article
+            class="profile-flow-node lane-${escapeHtml(flowNode.lane)}${selected ? ' selected' : ''}${disabled ? ' disabled' : ''}${testClass}"
+            data-flow-node="${escapeHtml(flowNode.id)}"
+            style="--flow-column:${flowNode.column};--flow-row:${flowNode.row};"
+            tabindex="0"
+        >
+            <div class="profile-flow-node-head">
+                <span class="profile-flow-step">${escapeHtml(String(flowNode.step))}</span>
+                <span class="profile-flow-lane">${testResult
+                    ? escapeHtml(profileTestStatusLabel(testResult))
+                    : escapeHtml(lanes[flowNode.lane] || flowNode.lane)}</span>
+            </div>
+            <strong>${escapeHtml(flowNode.title)}</strong>
+            <small>${escapeHtml(flowNode.subtitle || '')}</small>
+            ${flowNode.model_kind
+                ? `<select data-flow-model-slot="${escapeHtml(flowNode.model_slot || flowNode.model_kind)}" aria-label="${escapeHtml(flowNode.title)}模型">${options}</select>`
+                : `<span class="profile-flow-fixed">${escapeHtml(stageNames[flowNode.stage] || '固定阶段')}</span>`}
+        </article>`;
+    }).join('');
+    nodes.profileFlowNodes.querySelectorAll('[data-flow-node]').forEach(node => {
+        const selectNode = node.querySelector('[data-flow-model-slot]');
+        node.addEventListener('click', event => {
+            if (event.target === selectNode) return;
+            selectedProfileFlowNodeId = node.dataset.flowNode;
+            renderProfileFlow();
+        });
+        node.addEventListener('keydown', event => {
+            if (event.key !== 'Enter' && event.key !== ' ') return;
+            event.preventDefault();
+            selectedProfileFlowNodeId = node.dataset.flowNode;
+            renderProfileFlow();
+        });
+        selectNode?.addEventListener('change', event => {
+            event.stopPropagation();
+            profileModelSelections[event.target.dataset.flowModelSlot] = event.target.value;
+            selectedProfileFlowNodeId = node.dataset.flowNode;
+            renderProfileFlow();
+        });
+    });
+    renderProfileFlowInspector(selectedProfileFlowNodeId);
+    scheduleProfileFlowEdges();
+}
+
+function renderSettingsProfileList() {
+    const profiles = settingsData?.profiles || [];
+    nodes.settingsProfileList.innerHTML = profiles.map(profile => {
+        const selected = profile.name === selectedSettingsProfileName ? ' selected' : '';
+        const active = profile.name === settingsData.active_runtime_profile ? '默认 · ' : '';
+        const workflow = settingsData?.schema?.workflows?.[profile.workflow_id || 'video_operation_manual'];
+        return `<button class="settings-item${selected}" type="button" data-settings-profile="${escapeHtml(profile.name)}">
+            <strong>${escapeHtml(profile.label || profile.name)}</strong>
+            <span>${escapeHtml(active + profile.name + (workflow ? ` · ${workflow.label}` : ''))}</span>
+            <small>${escapeHtml(profile.description || (profile.built_in ? '内置方案' : '自定义方案'))}</small>
+        </button>`;
+    }).join('');
+    nodes.settingsProfileList.querySelectorAll('[data-settings-profile]').forEach(button => {
+        button.addEventListener('click', () => selectSettingsProfile(button.dataset.settingsProfile));
+    });
+}
+
+function resetProfileEditor(source = null) {
+    selectedSettingsProfileName = '';
+    profileTestReport = null;
+    nodes.profileSettingsForm.reset();
+    nodes.profileId.disabled = false;
+    nodes.profileId.value = '';
+    nodes.profileLabel.value = source ? `${source.label || source.name} 副本` : '';
+    nodes.profileWorkflow.innerHTML = Object.values(settingsData?.schema?.workflows || {}).map(workflow => (
+        `<option value="${escapeHtml(workflow.id)}">${escapeHtml(workflow.label)}</option>`
+    )).join('');
+    nodes.profileWorkflow.value = source?.workflow_id || 'video_operation_manual';
+    nodes.profileDescription.value = source?.description || '';
+    profileModelSelections = {};
+    setProfileModelSelections(source);
+    selectedProfileFlowNodeId = profileFlowSchema().nodes[0]?.id || '';
+    nodes.profilePipelineMode.value = source?.pipeline_mode || 'balanced';
+    nodes.profileVlConcurrency.value = source?.vl_concurrency ?? 5;
+    nodes.profileOcrConcurrency.value = source?.ocr_concurrency ?? 'auto';
+    nodes.profileTextTimeout.value = source?.text_timeout_seconds ?? 600;
+    nodes.profileSettingsJson.value = JSON.stringify(source ? profileAdvancedSettings(source) : {}, null, 2);
+    nodes.profileEditorTitle.textContent = source ? '复制运行方案' : '新增运行方案';
+    nodes.profileEditorMeta.textContent = '组合各阶段模型';
+    nodes.duplicateProfileButton.disabled = true;
+    nodes.activateProfileButton.disabled = true;
+    nodes.deleteProfileButton.disabled = true;
+    nodes.profileSettingsMessage.textContent = '';
+    renderSettingsProfileList();
+    renderProfileFlow();
+    renderProfileTestSummary();
+}
+
+function selectSettingsProfile(profileName) {
+    const profile = (settingsData?.profiles || []).find(item => item.name === profileName);
+    if (!profile) return;
+    selectedSettingsProfileName = profileName;
+    profileTestReport = null;
+    nodes.profileId.disabled = true;
+    nodes.profileId.value = profile.name;
+    nodes.profileLabel.value = profile.label || profile.name;
+    nodes.profileWorkflow.innerHTML = Object.values(settingsData?.schema?.workflows || {}).map(workflow => (
+        `<option value="${escapeHtml(workflow.id)}">${escapeHtml(workflow.label)}</option>`
+    )).join('');
+    nodes.profileWorkflow.value = profile.workflow_id || 'video_operation_manual';
+    nodes.profileDescription.value = profile.description || '';
+    profileModelSelections = {};
+    setProfileModelSelections(profile);
+    selectedProfileFlowNodeId = profileFlowSchema().nodes[0]?.id || '';
+    nodes.profilePipelineMode.value = profile.pipeline_mode || 'balanced';
+    nodes.profileVlConcurrency.value = profile.vl_concurrency ?? 5;
+    nodes.profileOcrConcurrency.value = profile.ocr_concurrency ?? 'auto';
+    nodes.profileTextTimeout.value = profile.text_timeout_seconds ?? 600;
+    nodes.profileSettingsJson.value = JSON.stringify(profileAdvancedSettings(profile), null, 2);
+    nodes.profileEditorTitle.textContent = profile.label || profile.name;
+    nodes.profileEditorMeta.textContent = `${profile.name}${profile.built_in ? ' · 内置方案' : ''}`;
+    nodes.duplicateProfileButton.disabled = false;
+    nodes.activateProfileButton.disabled = profile.name === settingsData.active_runtime_profile;
+    nodes.deleteProfileButton.disabled = profile.name === settingsData.active_runtime_profile;
+    nodes.profileSettingsMessage.textContent = '';
+    renderSettingsProfileList();
+    renderProfileFlow();
+    renderProfileTestSummary();
+}
+
+async function saveProfileSettings(event) {
+    event.preventDefault();
+    const profileName = nodes.profileId.value.trim();
+    const settings = parseJsonField(nodes.profileSettingsJson, '运行参数');
+    settings.pipeline_mode = nodes.profilePipelineMode.value;
+    settings.vl_concurrency = Number(nodes.profileVlConcurrency.value || 1);
+    settings.ocr_concurrency = nodes.profileOcrConcurrency.value.trim() || 'auto';
+    settings.text_timeout_seconds = Number(nodes.profileTextTimeout.value || 600);
+    const models = currentProfileModelRefs();
+    const payload = {
+        name: profileName,
+        label: nodes.profileLabel.value.trim(),
+        description: nodes.profileDescription.value.trim(),
+        workflow_id: selectedWorkflowId(),
+        models,
+        settings
+    };
+    nodes.saveProfileButton.disabled = true;
+    try {
+        await getJson(
+            selectedSettingsProfileName
+                ? `/api/settings/profiles/${encodeURIComponent(selectedSettingsProfileName)}`
+                : '/api/settings/profiles',
+            {
+                method: selectedSettingsProfileName ? 'PUT' : 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            }
+        );
+        selectedSettingsProfileName = profileName;
+        await loadSettings({ profileName });
+        await loadOptions();
+        nodes.profileSettingsMessage.textContent = '运行方案已保存';
+    } finally {
+        nodes.saveProfileButton.disabled = false;
+    }
+}
+
+async function activateSelectedSettingsProfile() {
+    if (!selectedSettingsProfileName) return;
+    await getJson(`/api/settings/profiles/${encodeURIComponent(selectedSettingsProfileName)}/activate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}'
+    });
+    await loadSettings({ profileName: selectedSettingsProfileName });
+    await loadOptions();
+}
+
+async function deleteSelectedSettingsProfile() {
+    if (!selectedSettingsProfileName) return;
+    const profile = (settingsData?.profiles || []).find(item => item.name === selectedSettingsProfileName);
+    if (!window.confirm(`${profile?.built_in ? '从本机禁用内置运行方案' : '删除运行方案'}？\n\n${profile?.label || selectedSettingsProfileName}`)) return;
+    await getJson(`/api/settings/profiles/${encodeURIComponent(selectedSettingsProfileName)}`, { method: 'DELETE' });
+    selectedSettingsProfileName = '';
+    await loadSettings();
+    await loadOptions();
+}
+
+async function loadSettings(selection = {}) {
+    settingsData = await getJson('/api/settings');
+    const kinds = Object.keys(settingsData.schema?.kinds || {});
+    nodes.settingsModelKindFilter.innerHTML = [
+        '<option value="">全部类型</option>',
+        ...kinds.map(kind => `<option value="${escapeHtml(kind)}">${escapeHtml(kind)}</option>`)
+    ].join('');
+    nodes.modelKind.innerHTML = kinds.map(kind => `<option value="${escapeHtml(kind)}">${escapeHtml(kind)}</option>`).join('');
+    nodes.settingsSummary.textContent = `${settingsData.models.length} 个模型资源 · ${settingsData.profiles.length} 个运行方案 · 默认 ${settingsData.active_runtime_profile || '-'}`;
+    renderSettingsModelList();
+    renderSettingsProfileList();
+    const modelId = selection.modelId || selectedSettingsModelId;
+    const profileName = selection.profileName || selectedSettingsProfileName;
+    if (modelId && settingsData.models.some(item => item.id === modelId)) {
+        selectSettingsModel(modelId);
+    } else if (!selectedSettingsModelId) {
+        resetModelEditor();
+    }
+    if (profileName && settingsData.profiles.some(item => item.name === profileName)) {
+        selectSettingsProfile(profileName);
+    } else if (!selectedSettingsProfileName) {
+        resetProfileEditor();
+    }
+}
+
 function jobPayload() {
     addPendingUrls();
     return {
@@ -817,16 +1683,19 @@ function selectJob(jobId, updateUrl = true) {
 }
 
 function setView(view, updateUrl = true) {
-    currentView = ['qa', 'vscode'].includes(view) ? view : 'console';
+    currentView = ['qa', 'vscode', 'settings'].includes(view) ? view : 'console';
     nodes.consoleView.hidden = currentView !== 'console';
     nodes.qaView.hidden = currentView !== 'qa';
     nodes.vscodeView.hidden = currentView !== 'vscode';
+    nodes.settingsView.hidden = currentView !== 'settings';
     nodes.consoleView.classList.toggle('active', currentView === 'console');
     nodes.qaView.classList.toggle('active', currentView === 'qa');
     nodes.vscodeView.classList.toggle('active', currentView === 'vscode');
+    nodes.settingsView.classList.toggle('active', currentView === 'settings');
     nodes.consoleTab.classList.toggle('active', currentView === 'console');
     nodes.qaTab.classList.toggle('active', currentView === 'qa');
     nodes.vscodeTab.classList.toggle('active', currentView === 'vscode');
+    nodes.settingsTab.classList.toggle('active', currentView === 'settings');
     if (updateUrl) {
         const url = new URL(window.location.href);
         if (currentView !== 'console') {
@@ -838,6 +1707,11 @@ function setView(view, updateUrl = true) {
     }
     renderQaPanel(currentJob);
     renderVscodePanel(currentJob);
+    if (currentView === 'settings' && !settingsData) {
+        loadSettings().catch(error => {
+            nodes.settingsSummary.textContent = error.message;
+        });
+    }
     applySkillsFocusMode();
 }
 
@@ -872,13 +1746,14 @@ function setResourceView(view, updateUrl = true) {
 }
 
 function setSkillsScope(scope, updateUrl = true) {
-    currentSkillsScope = ['enabled', 'disabled', 'trash'].includes(scope) ? scope : 'current';
+    currentSkillsScope = ['projects', 'enabled', 'disabled', 'trash'].includes(scope) ? scope : 'current';
     nodes.skillsScopeTabs.forEach(button => {
         button.classList.toggle('active', button.dataset.skillsScope === currentSkillsScope);
     });
     nodes.currentSkillsWorkspace.hidden = currentSkillsScope !== 'current';
-    nodes.skillLibraryWorkspace.hidden = currentSkillsScope === 'current';
-    nodes.skillLibrarySearchLabel.hidden = currentSkillsScope === 'current';
+    nodes.skillProjectsWorkspace.hidden = currentSkillsScope !== 'projects';
+    nodes.skillLibraryWorkspace.hidden = currentSkillsScope === 'current' || currentSkillsScope === 'projects';
+    nodes.skillLibrarySearchLabel.hidden = currentSkillsScope === 'current' || currentSkillsScope === 'projects';
     if (updateUrl) {
         const url = new URL(window.location.href);
         url.searchParams.set('view', 'vscode');
@@ -888,6 +1763,8 @@ function setSkillsScope(scope, updateUrl = true) {
     }
     if (currentSkillsScope === 'current') {
         renderSkillsWorkspace(currentJob);
+    } else if (currentSkillsScope === 'projects') {
+        loadSkillProjects();
     } else {
         window.requestAnimationFrame(constrainSkillsLayouts);
         selectedLibrarySkillId = '';
@@ -895,6 +1772,7 @@ function setSkillsScope(scope, updateUrl = true) {
         resetSkillEditor();
         loadSkillLibrary();
     }
+    syncSkillProjectPolling();
 }
 
 function jobTimeValue(job) {
@@ -983,6 +1861,7 @@ async function refreshJobs() {
     renderGlobal(data);
     const jobs = data.jobs || [];
     latestJobs = jobs;
+    updateProfileTestAvailability();
     renderJobList(jobs);
     renderSelectedJobSnapshot(jobs);
     const first = preferredJob(jobs);
@@ -1008,6 +1887,7 @@ async function refreshJobsNoSelect() {
     renderGlobal(data);
     const jobs = data.jobs || [];
     latestJobs = jobs;
+    updateProfileTestAvailability();
     renderJobList(jobs);
     renderSelectedJobSnapshot(jobs);
 }
@@ -1192,6 +2072,18 @@ function renderJob(job) {
     setText(nodes.detailUrl, jobSourceLabel(job));
     setText(nodes.detailRunDir, job.summary?.run_dir || job.run_dir);
     setText(nodes.detailMode, `${job.options?.analysis_mode || '-'} -> ${job.resolved_mode || '-'}`);
+    const runtimeSnapshot = job.runtime_profile_snapshot || {};
+    const runtimeModels = runtimeSnapshot.models || {};
+    setText(
+        nodes.detailProfile,
+        `${runtimeSnapshot.profile || job.options?.profile || '-'}${runtimeSnapshot.fingerprint ? ` · ${runtimeSnapshot.fingerprint.slice(0, 10)}` : ''}`
+    );
+    setText(
+        nodes.detailModels,
+        Object.entries(runtimeModels)
+            .map(([kind, value]) => `${kind}: ${value === true ? 'enabled' : value === false ? 'disabled' : value || '-'}`)
+            .join(' · ') || '-'
+    );
     setText(nodes.detailUpdated, job.updated_at);
 
     if (job.error_summary) {
@@ -1587,6 +2479,7 @@ function renderSkillCandidatePanel(job) {
     nodes.skillProgressBar.style.width = `${Math.max(0, Math.min(progress, 100))}%`;
     renderSkillLiveActivity(skill);
     nodes.generateSkillButton.disabled = !job || !runDir || active || waitingOverview || waitingCandidates;
+    nodes.createTargetedSkillProjectButton.disabled = !job;
     nodes.generateSkillButton.textContent = completed ? '重新蒸馏' : '开始蒸馏';
     nodes.resumeSkillButton.hidden = !resumable;
     nodes.resumeSkillButton.disabled = !job || active;
@@ -1739,9 +2632,16 @@ function renderSkillsWorkspace(job) {
         button.classList.toggle('active', button.dataset.skillsScope === currentSkillsScope);
     });
     nodes.currentSkillsWorkspace.hidden = currentSkillsScope !== 'current';
-    nodes.skillLibraryWorkspace.hidden = currentSkillsScope === 'current';
-    nodes.skillLibrarySearchLabel.hidden = currentSkillsScope === 'current';
+    nodes.skillProjectsWorkspace.hidden = currentSkillsScope !== 'projects';
+    nodes.skillLibraryWorkspace.hidden = currentSkillsScope === 'current' || currentSkillsScope === 'projects';
+    nodes.skillLibrarySearchLabel.hidden = currentSkillsScope === 'current' || currentSkillsScope === 'projects';
     window.requestAnimationFrame(constrainSkillsLayouts);
+    if (currentSkillsScope === 'projects') {
+        loadSkillProjects();
+        syncSkillProjectPolling();
+        return;
+    }
+    syncSkillProjectPolling();
     if (currentSkillsScope !== 'current') return;
     if (!job?.job_id || !(job.summary?.run_dir || job.run_dir)) {
         loadedSkillsWorkspaceKey = '';
@@ -1756,6 +2656,575 @@ function renderSkillsWorkspace(job) {
     if (workspaceKey !== loadedSkillsWorkspaceKey) {
         loadCurrentSkillsWorkspace(job.job_id, workspaceKey);
     }
+}
+
+async function loadSkillProjects(preferredProjectId = selectedSkillProjectId) {
+    if (currentSkillsScope !== 'projects') return;
+    try {
+        const payload = await getJson('/api/skill-projects');
+        const items = payload.items || [];
+        nodes.skillProjectsCount.textContent = `${items.length} 项`;
+        if (!items.length) {
+            selectedSkillProjectId = '';
+            currentSkillProject = null;
+            currentSkillProjectWorkspace = null;
+            nodes.skillProjectsList.innerHTML = '<div class="skills-empty">暂无项目</div>';
+            renderSkillProjectDetail();
+            return;
+        }
+        if (!items.some(item => item.id === preferredProjectId)) {
+            preferredProjectId = items[0].id;
+        }
+        selectedSkillProjectId = preferredProjectId;
+        nodes.skillProjectsList.innerHTML = items.map(item => `
+            <button class="skills-item ${item.id === selectedSkillProjectId ? 'active' : ''}" type="button" data-skill-project-id="${escapeHtml(item.id)}">
+                <strong>${escapeHtml(item.title || item.goal || item.id)}</strong>
+                <span>${escapeHtml(item.status || 'draft')} · ${escapeHtml(item.skill_type || '-')}</span>
+                <small>${escapeHtml(item.assessment?.summary || item.goal || '')}</small>
+            </button>
+        `).join('');
+        nodes.skillProjectsList.querySelectorAll('[data-skill-project-id]').forEach(button => {
+            button.addEventListener('click', () => selectSkillProject(button.dataset.skillProjectId));
+        });
+        await selectSkillProject(selectedSkillProjectId, false);
+    } catch (error) {
+        nodes.skillProjectsList.innerHTML = `<div class="skills-empty error-text">加载失败：${escapeHtml(error.message)}</div>`;
+    }
+}
+
+async function selectSkillProject(projectId, refreshList = true) {
+    if (!projectId) {
+        currentSkillProject = null;
+        currentSkillProjectWorkspace = null;
+        renderSkillProjectDetail();
+        return;
+    }
+    selectedSkillProjectId = projectId;
+    try {
+        const [project, workspace] = await Promise.all([
+            getJson(`/api/skill-projects/${projectId}`),
+            getJson(`/api/skill-projects/${projectId}/workspace`)
+        ]);
+        if (selectedSkillProjectId !== projectId || currentSkillsScope !== 'projects') return;
+        currentSkillProject = project;
+        currentSkillProjectWorkspace = workspace;
+        renderSkillProjectDetail();
+        void loadSkillProjectLog(projectId);
+        if (refreshList) loadSkillProjects(projectId);
+    } catch (error) {
+        currentSkillProject = null;
+        currentSkillProjectWorkspace = null;
+        nodes.skillProjectDetail.innerHTML = `<div class="skills-empty error-text">加载失败：${escapeHtml(error.message)}</div>`;
+    }
+}
+
+function renderSkillProjectDetail() {
+    const project = currentSkillProject;
+    const workspace = currentSkillProjectWorkspace;
+    const currentJobAvailable = Boolean(currentJob?.job_id);
+    nodes.assessSkillProjectButton.disabled = !project;
+    nodes.startSkillProjectButton.disabled = !project;
+    nodes.addCurrentJobSkillSourceButton.disabled = !project || !currentJobAvailable;
+    nodes.importSkillProjectSourceButton.disabled = !project;
+    if (!project) {
+        nodes.skillProjectDetail.innerHTML = '<div class="skills-empty">创建或选择一个 Skill 项目</div>';
+        nodes.skillProjectSources.innerHTML = '暂无资料';
+        return;
+    }
+    const assessment = project.assessment || {};
+    const workspaceSummary = workspace?.summary || {};
+    const sources = project.sources || [];
+    const materialRequests = assessment.material_requests || [];
+    const checks = project.capability_checks || [];
+    const candidates = workspace?.candidates || [];
+    const waitingOverview = workspaceSummary.status === 'waiting_overview_review';
+    const waitingCandidates = workspaceSummary.status === 'waiting_candidate_review';
+    const running = workspaceSummary.status === 'running';
+    const runnerKnown = typeof workspace?.runner?.active === 'boolean';
+    const workerActive = Boolean(workspace?.runner?.active);
+    const progress = workspaceSummary.progress || {};
+    const stage = workspaceSummary.current_stage || '';
+    const stageInfo = progress.stages?.[stage] || {};
+    const startedAt = stageInfo.started_at || workspaceSummary.updated_at;
+    const elapsed = startedAt
+        ? formatSkillElapsed(Math.max(0, (Date.now() - new Date(startedAt).getTime()) / 1000))
+        : '';
+    const displayStatus = workspaceSummary.status === 'running'
+        ? '运行中'
+        : (project.status || 'draft');
+    const stageLabel = skillStageNames[stage] || stage || '准备中';
+    const progressPercent = Math.max(0, Math.min(Number(progress.percent || 0), 100));
+    const logStages = Object.keys(progress.stages || {});
+    const logStage = chooseSkillProjectLogStage(logStages, stage);
+    const canStart = ['ready', 'ready_limited'].includes(assessment.verdict);
+    nodes.startSkillProjectButton.disabled = !canStart || running;
+    nodes.startSkillProjectButton.textContent = assessment.verdict === 'ready_limited'
+        ? '接受限制后蒸馏'
+        : '开始蒸馏';
+    const projectActions = [
+        waitingOverview ? '<button type="button" data-project-action="review-overview">确认骨架</button>' : '',
+        ['failed', 'interrupted', 'cancelled', 'ready'].includes(workspaceSummary.status)
+            ? '<button class="secondary" type="button" data-project-action="resume">继续</button>' : '',
+        workspaceSummary.status === 'running'
+            ? '<button class="secondary" type="button" data-project-action="cancel">取消</button>' : '',
+        workspaceSummary.status === 'succeeded'
+            ? '<button type="button" data-project-action="enable">启用 Skills</button>' : ''
+    ].join('');
+    nodes.skillProjectDetail.innerHTML = `
+        <section>
+            <h3>${escapeHtml(project.title || project.goal)}</h3>
+            <p>${escapeHtml(project.brief?.goal || '')}</p>
+            <p>状态：${escapeHtml(displayStatus)} · 评估：${escapeHtml(assessment.verdict || '未评估')}</p>
+            <div class="skill-actions">${projectActions}</div>
+        </section>
+        <section class="skill-project-run ${running ? 'running' : ''}">
+            <div class="skill-project-run-head">
+                ${running ? '<span class="skill-project-spinner" aria-hidden="true"></span>' : ''}
+                <div>
+                    <h4>${running ? `正在${escapeHtml(stageLabel)}` : '蒸馏进度'}</h4>
+                    <p>${running
+                        ? (workerActive
+                            ? `后台线程存活${elapsed ? ` · 已持续 ${elapsed}` : ''}`
+                            : (runnerKnown
+                                ? '状态仍显示运行，但当前服务未检测到后台线程'
+                                : `流程状态运行中${elapsed ? ` · 已持续 ${elapsed}` : ''}`))
+                        : escapeHtml(workspaceSummary.status || '尚未开始')}</p>
+                </div>
+                <strong>${progressPercent}%</strong>
+            </div>
+            <div class="skill-project-progress" aria-label="Skill 项目蒸馏进度">
+                <span style="width:${progressPercent}%"></span>
+            </div>
+            ${renderSkillProjectStageRail(progress, stage)}
+        </section>
+        ${waitingCandidates ? renderSkillProjectCandidateReview(project.id, candidates) : ''}
+        <section>
+            <h4>评估</h4>
+            <p>${escapeHtml(assessment.summary || '尚未评估')}</p>
+            ${(assessment.questions || []).length ? `<ul>${assessment.questions.map(item => `<li>${escapeHtml(item)}</li>`).join('')}</ul>` : ''}
+            ${(materialRequests || []).length ? `<ul>${materialRequests.map(item => `<li>${escapeHtml(item.reason || '')}；${escapeHtml(item.acceptance || '')}</li>`).join('')}</ul>` : ''}
+        </section>
+        <section>
+            <h4>蒸馏</h4>
+            <p>${escapeHtml(workspaceSummary.status || '尚未开始')} · ${escapeHtml(workspaceSummary.current_stage || '-')}</p>
+            <p>候选 ${candidates.length} · 成品 ${(workspace?.generated_skills || []).length}</p>
+        </section>
+        <section class="skill-project-log-console">
+            <div class="skill-project-log-head">
+                <div>
+                    <h4>实时日志</h4>
+                    <p>当前显示 ${escapeHtml(skillStageNames[logStage] || logStage || '暂无阶段')} 的日志尾部</p>
+                </div>
+                <button class="secondary tiny" type="button" data-skill-project-log-copy>复制完整日志</button>
+            </div>
+            <div class="skill-project-log-tabs" role="tablist">
+                ${logStages.map(name => `
+                    <button class="secondary tiny ${name === logStage ? 'active' : ''}" type="button"
+                        data-skill-project-log-stage="${escapeHtml(name)}">${escapeHtml(skillStageNames[name] || name)}</button>
+                `).join('')}
+            </div>
+            <pre id="skillProjectLogText" class="skill-project-log-text">加载日志中…</pre>
+        </section>
+        <section>
+            <h4>能力检查</h4>
+            ${checks.length ? checks.map(check => `
+                <p>${escapeHtml(check.label || check.id)}：${escapeHtml(check.status || 'unknown')}
+                    ${check.smoke_test ? `<button class="secondary tiny" type="button" data-capability-check="${escapeHtml(check.id)}">验证</button>` : ''}
+                </p>
+            `).join('') : '<p>当前目标不要求额外执行能力。</p>'}
+        </section>
+    `;
+    nodes.skillProjectSources.innerHTML = sources.length
+        ? sources.map(source => `<div>
+            <strong>${escapeHtml(source.label || source.filename || source.job_id || source.id)}</strong>
+            <small>${escapeHtml(source.kind || '')}</small>
+            <button class="secondary tiny" type="button" data-remove-skill-source="${escapeHtml(source.id)}">移除</button>
+        </div>`).join('')
+        : '暂无资料';
+    nodes.skillProjectDetail.querySelectorAll('[data-project-action]').forEach(button => {
+        button.addEventListener('click', () => runSkillProjectAction(button.dataset.projectAction));
+    });
+    nodes.skillProjectDetail.querySelectorAll('[data-skill-project-candidate]').forEach(input => {
+        input.addEventListener('change', updateSkillProjectCandidateDraft);
+    });
+    nodes.skillProjectDetail.querySelectorAll('[data-skill-project-selection]').forEach(button => {
+        button.addEventListener('click', () => {
+            setSkillProjectCandidateSelection(button.dataset.skillProjectSelection);
+        });
+    });
+    nodes.skillProjectDetail.querySelectorAll('[data-project-candidate-confirm]').forEach(button => {
+        button.addEventListener('click', () => runSkillProjectAction('review-candidates'));
+    });
+    nodes.skillProjectDetail.querySelectorAll('[data-skill-project-log-stage]').forEach(button => {
+        button.addEventListener('click', () => {
+            selectedSkillProjectLogStage = button.dataset.skillProjectLogStage || '';
+            renderSkillProjectDetail();
+            void loadSkillProjectLog(project.id, selectedSkillProjectLogStage);
+        });
+    });
+    nodes.skillProjectDetail.querySelector('[data-skill-project-log-copy]')?.addEventListener('click', () => {
+        void copySkillProjectLog(project.id);
+    });
+    nodes.skillProjectDetail.querySelectorAll('[data-capability-check]').forEach(button => {
+        button.addEventListener('click', () => runSkillProjectCapabilityCheck(button.dataset.capabilityCheck));
+    });
+    nodes.skillProjectSources.querySelectorAll('[data-remove-skill-source]').forEach(button => {
+        button.addEventListener('click', () => removeSkillProjectSource(button.dataset.removeSkillSource));
+    });
+    syncSkillProjectPolling();
+}
+
+function chooseSkillProjectLogStage(stages, currentStage) {
+    if (selectedSkillProjectLogStage && stages.includes(selectedSkillProjectLogStage)) {
+        return selectedSkillProjectLogStage;
+    }
+    return currentStage && stages.includes(currentStage)
+        ? currentStage
+        : (stages[stages.length - 1] || '');
+}
+
+function skillProjectLogPath(stage) {
+    return `skills/cangjie_pack/logs/${stage}.jsonl`;
+}
+
+function formatSkillProjectLog(text) {
+    const lines = String(text || '').trim().split('\n').filter(Boolean);
+    if (!lines.length) return '暂无日志输出';
+    return lines.map(line => {
+        try {
+            const item = JSON.parse(line);
+            const time = String(item.time || '').replace('T', ' ').replace(/\.\d+\+\d\d:\d\d$/, '');
+            return `${time ? `[${time}] ` : ''}${item.event || 'log'}${item.message ? ` · ${item.message}` : ''}`;
+        } catch {
+            return line;
+        }
+    }).join('\n');
+}
+
+async function loadSkillProjectLog(projectId, requestedStage = '') {
+    const logText = document.getElementById('skillProjectLogText');
+    const progress = currentSkillProjectWorkspace?.summary?.progress || {};
+    const stage = requestedStage || chooseSkillProjectLogStage(
+        Object.keys(progress.stages || {}),
+        currentSkillProjectWorkspace?.summary?.current_stage || ''
+    );
+    if (!logText || !projectId || !stage) return;
+    const requestId = ++skillProjectLogRequestId;
+    try {
+        const response = await fetch(
+            `/api/skill-projects/${projectId}/resource?path=${encodeURIComponent(skillProjectLogPath(stage))}`
+        );
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const text = await response.text();
+        if (requestId !== skillProjectLogRequestId || selectedSkillProjectId !== projectId) return;
+        logText.textContent = formatSkillProjectLog(text);
+    } catch (error) {
+        if (requestId !== skillProjectLogRequestId || selectedSkillProjectId !== projectId) return;
+        logText.textContent = `日志暂不可用：${error.message}`;
+    }
+}
+
+async function copySkillProjectLog(projectId) {
+    const progress = currentSkillProjectWorkspace?.summary?.progress || {};
+    const stage = chooseSkillProjectLogStage(
+        Object.keys(progress.stages || {}),
+        currentSkillProjectWorkspace?.summary?.current_stage || ''
+    );
+    if (!projectId || !stage) return;
+    const button = nodes.skillProjectDetail.querySelector('[data-skill-project-log-copy]');
+    try {
+        const response = await fetch(
+            `/api/skill-projects/${projectId}/resource?path=${encodeURIComponent(skillProjectLogPath(stage))}`
+        );
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        await copyText(formatSkillProjectLog(await response.text()));
+        if (button) button.textContent = '已复制';
+    } catch (error) {
+        if (button) button.textContent = '复制失败';
+    }
+}
+
+function skillProjectCandidateDraft(projectId, candidates) {
+    const signature = candidates
+        .map(item => `${item.group}:${item.id}:${item.eligible ? '1' : '0'}:${item.selected ? '1' : '0'}`)
+        .sort()
+        .join('|');
+    let draft = skillProjectCandidateDrafts.get(projectId);
+    if (!draft || draft.signature !== signature) {
+        draft = {
+            signature,
+            selected: new Set(
+                candidates
+                    .filter(item => item.eligible && item.selected)
+                    .map(item => item.id)
+            )
+        };
+        skillProjectCandidateDrafts.set(projectId, draft);
+    }
+    return draft;
+}
+
+function renderSkillProjectCandidateReview(projectId, candidates) {
+    const draft = skillProjectCandidateDraft(projectId, candidates);
+    const groups = [
+        {
+            id: 'accepted',
+            title: '已验证候选',
+            description: '已通过完整验证，可直接选择。',
+            selectable: true,
+            collapsible: false
+        },
+        {
+            id: 'single_case',
+            title: '可构建候选',
+            description: '来自单一案例，需要你确认是否值得先构建。',
+            selectable: true,
+            collapsible: false
+        },
+        {
+            id: 'glossary',
+            title: '术语参考',
+            description: '用于理解，不会生成 Skill。',
+            selectable: false,
+            collapsible: true
+        },
+        {
+            id: 'rejected',
+            title: '不建议构建',
+            description: '保留拒绝原因，不能提交。',
+            selectable: false,
+            collapsible: true
+        }
+    ];
+    const eligibleCount = candidates.filter(item => item.eligible).length;
+    const selectedCount = draft.selected.size;
+    const renderRow = (item, selectable) => {
+        const reason = item.reason || item.v1?.reason || '';
+        const evidence = item.source_count
+            ? `${item.source_count} 条证据`
+            : '无证据引用';
+        const check = selectable
+            ? `<input type="checkbox" data-skill-project-candidate="${escapeHtml(item.id)}" ${draft.selected.has(item.id) ? 'checked' : ''}>`
+            : '<span class="skill-project-candidate-marker" aria-hidden="true"></span>';
+        return `<label class="skill-project-candidate ${selectable ? 'selectable' : 'reference'}">
+            ${check}
+            <span>
+                <strong>${escapeHtml(item.title || item.id)}</strong>
+                <small>${escapeHtml(item.summary || '')}</small>
+                <small>${escapeHtml(evidence)}${reason ? ` · ${escapeHtml(reason)}` : ''}</small>
+            </span>
+        </label>`;
+    };
+    const groupsHtml = groups.map(group => {
+        const items = candidates.filter(item => item.group === group.id);
+        const body = items.length
+            ? items.map(item => renderRow(item, group.selectable && item.eligible)).join('')
+            : '<div class="skills-empty">无</div>';
+        const content = `<div class="skill-project-candidate-group-body">${body}</div>`;
+        const heading = `<div class="skill-project-candidate-group-head">
+            <div><h4>${escapeHtml(group.title)} · ${items.length}</h4><p>${escapeHtml(group.description)}</p></div>
+        </div>`;
+        return group.collapsible
+            ? `<details class="skill-project-candidate-group"><summary>${heading}</summary>${content}</details>`
+            : `<section class="skill-project-candidate-group">${heading}${content}</section>`;
+    }).join('');
+    return `<section class="skill-project-candidate-review">
+        <div class="skill-project-candidate-review-head">
+            <div><h4>候选 Review · ${candidates.length}</h4><p>只可选择已验证或单案例候选。</p></div>
+            <div class="skill-actions">
+                <button class="secondary tiny" type="button" data-skill-project-selection="all" ${eligibleCount ? '' : 'disabled'}>全选可构建</button>
+                <button class="secondary tiny" type="button" data-skill-project-selection="none" ${selectedCount ? '' : 'disabled'}>清空</button>
+                <button type="button" data-project-candidate-confirm ${selectedCount ? '' : 'disabled'}>确认 ${selectedCount} 项</button>
+            </div>
+        </div>
+        ${groupsHtml}
+    </section>`;
+}
+
+function updateSkillProjectCandidateDraft(event) {
+    const candidateId = event.target.dataset.skillProjectCandidate;
+    const draft = skillProjectCandidateDrafts.get(selectedSkillProjectId);
+    if (!candidateId || !draft) return;
+    if (event.target.checked) {
+        draft.selected.add(candidateId);
+    } else {
+        draft.selected.delete(candidateId);
+    }
+    renderSkillProjectDetail();
+}
+
+function setSkillProjectCandidateSelection(action) {
+    const candidates = currentSkillProjectWorkspace?.candidates || [];
+    const draft = skillProjectCandidateDraft(selectedSkillProjectId, candidates);
+    if (action === 'all') {
+        draft.selected = new Set(candidates.filter(item => item.eligible).map(item => item.id));
+    } else {
+        draft.selected.clear();
+    }
+    renderSkillProjectDetail();
+}
+
+function renderSkillProjectStageRail(progress, currentStage) {
+    const stages = progress.stages || {};
+    const rows = Object.entries(stages);
+    if (!rows.length) return '<div class="skill-project-stage-rail">等待开始</div>';
+    return `<div class="skill-project-stage-rail">${rows.map(([name, item]) => {
+        const status = item.status || (name === currentStage ? 'running' : 'pending');
+        return `<span class="${escapeHtml(status)}">${escapeHtml(skillStageNames[name] || name)}</span>`;
+    }).join('')}</div>`;
+}
+
+function syncSkillProjectPolling() {
+    const status = currentSkillProjectWorkspace?.summary?.status;
+    const shouldPoll = currentSkillsScope === 'projects'
+        && Boolean(selectedSkillProjectId)
+        && status === 'running';
+    if (!shouldPoll) {
+        if (skillProjectPollTimer) {
+            window.clearInterval(skillProjectPollTimer);
+            skillProjectPollTimer = null;
+        }
+        return;
+    }
+    if (skillProjectPollTimer) return;
+    skillProjectPollTimer = window.setInterval(async () => {
+        if (skillProjectPollInFlight || currentSkillsScope !== 'projects' || !selectedSkillProjectId) return;
+        skillProjectPollInFlight = true;
+        try {
+            await selectSkillProject(selectedSkillProjectId, false);
+        } finally {
+            skillProjectPollInFlight = false;
+        }
+    }, 2000);
+}
+
+async function createSkillProject(event) {
+    event.preventDefault();
+    const goal = nodes.skillProjectGoal.value.trim();
+    if (!goal) return;
+    const project = await getJson('/api/skill-projects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            title: nodes.skillProjectTitle.value.trim(),
+            goal,
+            job_id: currentJob?.job_id || ''
+        })
+    });
+    nodes.skillProjectTitle.value = '';
+    nodes.skillProjectGoal.value = '';
+    selectedSkillProjectId = project.id;
+    await loadSkillProjects(project.id);
+}
+
+async function assessSkillProject() {
+    if (!selectedSkillProjectId) return;
+    await getJson(`/api/skill-projects/${selectedSkillProjectId}/assess`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}'
+    });
+    await selectSkillProject(selectedSkillProjectId);
+}
+
+async function addCurrentJobSkillSource() {
+    if (!selectedSkillProjectId || !currentJob?.job_id) return;
+    await getJson(`/api/skill-projects/${selectedSkillProjectId}/sources`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind: 'job', job_id: currentJob.job_id, include_qa: true })
+    });
+    await selectSkillProject(selectedSkillProjectId);
+}
+
+async function importSkillProjectSource() {
+    if (!selectedSkillProjectId) return;
+    let content = nodes.skillProjectImportText.value;
+    let filename = 'conversation.md';
+    const file = nodes.skillProjectImportFile.files?.[0];
+    if (file) {
+        filename = file.name;
+        content = await file.text();
+    }
+    if (!content.trim()) return;
+    await getJson(`/api/skill-projects/${selectedSkillProjectId}/sources`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind: 'conversation', filename, content })
+    });
+    nodes.skillProjectImportText.value = '';
+    nodes.skillProjectImportFile.value = '';
+    await selectSkillProject(selectedSkillProjectId);
+}
+
+async function removeSkillProjectSource(sourceId) {
+    if (!selectedSkillProjectId || !sourceId) return;
+    await getJson(`/api/skill-projects/${selectedSkillProjectId}/sources/${encodeURIComponent(sourceId)}`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}'
+    });
+    await selectSkillProject(selectedSkillProjectId);
+}
+
+async function startSkillProjectDistillation() {
+    if (!selectedSkillProjectId || !currentSkillProject) return;
+    const limited = currentSkillProject.assessment?.verdict === 'ready_limited';
+    if (limited && !window.confirm('该项目存在已显示的资料或能力限制。确认接受限制并开始蒸馏？')) return;
+    await getJson(`/api/skill-projects/${selectedSkillProjectId}/distillation/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ profile: 'deepseek_v4_pro', accept_limitations: limited })
+    });
+    await selectSkillProject(selectedSkillProjectId);
+}
+
+async function runSkillProjectAction(action) {
+    if (!selectedSkillProjectId) return;
+    const base = `/api/skill-projects/${selectedSkillProjectId}/distillation`;
+    if (action === 'enable' && !window.confirm('启用已通过测试的 Skills 并写入项目 .codex/skills？')) return;
+    const payload = action === 'review-overview'
+        ? { action: 'confirm' }
+        : action === 'review-candidates'
+            ? {
+                selected_ids: Array.from(
+                    skillProjectCandidateDraft(
+                        selectedSkillProjectId,
+                        currentSkillProjectWorkspace?.candidates || []
+                    ).selected
+                )
+            }
+            : action === 'enable'
+                ? { overwrite: false }
+                : {};
+    const endpoint = action === 'review-overview'
+        ? 'review-overview'
+        : action === 'review-candidates'
+            ? 'review-candidates'
+            : action;
+    await getJson(`${base}/${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+    });
+    await selectSkillProject(selectedSkillProjectId);
+}
+
+async function runSkillProjectCapabilityCheck(checkId) {
+    if (!selectedSkillProjectId || !currentSkillProject) return;
+    if (!window.confirm('将执行已列出的本地能力 smoke test。确认继续？')) return;
+    await getJson(
+        `/api/skill-projects/${selectedSkillProjectId}/capability-checks/${encodeURIComponent(checkId)}/run`,
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                confirm: true,
+                assessment_revision: currentSkillProject.assessment?.project_revision || ''
+            })
+        }
+    );
+    await selectSkillProject(selectedSkillProjectId);
 }
 
 async function loadCurrentSkillsWorkspace(jobId, workspaceKey) {
@@ -4629,11 +6098,10 @@ async function runSelectedJob() {
     nodes.runButton.disabled = true;
     try {
         const action = nodes.runButton.dataset.action || (currentJob?.status === 'succeeded' ? 'open-run-dir' : 'run');
-        const resumeProfile = action === 'run' ? currentJob?.failure_disposition?.recommended_profile : null;
         await getJson(`/api/video-link/jobs/${selectedJobId}/${action}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(resumeProfile ? { profile: resumeProfile } : {})
+            body: '{}'
         });
         if (action === 'run' || action === 'stop') {
             await refreshSelectedJob();
@@ -4651,6 +6119,75 @@ async function boot() {
     nodes.consoleTab.addEventListener('click', () => setView('console'));
     nodes.qaTab.addEventListener('click', () => setView('qa'));
     nodes.vscodeTab.addEventListener('click', () => setView('vscode'));
+    nodes.settingsTab.addEventListener('click', () => setView('settings'));
+    nodes.settingsModelsTab.addEventListener('click', () => setSettingsSection('models'));
+    nodes.settingsProfilesTab.addEventListener('click', () => setSettingsSection('profiles'));
+    nodes.settingsModelKindFilter.addEventListener('change', renderSettingsModelList);
+    nodes.settingsModelSearch.addEventListener('input', renderSettingsModelList);
+    nodes.newModelButton.addEventListener('click', () => resetModelEditor());
+    nodes.modelKind.addEventListener('change', () => syncModelProtocolOptions());
+    nodes.modelSettingsForm.addEventListener('submit', event => {
+        saveModelSettings(event).catch(error => {
+            nodes.modelSettingsMessage.textContent = error.message;
+            nodes.modelSettingsMessage.classList.add('error-text');
+        });
+    });
+    nodes.testModelButton.addEventListener('click', () => {
+        testSelectedSettingsModel().catch(error => {
+            nodes.modelSettingsMessage.textContent = error.message;
+            nodes.modelSettingsMessage.classList.add('error-text');
+        });
+    });
+    nodes.deleteModelButton.addEventListener('click', () => {
+        deleteSelectedSettingsModel().catch(error => {
+            nodes.modelSettingsMessage.textContent = error.message;
+            nodes.modelSettingsMessage.classList.add('error-text');
+        });
+    });
+    nodes.newProfileButton.addEventListener('click', () => resetProfileEditor());
+    nodes.profileWorkflow.addEventListener('change', () => {
+        profileTestReport = null;
+        profileModelSelections = {};
+        setProfileModelSelections();
+        selectedProfileFlowNodeId = profileFlowSchema().nodes[0]?.id || '';
+        renderProfileFlow();
+        renderProfileTestSummary();
+    });
+    nodes.duplicateProfileButton.addEventListener('click', () => {
+        const profile = (settingsData?.profiles || []).find(item => item.name === selectedSettingsProfileName);
+        resetProfileEditor(profile || null);
+    });
+    nodes.profileSettingsForm.addEventListener('submit', event => {
+        saveProfileSettings(event).catch(error => {
+            nodes.profileSettingsMessage.textContent = error.message;
+            nodes.profileSettingsMessage.classList.add('error-text');
+        });
+    });
+    nodes.activateProfileButton.addEventListener('click', () => {
+        activateSelectedSettingsProfile().catch(error => {
+            nodes.profileSettingsMessage.textContent = error.message;
+            nodes.profileSettingsMessage.classList.add('error-text');
+        });
+    });
+    nodes.deleteProfileButton.addEventListener('click', () => {
+        deleteSelectedSettingsProfile().catch(error => {
+            nodes.profileSettingsMessage.textContent = error.message;
+            nodes.profileSettingsMessage.classList.add('error-text');
+        });
+    });
+    nodes.testProfileButton.addEventListener('click', () => {
+        testCurrentProfile().catch(error => {
+            nodes.profileTestSummary.hidden = false;
+            nodes.profileTestSummary.classList.add('failed');
+            nodes.profileTestSummary.innerHTML = `<div><strong>通路测试失败</strong><span>${escapeHtml(error.message)}</span></div>`;
+        });
+    });
+    nodes.profileFlowViewport?.addEventListener('scroll', scheduleProfileFlowEdges, { passive: true });
+    window.addEventListener('resize', scheduleProfileFlowEdges);
+    if (window.ResizeObserver && nodes.profileFlowCanvas) {
+        profileFlowResizeObserver = new ResizeObserver(scheduleProfileFlowEdges);
+        profileFlowResizeObserver.observe(nodes.profileFlowCanvas);
+    }
     nodes.resourceDocsTab.addEventListener('click', () => setResourceView('docs'));
     nodes.resourceSkillsTab.addEventListener('click', () => setResourceView('skills'));
     nodes.skillsResourceDocsTab.addEventListener('click', () => setResourceView('docs'));
@@ -4664,6 +6201,10 @@ async function boot() {
         setView('vscode', false);
         setResourceView('skills', false);
         setSkillsScope('current', true);
+    });
+    nodes.createTargetedSkillProjectButton.addEventListener('click', () => {
+        setSkillsScope('projects');
+        nodes.skillProjectGoal.focus();
     });
     nodes.skillsScopeTabs.forEach(button => {
         button.addEventListener('click', () => setSkillsScope(button.dataset.skillsScope || 'current'));
@@ -4720,6 +6261,31 @@ async function boot() {
     nodes.skillCandidateList.addEventListener('change', updateSkillCandidateDraft);
     nodes.confirmSkillCandidatesButton.addEventListener('click', confirmSkillCandidates);
     nodes.enableSkillButton.addEventListener('click', enableSkillCandidate);
+    nodes.skillProjectForm.addEventListener('submit', event => {
+        createSkillProject(event).catch(error => {
+            nodes.skillProjectDetail.innerHTML = `<div class="skills-empty error-text">创建失败：${escapeHtml(error.message)}</div>`;
+        });
+    });
+    nodes.assessSkillProjectButton.addEventListener('click', () => {
+        assessSkillProject().catch(error => {
+            nodes.skillProjectDetail.innerHTML = `<div class="skills-empty error-text">评估失败：${escapeHtml(error.message)}</div>`;
+        });
+    });
+    nodes.startSkillProjectButton.addEventListener('click', () => {
+        startSkillProjectDistillation().catch(error => {
+            nodes.skillProjectDetail.innerHTML = `<div class="skills-empty error-text">启动失败：${escapeHtml(error.message)}</div>`;
+        });
+    });
+    nodes.addCurrentJobSkillSourceButton.addEventListener('click', () => {
+        addCurrentJobSkillSource().catch(error => {
+            nodes.skillProjectSources.textContent = `关联失败：${error.message}`;
+        });
+    });
+    nodes.importSkillProjectSourceButton.addEventListener('click', () => {
+        importSkillProjectSource().catch(error => {
+            nodes.skillProjectSources.textContent = `导入失败：${error.message}`;
+        });
+    });
     nodes.startVscodeButton.addEventListener('click', () => ensureVscodeSession(false));
     nodes.restartVscodeButton.addEventListener('click', () => ensureVscodeSession(true));
     nodes.stopVscodeButton.addEventListener('click', stopVscodeSession);

@@ -199,6 +199,50 @@ class SkillDistillationTests(unittest.TestCase):
             self.assertTrue((skill_dir / "test-prompts.json").is_file())
             self.assertTrue((distill.pack_dir(run_dir) / "DIGEST.md").is_file())
 
+    def test_build_resume_reuses_complete_candidate_skill_without_model_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            write_raw_evidence(run_dir)
+            runtime = fake_runtime()
+
+            with patch.object(distill, "resolve_model_runtime", return_value=runtime):
+                distill.initialize_distillation(run_dir)
+                pipeline = distill.SkillDistillationPipeline(run_dir)
+                pipeline.run_until_pause()
+                pipeline.review_overview("confirm")
+                waiting = pipeline.run_until_pause()
+                pipeline.review_candidates(waiting["candidates"]["selected_ids"])
+
+                verified = json.loads(
+                    (distill.pack_dir(run_dir) / "verified.json").read_text(encoding="utf-8")
+                )
+                candidate = verified["accepted"][0]
+                skill_dir = distill.pack_dir(run_dir) / "distilled_skills" / "existing-skill"
+                skill_dir.mkdir(parents=True)
+                skill_dir.joinpath("SKILL.md").write_text("# Existing\n", encoding="utf-8")
+                skill_dir.joinpath("skill.json").write_text(
+                    json.dumps(
+                        {
+                            "candidate_id": candidate["id"],
+                            "name": "existing-skill",
+                            "title": "Existing skill",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                with patch.object(
+                    distill,
+                    "call_json",
+                    side_effect=AssertionError("resume must not rebuild a complete skill"),
+                ):
+                    pipeline._build_skills()
+
+            self.assertEqual(pipeline.state["skills"]["count"], 1)
+            self.assertEqual(pipeline.state["skills"]["items"][0]["name"], "existing-skill")
+            self.assertEqual(pipeline.state["skills"]["items"][0]["status"], "built")
+
     def test_manifest_only_run_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "run"
@@ -305,6 +349,38 @@ class SkillDistillationTests(unittest.TestCase):
 
         self.assertEqual([item["title"] for item in normalized["structure"]], ["Core"])
         self.assertEqual(len(normalized["critique"]), 1)
+
+    def test_normalize_tests_adds_missing_sibling_confusion_case(self):
+        tests = distill.normalize_tests(
+            "current-skill",
+            {
+                "test_cases": [
+                    test_case("trigger-01", "should_trigger", "请处理当前方法", "current-skill"),
+                    test_case("trigger-02", "should_trigger", "继续处理当前方法", "current-skill"),
+                    test_case("trigger-03", "should_trigger", "再处理当前方法", "current-skill"),
+                    test_case("negative-01", "should_not_trigger", "现在几点", None),
+                    test_case("negative-02", "should_not_trigger", "API 参数是什么", None),
+                    test_case("edge-01", "edge_case", "不确定该不该触发", None),
+                ]
+            },
+            [
+                {"name": "current-skill", "title": "当前 Skill"},
+                {
+                    "name": "sibling-skill",
+                    "title": "相邻 Skill",
+                    "triggers": {"scenarios": ["用户需要相邻 Skill 的专属流程"]},
+                },
+            ],
+        )
+
+        confusion = next(
+            item
+            for item in tests["test_cases"]
+            if item["id"] == "should-not-trigger-sibling-confusion"
+        )
+        self.assertEqual(confusion["expected_skill"], "sibling-skill")
+        self.assertEqual(confusion["type"], "should_not_trigger")
+        self.assertIn("相邻 Skill", confusion["prompt"])
 
     def test_verification_normalization_rejects_candidates_omitted_by_model(self):
         records = {

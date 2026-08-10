@@ -426,6 +426,54 @@ def transcribe():
         path.unlink(missing_ok=True)
 
 
+@app.post("/api/firered/transcribe")
+def transcribe_firered_only():
+    try:
+        require_token()
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 401
+    audio = request.files.get("audio")
+    if audio is None or not audio.filename:
+        return jsonify({"error": "audio file is required"}), 400
+    suffix = Path(audio.filename).suffix or ".wav"
+    with tempfile.NamedTemporaryFile(prefix="firered_asr2_", suffix=suffix, delete=False) as handle:
+        path = Path(handle.name)
+        audio.save(handle)
+    try:
+        audio_sha256 = sha256_file(path)
+        payload, timing = run_cached_stage(
+            "firered",
+            audio_sha256,
+            firered_fingerprint(),
+            FIRERED_SEMAPHORE,
+            lambda: transcribe_with_firered(path),
+            lambda item: bool(str(item.get("text") or "").strip())
+            and isinstance(item.get("segments") or [], list),
+        )
+        return jsonify(
+            {
+                "success": True,
+                "provider": "firered_asr2",
+                "text": str(payload.get("text") or ""),
+                "segments": list(payload.get("segments") or []),
+                "language": str(payload.get("language") or "Chinese"),
+                "metadata": {
+                    key: value
+                    for key, value in payload.items()
+                    if key not in {"text", "segments", "language"}
+                },
+                "audio_sha256": audio_sha256,
+                "stage_timing": timing,
+            }
+        )
+    except requests.RequestException as exc:
+        return jsonify({"error": f"FireRed endpoint unavailable: {exc}"}), 502
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+    finally:
+        path.unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     app.run(
         host=os.environ.get("FIRERED_3DSPEAKER_HOST", "127.0.0.1"),

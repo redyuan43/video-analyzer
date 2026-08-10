@@ -10,6 +10,8 @@ from importlib import resources
 import ipaddress
 from urllib.parse import urlparse
 
+from .model_settings import apply_disabled_runtime_profiles, expand_runtime_profile
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_DEEPSEEK_ENV = Path("~/.config/video-analyzer/deepseek.env").expanduser()
@@ -18,6 +20,8 @@ ENDPOINT_REF_RE = re.compile(r"\{([A-Za-z0-9_.-]+)\}")
 
 class Config:
     def __init__(self, config_dir: str = "config"):
+        if config_dir == "config":
+            config_dir = os.environ.get("VIDEO_ANALYZER_CONFIG_DIR", config_dir)
         # Handle user-provided config directory
         self.config_dir = Path(config_dir)
         self.user_config = self.config_dir / "config.json"
@@ -56,7 +60,7 @@ class Config:
             else:
                 logger.debug("No user config found, using default config")
                 self.config = default_config
-            self.config = resolve_endpoint_config(self.config)
+            self.config = resolve_endpoint_config(apply_disabled_runtime_profiles(self.config))
                     
             # Ensure prompts is a list
             if not isinstance(self.config.get("prompts", []), list):
@@ -177,6 +181,7 @@ class Config:
             )
             text_model = manual_config.get("text_model") or profile.get("text_model") or vision_model
             text_temperature = manual_config.get("text_temperature", profile.get("text_temperature"))
+            text_timeout_seconds = manual_config.get("text_timeout_seconds", profile.get("text_timeout_seconds"))
             manual_config["llm_base_url"] = llm_base_url
             manual_config["vision_base_url"] = vision_base_url
             manual_config["text_base_url"] = text_base_url
@@ -184,6 +189,8 @@ class Config:
             manual_config["text_model"] = text_model
             if text_temperature is not None:
                 manual_config["text_temperature"] = text_temperature
+            if text_timeout_seconds is not None:
+                manual_config["text_timeout_seconds"] = int(text_timeout_seconds)
             if profile.get("text_api_key_env") and _is_deepseek_api(text_base_url):
                 manual_config["text_api_key_env"] = profile["text_api_key_env"]
             elif (
@@ -202,14 +209,41 @@ class Config:
             self.config["clients"]["openai_api"]["model"] = vision_model
             user_config_asr_provider = "provider" in (getattr(self, "user_config_data", {}).get("asr") or {})
             if not getattr(args, "asr_provider", None) and not user_config_asr_provider:
-                self.config.setdefault("asr", {})["provider"] = "auto"
+                self.config.setdefault("asr", {})["provider"] = profile.get("asr_provider", "auto")
             services = (self.config.get("endpoints") or {}).get("services") or {}
             vibevoice = self.config.setdefault("asr", {}).setdefault("vibevoice", {})
             profile_vibevoice_urls = normalize_string_list(profile.get("vibevoice_urls") or profile.get("vibevoice_url"))
             if profile_vibevoice_urls and not getattr(args, "vibevoice_url", None):
                 vibevoice["deep_remote_urls"] = profile_vibevoice_urls
+            profile_remote_urls = normalize_string_list(profile.get("remote_asr_urls") or profile.get("remote_asr_url"))
+            if profile_remote_urls and not getattr(args, "remote_asr_url", None):
+                vibevoice["remote_urls"] = profile_remote_urls
+            if profile.get("firered_3dspeaker_url"):
+                vibevoice["firered_3dspeaker_url"] = profile["firered_3dspeaker_url"]
+            if profile.get("firered_asr2_url"):
+                vibevoice["firered_asr2_url"] = profile["firered_asr2_url"]
+                vibevoice["firered_asr2_options"] = profile.get("firered_asr2_options") or {}
+            if profile.get("qwen3_asr_url"):
+                vibevoice["qwen3_asr_url"] = profile["qwen3_asr_url"]
+                vibevoice["qwen3_asr_model"] = profile.get("qwen3_asr_model")
+                vibevoice["qwen3_asr_options"] = profile.get("qwen3_asr_options") or {}
+            if profile.get("openai_audio_url"):
+                vibevoice["openai_audio_url"] = profile["openai_audio_url"]
+                vibevoice["openai_audio_model"] = profile.get("openai_audio_model")
+                vibevoice["asr_api_key_env"] = profile.get("asr_api_key_env")
             if services.get("capswriter_url"):
                 vibevoice.setdefault("capswriter_url", services["capswriter_url"])
+            if isinstance(profile.get("speaker_diarization"), dict):
+                self.config["speaker_diarization"] = deep_merge(
+                    self.config.get("speaker_diarization") or {},
+                    profile["speaker_diarization"],
+                )
+            if profile.get("ocr_engine"):
+                self.config.setdefault("ocr", {})["engine"] = profile["ocr_engine"]
+            if profile.get("ocr_worker_count"):
+                self.config.setdefault("ocr", {})["worker_count"] = profile["ocr_worker_count"]
+            if isinstance(profile.get("vision_runtime"), dict):
+                manual_config["vision_runtime"] = dict(profile["vision_runtime"])
 
     def save_user_config(self):
         """Save current configuration to user config file."""
@@ -319,7 +353,7 @@ def get_runtime_profile(config: dict[str, Any], profile_name: str | None = None)
     if profile is None:
         available = ", ".join(sorted(profiles)) or "(none)"
         raise ValueError(f"Unknown runtime profile '{name}'. Available profiles: {available}")
-    return dict(profile)
+    return expand_runtime_profile(config, dict(profile))
 
 
 def build_openai_extra_body(settings: dict[str, Any], api_url: str | None = None, prefix: str = "") -> dict[str, Any]:

@@ -88,7 +88,7 @@ echo "[run] frame extractor: jetson nx2,nx3"
   --text-base-url "$AMD_FAST_BASE_URL" \
   --vision-model "minicpm-v-4.5-v100" \
   --text-model "hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive" \
-  --vl-concurrency 6 \
+  --vl-concurrency 5 \
   --vl-context-before 0 \
   --vl-context-after 0 \
   --manual-language zh-CN \

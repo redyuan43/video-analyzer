@@ -27,7 +27,7 @@
 - The current `ai` machine has five Tesla P40 cards plus one Tesla V100. VibeVoice uses the P40/Pascal runtime and must exclude the V100 until the user explicitly asks to validate a V100 path.
 - When starting VibeVoice workers, choose only P40 GPU indices from current `nvidia-smi` output. As of 2026-06-01, the expected P40 indices are `0,1,2,4,5`; GPU `3` is `Tesla V100-SXM2-16GB` and should not be included in VibeVoice worker mapping.
 - If VibeVoice startup fails with an apparent CUDA OOM on a 15-16 GiB device, first suspect that the V100 was selected accidentally. Check `nvidia-smi --query-gpu=index,name,pci.bus_id,memory.total --format=csv,noheader` and fix the GPU mapping before changing model length, memory utilization, or ASR provider.
-- MiniCPM VL may use the V100 together with the five P40 cards. Its normal local worker set is six GPUs, `0,1,2,3,4,5`, with `CUDA_DEVICE_ORDER=PCI_BUS_ID` so script GPU IDs match `nvidia-smi`.
+- GPU `3` is dedicated to the long-running Foundation-Sec security model. MiniCPM VL must use only the five P40 GPUs, `0,1,2,4,5`, with `CUDA_DEVICE_ORDER=PCI_BUS_ID`; its normal local worker set and VL concurrency are both five.
 - MiniCPM VL keeps the OpenAI-compatible proxy on `http://127.0.0.1:18082/v1` alive while worker `llama-server` processes are lazy and unloadable. `tools/minicpm_p40_proxy.py` starts workers only on `POST /v1/...`; `/api/health` and `/v1/models` must not load the model. Workers unload after `MINICPM_IDLE_UNLOAD_SECONDS` seconds of no inflight work, default `600`, while the proxy API remains available for the next call.
 - MiniCPM proxy autostart is installed as the user service `minicpm-p40-proxy.service`. It starts only the proxy after reboot; it sets `MINICPM_STOP_CONFLICTS=0`, so boot-time proxy recovery does not stop VibeVoice or DotsMOCR. Check it with `systemctl --user status minicpm-p40-proxy.service --no-pager`.
 - DotsMOCR OCR must remain P40-only for now: use `0,1,2,4,5`. A 2026-06-01 V100 smoke failed in the current vLLM/Pascal runtime with `CUDA error: no kernel image is available for execution on the device`, so do not include GPU `3` in OCR until the OCR runtime is rebuilt or otherwise validated for sm_70.
@@ -117,8 +117,9 @@ A passing local response includes:
 - When the user asks for DeepSeek V4 Pro output, use the `deepseek_v4_pro` runtime profile for text/manual/multidoc stages. Treat DeepSeek V4 Pro as a text/review path; keep visual frame analysis on the configured vision model such as MiniCPM unless the user explicitly asks to change the visual model.
 - For publisher resume after operation-manual artifacts already exist, use:
   `~/.codex/skills/video-link/scripts/run_video_link_analysis_publisher.sh URL --profile deepseek_v4_pro --run-dir "$RUN_DIR" --skip-operation`
-- Current final publish is mobile-first PDF-only by default. Do not require `.long.png` unless the user explicitly asks for long-image delivery.
-- The default PDF backend is `tools/md_to_mobile_pdf.py` through `tools/export_video_docs.sh`. It renders prepared Markdown to narrow mobile-readable PDF with WeasyPrint. Simple acyclic `flowchart TB/TD` and `graph TB/TD/LR/RL` Mermaid blocks should render as native mobile HTML flowcharts, including branch/merge flows and `<br/>` label breaks; more complex Mermaid blocks rely on `@mermaid-js/mermaid-cli` plus Chrome/Chromium PNG rendering. If a PDF shows raw Mermaid source, first check whether the diagram is outside the built-in simple-flow renderer and whether the Mermaid CLI/Puppeteer/Chrome path is failing.
+- Current final publish is Markdown-first and does not generate PDF by default. The four final documents are `operation_manual.md`, `docs_analysis_chapters/knowledge_notes_v2.md`, `docs_analysis_chapters/deep_report_v2.md`, and `manual_evidence.md`.
+- PDF export is opt-in only. Use `tools/run_video_doc_final_publish.sh RUN_DIR --pdf` or `tools/export_video_docs.sh` only when the user explicitly requests PDF delivery.
+- The optional PDF backend is `tools/md_to_mobile_pdf.py` through `tools/export_video_docs.sh`. It renders prepared Markdown to narrow mobile-readable PDF with WeasyPrint. Simple acyclic `flowchart TB/TD` and `graph TB/TD/LR/RL` Mermaid blocks should render as native mobile HTML flowcharts, including branch/merge flows and `<br/>` label breaks; more complex Mermaid blocks rely on `@mermaid-js/mermaid-cli` plus Chrome/Chromium PNG rendering.
 - If final publish appears stuck during PDF export, first identify the exact document being rendered. Check the stage log, live process, and export directory before suspecting OCR/GPU/model work:
   `tail -n 160 tmp/video-link-status/jobs/<job_id>/logs/final-publish.log`,
   `pgrep -af 'run_video_doc_final_publish|export_video_docs|md_to_mobile_pdf'`,
@@ -127,11 +128,10 @@ A passing local response includes:
 - For `manual_evidence.pdf`, keep the source Markdown/JSON evidence complete, but make the export-prepared Markdown PDF-friendly. `tools/prepare_video_doc_export.py` should summarize or card-ify pathological evidence tables and avoid passing huge OCR/VL cells, inline HTML tables, and dense frame evidence maps directly to WeasyPrint. Validate with a focused smoke before rerunning final publish:
   `.venv/bin/python tools/prepare_video_doc_export.py RUN_DIR RUN_DIR/manual_evidence.md /tmp/manual_evidence_test.md`
   then `timeout 60 .venv/bin/python tools/md_to_mobile_pdf.py /tmp/manual_evidence_test.md /tmp/manual_evidence_test.pdf --title manual_evidence`.
-- If `final-publish` was interrupted while stuck, verify whether the stage was recorded as `skipped`/soft-failed with incomplete exports. In that case the manual stage endpoint must be able to rerun `final-publish`; a skipped final publish is only safe to treat as complete when all expected exports exist and are non-empty. After a manual stage rerun, ensure both the stage and top-level runner settle to `succeeded` with `current_stage=null`, otherwise the Web UI can keep showing a stale queued/running state even though `pdf=4` was verified.
-- Optional long-image delivery uses `tools/export_video_docs.sh --long-png` or `tools/run_video_doc_final_publish.sh --long-png`. It converts each verified PDF page to PNG, trims page whitespace, and stitches pages into `<name>.long.png`.
-- Final publish should generate the four Baoyu final images when `skip_images` is false, run `tools/augment_video_docs_images.py`, then generate PDFs from the image-augmented Markdown.
-- Before reporting video-link completion, verify the four default PDF outputs exist and are non-empty, and verify four final image PNGs exist unless `skip_images` is true:
-  `operation_manual.pdf`, `knowledge_notes_v2.pdf`, `deep_report_v2.pdf`, and `manual_evidence.pdf`.
+- If `final-publish` was interrupted, verify the four final Markdown documents and `final_publish_summary.json`; incomplete final documents must leave the stage and top-level runner failed.
+- Optional long-image delivery requires explicit PDF export and uses `tools/export_video_docs.sh --long-png` or `tools/run_video_doc_final_publish.sh --pdf --long-png`.
+- Final publish should generate the configured Baoyu final images when `skip_images` is false and run `tools/augment_video_docs_images.py`; it must not generate PDFs unless explicitly requested.
+- Before reporting video-link completion, verify the four final Markdown documents exist and are non-empty, and verify configured final image PNGs exist unless `skip_images` is true.
   Keep `knowledge_notes`, `deep_report`, and `deep_report_v2.review` as intermediate or QA artifacts unless the user explicitly asks for them.
 
 ## Jetson Frame Extraction
@@ -140,11 +140,13 @@ A passing local response includes:
 - For long podcast/talk videos, do not scan at `1fps` by default. Use the scripted fast path with subtitles and a sparse visual scan:
   `tools/run_long_talk_fast_from_url.sh URL --keep-existing`
   This path should use subtitles as transcript when available, skip audio ASR with `--asr-provider none`, disable VL with `--vl-frame-policy none`, use Jetson workers, require hardware decode, and sample at `--jetson-sample-fps 0.5` (one preview frame every 2 seconds).
-- The current validated long-talk worker set is:
-  `--jetson-frame-hosts nx1,nx2,nx3,nx4,agx`
-  Use equal-weight splitting across the five devices. Do not give AGX double segment weight by default; the measured 3.8-hour sample showed AGX became the tail when assigned two slices.
-- AGX can run multiple NVDEC sessions concurrently; a two-way `h264_nvv4l2dec` smoke improved two 300s segments from about 138s sequential to about 48s parallel. The best AGX internal subworker count is not fixed yet, so do not enable a default without a dedicated benchmark.
-- Hardware decode is mandatory for long-video Jetson extraction. Before claiming a worker is healthy, verify the worker `health` result reports `decode_backend` containing `nvdec`. The current expected backend is `ffmpeg-nvdec` on `nx1`, `nx2`, `nx3`, `nx4`, and `agx`. Do not silently fall back to software `ffmpeg` for long videos.
+- The current validated long-talk worker set is one physical AGX exposed as two
+  logical frame workers:
+  `--jetson-frame-hosts agx,agx`
+  NX1-NX4 are manual override workers only and must not join the default Ray
+  cluster.
+- AGX can run two NVDEC sessions concurrently; a two-way `h264_nvv4l2dec` smoke improved two 300s segments from about 138s sequential to about 48s parallel. Keep the default at two AGX frame workers unless a dedicated benchmark proves a better count.
+- Hardware decode is mandatory for long-video Jetson extraction. Before claiming the AGX worker is healthy, verify its `health` result reports `decode_backend` containing `nvdec`. Do not silently fall back to software `ffmpeg` for long videos.
 - Jetson workers should use hardware low-res previews for frame-difference scoring when available: `nvv4l2decoder ! nvvidconv ! video/x-raw,format=GRAY8,width=320,height=180`. The selected candidate timestamps are then materialized as high-resolution JPEG stills for OCR/VL. This keeps OCR quality while moving grayscale/resize work to VIC.
 - The current validated long-talk transport is Ray. Use `tools/start_jetson_frame_ray.sh` before long-video runs; it verifies the AGX Ray head and all five host resources, and restarts the cluster only when the resource set is incomplete.
 - Ray worker subprocesses must not inherit an empty `CUDA_VISIBLE_DEVICES`. On AGX, `ffmpeg -c:v h264_nvv4l2dec` can SIGSEGV under Ray when `CUDA_VISIBLE_DEVICES=""`; remove that variable before launching the frame worker subprocess.

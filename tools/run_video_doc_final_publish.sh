@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [ "${1:-}" = "" ]; then
-  echo "Usage: tools/run_video_doc_final_publish.sh RUN_DIR [--profile PROFILE] [--jobs N] [--finalize-only] [--skip-images] [--skip-pdf] [--skip-send] [--to WECHAT_ID] [--long-png]" >&2
+  echo "Usage: tools/run_video_doc_final_publish.sh RUN_DIR [--profile PROFILE] [--jobs N] [--finalize-only] [--skip-images] [--pdf|--skip-pdf] [--skip-send] [--to WECHAT_ID] [--long-png]" >&2
   exit 2
 fi
 
@@ -10,11 +10,11 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_DIR="$(realpath "$1")"
 shift
 
-PROFILE="deepseek_v4_pro"
+PROFILE="deepseek_v4_flash"
 JOBS=3
 FINALIZE_ONLY=0
 SKIP_IMAGES=0
-SKIP_PDF=0
+SKIP_PDF=1
 SKIP_SEND=0
 LONG_PNG=0
 WECHAT_TO="${WECLAW_TO:-}"
@@ -41,6 +41,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --skip-pdf)
       SKIP_PDF=1
+      shift
+      ;;
+    --pdf)
+      SKIP_PDF=0
       shift
       ;;
     --skip-send)
@@ -90,15 +94,8 @@ IMAGE_LOG_DIR="$RUN_DIR/baoyu_images/logs"
 EXPORT_DIR="$RUN_DIR/exports"
 mkdir -p "$FINAL_DIR" "$IMAGE_LOG_DIR" "$EXPORT_DIR"
 
-declare -a FINAL_IMAGES=(
-  "02-infographic-knowledge-notes.png"
-  "03-infographic-deep-report.png"
-)
-
-declare -a PROMPTS=(
-  "02-infographic-knowledge-notes.md"
-  "03-infographic-deep-report.md"
-)
+declare -a FINAL_IMAGES=()
+declare -a PROMPTS=()
 
 declare -a DEPRECATED_FINAL_IMAGES=(
   "01-image-cards-operation-manual.png"
@@ -131,8 +128,18 @@ generate_final_images() {
     echo "[images] prompt directory missing: $PROMPT_DIR" >&2
     return 1
   fi
+  refresh_image_plan
   for index in "${!PROMPTS[@]}"; do
     generate_one_final_image "$index"
+  done
+}
+
+refresh_image_plan() {
+  mapfile -t PROMPTS < <(find "$PROMPT_DIR" -maxdepth 1 -type f -name '*.md' -printf '%f\n' | sort)
+  FINAL_IMAGES=()
+  local prompt
+  for prompt in "${PROMPTS[@]}"; do
+    FINAL_IMAGES+=("${prompt%.md}.png")
   done
 }
 
@@ -204,19 +211,32 @@ EOF
 
 regenerate_docs() {
   echo "[docs] multidoc"
-  "$ROOT_DIR/tools/run_multidoc_analysis.sh" "$RUN_DIR" --profile "$PROFILE"
-  echo "[docs] deep-v2"
-  "$PYTHON_BIN" "$ROOT_DIR/tools/generate_chapter_deep_report.py" "$RUN_DIR" \
+  "$PYTHON_BIN" "$ROOT_DIR/tools/run_local_model_stage.py" \
+    --stage text \
+    --config config \
     --profile "$PROFILE" \
-    --deep-v2 \
-    --no-final-synthesis \
-    --no-format-markdown-final \
-    --refresh-chapters \
-    --chapter-concurrency "$JOBS"
+    -- "$ROOT_DIR/tools/run_multidoc_analysis.sh" "$RUN_DIR" --profile "$PROFILE"
+  echo "[docs] deep-v2"
+  "$PYTHON_BIN" "$ROOT_DIR/tools/run_local_model_stage.py" \
+    --stage text \
+    --config config \
+    --profile "$PROFILE" \
+    -- "$PYTHON_BIN" "$ROOT_DIR/tools/generate_chapter_deep_report.py" "$RUN_DIR" \
+      --profile "$PROFILE" \
+      --deep-v2 \
+      --no-final-synthesis \
+      --no-format-markdown-final \
+      --refresh-chapters \
+      --chapter-concurrency "$JOBS"
 }
 
 verify_counts() {
+  test -s "$RUN_DIR/operation_manual.md"
+  test -s "$RUN_DIR/docs_analysis_chapters/knowledge_notes_v2.md"
+  test -s "$RUN_DIR/docs_analysis_chapters/deep_report_v2.md"
+  test -s "$RUN_DIR/manual_evidence.md"
   if [ "$SKIP_IMAGES" -eq 0 ]; then
+    refresh_image_plan
     for name in "${FINAL_IMAGES[@]}"; do
       test -s "$FINAL_DIR/$name"
     done

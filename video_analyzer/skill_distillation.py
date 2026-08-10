@@ -31,6 +31,7 @@ STATE_NAME = "PIPELINE_STATE.json"
 STATE_MD_NAME = "PIPELINE_STATE.md"
 SOURCE_MANIFEST_NAME = "source_manifest.json"
 SOURCE_RECORDS_NAME = "evidence_records.jsonl"
+PROJECT_SOURCE_RECORDS_NAME = "skill_project_evidence.jsonl"
 EVIDENCE_EVENTS_NAME = "evidence_events.json"
 OVERVIEW_JSON_NAME = "BOOK_OVERVIEW.json"
 OVERVIEW_MD_NAME = "BOOK_OVERVIEW.md"
@@ -198,7 +199,11 @@ def initialize_distillation(
     run_dir: Path,
     *,
     profile_name: str = DEFAULT_DISTILLATION_PROFILE,
+    config_dir: str = "config",
     force: bool = False,
+    target_brief: dict[str, Any] | None = None,
+    assessment: dict[str, Any] | None = None,
+    source_records: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     run_dir = run_dir.expanduser().resolve()
     if not run_dir.is_dir():
@@ -210,7 +215,11 @@ def initialize_distillation(
     if root.exists() and force:
         shutil.rmtree(root)
     root.mkdir(parents=True, exist_ok=True)
-    runtime = resolve_model_runtime(profile_name)
+    project_records_path = None
+    if source_records is not None:
+        project_records_path = PROJECT_SOURCE_RECORDS_NAME
+        write_jsonl(run_dir / project_records_path, source_records)
+    runtime = resolve_model_runtime(profile_name, config_dir=config_dir)
     now = utc_now()
     state = {
         "version": PIPELINE_VERSION,
@@ -220,6 +229,7 @@ def initialize_distillation(
         "status": "ready",
         "current_stage": "source",
         "profile": runtime.profile_name,
+        "config_dir": config_dir,
         "generation_model": runtime.generation_model,
         "review_model": runtime.review_model,
         "vision_model": runtime.vision_model,
@@ -232,6 +242,9 @@ def initialize_distillation(
         "skills": {"count": 0, "passed": 0, "failed": 0, "items": []},
         "installed": {"paths": []},
         "artifacts": {},
+        "target_brief": dict(target_brief or {}),
+        "assessment": dict(assessment or {}),
+        "project_source_records_path": project_records_path,
     }
     save_state(run_dir, state)
     return state
@@ -246,6 +259,7 @@ def resolve_model_runtime(
     config = Config(config_dir)
     profile = config.get_runtime_profile(profile_name or DEFAULT_DISTILLATION_PROFILE)
     base_url = str(profile.get("text_base_url") or profile.get("llm_base_url") or "").rstrip("/")
+    review_base_url = str(profile.get("review_base_url") or base_url).rstrip("/")
     generation_model = str(profile.get("text_model") or "").strip()
     review_model = str(profile.get("review_model") or generation_model).strip()
     if not base_url or not generation_model:
@@ -264,11 +278,18 @@ def resolve_model_runtime(
         timeout_seconds=timeout,
         extra_body=build_openai_extra_body(profile, base_url),
     )
+    review_api_key = resolve_api_key(
+        profile.get("review_api_key"),
+        profile.get("review_api_key_env")
+        or profile.get("text_api_key_env")
+        or profile.get("api_key_env"),
+        review_base_url,
+    )
     review_client = client_factory(
-        api_key,
-        base_url,
-        timeout_seconds=timeout,
-        extra_body=build_openai_extra_body(profile, base_url, prefix="review_"),
+        review_api_key,
+        review_base_url,
+        timeout_seconds=int(profile.get("review_timeout_seconds") or timeout),
+        extra_body=build_openai_extra_body(profile, review_base_url, prefix="review_"),
     )
     configured_concurrency = int(
         (config.get("skill_distillation") or {}).get("concurrency") or 0
@@ -340,6 +361,8 @@ class SkillDistillationPipeline:
         state = load_state(self.run_dir)
         if not state:
             raise DistillationError("Skill distillation is not initialized")
+        if config_dir == "config" and state.get("config_dir"):
+            config_dir = str(state["config_dir"])
         self.state = state
         self.config = Config(config_dir).config
         self.runtime = resolve_model_runtime(
@@ -492,7 +515,17 @@ class SkillDistillationPipeline:
         self._append_log(stage, "done", f"stage={stage}")
 
     def _build_source_bundle(self) -> None:
-        records, sources = load_evidence_records(self.run_dir)
+        project_source_path = str(self.state.get("project_source_records_path") or "")
+        if project_source_path:
+            source_path = (self.run_dir / project_source_path).resolve()
+            try:
+                source_path.relative_to(self.run_dir)
+            except ValueError as exc:
+                raise DistillationError("Project source records path escapes run directory") from exc
+            records = read_jsonl(source_path)
+            sources = [{"type": "skill_project", "paths": [project_source_path], "records": len(records)}]
+        else:
+            records, sources = load_evidence_records(self.run_dir)
         if not records:
             raise FileNotFoundError(
                 "No substantive transcript, subtitle, OCR, VL, or page evidence is available"
@@ -569,7 +602,7 @@ class SkillDistillationPipeline:
         overview = call_json(
             self.runtime.generation_client,
             self.runtime.generation_model,
-            overview_synthesis_prompt(digests, feedback),
+            overview_synthesis_prompt(digests, feedback, self._target_brief()),
             self.runtime.generation_temperature,
             7000,
         )
@@ -605,7 +638,14 @@ class SkillDistillationPipeline:
             result = call_json(
                 self.runtime.generation_client,
                 self.runtime.generation_model,
-                extractor_prompt(name, candidate_type, instruction, overview, digests),
+                extractor_prompt(
+                    name,
+                    candidate_type,
+                    instruction,
+                    overview,
+                    digests,
+                    self._target_brief(),
+                ),
                 self.runtime.generation_temperature,
                 7000,
             )
@@ -664,7 +704,7 @@ class SkillDistillationPipeline:
         result = call_json(
             self.runtime.review_client,
             self.runtime.review_model,
-            verification_prompt(skill_candidates),
+            verification_prompt(skill_candidates, self._target_brief()),
             self.runtime.review_temperature,
             10000,
         )
@@ -830,6 +870,28 @@ class SkillDistillationPipeline:
         skills_dir.mkdir(parents=True, exist_ok=True)
         items = []
         for candidate in selected:
+            candidate_id = str(candidate["id"])
+            existing_slug = existing_skill_slug_for_candidate(skills_dir, candidate_id)
+            if existing_slug:
+                existing_dir = skills_dir / existing_slug
+                existing_skill = read_json(existing_dir / "skill.json") or {}
+                if (
+                    str(existing_skill.get("candidate_id") or "") == candidate_id
+                    and (existing_dir / "SKILL.md").is_file()
+                ):
+                    items.append(
+                        {
+                            "candidate_id": candidate_id,
+                            "name": existing_slug,
+                            "title": existing_skill.get("title") or candidate.get("title"),
+                            "status": "built",
+                            "path": str(
+                                PACK_DIR / "distilled_skills" / existing_slug / "SKILL.md"
+                            ),
+                        }
+                    )
+                    self._append_log("build", "reuse", existing_slug)
+                    continue
             evidence = [
                 records[evidence_id]
                 for evidence_id in candidate.get("source_ids") or []
@@ -838,15 +900,18 @@ class SkillDistillationPipeline:
             result = call_json(
                 self.runtime.generation_client,
                 self.runtime.generation_model,
-                skill_build_prompt(candidate, evidence, selected, overview),
+                skill_build_prompt(
+                    candidate,
+                    evidence,
+                    selected,
+                    overview,
+                    self._target_brief(),
+                ),
                 self.runtime.generation_temperature,
                 9000,
             )
             skill = normalize_skill(result, candidate)
-            slug = existing_skill_slug_for_candidate(
-                skills_dir,
-                str(candidate["id"]),
-            ) or unique_skill_slug(
+            slug = existing_slug or unique_skill_slug(
                 skills_dir,
                 safe_slug(
                     skill.get("name")
@@ -975,7 +1040,11 @@ class SkillDistillationPipeline:
             test_spec = call_json(
                 self.runtime.generation_client,
                 self.runtime.generation_model,
-                test_generation_prompt(skill, names_and_descriptions),
+                test_generation_prompt(
+                    skill,
+                    names_and_descriptions,
+                    self._target_brief(),
+                ),
                 self.runtime.generation_temperature,
                 5000,
             )
@@ -994,7 +1063,12 @@ class SkillDistillationPipeline:
                 judged = call_json(
                     self.runtime.review_client,
                     self.runtime.review_model,
-                    blind_test_prompt(skill, tests, names_and_descriptions),
+                    blind_test_prompt(
+                        skill,
+                        tests,
+                        names_and_descriptions,
+                        self._target_brief(),
+                    ),
                     self.runtime.review_temperature,
                     7000,
                 )
@@ -1158,6 +1232,9 @@ class SkillDistillationPipeline:
     def _check_cancel(cancel_event: threading.Event | None) -> None:
         if cancel_event and cancel_event.is_set():
             raise DistillationCancelled("distillation cancelled")
+
+    def _target_brief(self) -> dict[str, Any]:
+        return dict(self.state.get("target_brief") or {})
 
 
 def enable_distilled_skills(
@@ -1563,7 +1640,11 @@ def overview_chunk_prompt(index: int, total: int, chunk: str) -> str:
 """
 
 
-def overview_synthesis_prompt(digests: list[dict[str, Any]], feedback: str) -> str:
+def overview_synthesis_prompt(
+    digests: list[dict[str, Any]],
+    feedback: str,
+    target_brief: dict[str, Any] | None = None,
+) -> str:
     feedback_text = feedback or "无额外修订意见"
     return f"""你负责把一组视频证据摘要合成为面向 skill 蒸馏的全局理解。
 不得创造摘要中不存在的事实；所有重要判断保留 source_ids。
@@ -1587,6 +1668,9 @@ source_ids 只能使用 transcript:/ocr:/visual:/page:/comments: 开头的真实
 
 用户修订意见：{feedback_text}
 
+目标约束（为空时保持通用蒸馏）：
+{json.dumps(target_brief or {}, ensure_ascii=False)}
+
 分块摘要：
 {json.dumps(digests, ensure_ascii=False)}
 """
@@ -1598,6 +1682,7 @@ def extractor_prompt(
     instruction: str,
     overview: dict[str, Any],
     digests: list[dict[str, Any]],
+    target_brief: dict[str, Any] | None = None,
 ) -> str:
     return f"""你是独立的 {name} 提取器。你的唯一职责：{instruction}
 候选必须来自输入中的 source_ids。宁可少，不要把常识、广告或无执行意义的事实做成 skill。
@@ -1621,12 +1706,18 @@ def extractor_prompt(
 全局理解：
 {json.dumps(overview, ensure_ascii=False)}
 
+目标约束：
+{json.dumps(target_brief or {}, ensure_ascii=False)}
+
 证据摘要：
 {json.dumps(digests, ensure_ascii=False)}
 """
 
 
-def verification_prompt(candidates: list[dict[str, Any]]) -> str:
+def verification_prompt(
+    candidates: list[dict[str, Any]],
+    target_brief: dict[str, Any] | None = None,
+) -> str:
     return f"""你是严格的 skill 候选评审器。逐条执行三项验证：
 - V1：至少两个独立语境支持，不得把同一案例换种说法重复计数。
 - V2：方法可以对输入未直接讨论的新场景产生非平庸结论。
@@ -1651,6 +1742,9 @@ def verification_prompt(candidates: list[dict[str, Any]]) -> str:
 
 候选：
 {json.dumps(candidates, ensure_ascii=False)}
+
+目标约束：
+{json.dumps(target_brief or {}, ensure_ascii=False)}
 """
 
 
@@ -1702,6 +1796,7 @@ def skill_build_prompt(
     evidence: list[dict[str, Any]],
     siblings: list[dict[str, Any]],
     overview: dict[str, Any],
+    target_brief: dict[str, Any] | None = None,
 ) -> str:
     sibling_titles = [item.get("title") for item in siblings if item.get("id") != candidate.get("id")]
     return f"""把一个已审核的方法单元构造成简洁、可触发、可执行的 Codex skill。
@@ -1738,6 +1833,9 @@ description 必须同时说明何时使用、何时不使用以及用户语言�
 
 全局批判与限制：
 {json.dumps(overview.get('critique') or [], ensure_ascii=False)}
+
+目标约束：
+{json.dumps(target_brief or {}, ensure_ascii=False)}
 """
 
 
@@ -1760,7 +1858,11 @@ Skills：
 """
 
 
-def test_generation_prompt(skill: dict[str, Any], siblings: list[dict[str, Any]]) -> str:
+def test_generation_prompt(
+    skill: dict[str, Any],
+    siblings: list[dict[str, Any]],
+    target_brief: dict[str, Any] | None = None,
+) -> str:
     return f"""为以下 skill 生成触发压力测试。至少 3 条 should_trigger、2 条 should_not_trigger、
 1 条 edge_case；其中至少一条 should_not_trigger 应当触发兄弟 skill，测试相互抢调用。
 
@@ -1779,6 +1881,9 @@ def test_generation_prompt(skill: dict[str, Any], siblings: list[dict[str, Any]]
 
 兄弟 skills：
 {json.dumps(siblings, ensure_ascii=False)}
+
+目标约束：
+{json.dumps(target_brief or {}, ensure_ascii=False)}
 """
 
 
@@ -1786,6 +1891,7 @@ def blind_test_prompt(
     skill: dict[str, Any],
     tests: dict[str, Any],
     siblings: list[dict[str, Any]],
+    target_brief: dict[str, Any] | None = None,
 ) -> str:
     blind_cases = [{"id": item["id"], "prompt": item["prompt"]} for item in tests["test_cases"]]
     catalog = [
@@ -1809,6 +1915,9 @@ def blind_test_prompt(
 
 测试 prompts：
 {json.dumps(blind_cases, ensure_ascii=False)}
+
+目标约束：
+{json.dumps(target_brief or {}, ensure_ascii=False)}
 """
 
 
@@ -2209,9 +2318,34 @@ def normalize_tests(
         item["type"] == "should_not_trigger" and item.get("expected_skill") in other_skill_names
         for item in cases
     ):
-        raise DistillationError(
-            f"Test generation for {skill_name} is missing a sibling-skill confusion case"
+        sibling = next(
+            (
+                item
+                for item in sorted(siblings, key=lambda value: str(value.get("name") or ""))
+                if item.get("name") in other_skill_names
+            ),
+            None,
         )
+        if sibling:
+            scenarios = list((sibling.get("triggers") or {}).get("scenarios") or [])
+            prompt = str(
+                scenarios[0]
+                if scenarios
+                else sibling.get("description") or sibling.get("title") or sibling["name"]
+            ).strip()
+            cases.append(
+                {
+                    "id": "should-not-trigger-sibling-confusion",
+                    "type": "should_not_trigger",
+                    "prompt": f"我需要处理这样一个需求：{prompt}",
+                    "expected_behavior": (
+                        f"应触发 {sibling['name']}，而不是 {skill_name}，"
+                        "用于验证相邻 Skill 的边界。"
+                    ),
+                    "expected_skill": sibling["name"],
+                    "notes": "由测试规范补全的兄弟 Skill 混淆用例。",
+                }
+            )
     return {
         "skill": skill_name,
         "version": "0.1.0",

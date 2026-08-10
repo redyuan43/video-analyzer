@@ -36,7 +36,8 @@ from video_analyzer.transcription_pipeline import load_provided_transcript  # no
 
 DEFAULT_TEMPLATE_CATALOG = REPO_ROOT / "video-analyzer-ui" / "video_analyzer_ui" / "static" / "data" / "audio_prompt_templates.json"
 DEFAULT_TEMPLATE_ID = "auto"
-EXPECTED_TEMPLATE_COUNT = 382
+AUDIO_PIPELINE_PROFILE = "audio_nx1"
+AUDIO_PIPELINE_VERSION = 1
 DOWAY_SOURCE_REPO = "Doway AI server"
 DOWAY_SOURCE_PATH = "analysis/doway_prompts/server_prompts_zh.json"
 DOWAY_GENERAL_TEMPLATE_ID = "2"
@@ -63,6 +64,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--language", default="zh-CN")
     parser.add_argument("--source-name", default="")
     parser.add_argument("--transcript-json")
+    parser.add_argument(
+        "--compute-route",
+        choices=("local", "cloud_fallback"),
+        default="local",
+    )
     return parser.parse_args()
 
 
@@ -154,6 +160,7 @@ def main() -> int:
         evidence_path=evidence_path,
         study_guide_path=study_guide_path,
         elapsed_seconds=round(time.perf_counter() - started, 3),
+        compute_route=args.compute_route,
     )
 
     print(f"[audio-template] transcript: {transcript_path}")
@@ -174,7 +181,51 @@ def load_operation_config(args: argparse.Namespace) -> Config:
             asr_provider=None,
         )
     )
+    if args.compute_route == "cloud_fallback":
+        apply_cloud_fallback(config, args.profile)
     return config
+
+
+def apply_cloud_fallback(config: Config, profile_name: str | None) -> None:
+    profile = config.get_runtime_profile(profile_name)
+    fallback = profile.get("audio_cloud_fallback") or {}
+    if not fallback.get("enabled"):
+        raise ValueError(
+            f"runtime profile {profile_name or '(default)'} does not enable audio cloud fallback"
+        )
+    asr = fallback.get("asr") or {}
+    diarization = fallback.get("diarization") or {}
+    protocol = str(asr.get("protocol") or "")
+    endpoints = [str(item) for item in (asr.get("endpoints") or []) if str(item)]
+    provider = {
+        "vibevoice_http": "vibevoice",
+        "generic_http": "remote_http",
+        "firered_3dspeaker_http": "firered_3dspeaker",
+        "openai_audio": "openai_audio",
+    }.get(protocol)
+    if not provider or not endpoints:
+        raise ValueError(f"unsupported audio cloud fallback ASR protocol: {protocol or '(missing)'}")
+    if str(diarization.get("protocol") or "") != "asr_embedded":
+        raise ValueError("audio cloud fallback requires ASR embedded speaker labels")
+
+    asr_config = config.config.setdefault("asr", {})
+    asr_config["provider"] = provider
+    vibevoice = asr_config.setdefault("vibevoice", {})
+    if protocol == "vibevoice_http":
+        vibevoice["deep_remote_urls"] = endpoints
+    elif protocol == "generic_http":
+        vibevoice["remote_urls"] = endpoints
+    elif protocol == "firered_3dspeaker_http":
+        vibevoice["firered_3dspeaker_url"] = endpoints[0]
+    elif protocol == "openai_audio":
+        vibevoice["openai_audio_url"] = endpoints[0]
+        vibevoice["openai_audio_model"] = asr.get("model")
+        vibevoice["asr_api_key_env"] = asr.get("api_key_env")
+    config.config["speaker_diarization"] = {
+        "enabled": False,
+        "assignment_enabled": False,
+        "source": "asr_embedded",
+    }
 
 
 def client_focus_supplement(value: str) -> str:
@@ -186,11 +237,8 @@ def load_templates(path: Path) -> list[dict[str, Any]]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, list):
         raise ValueError(f"template catalog must be a list: {path}")
-    if len(data) != EXPECTED_TEMPLATE_COUNT:
-        raise ValueError(
-            f"Doway template catalog must contain exactly {EXPECTED_TEMPLATE_COUNT} entries: "
-            f"got {len(data)} from {path}"
-        )
+    if not data:
+        raise ValueError(f"Doway template catalog must not be empty: {path}")
 
     ids: set[str] = set()
     templates: list[dict[str, Any]] = []
@@ -313,12 +361,34 @@ def truthy_config_value(value: Any, default: bool = False) -> bool:
 
 
 def build_template_selector_client(config: Config) -> tuple[GenericOpenAIAPIClient, str, str, float]:
+    profile = config.get_runtime_profile(None)
     study_config = config.get("study_cards") or {}
-    base_url = study_config.get("llm_base_url") or "http://agx.taild500c8.ts.net:11434/v1"
-    model = study_config.get("model") or "qwen3:4b-instruct"
-    temperature = float(study_config.get("temperature", 0.1))
+    inherit_text = profile.get("template_selector_inherit") == "text"
+    base_url = (
+        profile.get("text_base_url")
+        if inherit_text
+        else profile.get("template_selector_base_url")
+    ) or study_config.get("llm_base_url") or "http://agx.taild500c8.ts.net:11434/v1"
+    model = (
+        profile.get("text_model")
+        if inherit_text
+        else profile.get("template_selector_model")
+    ) or study_config.get("model") or "qwen3:4b-instruct"
+    temperature = float(
+        profile.get("template_selector_temperature")
+        or study_config.get("temperature", 0.1)
+    )
+    api_key_env = (
+        profile.get("text_api_key_env")
+        if inherit_text
+        else profile.get("template_selector_api_key_env")
+    )
     client = GenericOpenAIAPIClient(
-        api_key=resolve_api_key(study_config.get("api_key"), study_config.get("api_key_env"), base_url),
+        api_key=resolve_api_key(
+            study_config.get("api_key"),
+            api_key_env or study_config.get("api_key_env"),
+            base_url,
+        ),
         api_url=base_url,
         timeout_seconds=int(study_config.get("timeout_seconds", 600)),
         extra_body=build_openai_extra_body(study_config, base_url, prefix=""),
@@ -830,6 +900,7 @@ def write_audio_only_manifest(output_dir: Path, media_path: Path, audio_path: Pa
         {
             "version": 1,
             "source": "audio_only",
+            "pipeline_profile": AUDIO_PIPELINE_PROFILE,
             "media_path": str(media_path),
             "audio_path": str(audio_path),
             "frames": [],
@@ -1109,6 +1180,7 @@ def write_analysis_json(
     evidence_path: Path,
     study_guide_path: Path,
     elapsed_seconds: float,
+    compute_route: str = "local",
 ) -> Path:
     orin = output_dir / "orin"
     orin.mkdir(parents=True, exist_ok=True)
@@ -1132,6 +1204,9 @@ def write_analysis_json(
         ),
     }
     audio_template_analysis = {
+        "pipeline_profile": AUDIO_PIPELINE_PROFILE,
+        "pipeline_version": AUDIO_PIPELINE_VERSION,
+        "compute_route": compute_route,
         "selected_template": selected_template,
         "classification": classification,
         "summary": summary,
@@ -1145,8 +1220,14 @@ def write_analysis_json(
     }
     write_json(output_dir / "audio_template_analysis.json", audio_template_analysis)
     payload = {
+        "pipeline_profile": AUDIO_PIPELINE_PROFILE,
+        "pipeline_version": AUDIO_PIPELINE_VERSION,
+        "compute_route": compute_route,
         "metadata": {
             "task": "audio_template_summary",
+            "pipeline_profile": AUDIO_PIPELINE_PROFILE,
+            "pipeline_version": AUDIO_PIPELINE_VERSION,
+            "compute_route": compute_route,
             "source_type": "audio_upload",
             "media_path": str(media_path),
             "text_base_url": content_base_url,

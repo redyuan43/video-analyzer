@@ -64,10 +64,11 @@ def process_transcript_speakers(
     if current_speakers:
         return refine_transcript_speakers(audio_path, transcript, config)
 
+    backend = str(config.get("backend") or "3dspeaker")
     report: dict[str, Any] = {
         "enabled": True,
         "mode": "assignment",
-        "backend": "3dspeaker",
+        "backend": backend,
         "original_speaker_count": 0,
         "original_speakers": [],
         "notes": [],
@@ -77,7 +78,7 @@ def process_transcript_speakers(
         transcript.metadata = _with_hybrid_metadata(transcript.metadata, report)
         return transcript, report
 
-    turns, assignment_report = run_3dspeaker_assignment(audio_path, config)
+    turns, assignment_report = run_diarization_assignment(audio_path, config)
     report.update(assignment_report)
     if not turns:
         report["notes"].append("no diarization turns produced")
@@ -88,6 +89,156 @@ def process_transcript_speakers(
     report.update(assignment_stats)
     assigned.metadata = _with_hybrid_metadata(assigned.metadata, report)
     return assigned, report
+
+
+def run_diarization_assignment(
+    audio_path: Path,
+    config: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    config = config or {}
+    backend = str(config.get("backend") or "3dspeaker")
+    if backend == "3dspeaker":
+        return run_3dspeaker_assignment(audio_path, config)
+    if backend == "pyannote_community":
+        return run_pyannote_assignment(audio_path, config)
+    if backend == "wespeaker":
+        return run_wespeaker_assignment(audio_path, config)
+    return [], {"backend": backend, "error": f"unknown diarization backend: {backend}"}
+
+
+def _run_assignment_command(
+    command: list[str],
+    backend: str,
+    timeout: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    started = time.perf_counter()
+    env = os.environ.copy()
+    env.setdefault("CUDA_VISIBLE_DEVICES", str(env.get("DIARIZATION_GPU_ID") or "0"))
+    env.setdefault("NO_PROXY", "127.0.0.1,localhost")
+    env.setdefault("no_proxy", "127.0.0.1,localhost")
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return [], {
+            "backend": backend,
+            "error": f"{backend} assignment timed out",
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+        }
+    report = {
+        "backend": backend,
+        "elapsed_seconds": round(time.perf_counter() - started, 3),
+    }
+    if completed.returncode != 0:
+        report["error"] = (completed.stderr or completed.stdout or f"{backend} failed")[-3000:]
+        return [], report
+    try:
+        payload = json.loads(completed.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError):
+        report["error"] = f"invalid {backend} output: {completed.stdout[-1500:]}"
+        return [], report
+    turns = [
+        {
+            "start": float(turn.get("start", turn.get("start_sec", 0))),
+            "end": float(turn.get("end", turn.get("end_sec", 0))),
+            "speaker": str(turn.get("speaker") or turn.get("speaker_id") or ""),
+        }
+        for turn in (payload.get("turns") or [])
+        if isinstance(turn, dict)
+    ]
+    turns = [turn for turn in turns if turn["speaker"] and turn["end"] > turn["start"]]
+    speakers = sorted({turn["speaker"] for turn in turns})
+    report.update(
+        {
+            "turn_count": len(turns),
+            "detected_speakers": speakers,
+            "detected_speaker_count": len(speakers),
+        }
+    )
+    return turns, report
+
+
+def run_pyannote_assignment(
+    audio_path: Path,
+    config: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    config = config or {}
+    python = str(config.get("external_python") or "/home/ai/pyannote-community-venv/bin/python")
+    helper = Path(__file__).resolve().parents[1] / "tools" / "run_diarization_benchmark.py"
+    with tempfile.TemporaryDirectory(prefix="pyannote_assignment_") as temp:
+        output = Path(temp) / "result.json"
+        command = [
+            python,
+            str(helper),
+            str(audio_path),
+            "--provider",
+            "pyannote_community",
+            "--output",
+            str(output),
+            "--device",
+            str(config.get("device") or "cpu"),
+        ]
+        speaker_num = config.get("speaker_num")
+        if speaker_num not in (None, "", 0, "0"):
+            command.extend(["--speaker-num", str(int(speaker_num))])
+        turns, report = _run_assignment_command(
+            command,
+            "pyannote_community",
+            float(config.get("assignment_timeout_seconds") or DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS),
+        )
+        if not turns and output.is_file():
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            turns = list(payload.get("turns") or [])
+            speakers = sorted(
+                {
+                    str(turn.get("speaker") or turn.get("speaker_id") or "")
+                    for turn in turns
+                    if isinstance(turn, dict)
+                    and (turn.get("speaker") or turn.get("speaker_id"))
+                }
+            )
+            report.update(
+                {
+                    "turn_count": len(turns),
+                    "detected_speakers": speakers,
+                    "detected_speaker_count": len(speakers),
+                }
+            )
+        return turns, report
+
+
+def run_wespeaker_assignment(
+    audio_path: Path,
+    config: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    config = config or {}
+    python = str(config.get("external_python") or DEFAULT_EXTERNAL_PYTHON)
+    if python == "/home/ai/wespeaker-venv/bin/python" and not Path(python).exists():
+        python = DEFAULT_EXTERNAL_PYTHON
+    helper = Path(__file__).resolve().parents[1] / "tools" / "run_wespeaker_diarization.py"
+    command = [
+        python,
+        str(helper),
+        str(audio_path),
+        "--model",
+        str(config.get("model_id") or "chinese"),
+        "--device",
+        str(config.get("device") or "cuda"),
+    ]
+    speaker_num = config.get("speaker_num")
+    if speaker_num not in (None, "", 0, "0"):
+        command.extend(["--speaker-num", str(int(speaker_num))])
+    return _run_assignment_command(
+        command,
+        "wespeaker",
+        float(config.get("assignment_timeout_seconds") or DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS),
+    )
 
 
 def run_3dspeaker_assignment(

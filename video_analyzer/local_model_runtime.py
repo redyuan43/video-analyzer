@@ -42,7 +42,14 @@ def local_model_stage_needed(stage: str, config: dict) -> bool:
     if not (config.get("local_model_runtime") or {}).get("enabled", True):
         return False
     if stage == "asr":
+        provider = str((config.get("asr") or {}).get("provider") or "").strip().lower()
+        if provider in {"firered_3dspeaker", "capswriter"}:
+            return False
         vibevoice = (config.get("asr") or {}).get("vibevoice") or {}
+        if provider == "qwen3_asr":
+            return is_loopback_endpoint(vibevoice.get("qwen3_asr_url"))
+        if provider == "firered_asr2":
+            return is_loopback_endpoint(vibevoice.get("firered_asr2_url"))
         return has_loopback_endpoint(vibevoice.get("deep_remote_urls") or vibevoice.get("remote_urls"))
     if stage == "ocr":
         ocr = config.get("ocr") or {}
@@ -50,11 +57,14 @@ def local_model_stage_needed(stage: str, config: dict) -> bool:
     if stage == "vl":
         manual = config.get("operation_manual") or {}
         return is_loopback_endpoint(manual.get("vision_base_url") or manual.get("llm_base_url"))
+    if stage == "text":
+        manual = config.get("operation_manual") or {}
+        return is_loopback_endpoint(manual.get("text_base_url") or manual.get("llm_base_url"))
     return False
 
 
 def local_model_runtime_needed(config: dict) -> bool:
-    return any(local_model_stage_needed(stage, config) for stage in ("asr", "ocr", "vl"))
+    return any(local_model_stage_needed(stage, config) for stage in ("asr", "ocr", "vl", "text"))
 
 
 @contextlib.contextmanager
@@ -73,6 +83,19 @@ def local_model_runtime_session(config: dict, logger: logging.Logger, owner: str
 
 
 @contextlib.contextmanager
+def local_model_runtime_lock(
+    config: dict,
+    logger: logging.Logger,
+    owner: str,
+    *,
+    stage: str = "text",
+) -> Iterator[None]:
+    """Hold the shared local-model lock without switching model services."""
+    with _local_model_lock(stage, config, logger, owner):
+        yield
+
+
+@contextlib.contextmanager
 def local_model_stage(stage: str, config: dict, logger: logging.Logger, owner: str) -> Iterator[None]:
     """Switch to a local GPU model stage without letting another task preempt it."""
     if not local_model_stage_needed(stage, config):
@@ -81,12 +104,18 @@ def local_model_stage(stage: str, config: dict, logger: logging.Logger, owner: s
 
     if _SESSION_DEPTH.get() > 0:
         prepare_local_model_stage(stage, config, logger)
-        yield
+        try:
+            yield
+        finally:
+            unload_local_model_stage(config, logger)
         return
 
     with _local_model_lock(stage, config, logger, owner):
         prepare_local_model_stage(stage, config, logger)
-        yield
+        try:
+            yield
+        finally:
+            unload_local_model_stage(config, logger)
 
 
 @contextlib.contextmanager
@@ -152,7 +181,7 @@ def _write_lock_metadata(fd: int, stage: str, owner: str) -> None:
 
 
 def prepare_local_model_stage(stage: str, config: dict, logger: logging.Logger) -> None:
-    if not local_model_stage_needed(stage, config):
+    if stage != "stop" and not local_model_stage_needed(stage, config):
         return
 
     runtime = config.get("local_model_runtime") or {}
@@ -170,6 +199,41 @@ def prepare_local_model_stage(stage: str, config: dict, logger: logging.Logger) 
     env = os.environ.copy()
     env.setdefault("NO_PROXY", "127.0.0.1,localhost")
     env.setdefault("no_proxy", "127.0.0.1,localhost")
+    if stage == "asr":
+        asr = config.get("asr") or {}
+        provider = str(asr.get("provider") or "vibevoice")
+        vibevoice = asr.get("vibevoice") or {}
+        env["ASR_ENGINE"] = provider
+        if provider == "qwen3_asr":
+            options = vibevoice.get("qwen3_asr_options") or {}
+            env["QWEN3_ASR_WORKER_COUNT"] = str(options.get("worker_count") or 5)
+            if vibevoice.get("qwen3_asr_model"):
+                env["QWEN3_ASR_MODEL"] = str(vibevoice["qwen3_asr_model"])
+        elif provider == "firered_asr2":
+            options = vibevoice.get("firered_asr2_options") or {}
+            env["FIRERED_ASR2_WORKER_COUNT"] = str(options.get("worker_count") or 5)
+            env["FIRERED_ASR2_CHUNK_SECONDS"] = str(options.get("chunk_duration_sec") or 30)
+            env["FIRERED_ASR2_CHUNK_OVERLAP_SECONDS"] = str(
+                options.get("chunk_overlap_sec") or 3
+            )
+    elif stage == "ocr":
+        ocr = config.get("ocr") or {}
+        env["OCR_ENGINE"] = str(ocr.get("engine") or ocr.get("provider") or "unlimited")
+        if ocr.get("worker_count"):
+            env["UNLIMITED_OCR_WORKER_COUNT"] = str(ocr["worker_count"])
+            env["DOTS_MOCR_WORKER_COUNT"] = str(ocr["worker_count"])
+    elif stage == "vl":
+        runtime_options = (config.get("operation_manual") or {}).get("vision_runtime") or {}
+        env["VISION_ENGINE"] = str(runtime_options.get("engine") or "minicpm_v45")
+        if runtime_options.get("worker_count"):
+            env["MINICPM_WORKER_COUNT"] = str(runtime_options["worker_count"])
     timeout = int(runtime.get("stage_timeout_seconds") or 900)
     logger.info("Preparing local GPU model stage '%s' with %s", stage, " ".join(command_args))
     subprocess.run(command_args, cwd=REPO_ROOT, env=env, timeout=timeout, check=True)
+
+
+def unload_local_model_stage(config: dict, logger: logging.Logger) -> None:
+    runtime = config.get("local_model_runtime") or {}
+    if not runtime.get("unload_on_stage_exit", False):
+        return
+    prepare_local_model_stage("stop", config, logger)

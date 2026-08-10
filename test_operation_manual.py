@@ -162,7 +162,7 @@ class OperationManualTests(unittest.TestCase):
         self.assertEqual(resolve_jetson_sample_fps("auto", "deep"), 3.0)
         self.assertEqual(resolve_jetson_sample_fps("0.5", "fast"), 0.5)
 
-    def test_operation_manual_config_uses_ivan_minicpm_vision_defaults(self):
+    def test_operation_manual_config_uses_active_local_vision_defaults(self):
         args = argparse.Namespace(
             video_path="video.mp4",
             config="config",
@@ -220,7 +220,7 @@ class OperationManualTests(unittest.TestCase):
             )
             self.assertEqual(
                 config.get("operation_manual")["text_model"],
-                "deepseek-v4-pro",
+                "deepseek-v4-flash",
             )
             self.assertEqual(config.get("asr")["provider"], "auto")
             self.assertEqual(config.get("asr")["strategy"], "balanced")
@@ -281,7 +281,8 @@ class OperationManualTests(unittest.TestCase):
             self.assertEqual(profile["vibevoice_url"], "http://lab.local/asr")
             self.assertEqual(profile["ocr_base_url"], "http://lab.local/ocr")
             self.assertIn("spark", config.get("runtime_profiles"))
-            self.assertIn("local_lan", config.get("runtime_profiles"))
+            self.assertIn("deepseek_v4_flash", config.get("runtime_profiles"))
+            self.assertNotIn("local_lan", config.get("runtime_profiles"))
 
             args = argparse.Namespace(
                 config=str(config_dir),

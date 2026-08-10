@@ -33,8 +33,8 @@ from .frame_manifest import MANIFEST_NAME, read_frames_from_manifest, write_fram
 from .jetson_frames import extract_frames_with_jetson_workers, extract_local_screen_keyframes
 from .prompt import PromptLoader
 from .analyzer import VideoAnalyzer
-from .audio_processor import AudioProcessor, AudioTranscript
-from .asr_providers import ASRStrategyResult, extract_audio_to_wav, transcribe_with_provider_result, transcribe_with_strategy
+from .audio_processor import AudioTranscript
+from .asr_providers import ASRStrategyResult, extract_audio_to_wav
 from .clients.ollama import OllamaClient
 from .clients.generic_openai_api import GenericOpenAIAPIClient
 from .manual import (
@@ -61,6 +61,7 @@ from .vl_checkpoint import (
     load_vl_checkpoint,
     write_vl_checkpoint,
 )
+from .transcription_pipeline import apply_speaker_diarization, transcribe_configured_audio
 
 # Initialize logger at module level
 logger = logging.getLogger(__name__)
@@ -639,7 +640,7 @@ def create_operation_manual_text_client(config: Config, fallback_client):
             text_base_url,
         ),
         text_base_url,
-        timeout_seconds=int(openai_config.get("timeout_seconds", 600)),
+        timeout_seconds=int(manual_config.get("text_timeout_seconds") or openai_config.get("timeout_seconds", 600)),
         extra_body=build_openai_extra_body(manual_config, text_base_url),
     )
 
@@ -696,7 +697,11 @@ def main():
     parser.add_argument("--text-base-url", type=str, help="OpenAI-compatible base URL for final manual generation")
     parser.add_argument("--vision-model", type=str, help="Vision model used for frame analysis")
     parser.add_argument("--text-model", type=str, help="Text model used for manual generation")
-    parser.add_argument("--ocr-provider", choices=["auto", "dots_mocr_vllm", "openai_vision", "none"], help="OCR provider")
+    parser.add_argument(
+        "--ocr-provider",
+        choices=["auto", "unlimited_ocr", "dots_ocr", "dots_mocr_vllm", "openai_vision", "none"],
+        help="OCR provider",
+    )
     parser.add_argument("--ocr-base-url", action="append", help="OCR OpenAI-compatible base URL; can be provided multiple times")
     parser.add_argument("--ocr-concurrency", default=None, help="OCR concurrency per endpoint, or auto")
     parser.add_argument("--ocr-cache", choices=["on", "off", "refresh"], default=None, help="OCR cache mode")
@@ -724,7 +729,22 @@ def main():
         default=None,
         help="Retry the same OCR frame on another healthy endpoint after failure",
     )
-    parser.add_argument("--asr-provider", choices=["auto", "remote_http", "capswriter_http", "vibevoice", "faster_whisper", "none"], help="ASR provider")
+    parser.add_argument(
+        "--asr-provider",
+        choices=[
+            "auto",
+            "remote_http",
+            "capswriter_http",
+            "qwen3_asr",
+            "firered_asr2",
+            "firered_3dspeaker",
+            "openai_audio",
+            "vibevoice",
+            "faster_whisper",
+            "none",
+        ],
+        help="ASR provider",
+    )
     parser.add_argument("--asr-strategy", choices=["fast", "balanced", "deep"], help="Dual-ASR strategy for operation manuals")
     parser.add_argument("--remote-asr-url", action="append", help="Remote fast ASR endpoint; can be provided multiple times")
     parser.add_argument("--vibevoice-url", action="append", help="Remote GPU VibeVoice ASR endpoint; can be provided multiple times")
@@ -817,6 +837,7 @@ def main():
         page_context = ""
         page_context_metadata = {"context_file": "", "text_length": 0}
         transcript_markdown_path = None
+        speaker_diarization_report = None
         timings = {}
         frame_selection_metadata = {}
         frame_extraction_metadata = {}
@@ -881,47 +902,13 @@ def main():
                     asr_config = config.get("asr", {})
                     provider = asr_config.get("provider", "faster_whisper")
                     use_asr_strategy = task == "operation_manual" and args.asr_provider is None and provider == "auto"
-                    asr_lock = (
-                        contextlib.nullcontext()
-                        if provider == "none"
-                        else analyzer_resource_lock(config.config, "asr", str(output_dir), logger)
+                    transcript, asr_result = transcribe_configured_audio(
+                        audio_path,
+                        output_dir,
+                        config,
+                        use_asr_strategy=use_asr_strategy,
+                        logger=logger,
                     )
-                    with asr_lock:
-                        with local_model_stage("asr", config.config, logger, str(output_dir)):
-                            if use_asr_strategy:
-                                asr_result = transcribe_with_strategy(
-                                    strategy=asr_config.get("strategy", "balanced"),
-                                    audio_path=audio_path,
-                                    language=config.get("audio", {}).get("language", ""),
-                                    whisper_model=config.get("audio", {}).get("whisper_model", "medium"),
-                                    device=config.get("audio", {}).get("device", "cpu"),
-                                    vibevoice_config=asr_config.get("vibevoice", {}),
-                                )
-                                transcript = asr_result.transcript
-                            elif provider == "faster_whisper":
-                                audio_processor = AudioProcessor(
-                                    language=config.get("audio", {}).get("language", ""),
-                                    model_size_or_path=config.get("audio", {}).get("whisper_model", "medium"),
-                                    device=config.get("audio", {}).get("device", "cpu"),
-                                )
-                                transcript = audio_processor.transcribe(audio_path)
-                            else:
-                                asr_result = transcribe_with_provider_result(
-                                    provider=provider,
-                                    audio_path=audio_path,
-                                    language=config.get("audio", {}).get("language", ""),
-                                    whisper_model=config.get("audio", {}).get("whisper_model", "medium"),
-                                    device=config.get("audio", {}).get("device", "cpu"),
-                                    vibevoice_config=asr_config.get("vibevoice", {}),
-                                )
-                                transcript = asr_result.transcript
-                    if asr_result is None:
-                        asr_result = ASRStrategyResult(
-                            strategy=f"provider:{provider}",
-                            transcript=transcript,
-                            fast_transcript=transcript,
-                            providers_run=[] if provider == "none" else [provider],
-                        )
                     if transcript is None:
                         require_transcript = bool(asr_config.get("require_transcript", task == "operation_manual"))
                         if require_transcript and provider != "none":
@@ -932,6 +919,15 @@ def main():
                             )
                         logger.warning("Could not generate reliable transcript. Proceeding with video analysis only.")
                     else:
+                        transcript, speaker_diarization_report = apply_speaker_diarization(
+                            audio_path,
+                            transcript,
+                            output_dir,
+                            config,
+                            logger=logger,
+                        )
+                        if asr_result:
+                            asr_result.transcript = transcript
                         transcript_markdown_path = write_transcript_markdown(transcript, output_dir / "transcript.md")
                         current_progress_step = "asr_done"
                         write_analysis_progress(
@@ -1418,20 +1414,21 @@ def main():
                 page_context_metadata = read_page_context_metadata(config.get("context_file", ""), page_context)
                 text_model = manual_config.get("text_model") or model
                 frame_assets = prepare_frame_assets(frames, output_dir)
-                operation_manual = generate_operation_manual(
-                    client=text_client,
-                    text_model=text_model,
-                    frame_analyses=frame_analyses,
-                    frames=frames,
-                    transcript=transcript,
-                    asr_metadata=asr_result.to_metadata() if asr_result else {},
-                    ocr_events=ocr_events,
-                    page_context=page_context,
-                    language=config.get("manual_language", "zh-CN"),
-                    temperature=resolve_temperature(manual_config, config.get("clients", {}).get("temperature", 0.2)),
-                    frame_assets=frame_assets,
-                    no_think=bool(manual_config.get("manual_no_think", manual_config.get("frame_no_think", False))),
-                )
+                with local_model_stage("text", config.config, logger, str(output_dir)):
+                    operation_manual = generate_operation_manual(
+                        client=text_client,
+                        text_model=text_model,
+                        frame_analyses=frame_analyses,
+                        frames=frames,
+                        transcript=transcript,
+                        asr_metadata=asr_result.to_metadata() if asr_result else {},
+                        ocr_events=ocr_events,
+                        page_context=page_context,
+                        language=config.get("manual_language", "zh-CN"),
+                        temperature=resolve_temperature(manual_config, config.get("clients", {}).get("temperature", 0.2)),
+                        frame_assets=frame_assets,
+                        no_think=bool(manual_config.get("manual_no_think", manual_config.get("frame_no_think", False))),
+                    )
                 operation_manual["response"] = embed_step_images(
                     operation_manual.get("response", ""),
                     frames,

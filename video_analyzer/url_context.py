@@ -74,7 +74,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manual-language")
     parser.add_argument(
         "--asr-provider",
-        choices=["none", "remote_http", "capswriter_http", "vibevoice", "faster_whisper"],
+        choices=[
+            "none",
+            "remote_http",
+            "capswriter_http",
+            "firered_3dspeaker",
+            "openai_audio",
+            "vibevoice",
+            "faster_whisper",
+        ],
         help="Analyzer ASR provider when no subtitle transcript is used",
     )
     parser.add_argument("--vibevoice-url", action="append", help="Remote GPU VibeVoice ASR endpoint; can be provided multiple times")
@@ -1137,7 +1145,7 @@ def build_analyzer_command(args: argparse.Namespace, video_path: Path, context_p
         "--context-file",
         str(context_path),
         "--ocr-provider",
-        args.ocr_provider,
+        getattr(args, "ocr_provider", "auto"),
         "--llm-base-url",
         args.llm_base_url,
         "--vision-base-url",
