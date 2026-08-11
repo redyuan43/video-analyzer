@@ -77,55 +77,81 @@ VIDEO_WORKFLOW_ID = "video_operation_manual"
 AUDIO_WORKFLOW_ID = "audio_nx1"
 
 VIDEO_PROFILE_FLOW = {
-    "version": 1,
+    "version": 3,
     "lanes": [
         {"id": "audio", "label": "音频"},
         {"id": "visual", "label": "视觉"},
         {"id": "main", "label": "主流程"},
+        {"id": "fallback", "label": "故障回退"},
         {"id": "quality", "label": "质量"},
         {"id": "learning", "label": "学习"},
         {"id": "delivery", "label": "交付"},
     ],
     "nodes": [
-        {"id": "input", "step": 1, "column": 1, "row": 2, "mobile_order": 1, "lane": "main", "title": "输入与上下文", "subtitle": "视频、字幕、评论与页面信息", "stage": "prepare"},
-        {"id": "audio_extract", "step": 2, "column": 2, "row": 1, "mobile_order": 2, "lane": "audio", "title": "音频提取", "subtitle": "生成可转写音轨", "stage": "analyze-core"},
-        {"id": "frame_extract", "step": 2, "column": 2, "row": 3, "mobile_order": 5, "lane": "visual", "title": "关键帧提取", "subtitle": "采样并筛选候选帧", "stage": "analyze-core"},
-        {"id": "asr", "step": 3, "column": 3, "row": 1, "mobile_order": 3, "lane": "audio", "title": "语音识别", "subtitle": "与说话人分离并行执行", "model_kind": "asr", "required": False},
-        {"id": "diarization", "step": 3, "column": 3, "row": 2, "mobile_order": 4, "lane": "audio", "title": "说话人分离", "subtitle": "与语音识别并行生成声纹轨", "model_kind": "diarization", "required": False},
-        {"id": "ocr", "step": 3, "column": 3, "row": 3, "mobile_order": 6, "lane": "visual", "title": "画面 OCR", "subtitle": "提取画面文字证据", "model_kind": "ocr", "required": False},
-        {"id": "vision", "step": 3, "column": 4, "row": 3, "mobile_order": 7, "lane": "visual", "title": "视觉理解", "subtitle": "理解动作、界面和场景", "model_kind": "vision", "required": False},
-        {"id": "evidence_merge", "step": 4, "column": 5, "row": 2, "mobile_order": 8, "lane": "main", "title": "证据汇合", "subtitle": "合并音频、视觉与页面证据", "stage": "analyze-core"},
-        {"id": "text", "step": 5, "column": 6, "row": 2, "mobile_order": 9, "lane": "main", "title": "核心分析", "subtitle": "结构化理解与手册生成", "model_kind": "text", "required": True},
-        {"id": "core_verify", "step": 6, "column": 7, "row": 2, "mobile_order": 10, "lane": "quality", "title": "核心校验", "subtitle": "检查产物完整性与证据引用", "stage": "verify-core"},
-        {"id": "documents", "step": 6, "column": 8, "row": 2, "mobile_order": 11, "lane": "main", "title": "多文档分析", "subtitle": "知识笔记与章节报告", "stage": "multidoc"},
-        {"id": "review", "step": 6, "column": 9, "row": 1, "mobile_order": 12, "lane": "quality", "title": "证据复核", "subtitle": "模型复核与发布门禁", "model_kind": "review", "required": False},
-        {"id": "study", "step": 6, "column": 9, "row": 3, "mobile_order": 13, "lane": "learning", "title": "学习卡片", "subtitle": "提炼可学习的知识单元", "model_kind": "study", "required": False},
-        {"id": "triage", "step": 6, "column": 10, "row": 3, "mobile_order": 14, "lane": "learning", "title": "证据 Triage", "subtitle": "筛选学习证据与问题", "model_kind": "triage", "required": False},
-        {"id": "qa_index", "step": 7, "column": 11, "row": 2, "mobile_order": 15, "lane": "delivery", "title": "问答索引", "subtitle": "建立可追溯问答证据", "stage": "qa-index"},
-        {"id": "image", "step": 7, "column": 12, "row": 2, "mobile_order": 16, "lane": "delivery", "title": "文档配图", "subtitle": "生成最终文档插图", "model_kind": "image", "required": False},
-        {"id": "final_publish", "step": 7, "column": 13, "row": 2, "mobile_order": 17, "lane": "delivery", "title": "最终发布", "subtitle": "定稿并输出交付文档", "stage": "final-publish"},
+        {"id": "input", "step": 1, "column": 1, "row": 2, "mobile_order": 1, "lane": "main", "title": "输入素材", "subtitle": "视频、字幕、评论与页面信息", "stage": "probe"},
+        {"id": "prepare", "step": 2, "column": 2, "row": 2, "mobile_order": 2, "lane": "main", "title": "素材准备", "subtitle": "下载媒体并整理页面上下文", "stage": "prepare"},
+        {"id": "audio_extract", "step": 3, "column": 3, "row": 1, "mobile_order": 3, "lane": "audio", "title": "音频提取", "subtitle": "生成可转写音轨", "stage": "analyze-core", "progress_step": "audio"},
+        {"id": "asr", "step": 4, "column": 4, "row": 1, "mobile_order": 4, "lane": "audio", "title": "语音识别", "subtitle": "与说话人分离并行执行", "model_kind": "asr", "required": False, "stage": "analyze-core", "progress_step": "asr"},
+        {"id": "diarization", "step": 4, "column": 4, "row": 2, "mobile_order": 5, "lane": "audio", "title": "说话人分离", "subtitle": "与语音识别并行生成声纹轨", "model_kind": "diarization", "required": False, "stage": "analyze-core"},
+        {"id": "transcript_merge", "step": 5, "column": 5, "row": 1, "mobile_order": 6, "lane": "audio", "title": "转写与说话人合并", "subtitle": "对齐文字、时间戳与说话人", "stage": "analyze-core", "progress_step": "asr_done"},
+        {"id": "frame_extract", "step": 3, "column": 3, "row": 3, "mobile_order": 7, "lane": "visual", "title": "候选帧提取", "subtitle": "采样并筛选可分析画面", "stage": "analyze-core", "progress_step": "frames"},
+        {"id": "ocr", "step": 4, "column": 4, "row": 3, "mobile_order": 8, "lane": "visual", "title": "画面 OCR", "subtitle": "提取画面文字证据", "model_kind": "ocr", "required": False, "stage": "analyze-core", "progress_step": "ocr"},
+        {"id": "vision", "step": 5, "column": 5, "row": 3, "mobile_order": 9, "lane": "visual", "title": "视觉理解", "subtitle": "在 OCR 之后理解动作、界面和场景", "model_kind": "vision", "required": False, "stage": "analyze-core", "progress_step": "vl"},
+        {"id": "visual_evidence", "step": 6, "column": 6, "row": 3, "mobile_order": 10, "lane": "visual", "title": "视觉证据", "subtitle": "整理 OCR、VL 与帧引用", "stage": "analyze-core", "progress_step": "vl"},
+        {"id": "evidence_merge", "step": 7, "column": 7, "row": 2, "mobile_order": 11, "lane": "main", "title": "证据汇合", "subtitle": "合并转写、视觉与页面上下文", "stage": "analyze-core", "progress_step": "manual"},
+        {"id": "text", "step": 8, "column": 8, "row": 2, "mobile_order": 12, "lane": "main", "title": "核心分析", "subtitle": "结构化理解并生成手册草稿", "model_kind": "text", "required": True, "stage": "analyze-core", "progress_step": "manual"},
+        {"id": "text_fallback", "step": 9, "column": 9, "row": 4, "mobile_order": 13, "lane": "fallback", "title": "核心文本兜底", "subtitle": "主文本模型失败时调用，可禁用", "model_slot": "text_fallback", "model_kind": "text", "required": False, "stage": "analyze-core", "progress_step": "manual"},
+        {"id": "core_verify", "step": 10, "column": 10, "row": 2, "mobile_order": 14, "lane": "quality", "title": "核心校验", "subtitle": "检查核心产物与证据引用", "stage": "verify-core"},
+        {"id": "study", "step": 11, "column": 11, "row": 3, "mobile_order": 15, "lane": "learning", "title": "学习账本", "subtitle": "提炼章节与学习卡片", "model_kind": "study", "required": False, "stage": "study-guide"},
+        {"id": "triage", "step": 12, "column": 12, "row": 3, "mobile_order": 16, "lane": "learning", "title": "证据 Triage", "subtitle": "判断证据缺口与处理路由", "model_kind": "triage", "required": False, "stage": "study-guide"},
+        {"id": "documents", "step": 13, "column": 12, "row": 2, "mobile_order": 17, "lane": "main", "title": "多文档章节分析", "subtitle": "生成知识笔记与初版报告", "model_kind": "text", "model_slot": "text", "required": True, "stage": "multidoc"},
+        {"id": "deep_report", "step": 14, "column": 13, "row": 2, "mobile_order": 18, "lane": "main", "title": "章节深度报告", "subtitle": "逐章分析与最终综合", "model_kind": "text", "model_slot": "text", "required": True, "stage": "deep-v2", "stage_step": "chapters"},
+        {"id": "deep_review", "step": 15, "column": 14, "row": 2, "mobile_order": 19, "lane": "quality", "title": "深度报告复核", "subtitle": "语义审核与格式校验", "model_kind": "review", "required": False, "stage": "deep-v2", "stage_step": "review"},
+        {"id": "evidence_review", "step": 16, "column": 15, "row": 1, "mobile_order": 20, "lane": "quality", "title": "证据复核与发布门禁", "subtitle": "复核缺口对最终发布的影响", "model_kind": "text", "model_slot": "text", "required": True, "stage": "evidence-review"},
+        {"id": "web_evidence", "step": 17, "column": 16, "row": 1, "mobile_order": 21, "lane": "quality", "title": "联网补证据", "subtitle": "仅补充可由外部来源验证的缺口", "model_kind": "text", "model_slot": "text", "required": True, "stage": "web-evidence"},
+        {"id": "qa_index", "step": 18, "column": 17, "row": 2, "mobile_order": 22, "lane": "delivery", "title": "问答证据索引", "subtitle": "规则切片并建立可追溯索引", "stage": "qa-index"},
+        {"id": "image_prompts", "step": 19, "column": 17, "row": 3, "mobile_order": 23, "lane": "delivery", "title": "配图提示词", "subtitle": "整理最终文档的配图需求", "stage": "image-prompts"},
+        {"id": "image", "step": 20, "column": 18, "row": 3, "mobile_order": 24, "lane": "delivery", "title": "文档配图", "subtitle": "生成或复用最终文档插图", "model_kind": "image", "required": False, "stage": "final-publish", "stage_step": "images"},
+        {"id": "final_publish", "step": 21, "column": 19, "row": 2, "mobile_order": 25, "lane": "delivery", "title": "最终定稿与发布", "subtitle": "补齐、插图并校验交付文档", "stage": "final-publish"},
+        {"id": "operation_manual_doc", "step": 22, "column": 20, "row": 1, "mobile_order": 26, "lane": "delivery", "title": "操作手册", "subtitle": "operation_manual.md", "stage": "final-publish", "artifact_path": "operation_manual.md", "node_kind": "output"},
+        {"id": "knowledge_notes_doc", "step": 22, "column": 20, "row": 2, "mobile_order": 27, "lane": "delivery", "title": "逐章知识笔记", "subtitle": "knowledge_notes_v2.md", "stage": "final-publish", "artifact_path": "docs_analysis_chapters/knowledge_notes_v2.md", "node_kind": "output"},
+        {"id": "deep_report_doc", "step": 22, "column": 20, "row": 3, "mobile_order": 28, "lane": "delivery", "title": "深度报告", "subtitle": "deep_report_v2.md", "stage": "final-publish", "artifact_path": "docs_analysis_chapters/deep_report_v2.md", "node_kind": "output"},
+        {"id": "manual_evidence_doc", "step": 22, "column": 20, "row": 4, "mobile_order": 29, "lane": "delivery", "title": "证据审计表", "subtitle": "manual_evidence.md", "stage": "final-publish", "artifact_path": "manual_evidence.md", "node_kind": "output"},
     ],
     "edges": [
-        {"from": "input", "to": "audio_extract", "lane": "audio"},
-        {"from": "input", "to": "frame_extract", "lane": "visual"},
-        {"from": "audio_extract", "to": "asr", "lane": "audio"},
-        {"from": "audio_extract", "to": "diarization", "lane": "audio"},
-        {"from": "asr", "to": "evidence_merge", "lane": "audio"},
-        {"from": "diarization", "to": "evidence_merge", "lane": "audio"},
-        {"from": "frame_extract", "to": "ocr", "lane": "visual"},
-        {"from": "frame_extract", "to": "vision", "lane": "visual"},
-        {"from": "ocr", "to": "evidence_merge", "lane": "visual"},
-        {"from": "vision", "to": "evidence_merge", "lane": "visual"},
-        {"from": "evidence_merge", "to": "text", "lane": "main"},
-        {"from": "text", "to": "core_verify", "lane": "main"},
-        {"from": "core_verify", "to": "documents", "lane": "quality"},
-        {"from": "documents", "to": "review", "lane": "quality"},
-        {"from": "documents", "to": "study", "lane": "learning"},
-        {"from": "study", "to": "triage", "lane": "learning"},
-        {"from": "review", "to": "qa_index", "lane": "quality"},
-        {"from": "triage", "to": "qa_index", "lane": "learning"},
-        {"from": "qa_index", "to": "image", "lane": "delivery"},
-        {"from": "image", "to": "final_publish", "lane": "delivery"},
+        {"from": "input", "to": "prepare", "lane": "main", "label": "探测与下载"},
+        {"from": "prepare", "to": "audio_extract", "lane": "audio", "label": "音轨"},
+        {"from": "prepare", "to": "frame_extract", "lane": "visual", "label": "视频画面"},
+        {"from": "prepare", "to": "evidence_merge", "lane": "main", "label": "页面上下文"},
+        {"from": "audio_extract", "to": "asr", "lane": "audio", "label": "音频"},
+        {"from": "audio_extract", "to": "diarization", "lane": "audio", "label": "并行音频"},
+        {"from": "asr", "to": "transcript_merge", "lane": "audio", "label": "转写文本"},
+        {"from": "diarization", "to": "transcript_merge", "lane": "audio", "label": "说话人片段"},
+        {"from": "transcript_merge", "to": "evidence_merge", "lane": "audio", "label": "带说话人文字稿"},
+        {"from": "frame_extract", "to": "ocr", "lane": "visual", "label": "候选帧"},
+        {"from": "ocr", "to": "vision", "lane": "visual", "label": "OCR 文本"},
+        {"from": "vision", "to": "visual_evidence", "lane": "visual", "label": "画面解释"},
+        {"from": "visual_evidence", "to": "evidence_merge", "lane": "visual", "label": "帧证据"},
+        {"from": "evidence_merge", "to": "text", "lane": "main", "label": "证据包"},
+        {"from": "text", "to": "core_verify", "lane": "main", "label": "主模型成功"},
+        {"from": "text", "to": "text_fallback", "lane": "fallback", "label": "主模型失败"},
+        {"from": "text_fallback", "to": "core_verify", "lane": "fallback", "label": "兜底结果"},
+        {"from": "core_verify", "to": "study", "lane": "quality", "label": "已校验证据"},
+        {"from": "study", "to": "triage", "lane": "learning", "label": "证据缺口"},
+        {"from": "triage", "to": "documents", "lane": "learning", "label": "学习账本"},
+        {"from": "documents", "to": "deep_report", "lane": "main", "label": "章节材料"},
+        {"from": "deep_report", "to": "deep_review", "lane": "quality", "label": "报告草稿"},
+        {"from": "deep_review", "to": "evidence_review", "lane": "quality", "label": "复核结果"},
+        {"from": "evidence_review", "to": "web_evidence", "lane": "quality", "label": "可补证缺口"},
+        {"from": "web_evidence", "to": "qa_index", "lane": "delivery", "label": "完整证据"},
+        {"from": "qa_index", "to": "image_prompts", "lane": "delivery", "label": "最终材料"},
+        {"from": "image_prompts", "to": "image", "lane": "delivery", "label": "配图需求"},
+        {"from": "qa_index", "to": "final_publish", "lane": "delivery", "label": "问答索引"},
+        {"from": "image", "to": "final_publish", "lane": "delivery", "label": "最终图片"},
+        {"from": "final_publish", "to": "operation_manual_doc", "lane": "delivery", "label": "交付"},
+        {"from": "final_publish", "to": "knowledge_notes_doc", "lane": "delivery", "label": "交付"},
+        {"from": "final_publish", "to": "deep_report_doc", "lane": "delivery", "label": "交付"},
+        {"from": "final_publish", "to": "manual_evidence_doc", "lane": "delivery", "label": "交付"},
     ],
 }
 
@@ -167,6 +193,13 @@ WORKFLOW_MODEL_FIELDS = {
     VIDEO_WORKFLOW_ID: {
         kind: {"field": field, "kind": kind, "required": kind == "text"}
         for kind, field in PROFILE_MODEL_FIELDS.items()
+    }
+    | {
+        "text_fallback": {
+            "field": "text_fallback_model_id",
+            "kind": "text",
+            "required": False,
+        }
     },
     AUDIO_WORKFLOW_ID: {
         "asr": {"field": "asr_model_id", "kind": "asr", "required": True},
@@ -207,6 +240,7 @@ CONTROL_RESOURCES = (
     ("diarization-disabled", "diarization", "none", "禁用说话人分离"),
     ("ocr-disabled", "ocr", "none", "禁用 OCR"),
     ("vision-disabled", "vision", "none", "禁用视觉理解"),
+    ("text-disabled", "text", "none", "禁用文本模型兜底"),
     ("review-inherit-text", "review", "inherit_text", "继承文本模型"),
     ("review-disabled", "review", "none", "禁用独立审核模型"),
     ("study-inherit-text", "study", "inherit_text", "继承文本模型"),
@@ -586,6 +620,34 @@ def _add_builtin_model_resources(
                 "text_timeout_seconds": 900,
             },
         },
+        "text-deepseek-v4-pro": {
+            "name": "DeepSeek V4 Pro（云端）",
+            "kind": "text",
+            "protocol": "openai_compatible",
+            "model": "deepseek-v4-pro",
+            "endpoints": ["https://api.deepseek.com"],
+            "api_key_env": "DEEPSEEK_API_KEY",
+            "options": {
+                "deployment": "cloud",
+                "text_temperature": 1.0,
+                "deepseek_thinking": "disabled",
+                "text_timeout_seconds": 900,
+            },
+        },
+        "text-deepseek-v4-flash": {
+            "name": "DeepSeek V4 Flash（云端）",
+            "kind": "text",
+            "protocol": "openai_compatible",
+            "model": "deepseek-v4-flash",
+            "endpoints": ["https://api.deepseek.com"],
+            "api_key_env": "DEEPSEEK_API_KEY",
+            "options": {
+                "deployment": "cloud",
+                "text_temperature": 1.0,
+                "deepseek_thinking": "disabled",
+                "text_timeout_seconds": 900,
+            },
+        },
     }
     for resource_id, resource in resources.items():
         catalog.setdefault(
@@ -838,6 +900,9 @@ def build_settings_document(config: dict[str, Any]) -> dict[str, Any]:
             profile.get("diarization_fallback_model_id")
             or "diarization-disabled"
         )
+        profile["text_fallback_model_id"] = str(
+            profile.get("text_fallback_model_id") or "text-disabled"
+        )
         profiles[profile_name] = profile
 
     for item in catalog.values():
@@ -955,6 +1020,27 @@ def expand_runtime_profile(config: dict[str, Any], profile: dict[str, Any]) -> d
         "diarization": copy.deepcopy(fallback_diarization or {}),
         "trigger": "local_resource_busy",
     }
+
+    text_fallback = model_for_field("text_fallback_model_id")
+    text_fallback_enabled = bool(
+        text_fallback and text_fallback.get("protocol") != "none"
+    )
+    text_fallback_options = dict((text_fallback or {}).get("options") or {})
+    text_fallback_endpoints = normalize_string_list(
+        (text_fallback or {}).get("endpoints")
+    )
+    expanded["text_fallback_enabled"] = text_fallback_enabled
+    expanded["text_fallback_base_url"] = (
+        text_fallback_endpoints[0] if text_fallback_enabled and text_fallback_endpoints else ""
+    )
+    expanded["text_fallback_model"] = (
+        (text_fallback or {}).get("model") if text_fallback_enabled else ""
+    )
+    expanded["text_fallback_api_key_env"] = (
+        (text_fallback or {}).get("api_key_env") if text_fallback_enabled else ""
+    )
+    for key, value in text_fallback_options.items():
+        expanded[f"text_fallback_{key}"] = value
 
     ocr = model_for("ocr")
     if ocr:
@@ -1140,6 +1226,10 @@ def _health_url_for(resource: dict[str, Any]) -> str:
 
 def _auth_headers(resource: dict[str, Any]) -> tuple[dict[str, str], str]:
     env_name = str(resource.get("api_key_env") or "").strip()
+    if env_name and not os.environ.get(env_name):
+        from .config import load_default_deepseek_env
+
+        load_default_deepseek_env()
     if env_name and not os.environ.get(env_name):
         return {}, f"缺少环境变量 {env_name}"
     token = os.environ.get(env_name, "0") if env_name else "0"
@@ -1727,6 +1817,8 @@ class RuntimeSettingsStore:
         selected: dict[str, dict[str, Any]] = {}
         for slot, spec in workflow["model_fields"].items():
             model_id = str(refs.get(slot) or "").strip()
+            if not model_id and not spec.get("required"):
+                model_id = f"{spec['kind']}-disabled"
             item = models_by_id.get(model_id)
             if not item or item.get("kind") != spec["kind"]:
                 raise SettingsValidationError(f"unknown {slot} model: {model_id}")
@@ -1755,11 +1847,19 @@ class RuntimeSettingsStore:
                 runtime_config,
                 logger,
                 f"settings-profile-test:{payload.get('profile_name') or 'draft'}",
-            )
+        )
         with lock_context:
+            tested_slots: dict[str, dict[str, Any]] = {}
             for node in sorted(flow["nodes"], key=lambda item: item["mobile_order"]):
                 slot = node.get("model_slot") or node.get("model_kind")
                 if not slot:
+                    continue
+                if slot in tested_slots:
+                    results[node["id"]] = {
+                        **tested_slots[slot],
+                        "node_id": node["id"],
+                        "reused_slot_result": slot,
+                    }
                     continue
                 item = selected[slot]
                 stage = {"asr": "asr", "ocr": "ocr", "vision": "vl"}.get(
@@ -1798,6 +1898,7 @@ class RuntimeSettingsStore:
                     }
                 result["node_id"] = node["id"]
                 results[node["id"]] = result
+                tested_slots[slot] = dict(result)
                 sample = str(result.get("sample") or "").strip()
                 if result.get("ok") and sample:
                     context_parts.append(f"{slot}: {sample}")

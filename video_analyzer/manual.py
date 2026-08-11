@@ -3,7 +3,7 @@ import logging
 import re
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .audio_processor import AudioTranscript
 from .clients.llm_client import LLMClient
@@ -16,6 +16,9 @@ DEFAULT_MAX_FRAME_EVIDENCE_CHARS = 70_000
 DEFAULT_MAX_TRANSCRIPT_TEXT_CHARS = 90_000
 DEFAULT_MAX_TRANSCRIPT_SEGMENTS_CHARS = 50_000
 DEFAULT_MAX_PAGE_CONTEXT_CHARS = 30_000
+DEFAULT_MANUAL_RESPONSE_TOKENS = 8_000
+DEFAULT_MANUAL_CONTEXT_RESERVE_TOKENS = 2_048
+MIN_MANUAL_PROMPT_CHARS = 6_000
 
 KEY_VISUAL_TERMS = (
     "workflow",
@@ -111,6 +114,23 @@ def _format_transcript_segments(segments: List[Dict[str, Any]], max_chars: int) 
     return marker + "\n" + "\n".join(selected)
 
 
+def resolve_manual_prompt_char_budget(
+    context_length: Any,
+    configured_max_chars: Any = None,
+) -> Optional[int]:
+    if configured_max_chars not in (None, "", 0, "0"):
+        return max(MIN_MANUAL_PROMPT_CHARS, int(configured_max_chars))
+    if context_length in (None, "", 0, "0"):
+        return None
+    available_tokens = max(
+        int(context_length)
+        - DEFAULT_MANUAL_RESPONSE_TOKENS
+        - DEFAULT_MANUAL_CONTEXT_RESERVE_TOKENS,
+        MIN_MANUAL_PROMPT_CHARS,
+    )
+    return max(MIN_MANUAL_PROMPT_CHARS, int(available_tokens * 0.85))
+
+
 def read_context_file(path: Optional[str]) -> str:
     if not path:
         return ""
@@ -130,7 +150,24 @@ def build_operation_manual_prompt(
     language: str,
     frame_assets: Optional[Dict[int, str]] = None,
     max_frame_evidence_chars: int = DEFAULT_MAX_FRAME_EVIDENCE_CHARS,
+    max_prompt_chars: Optional[int] = None,
 ) -> str:
+    if max_prompt_chars:
+        evidence_budget = max(max_prompt_chars - 7_000, 2_000)
+        max_frame_evidence_chars = min(
+            max_frame_evidence_chars,
+            max(600, int(evidence_budget * 0.28)),
+        )
+        max_transcript_text_chars = max(900, int(evidence_budget * 0.42))
+        max_transcript_segments_chars = max(600, int(evidence_budget * 0.16))
+        max_page_context_chars = max(500, int(evidence_budget * 0.08))
+        max_asr_metadata_chars = max(400, int(evidence_budget * 0.06))
+    else:
+        max_transcript_text_chars = DEFAULT_MAX_TRANSCRIPT_TEXT_CHARS
+        max_transcript_segments_chars = DEFAULT_MAX_TRANSCRIPT_SEGMENTS_CHARS
+        max_page_context_chars = DEFAULT_MAX_PAGE_CONTEXT_CHARS
+        max_asr_metadata_chars = 8_000
+
     frame_notes = []
     frame_assets = frame_assets or {}
     ocr_by_frame = {event.frame_number: event for event in ocr_events}
@@ -163,19 +200,23 @@ def build_operation_manual_prompt(
 
     transcript_text = _truncate_balanced_text(
         transcript.text if transcript else "",
-        DEFAULT_MAX_TRANSCRIPT_TEXT_CHARS,
+        max_transcript_text_chars,
         "Transcript",
     )
     transcript_segments = (
-        _format_transcript_segments(transcript.segments or [], DEFAULT_MAX_TRANSCRIPT_SEGMENTS_CHARS)
+        _format_transcript_segments(transcript.segments or [], max_transcript_segments_chars)
         if transcript
         else "[]"
     )
-    asr_metadata_text = json.dumps(asr_metadata or {}, ensure_ascii=False, indent=2)
+    asr_metadata_text = _truncate_balanced_text(
+        json.dumps(asr_metadata or {}, ensure_ascii=False, indent=2),
+        max_asr_metadata_chars,
+        "ASR metadata",
+    )
     asr_rules = _build_asr_rules(asr_metadata or {})
-    page_context = _truncate_balanced_text(page_context, DEFAULT_MAX_PAGE_CONTEXT_CHARS, "Page context")
+    page_context = _truncate_balanced_text(page_context, max_page_context_chars, "Page context")
 
-    return f"""
+    prompt = f"""
 You are converting an installation or operation video into a precise operating manual.
 Write the final answer in {language}.
 
@@ -226,6 +267,25 @@ Return Markdown with these sections:
 7. 社区补充/常见问题
 8. 需复核项
 """.strip()
+    if max_prompt_chars and len(prompt) > max_prompt_chars:
+        reduced_budget = max(
+            MIN_MANUAL_PROMPT_CHARS,
+            max_prompt_chars - (len(prompt) - max_prompt_chars) - 512,
+        )
+        if reduced_budget < max_prompt_chars:
+            return build_operation_manual_prompt(
+                frame_analyses=frame_analyses,
+                frames=frames,
+                transcript=transcript,
+                asr_metadata=asr_metadata,
+                ocr_events=ocr_events,
+                page_context=page_context,
+                language=language,
+                frame_assets=frame_assets,
+                max_frame_evidence_chars=max_frame_evidence_chars,
+                max_prompt_chars=reduced_budget,
+            )
+    return prompt
 
 
 def _build_asr_rules(asr_metadata: Dict[str, Any]) -> str:
@@ -262,6 +322,11 @@ def generate_operation_manual(
     frame_assets: Optional[Dict[int, str]] = None,
     no_think: bool = False,
     max_frame_evidence_chars: int = DEFAULT_MAX_FRAME_EVIDENCE_CHARS,
+    max_prompt_chars: Optional[int] = None,
+    fallback_client: Optional[LLMClient] = None,
+    fallback_model: str = "",
+    fallback_temperature: Optional[float] = None,
+    fallback_status_callback: Optional[Callable[[str, str], None]] = None,
 ) -> Dict[str, Any]:
     prompt = build_operation_manual_prompt(
         frame_analyses=frame_analyses,
@@ -273,6 +338,7 @@ def generate_operation_manual(
         language=language,
         frame_assets=frame_assets,
         max_frame_evidence_chars=max_frame_evidence_chars,
+        max_prompt_chars=max_prompt_chars,
     )
     if no_think:
         prompt = f"/no_think\n{prompt}"
@@ -283,10 +349,71 @@ def generate_operation_manual(
             temperature=temperature,
             num_predict=8000,
         )
-        return {k: v for k, v in response.items() if k != "context"}
+        return {
+            **{k: v for k, v in response.items() if k != "context"},
+            "prompt_chars": len(prompt),
+            "fallback_used": False,
+        }
     except Exception as exc:
         logger.error("Error generating operation manual: %s", exc)
-        return {"response": f"Error generating operation manual: {exc}"}
+        if fallback_client is None or not fallback_model:
+            return {
+                "response": f"Error generating operation manual: {exc}",
+                "prompt_chars": len(prompt),
+                "fallback_used": False,
+                "primary_error": str(exc),
+            }
+        if fallback_status_callback:
+            fallback_status_callback("running", f"primary text model failed: {exc}")
+        logger.warning(
+            "Primary text model failed; retrying operation manual with fallback model %s",
+            fallback_model,
+        )
+        try:
+            response = fallback_client.generate(
+                prompt=prompt,
+                model=fallback_model,
+                temperature=(
+                    temperature
+                    if fallback_temperature is None
+                    else fallback_temperature
+                ),
+                num_predict=8000,
+            )
+            if fallback_status_callback:
+                fallback_status_callback(
+                    "succeeded",
+                    f"fallback model {fallback_model} completed",
+                )
+            return {
+                **{k: v for k, v in response.items() if k != "context"},
+                "prompt_chars": len(prompt),
+                "fallback_used": True,
+                "fallback_model": fallback_model,
+                "primary_error": str(exc),
+            }
+        except Exception as fallback_exc:
+            logger.error(
+                "Fallback operation-manual model %s also failed: %s",
+                fallback_model,
+                fallback_exc,
+            )
+            if fallback_status_callback:
+                fallback_status_callback(
+                    "failed",
+                    f"fallback model failed: {fallback_exc}",
+                )
+            return {
+                "response": (
+                    "Error generating operation manual: "
+                    f"primary={exc}; fallback={fallback_exc}"
+                ),
+                "prompt_chars": len(prompt),
+                "fallback_used": True,
+                "fallback_model": fallback_model,
+                "primary_error": str(exc),
+                "fallback_error": str(fallback_exc),
+            }
 
 
 def prepare_frame_assets(frames: List[Frame], output_dir: Path) -> Dict[int, str]:

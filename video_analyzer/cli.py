@@ -6,9 +6,11 @@ import logging
 import re
 import shutil
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
+from datetime import datetime
 from statistics import median
 from typing import Any
 
@@ -46,6 +48,7 @@ from .manual import (
     generate_operation_manual,
     prepare_frame_assets,
     read_context_file,
+    resolve_manual_prompt_char_budget,
     review_operation_manual_markdown,
     write_frame_evidence_index,
 )
@@ -76,6 +79,7 @@ TRANSCRIPT_LINE_RE = re.compile(
     r"^-\s+\[(?P<start>\d\d:\d\d:\d\d)\s+-\s+(?P<end>\d\d:\d\d:\d\d)\]\s+(?P<text>.*)$"
 )
 PROGRESS_FILENAME = "progress.json"
+ANALYSIS_PROGRESS_LOCK = threading.Lock()
 DEFAULT_VL_SECONDS_PER_FRAME = 30.0
 DEFAULT_VL_TARGET_SECONDS = 45 * 60
 
@@ -201,24 +205,64 @@ def write_analysis_progress(
     message: str | None = None,
     artifacts: dict[str, str] | None = None,
     details: dict[str, Any] | None = None,
+    node_updates: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     """Best-effort durable progress for status UIs; never fail analysis work."""
     try:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "version": 2,
-            "stage": "analyze-core",
-            "current_step": current_step,
-            "status": status,
-            "message": message,
-            "artifacts": artifacts or {},
-            "details": details or {},
-            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
-        }
-        progress_path = output_dir / PROGRESS_FILENAME
-        tmp_path = output_dir / f".{PROGRESS_FILENAME}.tmp"
-        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp_path.replace(progress_path)
+        with ANALYSIS_PROGRESS_LOCK:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            progress_path = output_dir / PROGRESS_FILENAME
+            existing = {}
+            if progress_path.is_file():
+                try:
+                    loaded = json.loads(progress_path.read_text(encoding="utf-8"))
+                    existing = loaded if isinstance(loaded, dict) else {}
+                except Exception:
+                    existing = {}
+            now = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
+            node_states = dict(existing.get("node_states") or {})
+            for node_id, raw_update in (node_updates or {}).items():
+                update = dict(raw_update or {})
+                previous = dict(node_states.get(node_id) or {})
+                node_status = str(update.get("status") or previous.get("status") or "pending")
+                if node_status == "running" and not update.get("started_at"):
+                    update["started_at"] = previous.get("started_at") or now
+                    update.pop("finished_at", None)
+                    update.pop("duration_seconds", None)
+                elif node_status in {"succeeded", "failed", "skipped", "stopped"}:
+                    started_at = update.get("started_at") or previous.get("started_at")
+                    update["started_at"] = started_at
+                    update["finished_at"] = update.get("finished_at") or now
+                    if started_at and update.get("duration_seconds") is None:
+                        try:
+                            started = datetime.fromisoformat(str(started_at))
+                            finished = datetime.fromisoformat(str(update["finished_at"]))
+                            update["duration_seconds"] = round(
+                                max(0.0, (finished - started).total_seconds()),
+                                3,
+                            )
+                        except Exception:
+                            pass
+                node_states[node_id] = {
+                    **previous,
+                    **update,
+                    "status": node_status,
+                    "updated_at": now,
+                }
+            payload = {
+                "version": 3,
+                "stage": "analyze-core",
+                "current_step": current_step,
+                "status": status,
+                "message": message,
+                "artifacts": artifacts or {},
+                "details": details or {},
+                "node_states": node_states,
+                "updated_at": now,
+            }
+            tmp_path = output_dir / f".{PROGRESS_FILENAME}.tmp"
+            tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp_path.replace(progress_path)
     except Exception:
         logger.debug("Could not write analysis progress", exc_info=True)
 
@@ -654,6 +698,40 @@ def create_operation_manual_text_client(config: Config, fallback_client):
     )
 
 
+def create_operation_manual_fallback_client(
+    config: Config,
+) -> tuple[GenericOpenAIAPIClient | None, str, float | None]:
+    manual_config = config.get("operation_manual", {})
+    if not manual_config.get("text_fallback_enabled"):
+        return None, "", None
+    base_url = str(manual_config.get("text_fallback_base_url") or "").strip()
+    model = str(manual_config.get("text_fallback_model") or "").strip()
+    if not base_url or not model:
+        return None, "", None
+    fallback_settings = {
+        "deepseek_thinking": manual_config.get(
+            "text_fallback_deepseek_thinking"
+        ),
+        "reasoning_effort": manual_config.get(
+            "text_fallback_reasoning_effort"
+        ),
+    }
+    client = GenericOpenAIAPIClient(
+        resolve_api_key(
+            None,
+            manual_config.get("text_fallback_api_key_env"),
+            base_url,
+        ),
+        base_url,
+        timeout_seconds=int(
+            manual_config.get("text_fallback_text_timeout_seconds") or 900
+        ),
+        extra_body=build_openai_extra_body(fallback_settings, base_url),
+    )
+    temperature = manual_config.get("text_fallback_text_temperature")
+    return client, model, float(temperature) if temperature is not None else None
+
+
 def read_page_context_metadata(context_file: str, page_context: str) -> dict:
     metadata = {
         "context_file": context_file,
@@ -874,6 +952,23 @@ def main():
         total_started = time.perf_counter()
         current_progress_step = "audio"
         write_analysis_progress(output_dir, current_progress_step, message="analysis started")
+
+        def report_transcription_progress(
+            node_id: str,
+            node_status: str,
+            node_message: str | None,
+        ) -> None:
+            write_analysis_progress(
+                output_dir,
+                current_progress_step,
+                message=node_message,
+                node_updates={
+                    node_id: {
+                        "status": node_status,
+                        "message": node_message,
+                    }
+                },
+            )
         
         # Stage 1: Frame and Audio Processing
         if args.start_stage <= 2:
@@ -883,7 +978,15 @@ def main():
             stage_started = time.perf_counter()
             if args.transcript_file:
                 current_progress_step = "asr"
-                write_analysis_progress(output_dir, current_progress_step, message="using existing transcript file")
+                write_analysis_progress(
+                    output_dir,
+                    current_progress_step,
+                    message="using existing transcript file",
+                    node_updates={
+                        "asr": {"status": "running", "message": "using existing transcript file"},
+                        "diarization": {"status": "skipped", "message": "provided transcript"},
+                    },
+                )
                 transcript_path = Path(args.transcript_file)
                 logger.info("Using existing transcript file: %s", transcript_path)
                 transcript = read_transcript_markdown(transcript_path)
@@ -900,10 +1003,21 @@ def main():
                     current_progress_step,
                     message="transcript ready",
                     artifacts={"transcript": str(transcript_markdown_path)} if transcript_markdown_path else {},
+                    node_updates={
+                        "asr": {"status": "succeeded", "message": "existing transcript loaded"},
+                        "transcript_merge": {"status": "succeeded", "message": "transcript ready"},
+                    },
                 )
             else:
                 current_progress_step = "audio"
-                write_analysis_progress(output_dir, current_progress_step, message="extracting audio")
+                write_analysis_progress(
+                    output_dir,
+                    current_progress_step,
+                    message="extracting audio",
+                    node_updates={
+                        "audio_extract": {"status": "running", "message": "extracting audio"},
+                    },
+                )
                 logger.info("Extracting audio from video...")
                 try:
                     audio_path = extract_audio_to_wav(video_path, output_dir)
@@ -914,7 +1028,27 @@ def main():
                 if audio_path is None:
                     logger.debug("No audio found in video - skipping transcription")
                     transcript = None
+                    write_analysis_progress(
+                        output_dir,
+                        current_progress_step,
+                        message="no audio stream found",
+                        node_updates={
+                            "audio_extract": {"status": "skipped", "message": "no audio stream"},
+                            "asr": {"status": "skipped", "message": "no audio stream"},
+                            "diarization": {"status": "skipped", "message": "no audio stream"},
+                            "transcript_merge": {"status": "skipped", "message": "no transcript"},
+                        },
+                    )
                 else:
+                    write_analysis_progress(
+                        output_dir,
+                        current_progress_step,
+                        message="audio track ready",
+                        artifacts={"audio": str(audio_path)},
+                        node_updates={
+                            "audio_extract": {"status": "succeeded", "message": "audio track ready"},
+                        },
+                    )
                     current_progress_step = "asr"
                     parallel_diarization = speaker_diarization_can_run_parallel(config)
                     progress_message = (
@@ -926,6 +1060,17 @@ def main():
                         output_dir,
                         current_progress_step,
                         message=progress_message,
+                        node_updates={
+                            "asr": {"status": "running", "message": "transcribing audio"},
+                            "diarization": {
+                                "status": "running" if parallel_diarization else "pending",
+                                "message": (
+                                    "running in parallel with ASR"
+                                    if parallel_diarization
+                                    else "waiting for ASR"
+                                ),
+                            },
+                        },
                     )
                     logger.info("%s...", progress_message.capitalize())
                     asr_config = config.get("asr", {})
@@ -938,6 +1083,7 @@ def main():
                             config,
                             use_asr_strategy=use_asr_strategy,
                             logger=logger,
+                            progress_callback=report_transcription_progress,
                         )
                     )
                     if transcript is None:
@@ -957,11 +1103,40 @@ def main():
                             current_progress_step,
                             message="transcript ready",
                             artifacts={"transcript": str(transcript_markdown_path)} if transcript_markdown_path else {},
+                            node_updates={
+                                "asr": {"status": "succeeded", "message": "transcript ready"},
+                                "diarization": {
+                                    "status": (
+                                        "failed"
+                                        if (speaker_diarization_report or {}).get("error")
+                                        else "succeeded"
+                                        if speaker_diarization_report
+                                        else "skipped"
+                                    ),
+                                    "message": (
+                                        (speaker_diarization_report or {}).get("error")
+                                        or "speaker turns aligned"
+                                        if speaker_diarization_report
+                                        else "speaker diarization not enabled"
+                                    ),
+                                },
+                                "transcript_merge": {
+                                    "status": "succeeded",
+                                    "message": "transcript and speaker turns ready",
+                                },
+                            },
                         )
             timings["asr_seconds"] = round(time.perf_counter() - stage_started, 3)
             
             current_progress_step = "frames"
-            write_analysis_progress(output_dir, current_progress_step, message="extracting candidate frames")
+            write_analysis_progress(
+                output_dir,
+                current_progress_step,
+                message="extracting candidate frames",
+                node_updates={
+                    "frame_extract": {"status": "running", "message": "extracting candidate frames"},
+                },
+            )
             logger.info(f"Extracting frames from video using model {model}...")
             stage_started = time.perf_counter()
             processor = VideoProcessor(
@@ -1005,6 +1180,9 @@ def main():
                     current_progress_step,
                     message="candidate frames reused",
                     artifacts={"frame_manifest": str(frame_manifest_path)},
+                    node_updates={
+                        "frame_extract": {"status": "succeeded", "message": "candidate frames reused"},
+                    },
                 )
                 frame_selection_metadata = {
                     "pipeline_mode": args.pipeline_mode,
@@ -1036,6 +1214,12 @@ def main():
                     current_progress_step,
                     message="audio-only input; skipped frame extraction",
                     artifacts={"frame_manifest": str(frame_manifest_path)},
+                    node_updates={
+                        "frame_extract": {"status": "skipped", "message": "audio-only input"},
+                        "ocr": {"status": "skipped", "message": "audio-only input"},
+                        "vision": {"status": "skipped", "message": "audio-only input"},
+                        "visual_evidence": {"status": "skipped", "message": "audio-only input"},
+                    },
                 )
             elif task == "operation_manual":
                 ocr_scan_sample_fps = resolve_ocr_scan_sample_fps(
@@ -1122,6 +1306,9 @@ def main():
                     current_progress_step,
                     message="candidate frames ready",
                     artifacts={"frame_manifest": str(frame_manifest_path)},
+                    node_updates={
+                        "frame_extract": {"status": "succeeded", "message": "candidate frames ready"},
+                    },
                 )
                 frame_selection_metadata = {
                     "pipeline_mode": args.pipeline_mode,
@@ -1144,6 +1331,9 @@ def main():
                     current_progress_step,
                     message="candidate frames ready",
                     artifacts={"frame_manifest": str(frame_manifest_path)},
+                    node_updates={
+                        "frame_extract": {"status": "succeeded", "message": "candidate frames ready"},
+                    },
                 )
             timings["candidate_frame_extraction_seconds"] = round(time.perf_counter() - stage_started, 3)
             frame_dedup_audit_path, frame_dedup_audit = write_frame_dedup_audit(frames, output_dir)
@@ -1155,7 +1345,14 @@ def main():
 
             if task == "operation_manual":
                 current_progress_step = "ocr"
-                write_analysis_progress(output_dir, current_progress_step, message="running OCR")
+                write_analysis_progress(
+                    output_dir,
+                    current_progress_step,
+                    message="running OCR",
+                    node_updates={
+                        "ocr": {"status": "running", "message": "running OCR"},
+                    },
+                )
                 logger.info("Running OCR on extracted frames...")
                 stage_started = time.perf_counter()
                 ocr_config = config.get("ocr", {})
@@ -1276,12 +1473,30 @@ def main():
                 }
                 timings["ocr_seconds"] = round(time.perf_counter() - stage_started, 3)
                 current_progress_step = "ocr_ready"
-                write_analysis_progress(output_dir, current_progress_step, message="OCR results ready")
+                write_analysis_progress(
+                    output_dir,
+                    current_progress_step,
+                    message="OCR results ready",
+                    node_updates={
+                        "ocr": {
+                            "status": "succeeded",
+                            "message": f"{len(ocr_events)} OCR frame results ready",
+                        },
+                    },
+                )
             
         # Stage 2: Frame Analysis
         if args.start_stage <= 2:
             current_progress_step = "vl"
-            write_analysis_progress(output_dir, current_progress_step, message="selecting and analyzing VL frames")
+            write_analysis_progress(
+                output_dir,
+                current_progress_step,
+                message="selecting and analyzing VL frames",
+                node_updates={
+                    "vision": {"status": "running", "message": "selecting and analyzing VL frames"},
+                    "visual_evidence": {"status": "pending", "message": "waiting for VL results"},
+                },
+            )
             logger.info("Selecting and analyzing VL frames...")
             stage_started = time.perf_counter()
             analyzer = VideoAnalyzer(
@@ -1403,6 +1618,13 @@ def main():
                         "vl",
                         message=f"VL frames {completed_count}/{total}",
                         details={"vl": vl_progress},
+                        node_updates={
+                            "vision": {
+                                "status": "running",
+                                "message": f"VL frames {completed_count}/{total}",
+                                "progress": vl_progress.get("percent"),
+                            }
+                        },
                     )
                 if frames:
                     with analyzer_resource_lock(config.config, "vl", str(output_dir), logger):
@@ -1435,6 +1657,22 @@ def main():
                     analysis = analyzer.analyze_frame(frame, ocr_text=ocr_text)
                     frame_analyses.append(analysis)
                 timings["vl_seconds"] = round(time.perf_counter() - stage_started, 3)
+            write_analysis_progress(
+                output_dir,
+                current_progress_step,
+                message="visual evidence ready",
+                node_updates={
+                    "vision": {
+                        "status": "succeeded",
+                        "message": f"{len(frame_analyses)} frame analyses ready",
+                        "progress": 100,
+                    },
+                    "visual_evidence": {
+                        "status": "succeeded",
+                        "message": "OCR and VL evidence ready",
+                    },
+                },
+            )
 
         release_local_runtime()
                 
@@ -1442,15 +1680,55 @@ def main():
         if args.start_stage <= 3:
             if task == "operation_manual":
                 current_progress_step = "manual"
-                write_analysis_progress(output_dir, current_progress_step, message="generating operation manual")
+                write_analysis_progress(
+                    output_dir,
+                    current_progress_step,
+                    message="generating operation manual",
+                    node_updates={
+                        "evidence_merge": {
+                            "status": "succeeded",
+                            "message": "audio, visual and page evidence merged",
+                        },
+                        "text": {"status": "running", "message": "generating operation manual"},
+                    },
+                )
                 logger.info("Generating operation manual...")
                 stage_started = time.perf_counter()
                 manual_config = config.get("operation_manual", {})
+                runtime_profile = config.get_runtime_profile(
+                    getattr(args, "profile", None)
+                )
                 text_client = create_operation_manual_text_client(config, client)
+                (
+                    fallback_text_client,
+                    fallback_text_model,
+                    fallback_text_temperature,
+                ) = create_operation_manual_fallback_client(config)
+                fallback_configured = bool(
+                    fallback_text_client and fallback_text_model
+                )
                 page_context = read_context_file(config.get("context_file", ""))
                 page_context_metadata = read_page_context_metadata(config.get("context_file", ""), page_context)
                 text_model = manual_config.get("text_model") or model
                 frame_assets = prepare_frame_assets(frames, output_dir)
+
+                def report_text_fallback(status: str, message: str) -> None:
+                    write_analysis_progress(
+                        output_dir,
+                        current_progress_step,
+                        message=message,
+                        node_updates={
+                            "text": {
+                                "status": "failed",
+                                "message": message,
+                            },
+                            "text_fallback": {
+                                "status": status,
+                                "message": message,
+                            },
+                        },
+                    )
+
                 with local_model_stage("text", config.config, logger, str(output_dir)):
                     operation_manual = generate_operation_manual(
                         client=text_client,
@@ -1465,6 +1743,19 @@ def main():
                         temperature=resolve_temperature(manual_config, config.get("clients", {}).get("temperature", 0.2)),
                         frame_assets=frame_assets,
                         no_think=bool(manual_config.get("manual_no_think", manual_config.get("frame_no_think", False))),
+                        max_prompt_chars=resolve_manual_prompt_char_budget(
+                            manual_config.get("context_length")
+                            or runtime_profile.get("context_length"),
+                            manual_config.get("max_prompt_chars"),
+                        ),
+                        fallback_client=fallback_text_client,
+                        fallback_model=fallback_text_model,
+                        fallback_temperature=fallback_text_temperature,
+                        fallback_status_callback=(
+                            report_text_fallback
+                            if fallback_configured
+                            else None
+                        ),
                     )
                 operation_manual["response"] = embed_step_images(
                     operation_manual.get("response", ""),
@@ -1499,6 +1790,53 @@ def main():
                 )
                 operation_manual["evidence_path"] = str(evidence_path)
                 timings["manual_generation_seconds"] = round(time.perf_counter() - stage_started, 3)
+                fallback_used = bool(operation_manual.get("fallback_used"))
+                quality_passed = bool(operation_manual["quality_gate_passed"])
+                if fallback_used:
+                    text_node = {
+                        "status": "failed",
+                        "message": operation_manual.get("primary_error")
+                        or "primary text model failed",
+                    }
+                    fallback_node = {
+                        "status": "succeeded" if quality_passed else "failed",
+                        "message": (
+                            f"{fallback_text_model} completed"
+                            if quality_passed
+                            else operation_manual.get("fallback_error")
+                            or "fallback output failed quality gate"
+                        ),
+                    }
+                else:
+                    text_node = {
+                        "status": "succeeded" if quality_passed else "failed",
+                        "message": (
+                            "operation manual draft ready"
+                            if quality_passed
+                            else "operation manual generation failed quality gate"
+                        ),
+                    }
+                    fallback_node = {
+                        "status": "skipped",
+                        "message": (
+                            "primary model succeeded"
+                            if fallback_configured
+                            else "text fallback disabled"
+                        ),
+                    }
+                write_analysis_progress(
+                    output_dir,
+                    current_progress_step,
+                    message=(
+                        "operation manual draft ready"
+                        if quality_passed
+                        else "operation manual draft failed quality gate"
+                    ),
+                    node_updates={
+                        "text": text_node,
+                        "text_fallback": fallback_node,
+                    },
+                )
             else:
                 logger.info("Reconstructing video description...")
                 video_description = analyzer.reconstruct_video(
@@ -1507,7 +1845,21 @@ def main():
         
         output_dir.mkdir(parents=True, exist_ok=True)
         current_progress_step = "write"
-        write_analysis_progress(output_dir, current_progress_step, message="writing analysis outputs")
+        write_analysis_progress(
+            output_dir,
+            current_progress_step,
+            message="writing analysis outputs",
+            node_updates=(
+                None
+                if operation_manual
+                else {
+                    "text": {
+                        "status": "succeeded",
+                        "message": "writing analysis outputs",
+                    }
+                }
+            ),
+        )
         timings["total_seconds"] = round(time.perf_counter() - total_started, 3)
         results = {
             "metadata": {
@@ -1631,7 +1983,29 @@ def main():
             
     except Exception as e:
         logger.error(f"Error during video analysis: {e}")
-        write_analysis_progress(output_dir, current_progress_step, status="failed", message=str(e))
+        failure_node = {
+            "audio": "audio_extract",
+            "asr": "asr",
+            "asr_done": "transcript_merge",
+            "frames": "frame_extract",
+            "frames_done": "frame_extract",
+            "ocr": "ocr",
+            "ocr_ready": "ocr",
+            "vl": "vision",
+            "manual": "text",
+            "write": "text",
+        }.get(current_progress_step)
+        write_analysis_progress(
+            output_dir,
+            current_progress_step,
+            status="failed",
+            message=str(e),
+            node_updates={
+                failure_node: {"status": "failed", "message": str(e)}
+            }
+            if failure_node
+            else None,
+        )
         if not config.get("keep_frames"):
             cleanup_files(output_dir)
         raise

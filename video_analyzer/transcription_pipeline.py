@@ -8,7 +8,7 @@ import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .artifacts import write_json
 from .asr_providers import ASRStrategyResult, transcribe_with_provider_result, transcribe_with_strategy
@@ -186,13 +186,23 @@ def transcribe_and_diarize_configured_audio(
     *,
     use_asr_strategy: bool,
     logger: logging.Logger,
+    progress_callback: Callable[[str, str, str | None], None] | None = None,
 ) -> tuple[AudioTranscript | None, ASRStrategyResult, dict[str, Any] | None]:
     """Run independent speaker-turn detection in parallel with configured ASR."""
     speaker_config = config.get("speaker_diarization") or {}
     asr_provider = str((config.get("asr") or {}).get("provider") or "").strip().lower()
     should_prepare_in_parallel = speaker_diarization_can_run_parallel(config)
 
+    def report_progress(node_id: str, status: str, message: str | None = None) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(node_id, status, message)
+        except Exception:
+            logger.debug("Could not report transcription node progress", exc_info=True)
+
     if not should_prepare_in_parallel:
+        report_progress("asr", "running", f"running {asr_provider or 'configured'} ASR")
         transcript, asr_result = transcribe_configured_audio(
             audio_path,
             output_dir,
@@ -200,8 +210,10 @@ def transcribe_and_diarize_configured_audio(
             use_asr_strategy=use_asr_strategy,
             logger=logger,
         )
+        report_progress("asr", "succeeded" if transcript is not None else "failed", "ASR finished")
         if transcript is None:
             return transcript, asr_result, None
+        report_progress("diarization", "running", "aligning speaker turns")
         transcript, report = apply_speaker_diarization(
             audio_path,
             transcript,
@@ -209,6 +221,9 @@ def transcribe_and_diarize_configured_audio(
             config,
             logger=logger,
         )
+        report_status = "failed" if report.get("error") else "succeeded"
+        progress_message = report.get("error") or "speaker diarization finished"
+        report_progress("diarization", report_status, progress_message)
         asr_result.transcript = transcript
         return transcript, asr_result, report
 
@@ -217,19 +232,37 @@ def transcribe_and_diarize_configured_audio(
         asr_provider,
         speaker_config.get("backend") or "3dspeaker",
     )
+    report_progress("asr", "running", f"running {asr_provider or 'configured'} ASR")
+    report_progress("diarization", "running", "running in parallel with ASR")
+
+    def prepare_assignment():
+        try:
+            prepared = prepare_speaker_assignment(
+                audio_path,
+                speaker_config,
+            )
+        except Exception as exc:
+            report_progress("diarization", "failed", str(exc))
+            raise
+        report_progress("diarization", "succeeded", "speaker turns prepared")
+        return prepared
+
     with ThreadPoolExecutor(max_workers=1) as executor:
         diarization_future = executor.submit(
-            prepare_speaker_assignment,
-            audio_path,
-            speaker_config,
+            prepare_assignment,
         )
-        transcript, asr_result = transcribe_configured_audio(
-            audio_path,
-            output_dir,
-            config,
-            use_asr_strategy=use_asr_strategy,
-            logger=logger,
-        )
+        try:
+            transcript, asr_result = transcribe_configured_audio(
+                audio_path,
+                output_dir,
+                config,
+                use_asr_strategy=use_asr_strategy,
+                logger=logger,
+            )
+        except Exception as exc:
+            report_progress("asr", "failed", str(exc))
+            raise
+        report_progress("asr", "succeeded" if transcript is not None else "failed", "ASR finished")
         try:
             prepared_assignment = diarization_future.result()
         except Exception as exc:
@@ -254,6 +287,11 @@ def transcribe_and_diarize_configured_audio(
         config,
         logger=logger,
         prepared_assignment=prepared_assignment,
+    )
+    report_progress(
+        "diarization",
+        "failed" if report.get("error") else "succeeded",
+        report.get("error") or "speaker diarization aligned",
     )
     asr_result.transcript = transcript
     return transcript, asr_result, report

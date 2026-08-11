@@ -3022,11 +3022,20 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             jobs_dir = Path(tmp) / "jobs"
             repo_root.mkdir()
             server = server_mod.VideoLinkStatusServer(jobs_dir, repo_root)
-            job_ids = []
             for index in range(2):
-                run_dir = Path(tmp) / f"run-{index}"
+                run_dir = (
+                    repo_root
+                    / "downloads"
+                    / "url-videos"
+                    / f"case-package-{index}"
+                    / "operation-manual-001"
+                )
                 transcript_dir = run_dir / "orin"
                 transcript_dir.mkdir(parents=True)
+                run_dir.joinpath("operation_manual.md").write_text(
+                    "# 操作手册\n\n执行并验证结果。",
+                    encoding="utf-8",
+                )
                 transcript_dir.joinpath("transcript.json").write_text(
                     json.dumps(
                         {
@@ -3041,23 +3050,24 @@ class VideoLinkStatusServerTests(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
-                job = server.create_job({"video_url": f"https://example.com/video-{index}"})
-                loaded = server.load_job(job["job_id"])
-                loaded["run_dir"] = str(run_dir)
-                server.save_job(loaded)
-                job_ids.append(job["job_id"])
+                transcript_dir.joinpath("ocr_events.json").write_text(
+                    json.dumps(
+                        [{"timestamp": 1, "frame_number": 1, "text": f"案例 {index} 完成"}]
+                    ),
+                    encoding="utf-8",
+                )
 
             project = server.create_skill_project(
                 {
                     "title": "案例方法",
                     "goal": "从两个独立案例沉淀可执行排错方法",
-                    "job_id": job_ids[0],
                 }
             )
-            server.add_skill_project_source(
-                project["id"],
-                {"kind": "job", "job_id": job_ids[1]},
-            )
+            for index in range(2):
+                server.import_skill_project_package(
+                    project["id"],
+                    {"package_id": f"case-package-{index}"},
+                )
             assessed = server.assess_skill_project(project["id"], {})
 
             self.assertEqual(assessed["assessment"]["verdict"], "ready")
@@ -3077,13 +3087,165 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             kwargs = initialize.call_args.kwargs
             self.assertEqual(initialize.call_args.args[0], repo_root / "var" / "skill-projects" / project["id"])
             self.assertEqual(kwargs["target_brief"]["goal"], "从两个独立案例沉淀可执行排错方法")
-            self.assertTrue(all(item["id"].startswith("job:") for item in kwargs["source_records"]))
+            self.assertTrue(all(item["id"].startswith("package:case-package-") for item in kwargs["source_records"]))
             self.assertTrue(
                 (repo_root / "var" / "skill-projects" / project["id"] / "source_snapshot.json").is_file()
             )
             self.assertEqual(workspace["project"]["status"], "distilling")
             self.assertFalse(workspace["runner"]["active"])
             start.assert_called_once_with(project["id"])
+
+    def test_skill_project_imports_video_analyzer_package_with_raw_evidence_and_references(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            package_root = repo_root / "downloads" / "url-videos" / "BV18Zu46DE3p"
+
+            def write_package(name: str, transcript_text: str) -> Path:
+                run_dir = package_root / name
+                orin = run_dir / "orin"
+                orin.mkdir(parents=True)
+                run_dir.joinpath("operation_manual.md").write_text(
+                    "# 操作手册\n\n## 步骤\n\n执行并验证结果。",
+                    encoding="utf-8",
+                )
+                orin.joinpath("transcript.json").write_text(
+                    json.dumps(
+                        {
+                            "segments": [
+                                {"start": 0, "end": 4, "text": transcript_text},
+                                {"start": 4, "end": 8, "text": "完成后检查输出。"},
+                            ]
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                orin.joinpath("ocr_events.json").write_text(
+                    json.dumps([{"timestamp": 1, "frame_number": 1, "text": "执行按钮"}]),
+                    encoding="utf-8",
+                )
+                orin.joinpath("frame_analyses.json").write_text(
+                    json.dumps([{"timestamp": 2, "frame_number": 2, "status": "succeeded", "response": "终端显示成功结果。"}]),
+                    encoding="utf-8",
+                )
+                run_dir.joinpath("study_guide.json").write_text(
+                    json.dumps(
+                        {
+                            "overview": {"summary": "学习执行和验证流程。"},
+                            "chapters": [{"title": "执行", "summary": "先执行再验证。"}],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                notes = run_dir / "docs_analysis_chapters"
+                notes.mkdir()
+                notes.joinpath("knowledge_notes_v2.md").write_text(
+                    "# 学习笔记\n\n把结果验证作为流程的一部分。",
+                    encoding="utf-8",
+                )
+                return run_dir
+
+            older = write_package("operation-manual-001", "旧版本执行步骤。")
+            newer = write_package("operation-manual-002", "新版本执行步骤。")
+            os.utime(older, (1, 1))
+            os.utime(newer, (2, 2))
+
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", repo_root)
+            project = server.create_skill_project({"goal": "沉淀可执行的验证方法"})
+            preview = server.preview_skill_project_package(project["id"], "BV18Zu46DE3p")
+            self.assertTrue(preview["can_import"])
+            self.assertFalse(preview["already_imported"])
+            self.assertEqual(preview["package"]["run_name"], "operation-manual-002")
+            self.assertEqual(server.skill_projects.load(project["id"])["sources"], [])
+
+            import_result = server.import_skill_project_package(
+                project["id"],
+                {"package_id": "BV18Zu46DE3p"},
+            )
+            self.assertTrue(import_result["created"])
+            source = import_result["source"]
+            duplicate = server.import_skill_project_package(
+                project["id"],
+                {"package_id": "BV18Zu46DE3p"},
+            )
+            self.assertFalse(duplicate["created"])
+            self.assertEqual(duplicate["source"]["id"], source["id"])
+            self.assertEqual(
+                len(server.skill_projects.load(project["id"])["sources"]),
+                1,
+            )
+
+            self.assertEqual(source["run_name"], "operation-manual-002")
+            self.assertEqual(source["package_id"], "BV18Zu46DE3p")
+            self.assertEqual({item["type"] for item in source["raw_evidence"]}, {"transcript", "ocr", "visual"})
+            self.assertEqual(
+                {item["id"] for item in source["reference_documents"]},
+                {"operation_manual", "study_guide", "knowledge_notes"},
+            )
+
+            loaded = server.skill_projects.load(project["id"])
+            bundle = server_mod.build_source_bundle(
+                loaded,
+                server.skill_projects.project_dir(project["id"]),
+                job_records=server._skill_project_job_records,
+                qa_history=server._skill_project_qa_records,
+                package_records=server._skill_project_package_records,
+            )
+            self.assertTrue(all(item["id"].startswith("package:BV18Zu46DE3p:operation-manual-002:") for item in bundle["records"]))
+            self.assertEqual(
+                {item["id"] for item in bundle["reference_documents"]},
+                {"operation_manual", "study_guide", "knowledge_notes"},
+            )
+            self.assertNotIn("reference", {item["source_type"] for item in bundle["records"]})
+
+            assessed = server.assess_skill_project(project["id"], {})
+            workbench = server.skill_project_workbench(project["id"])
+            self.assertEqual(workbench["selected_project_id"], project["id"])
+            self.assertEqual(
+                [node["id"] for node in workbench["flow"]["nodes"]],
+                ["goal", "packages", "readiness", "overview", "candidates", "build", "enable"],
+            )
+            self.assertEqual(workbench["flow"]["nodes"][1]["status"], "succeeded")
+            readiness_node = workbench["flow"]["nodes"][2]
+            self.assertEqual(readiness_node["action"], "start")
+            self.assertEqual(readiness_node["secondary_action"], "assess")
+            self.assertIsNone(workbench["flow"]["nodes"][5]["action"])
+            with (
+                patch.object(server_mod, "initialize_distillation", return_value={}) as initialize,
+                patch.object(server, "start_skill_project_runner") as start,
+            ):
+                server.start_skill_project_distillation(
+                    project["id"],
+                    {
+                        "profile": "deepseek_v4_pro",
+                        "accept_limitations": assessed["assessment"]["verdict"] == "ready_limited",
+                    },
+                )
+
+            self.assertEqual(
+                {item["id"] for item in initialize.call_args.kwargs["reference_context"]},
+                {"operation_manual", "study_guide", "knowledge_notes"},
+            )
+            self.assertTrue(
+                (server.skill_projects.project_dir(project["id"]) / "source_snapshot.json").is_file()
+            )
+            start.assert_called_once_with(project["id"])
+
+    def test_new_skill_project_rejects_current_job_as_implicit_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", repo_root)
+
+            with self.assertRaises(server_mod.BridgeError) as rejected:
+                server.create_skill_project(
+                    {
+                        "goal": "沉淀可执行方法",
+                        "job_id": "a" * 32,
+                    }
+                )
+
+        self.assertEqual(rejected.exception.status, server_mod.HTTPStatus.BAD_REQUEST)
 
     def test_skill_project_capability_smoke_requires_current_assessment_confirmation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3123,7 +3285,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
             self.assertEqual(verified["capability_checks"][0]["status"], "verified")
 
-    def test_skill_project_running_state_is_marked_interrupted_after_restart(self):
+    def test_skill_project_running_state_is_resumed_after_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp) / "repo"
             repo_root.mkdir()
@@ -3135,10 +3297,32 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             stored["status"] = "distilling"
             server.skill_projects.save(stored)
 
-            server.recover_interrupted_skill_projects()
+            with patch.object(server, "start_skill_project_runner") as resume:
+                server.recover_interrupted_skill_projects()
 
-            self.assertEqual(skill_distill.load_state(root)["status"], "interrupted")
-            self.assertEqual(server.skill_projects.load(project["id"])["status"], "interrupted")
+            self.assertEqual(skill_distill.load_state(root)["status"], "running")
+            recovered = server.skill_projects.load(project["id"])
+            self.assertEqual(recovered["status"], "distilling")
+            resume.assert_called_once_with(project["id"], recovery=True)
+
+    def test_skill_project_runner_lease_blocks_second_server_process(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            first = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs-a", repo_root)
+            second = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs-b", repo_root)
+            project = first.create_skill_project({"goal": "沉淀可执行的排错方法"})
+            key = f"project:{project['id']}"
+            first.skill_project_runner_leases[key] = first._acquire_skill_project_runner_lease(
+                project["id"]
+            )
+            try:
+                with self.assertRaises(server_mod.BridgeError) as blocked:
+                    second._acquire_skill_project_runner_lease(project["id"])
+            finally:
+                first._release_skill_project_runner_lease(key)
+
+            self.assertEqual(blocked.exception.status, server_mod.HTTPStatus.CONFLICT)
 
     def test_skill_project_candidate_review_exposes_groups_and_rejects_invalid_selection(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4177,6 +4361,188 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(full["lines"], ["one", "two", "three"])
         self.assertEqual(full["text"], "one\ntwo\nthree\n")
 
+    def test_execution_flow_uses_runtime_snapshot_and_document_lineage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_dir = Path(tmp) / "jobs"
+            server = server_mod.VideoLinkStatusServer(jobs_dir, REPO_ROOT)
+            job = server.create_job(
+                {
+                    "video_url": "https://example.com/video",
+                    "analysis_depth": "full",
+                    "skip_images": True,
+                }
+            )
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "run"
+            (run_dir / "orin").mkdir(parents=True)
+            (run_dir / "qa").mkdir()
+            (run_dir / "docs_analysis_chapters").mkdir()
+            (run_dir / "analysis.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": {
+                            "frames_extracted": 12,
+                            "vl_frames_processed": 4,
+                            "ocr_keyframes": {
+                                "ocr_frames_count": 8,
+                                "ocr_text_events_count": 6,
+                            },
+                            "timings": {
+                                "asr_seconds": 10.0,
+                                "ocr_seconds": 20.0,
+                                "vl_seconds": 30.0,
+                                "manual_generation_seconds": 40.0,
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            for relative in (
+                "orin/asr.json",
+                "orin/ocr_events.json",
+                "orin/frame_analyses.json",
+                "transcript.md",
+                "operation_manual.md",
+                "manual_evidence.md",
+                "docs_analysis_chapters/knowledge_notes_v2.md",
+                "docs_analysis_chapters/deep_report_v2.md",
+                "final_publish_summary.json",
+            ):
+                path = run_dir / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}\n", encoding="utf-8")
+            (run_dir / "qa" / "speaker_diarization_report.json").write_text(
+                json.dumps(
+                    {
+                        "backend": "wespeaker",
+                        "elapsed_seconds": 7.5,
+                        "final_speaker_count": 2,
+                        "parallel_with_asr": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config_dir = jobs_dir / job["job_id"] / "runtime-config"
+            config_dir.mkdir(parents=True, exist_ok=True)
+            config_dir.joinpath("config.json").write_text(
+                json.dumps(
+                    {
+                        "runtime_profiles": {
+                            "flow-test": {
+                                "workflow_id": "video_operation_manual",
+                                "asr_provider": "firered_asr2",
+                                "firered_asr2_url": "http://127.0.0.1:18014/api/asr/transcribe",
+                                "firered_asr2_options": {
+                                    "deployment": "local",
+                                    "worker_count": 5,
+                                },
+                                "speaker_diarization": {
+                                    "enabled": True,
+                                    "backend": "wespeaker",
+                                    "model_id": "chinese",
+                                },
+                                "ocr_provider": "unlimited_ocr",
+                                "ocr_model": "baidu/Unlimited-OCR",
+                                "ocr_base_url": "http://127.0.0.1:18088/v1",
+                                "ocr_worker_count": 5,
+                                "ocr_concurrency": 5,
+                                "vision_model": "minicpm-v-4.5-v100",
+                                "vision_base_url": "http://127.0.0.1:18082/v1",
+                                "vision_runtime": {
+                                    "deployment": "local",
+                                    "worker_count": 5,
+                                    "concurrency": 5,
+                                },
+                                "text_model": "prism-ml/bonsai-27b",
+                                "text_base_url": "http://100.90.114.26:18081/v1",
+                                "review_enabled": True,
+                                "study_card_enabled": True,
+                                "study_card_model": "qwen3:4b-instruct",
+                                "study_card_llm_base_url": "http://agx.taild500c8.ts.net:11434/v1",
+                                "triage_enabled": True,
+                                "image_enabled": False,
+                                "image_provider": "none",
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded["run_dir"] = str(run_dir)
+            loaded["runtime_profile_snapshot"] = {
+                "profile": "flow-test",
+                "workflow_id": "video_operation_manual",
+                "config_dir": str(config_dir),
+                "models": {
+                    "asr": "firered_asr2",
+                    "ocr": "baidu/Unlimited-OCR",
+                    "vision": "minicpm-v-4.5-v100",
+                    "text": "prism-ml/bonsai-27b",
+                },
+            }
+            for stage in server_mod.STAGE_ORDER:
+                loaded["stages"][stage] = {
+                    "status": "succeeded",
+                    "duration_seconds": 1.0,
+                }
+
+            flow = server.execution_flow(loaded)
+
+        nodes = {node["id"]: node for node in flow["nodes"]}
+        self.assertEqual(len(nodes), len(server_mod.VIDEO_PROFILE_FLOW["nodes"]))
+        self.assertEqual(nodes["asr"]["model"]["label"], "firered_asr2")
+        self.assertEqual(nodes["asr"]["model"]["worker_count"], 5)
+        self.assertEqual(nodes["diarization"]["model"]["label"], "wespeaker · chinese")
+        self.assertEqual(nodes["diarization"]["metrics"][0]["value"], 2)
+        self.assertEqual(nodes["ocr"]["model"]["label"], "baidu/Unlimited-OCR")
+        self.assertEqual(nodes["vision"]["model"]["label"], "minicpm-v-4.5-v100")
+        self.assertEqual(nodes["image"]["status"], "skipped")
+        self.assertEqual(nodes["operation_manual_doc"]["status"], "succeeded")
+        self.assertTrue(nodes["operation_manual_doc"]["artifacts"][0]["url"].endswith("/operation_manual.md"))
+        self.assertIn(
+            {"from": "ocr", "to": "vision", "lane": "visual", "label": "OCR 文本"},
+            flow["edges"],
+        )
+        self.assertFalse(
+            any(edge["from"] == "frame_extract" and edge["to"] == "vision" for edge in flow["edges"])
+        )
+        self.assertIn("flowchart LR", flow["mermaid"])
+
+    def test_execution_flow_exposes_parallel_asr_and_diarization_node_states(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            (run_dir / "progress.json").write_text(
+                json.dumps(
+                    {
+                        "current_step": "asr",
+                        "status": "running",
+                        "node_states": {
+                            "asr": {"status": "running", "message": "five workers"},
+                            "diarization": {
+                                "status": "running",
+                                "message": "running in parallel with ASR",
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded["run_dir"] = str(run_dir)
+            loaded["status"] = "running"
+            loaded["runner"] = {"status": "running", "current_stage": "analyze-core"}
+            loaded["stages"]["analyze-core"] = {"status": "running"}
+            flow = server.execution_flow(loaded)
+
+        nodes = {node["id"]: node for node in flow["nodes"]}
+        self.assertEqual(nodes["asr"]["status"], "running")
+        self.assertEqual(nodes["diarization"]["status"], "running")
+        self.assertEqual(set(flow["active_node_ids"]), {"asr", "diarization"})
+
     def test_core_progress_parses_current_substep_and_durations(self):
         text = "\n".join(
             [
@@ -4329,6 +4695,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
                     "completed": 25,
                     "reused": 10,
                     "failed": 1,
+                    "current_frame_number": 317,
                     "average_frame_seconds": 30.0,
                     "eta_seconds": 2250.0,
                 }
@@ -4341,6 +4708,10 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(progress["vl"]["completed"], 25)
         self.assertIn("25/100", by_id["vl"]["message"])
         self.assertIn("复用 10", by_id["vl"]["message"])
+        self.assertEqual(progress["position"]["kind"], "frame")
+        self.assertEqual(progress["position"]["current"], 25)
+        self.assertEqual(progress["position"]["total"], 100)
+        self.assertIn("帧 #317", progress["position"]["label"])
 
     def test_core_progress_infers_asr_done_from_transcript_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4395,6 +4766,42 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(by_id["download"]["status"], "succeeded")
         self.assertEqual(by_id["transcript"]["status"], "running")
         self.assertIn("subtitle transcript", by_id["transcript"]["message"])
+        self.assertEqual(progress["position"]["kind"], "step")
+        self.assertEqual(progress["position"]["label"], "准备字幕 Transcript")
+
+    def test_prepare_progress_exposes_live_download_position(self):
+        text = "\n".join(
+            [
+                "[youtube] abc: Downloading webpage",
+                "[download]  49.3% of   16.21MiB at   44.97MiB/s ETA 01:02",
+            ]
+        )
+
+        progress = server_mod.parse_stage_progress("prepare", text, "running")
+
+        self.assertEqual(progress["current_step"], "download")
+        self.assertEqual(progress["position"]["kind"], "download")
+        self.assertEqual(progress["position"]["current"], 49.3)
+        self.assertEqual(progress["position"]["total"], 100)
+        self.assertEqual(progress["position"]["eta_seconds"], 62)
+        self.assertIn("44.97MiB/s", progress["position"]["detail"])
+
+    def test_deep_report_progress_exposes_current_chapter(self):
+        text = "\n".join(
+            [
+                "load chapters from study_guide.json",
+                "[run] chapter concurrency=2",
+                "[run] chapter 04/12: KV cache 与调度",
+            ]
+        )
+
+        progress = server_mod.parse_stage_progress("deep-v2", text, "running")
+
+        self.assertEqual(progress["current_step"], "chapters")
+        self.assertEqual(progress["position"]["kind"], "chapter")
+        self.assertEqual(progress["position"]["current"], 4)
+        self.assertEqual(progress["position"]["total"], 12)
+        self.assertEqual(progress["position"]["detail"], "KV cache 与调度")
 
     def test_probe_progress_keeps_mode_resolution_as_distinct_substep(self):
         text = "probe stage started\nresolved mode: long-talk-fast\n"

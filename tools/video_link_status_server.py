@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import fcntl
 import hashlib
 import html
 import json
@@ -13,6 +14,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -44,9 +46,11 @@ from video_analyzer.doc_chat import ask_video_docs_result
 from video_analyzer.failures import FAILURE_FILE_ENV, read_failure_envelope
 from video_analyzer.model_settings import (
     AUDIO_WORKFLOW_ID,
+    AUDIO_PROFILE_FLOW,
     RuntimeSettingsStore,
     SettingsValidationError,
     VIDEO_WORKFLOW_ID,
+    VIDEO_PROFILE_FLOW,
     apply_disabled_runtime_profiles,
     build_settings_document,
     expand_runtime_profile,
@@ -354,6 +358,30 @@ EXPECTED_FINAL_DOCUMENTS = (
     "docs_analysis_chapters/deep_report_v2.md",
     "manual_evidence.md",
 )
+EXECUTION_NODE_ARTIFACTS = {
+    "prepare": ("input_page_context.md",),
+    "audio_extract": ("audio.wav",),
+    "asr": ("orin/asr.json",),
+    "diarization": ("qa/speaker_diarization_report.json",),
+    "transcript_merge": ("transcript.md", "orin/transcript.json"),
+    "frame_extract": ("frame_manifest.json", "frames_manifest.json"),
+    "ocr": ("orin/ocr_events.json",),
+    "vision": ("orin/frame_analyses.json",),
+    "visual_evidence": ("manual_evidence.md", "visual_review.html"),
+    "text": ("operation_manual.md", "operation_manual.quality_failed.md"),
+    "core_verify": ("analysis.json", "manual_evidence.md"),
+    "study": ("study_guide.json", "study_cards.md"),
+    "triage": ("evidence_triage.json", "evidence_gaps.json"),
+    "documents": ("docs_analysis/analysis.json", "docs_analysis/knowledge_notes.md"),
+    "deep_report": ("docs_analysis_chapters/deep_report_v2.md",),
+    "deep_review": ("docs_analysis_chapters/deep_report_v2.review.json",),
+    "evidence_review": ("evidence_review.json", "publish_decision.json"),
+    "web_evidence": ("web_evidence.json", "web_evidence.md"),
+    "qa_index": ("qa/answer_index.json", "qa/source_chunks.jsonl"),
+    "image_prompts": ("baoyu_images/prompts",),
+    "image": ("baoyu_images/final",),
+    "final_publish": ("final_publish_summary.json",),
+}
 DOCUMENT_PREVIEW_PRIMARY = (
     ("operation_manual.md", "操作手册", "优先阅读：核心结论、流程步骤和关键截图。"),
     ("docs_analysis_chapters/knowledge_notes_v2.md", "逐章知识笔记", "第二阅读：按章节整理概念、背景和要点。"),
@@ -4284,7 +4312,10 @@ class VideoLinkStatusServer:
     def create_skill_project(self, payload: dict[str, Any]) -> dict[str, Any]:
         job_id = str(payload.get("job_id") or "").strip()
         if job_id:
-            self.load_job(job_id)
+            raise BridgeError(
+                HTTPStatus.BAD_REQUEST,
+                "New Skill projects accept Video Analyzer material packages only",
+            )
         try:
             project = self.skill_projects.create(payload)
         except SkillProjectError as exc:
@@ -4312,16 +4343,47 @@ class VideoLinkStatusServer:
         return self.public_skill_project(project, include_detail=True)
 
     def add_skill_project_source(self, project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        job_id = str(payload.get("job_id") or "").strip()
-        if job_id:
-            self.load_job(job_id)
+        if str(payload.get("kind") or "").strip().lower() != "video_analyzer_package":
+            raise BridgeError(
+                HTTPStatus.BAD_REQUEST,
+                "Skill projects accept Video Analyzer material packages only",
+            )
         try:
-            project = self.skill_projects.add_source(project_id, payload)
+            project, _, _ = self.skill_projects.import_video_analyzer_package(
+                project_id,
+                str(payload.get("package_id") or ""),
+            )
         except FileNotFoundError as exc:
             raise BridgeError(HTTPStatus.NOT_FOUND, str(exc)) from exc
         except SkillProjectError as exc:
             raise BridgeError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
         return self.public_skill_project(project, include_detail=True)
+
+    def preview_skill_project_package(self, project_id: str, package_id: str) -> dict[str, Any]:
+        try:
+            return self.skill_projects.preview_video_analyzer_package(project_id, package_id)
+        except FileNotFoundError as exc:
+            raise BridgeError(HTTPStatus.NOT_FOUND, str(exc)) from exc
+        except SkillProjectError as exc:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+
+    def import_skill_project_package(self, project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            _, source, created = self.skill_projects.import_video_analyzer_package(
+                project_id,
+                str(payload.get("package_id") or ""),
+            )
+        except FileNotFoundError as exc:
+            raise BridgeError(HTTPStatus.NOT_FOUND, str(exc)) from exc
+        except SkillProjectError as exc:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+        assessment = self.assess_skill_project(project_id, {})
+        return {
+            "created": created,
+            "source": source,
+            "assessment": assessment.get("assessment") or {},
+            "workbench": self.skill_project_workbench(project_id),
+        }
 
     def remove_skill_project_source(self, project_id: str, source_id: str) -> dict[str, Any]:
         try:
@@ -4339,8 +4401,271 @@ class VideoLinkStatusServer:
         job = self.load_job(job_id)
         return load_evidence_records(self.require_run_dir(job))
 
+    def _skill_project_package_records(
+        self,
+        relative_run_dir: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        packages_root = (self.repo_root / "downloads" / "url-videos").resolve()
+        run_dir = (self.repo_root / str(relative_run_dir or "")).resolve()
+        try:
+            run_dir.relative_to(packages_root)
+        except ValueError as exc:
+            raise SkillProjectError("Video Analyzer material package path escapes downloads") from exc
+        if not run_dir.is_dir():
+            raise FileNotFoundError("Video Analyzer material package is not available")
+        return load_evidence_records(run_dir)
+
     def _skill_project_qa_records(self, job_id: str) -> list[dict[str, Any]]:
         return list(self.qa_history(job_id, limit=0).get("messages") or [])
+
+    def skill_project_flow(
+        self,
+        project: dict[str, Any],
+        workspace: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Project the durable state into the compact workbench flow."""
+
+        brief = project.get("brief") or {}
+        sources = list(project.get("sources") or [])
+        packages = [item for item in sources if item.get("kind") == "video_analyzer_package"]
+        legacy_sources = [item for item in sources if item.get("kind") != "video_analyzer_package"]
+        assessment = project.get("assessment") or {}
+        summary = workspace.get("summary") or {}
+        progress = summary.get("progress") or {}
+        stages = progress.get("stages") or {}
+        distillation_status = str(summary.get("status") or "not_started")
+        current_stage = str(summary.get("current_stage") or "")
+        candidates = list(workspace.get("candidates") or [])
+        generated_skills = list(workspace.get("generated_skills") or [])
+        coverage = assessment.get("source_coverage") or {}
+        candidate_groups = {
+            group: sum(1 for item in candidates if item.get("group") == group)
+            for group in ("accepted", "single_case", "rejected", "glossary")
+        }
+        flow_status = {
+            "running": "running",
+            "waiting_overview_review": "waiting",
+            "waiting_candidate_review": "waiting",
+            "succeeded": "succeeded",
+            "completed_no_skills": "succeeded",
+            "failed": "failed",
+            "interrupted": "interrupted",
+            "cancelled": "cancelled",
+            "cancelling": "running",
+            "waiting_resource_decision": "needs_action",
+        }
+        terminal = {"succeeded", "completed_no_skills"}
+        readiness = str(assessment.get("verdict") or "")
+        readiness_status = (
+            "succeeded"
+            if readiness == "ready"
+            else "limited"
+            if readiness == "ready_limited"
+            else "needs_action"
+            if packages
+            else "pending"
+        )
+        startable = (
+            readiness in {"ready", "ready_limited"}
+            and distillation_status == "not_started"
+        )
+        overview_status = "pending"
+        if distillation_status in {"waiting_overview_review"}:
+            overview_status = "waiting"
+        elif current_stage not in {"", "source", "overview"} or distillation_status in terminal:
+            overview_status = "succeeded"
+        elif distillation_status in flow_status:
+            overview_status = flow_status[distillation_status]
+        candidate_status = "pending"
+        if distillation_status == "waiting_candidate_review":
+            candidate_status = "waiting"
+        elif current_stage in {"build", "link", "test", "deliver"} or distillation_status in terminal:
+            candidate_status = "succeeded"
+        elif current_stage in {"extract", "verify"}:
+            candidate_status = flow_status.get(distillation_status, "running")
+        elif distillation_status in {"failed", "interrupted", "cancelled"} and current_stage in {"extract", "verify"}:
+            candidate_status = flow_status[distillation_status]
+        build_stage = stages.get("test") or stages.get("build") or {}
+        build_status = "pending"
+        if current_stage in {"build", "link", "test", "deliver"}:
+            build_status = flow_status.get(distillation_status, "running")
+        elif distillation_status in terminal:
+            build_status = "succeeded"
+        elif build_stage.get("status"):
+            build_status = str(build_stage.get("status"))
+        enabled = bool((project.get("distillation") or {}).get("enabled_at"))
+        nodes = [
+            {
+                "id": "goal",
+                "step": 1,
+                "title": "目标",
+                "subtitle": str(brief.get("goal") or "需要填写目标"),
+                "status": "succeeded" if str(brief.get("goal") or "").strip() else "needs_action",
+            },
+            {
+                "id": "packages",
+                "step": 2,
+                "title": "导入资料包",
+                "subtitle": f"{len(packages)} 个资料包 · {len(legacy_sources)} 个旧来源",
+                "status": "succeeded" if packages else "needs_action",
+                "action": "package",
+            },
+            {
+                "id": "readiness",
+                "step": 3,
+                "title": "证据就绪",
+                "subtitle": (
+                    f"{coverage.get('high_confidence_records', 0)} 条原始证据 · "
+                    f"{coverage.get('independent_learning_cases', 0)} 个案例"
+                ),
+                "status": readiness_status,
+                "action": "start" if startable else "assess" if packages else "package",
+                "secondary_action": "assess" if startable else None,
+            },
+            {
+                "id": "overview",
+                "step": 4,
+                "title": "方法骨架",
+                "subtitle": "生成后需要人工确认",
+                "status": overview_status,
+                "action": (
+                    "cancel"
+                    if overview_status == "running"
+                    else "review-overview"
+                    if overview_status == "waiting"
+                    else "resume"
+                    if overview_status in {
+                        "failed",
+                        "interrupted",
+                        "cancelled",
+                        "needs_action",
+                    }
+                    else None
+                ),
+            },
+            {
+                "id": "candidates",
+                "step": 5,
+                "title": "候选 Review",
+                "subtitle": (
+                    f"{len(candidates)} 个候选 · "
+                    f"可构建 {candidate_groups['accepted'] + candidate_groups['single_case']} 个"
+                    + (
+                        f" · {stages.get(current_stage, {}).get('message')}"
+                        if current_stage in {"extract", "verify"}
+                        and stages.get(current_stage, {}).get("message")
+                        else ""
+                    )
+                ),
+                "status": candidate_status,
+                "action": (
+                    "cancel"
+                    if candidate_status == "running"
+                    else "review-candidates"
+                    if candidate_status == "waiting"
+                    else "resume"
+                    if candidate_status in {
+                        "failed",
+                        "interrupted",
+                        "cancelled",
+                        "needs_action",
+                    }
+                    else None
+                ),
+            },
+            {
+                "id": "build",
+                "step": 6,
+                "title": "构建与压测",
+                "subtitle": (
+                    f"{len(generated_skills)} 项 Skill · "
+                    f"{(summary.get('skills') or {}).get('test_progress', {}).get('completed', 0)}/"
+                    f"{(summary.get('skills') or {}).get('test_progress', {}).get('total', 0)} 已测"
+                ),
+                "status": build_status,
+                "action": (
+                    "cancel"
+                    if build_status == "running"
+                    else "resume"
+                    if distillation_status in {"failed", "interrupted", "cancelled", "ready"}
+                    else None
+                ),
+            },
+            {
+                "id": "enable",
+                "step": 7,
+                "title": "启用",
+                "subtitle": (
+                    f"已启用 {len((project.get('distillation') or {}).get('enabled_paths') or [])} 项"
+                    if enabled
+                    else "仅通过测试后可启用"
+                ),
+                "status": "succeeded" if enabled else "pending",
+                "action": "enable" if distillation_status == "succeeded" and not enabled else None,
+            },
+        ]
+        return {
+            "nodes": nodes,
+            "active_node": (
+                "enable"
+                if enabled
+                else "overview"
+                if distillation_status == "waiting_overview_review"
+                else "candidates"
+                if distillation_status == "waiting_candidate_review"
+                else "build"
+                if current_stage in {"build", "link", "test", "deliver"}
+                else "candidates"
+                if current_stage in {"extract", "verify"}
+                else "overview"
+                if current_stage in {"source", "overview"} and distillation_status != "not_started"
+                else "readiness"
+                if readiness
+                else "packages"
+            ),
+            "status": distillation_status,
+        }
+
+    def skill_project_workbench(self, preferred_project_id: str = "") -> dict[str, Any]:
+        projects = self.skill_projects.list()
+        items = [self.public_skill_project(project) for project in projects]
+        selected_id = str(preferred_project_id or "").strip()
+        if not any(item.get("id") == selected_id for item in items):
+            selected_id = str(items[0].get("id") or "") if items else ""
+        if not selected_id:
+            return {
+                "items": items,
+                "selected_project_id": "",
+                "project": None,
+                "workspace": None,
+                "flow": {"nodes": [], "active_node": "", "status": "not_started"},
+                "snapshot_version": hashlib.sha256(
+                    json.dumps(items, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                ).hexdigest(),
+            }
+        project = self.get_skill_project(selected_id)
+        workspace = self.skill_project_workspace(selected_id)
+        flow = self.skill_project_flow(project, workspace)
+        version_payload = {
+            "items": [(item.get("id"), item.get("revision"), item.get("status")) for item in items],
+            "project": (project.get("id"), project.get("revision"), project.get("status")),
+            "workspace": (
+                (workspace.get("summary") or {}).get("status"),
+                (workspace.get("summary") or {}).get("current_stage"),
+                ((workspace.get("summary") or {}).get("progress") or {}).get("percent"),
+                (workspace.get("runner") or {}).get("active"),
+            ),
+        }
+        return {
+            "items": items,
+            "selected_project_id": selected_id,
+            "project": project,
+            "workspace": workspace,
+            "flow": flow,
+            "snapshot_version": hashlib.sha256(
+                json.dumps(version_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+        }
 
     def assess_skill_project(self, project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -4352,6 +4677,7 @@ class VideoLinkStatusServer:
                 self.skill_projects.project_dir(project_id),
                 job_records=self._skill_project_job_records,
                 qa_history=self._skill_project_qa_records,
+                package_records=self._skill_project_package_records,
             )
         except FileNotFoundError as exc:
             project = self.skill_projects.load(project_id)
@@ -4490,6 +4816,7 @@ class VideoLinkStatusServer:
                 root,
                 job_records=self._skill_project_job_records,
                 qa_history=self._skill_project_qa_records,
+                package_records=self._skill_project_package_records,
             )
             snapshot = self.skill_projects.freeze_sources(project_id, bundle)
             initialize_distillation(
@@ -4499,6 +4826,7 @@ class VideoLinkStatusServer:
                 target_brief=project.get("brief") or {},
                 assessment=assessment,
                 source_records=snapshot["records"],
+                reference_context=snapshot.get("reference_documents") or [],
             )
         except FileExistsError as exc:
             raise BridgeError(HTTPStatus.CONFLICT, str(exc)) from exc
@@ -4563,6 +4891,9 @@ class VideoLinkStatusServer:
         if state.get("status") in {"waiting_overview_review", "waiting_candidate_review"}:
             raise BridgeError(HTTPStatus.CONFLICT, "Skill project is waiting for review")
         if state.get("status") not in {"succeeded", "completed_no_skills"}:
+            project = self.skill_projects.load(project_id)
+            project["status"] = "distilling"
+            self.skill_projects.save(project)
             self.start_skill_project_runner(project_id)
         return self.skill_project_workspace(project_id)
 
@@ -4570,12 +4901,15 @@ class VideoLinkStatusServer:
         key = f"project:{project_id}"
         root = self.skill_projects.project_dir(project_id)
         with self.skill_distillation_lock:
-            event = self.skill_distillation_cancel_events.get(key)
-            thread = self.active_skill_distillations.get(key)
-            if event:
-                event.set()
+            process = self.active_skill_project_processes.get(key)
+            worker_active = bool(process and process.poll() is None)
+            if worker_active:
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                except ProcessLookupError:
+                    worker_active = False
         state = load_distillation_state(root)
-        if state and not thread:
+        if state and not worker_active:
             state.update(
                 {
                     "status": "cancelled",
@@ -4586,7 +4920,25 @@ class VideoLinkStatusServer:
             )
             save_distillation_state(root, state)
         project = self.skill_projects.load(project_id)
-        project["status"] = "cancelled"
+        runner = project.setdefault("distillation", {}).setdefault("runner", {})
+        if worker_active:
+            project["status"] = "cancelling"
+            runner.update(
+                {
+                    "status": "cancelling",
+                    "cancel_requested_at": iso_now(),
+                    "error": None,
+                }
+            )
+        else:
+            project["status"] = "cancelled"
+            runner.update(
+                {
+                    "status": "cancelled",
+                    "finished_at": iso_now(),
+                    "error": "distillation cancelled",
+                }
+            )
         self.skill_projects.save(project)
         return self.skill_project_workspace(project_id)
 
@@ -4617,7 +4969,11 @@ class VideoLinkStatusServer:
         key = f"project:{project_id}"
         with self.skill_distillation_lock:
             thread = self.active_skill_distillations.get(key)
-            worker_active = bool(thread and thread.is_alive())
+            process = self.active_skill_project_processes.get(key)
+            worker_active = bool(
+                (thread and thread.is_alive())
+                or (process and process.poll() is None)
+            )
         verified = self._read_json_file(root / "skills" / "cangjie_pack" / "verified.json", default={})
         selected = set((state.get("candidates") or {}).get("selected_ids") or [])
         candidates = []
@@ -4666,42 +5022,138 @@ class VideoLinkStatusServer:
             raise BridgeError(HTTPStatus.NOT_FOUND, "Skill project resource is not available")
         return path, mimetypes.guess_type(str(path))[0]
 
-    def start_skill_project_runner(self, project_id: str) -> None:
+    def _acquire_skill_project_runner_lease(self, project_id: str) -> int:
+        root = self.skill_projects.project_dir(project_id)
+        root.mkdir(parents=True, exist_ok=True)
+        fd = os.open(root / ".runner.lock", os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(fd)
+            raise BridgeError(
+                HTTPStatus.CONFLICT,
+                "Skill project distillation is already running in another server process",
+            ) from exc
+        return fd
+
+    def _release_skill_project_runner_lease(self, key: str) -> None:
+        fd = self.skill_project_runner_leases.pop(key, None)
+        if fd is None:
+            return
+        try:
+            os.ftruncate(fd, 0)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def start_skill_project_runner(self, project_id: str, *, recovery: bool = False) -> None:
         key = f"project:{project_id}"
         with self.skill_distillation_lock:
-            existing = self.active_skill_distillations.get(key)
-            if existing and existing.is_alive():
+            existing = self.active_skill_project_processes.get(key)
+            if existing and existing.poll() is None:
                 raise BridgeError(HTTPStatus.CONFLICT, "Skill project distillation is already running")
-            cancel_event = threading.Event()
-            thread = threading.Thread(
-                target=self._run_skill_project_distillation,
-                args=(project_id, cancel_event),
-                name=f"skill-project-{project_id[:8]}",
-                daemon=True,
+            lease = self._acquire_skill_project_runner_lease(project_id)
+            self.skill_project_runner_leases[key] = lease
+            project = self.skill_projects.load(project_id)
+            distillation = project.setdefault("distillation", {})
+            runner = distillation.setdefault("runner", {})
+            runner.update(
+                {
+                    "run_id": uuid.uuid4().hex,
+                    "attempt": int(runner.get("attempt") or 0) + 1,
+                    "status": "running",
+                    "started_at": iso_now(),
+                    "finished_at": None,
+                    "error": None,
+                }
             )
-            self.skill_distillation_cancel_events[key] = cancel_event
-            self.active_skill_distillations[key] = thread
-            thread.start()
+            if recovery:
+                runner["recovered_at"] = iso_now()
+            project["status"] = "distilling"
+            try:
+                self.skill_projects.save(project)
+                command = [
+                    sys.executable,
+                    "tools/run_skill_project_worker.py",
+                    "--repo-root",
+                    str(self.repo_root),
+                    "--project-id",
+                    project_id,
+                    "--run-id",
+                    str(runner["run_id"]),
+                    "--lease-fd",
+                    str(lease),
+                ]
+                process = subprocess.Popen(
+                    command,
+                    cwd=self.repo_root,
+                    env=operation_env(),
+                    start_new_session=True,
+                    pass_fds=(lease,),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                current_project = self.skill_projects.load(project_id)
+                current_runner = (
+                    current_project.setdefault("distillation", {})
+                    .setdefault("runner", {})
+                )
+                if str(current_runner.get("run_id") or "") == str(runner["run_id"]):
+                    current_runner["pid"] = process.pid
+                    self.skill_projects.save(current_project)
+                self.active_skill_project_processes[key] = process
+                threading.Thread(
+                    target=self._watch_skill_project_process,
+                    args=(project_id, str(runner["run_id"]), process),
+                    name=f"skill-project-watch-{project_id[:8]}",
+                    daemon=True,
+                ).start()
+            except Exception:
+                self.active_skill_project_processes.pop(key, None)
+                self._release_skill_project_runner_lease(key)
+                raise
 
-    def _run_skill_project_distillation(self, project_id: str, cancel_event: threading.Event) -> None:
+    def _watch_skill_project_process(
+        self,
+        project_id: str,
+        run_id: str,
+        process: subprocess.Popen[Any],
+    ) -> None:
         key = f"project:{project_id}"
         try:
+            exit_code = process.wait()
+            if exit_code == 0:
+                return
             root = self.skill_projects.project_dir(project_id)
-            state = SkillDistillationPipeline(root).run_until_pause(cancel_event=cancel_event)
-            project = self.skill_projects.load(project_id)
-            if state.get("status") in {"succeeded", "completed_no_skills"}:
-                project["status"] = "completed"
-            elif state.get("status") == "cancelled":
-                project["status"] = "cancelled"
-            elif state.get("status") == "failed":
-                project["status"] = "failed"
-            self.skill_projects.save(project)
-        except Exception:
-            pass
+            state = load_distillation_state(root) or {}
+            if state.get("status") == "running":
+                state.update(
+                    {
+                        "status": "failed",
+                        "retryable": True,
+                        "error": f"skill worker exited unexpectedly ({exit_code})",
+                        "updated_at": iso_now(),
+                    }
+                )
+                save_distillation_state(root, state)
+                project = self.skill_projects.load(project_id)
+                runner = project.setdefault("distillation", {}).setdefault("runner", {})
+                if str(runner.get("run_id") or "") == run_id:
+                    project["status"] = "failed"
+                    runner.update(
+                        {
+                            "status": "failed",
+                            "finished_at": iso_now(),
+                            "error": state["error"],
+                        }
+                    )
+                    self.skill_projects.save(project)
         finally:
             with self.skill_distillation_lock:
-                self.active_skill_distillations.pop(key, None)
-                self.skill_distillation_cancel_events.pop(key, None)
+                active = self.active_skill_project_processes.get(key)
+                if active is process:
+                    self.active_skill_project_processes.pop(key, None)
+                self._release_skill_project_runner_lease(key)
 
     def start_skill_distillation(self, job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         job = self.load_job(job_id)
@@ -4861,19 +5313,8 @@ class VideoLinkStatusServer:
                 state = load_distillation_state(root)
                 if not state or state.get("status") != "running":
                     continue
-                state.update(
-                    {
-                        "status": "interrupted",
-                        "retryable": True,
-                        "error": "server restarted while skill project distillation was running",
-                        "updated_at": iso_now(),
-                    }
-                )
-                save_distillation_state(root, state)
-                project["status"] = "interrupted"
-                project.setdefault("distillation", {})["interrupted_at"] = iso_now()
-                self.skill_projects.save(project)
-            except Exception:
+                self.start_skill_project_runner(project_id, recovery=True)
+            except BridgeError:
                 continue
 
     def generate_skill_candidate(self, job_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -4950,6 +5391,7 @@ class VideoLinkStatusServer:
         public["prompt_template"] = self.prompt_template_metadata(public)
         public["result_resources"] = self.result_resources(public)
         public["document_preview"] = self.document_preview(public)
+        public["execution_flow"] = self.execution_flow(public)
         queued_stage = public["queue"].get("stage")
         if queued_stage and queued_stage in public["stages"]:
             public["stages"][queued_stage] = dict(public["stages"][queued_stage])
@@ -4958,6 +5400,592 @@ class VideoLinkStatusServer:
         current_info = public["stages"].get(current_stage or "", {})
         public["process"] = self.public_process_info(current_info.get("process"))
         return public
+
+    def execution_flow(self, job: dict[str, Any]) -> dict[str, Any]:
+        snapshot = job.get("runtime_profile_snapshot") or {}
+        workflow_id = str(snapshot.get("workflow_id") or VIDEO_WORKFLOW_ID)
+        schema = AUDIO_PROFILE_FLOW if workflow_id == AUDIO_WORKFLOW_ID else VIDEO_PROFILE_FLOW
+        profile = self.execution_profile_payload(job)
+        core_snapshot = self.core_progress_snapshot(job) or {}
+        node_states = core_snapshot.get("node_states") if isinstance(core_snapshot.get("node_states"), dict) else {}
+        core_progress = job.get("core_progress") or {}
+        stage_progress = job.get("stage_progress") or {}
+        summary = job.get("summary") or self.collect_summary(job)
+        run_dir = self.discover_run_dir(job)
+        analysis = read_analysis_payload(run_dir)
+        timings = ((analysis.get("metadata") or {}).get("timings") or {}) if analysis else {}
+        diarization_report = self.execution_json_artifact(run_dir, "qa/speaker_diarization_report.json")
+        snapshot_models = snapshot.get("models") if isinstance(snapshot.get("models"), dict) else {}
+
+        nodes = []
+        for spec in schema.get("nodes") or []:
+            node = dict(spec)
+            model_kind = str(node.get("model_kind") or "")
+            model_role = str(node.get("model_slot") or model_kind)
+            model = (
+                self.execution_model_metadata(profile, model_role, snapshot_models)
+                if model_kind
+                else None
+            )
+            artifacts = self.execution_node_artifacts(
+                run_dir,
+                node,
+                str(job.get("job_id") or ""),
+            )
+            state = self.execution_node_state(
+                job,
+                node,
+                model,
+                artifacts,
+                core_progress,
+                stage_progress,
+                node_states,
+            )
+            node.update(state)
+            node["model"] = model
+            node["artifacts"] = artifacts
+            node["artifact_count"] = len(artifacts)
+            node["duration_seconds"] = self.execution_node_duration(
+                node,
+                state,
+                timings,
+                diarization_report,
+                job,
+            )
+            node["metrics"] = self.execution_node_metrics(
+                node["id"],
+                summary,
+                diarization_report,
+            )
+            nodes.append(node)
+
+        edges = [dict(edge) for edge in schema.get("edges") or []]
+        active_node_ids = [
+            node["id"]
+            for node in nodes
+            if node.get("status") in {"running", "queued"}
+        ]
+        failed_node_ids = [
+            node["id"]
+            for node in nodes
+            if node.get("status") == "failed"
+        ]
+        return {
+            "version": schema.get("version") or 1,
+            "workflow_id": workflow_id,
+            "profile": snapshot.get("profile") or (job.get("options") or {}).get("profile"),
+            "profile_fingerprint": snapshot.get("fingerprint"),
+            "read_only": True,
+            "lanes": copy.deepcopy(schema.get("lanes") or []),
+            "nodes": nodes,
+            "edges": edges,
+            "active_node_ids": active_node_ids,
+            "failed_node_ids": failed_node_ids,
+            "mermaid": self.execution_flow_mermaid(nodes, edges),
+        }
+
+    def execution_profile_payload(self, job: dict[str, Any]) -> dict[str, Any]:
+        snapshot = job.get("runtime_profile_snapshot") or {}
+        config_dir = str(snapshot.get("config_dir") or "")
+        profile_name = str(snapshot.get("profile") or "")
+        if config_dir:
+            path = Path(config_dir) / "config.json"
+            if path.is_file():
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    profile = (payload.get("runtime_profiles") or {}).get(profile_name)
+                    if isinstance(profile, dict):
+                        return profile
+                except Exception:
+                    pass
+        profiles = runtime_config().get("runtime_profiles") or {}
+        profile = profiles.get(profile_name)
+        return dict(profile) if isinstance(profile, dict) else {}
+
+    def execution_model_metadata(
+        self,
+        profile: dict[str, Any],
+        kind: str,
+        snapshot_models: dict[str, Any],
+    ) -> dict[str, Any]:
+        role_labels = {
+            "asr": "ASR",
+            "diarization": "说话人分离",
+            "ocr": "OCR",
+            "vision": "VL",
+            "text": "文本 LLM",
+            "text_fallback": "核心文本兜底",
+            "review": "审核 LLM",
+            "study": "学习模型",
+            "triage": "Triage 模型",
+            "image": "图片模型",
+            "asr_fallback": "云端 ASR 回退",
+            "diarization_fallback": "云端分离回退",
+            "selector": "模板选择模型",
+        }
+        resource_fields = {
+            "asr": "asr_model_id",
+            "diarization": "diarization_model_id",
+            "ocr": "ocr_model_id",
+            "vision": "vision_model_id",
+            "text": "text_model_id",
+            "text_fallback": "text_fallback_model_id",
+            "review": "review_model_id",
+            "study": "study_card_model_id",
+            "triage": "triage_model_id",
+            "image": "image_model_id",
+            "asr_fallback": "asr_fallback_model_id",
+            "diarization_fallback": "diarization_fallback_model_id",
+            "selector": "template_selector_model_id",
+        }
+        endpoint = ""
+        provider = ""
+        model = ""
+        worker_count = None
+        concurrency = None
+        deployment = ""
+        enabled = True
+        inherited_from = None
+
+        if kind == "asr":
+            provider = str(profile.get("asr_provider") or snapshot_models.get("asr") or "")
+            model = str(profile.get("asr_model") or provider)
+            endpoint = str(
+                profile.get(f"{provider}_url")
+                or profile.get("firered_asr2_url")
+                or profile.get("qwen3_asr_url")
+                or profile.get("deep_remote_url")
+                or ""
+            )
+            options = profile.get(f"{provider}_options") or profile.get("asr_options") or {}
+            worker_count = options.get("worker_count") or profile.get("asr_worker_count")
+            concurrency = options.get("concurrency") or profile.get("asr_concurrency")
+            deployment = str(options.get("deployment") or "")
+            enabled = provider not in {"", "none", "disabled"}
+        elif kind == "diarization":
+            config = profile.get("speaker_diarization") or {}
+            provider = str(config.get("backend") or "speaker_diarization")
+            model = str(config.get("model_id") or snapshot_models.get("diarization") or provider)
+            endpoint = str(config.get("base_url") or config.get("url") or "")
+            worker_count = config.get("worker_count")
+            concurrency = config.get("concurrency")
+            deployment = str(config.get("deployment") or "")
+            enabled = bool(config.get("enabled"))
+        elif kind == "ocr":
+            provider = str(profile.get("ocr_provider") or "")
+            model = str(profile.get("ocr_model") or snapshot_models.get("ocr") or provider)
+            endpoints = profile.get("ocr_base_urls") or []
+            endpoint = str(profile.get("ocr_base_url") or (endpoints[0] if endpoints else ""))
+            worker_count = profile.get("ocr_worker_count")
+            concurrency = profile.get("ocr_concurrency")
+            enabled = provider not in {"", "none", "disabled"}
+        elif kind == "vision":
+            runtime = profile.get("vision_runtime") or {}
+            provider = str(runtime.get("engine") or "openai_compatible")
+            model = str(profile.get("vision_model") or snapshot_models.get("vision") or "")
+            endpoint = str(profile.get("vision_base_url") or "")
+            worker_count = runtime.get("worker_count") or profile.get("vision_worker_count")
+            concurrency = runtime.get("concurrency") or profile.get("vl_concurrency")
+            deployment = str(runtime.get("deployment") or "")
+            enabled = bool(model) and provider not in {"none", "disabled"}
+        elif kind == "text":
+            provider = str(profile.get("runtime") or "openai_compatible")
+            model = str(profile.get("text_model") or snapshot_models.get("text") or "")
+            endpoint = str(profile.get("text_base_url") or profile.get("llm_base_url") or "")
+            worker_count = profile.get("worker_count")
+            concurrency = profile.get("concurrency")
+            deployment = str(profile.get("deployment") or "")
+            enabled = bool(model)
+        elif kind == "text_fallback":
+            provider = "openai_compatible"
+            model = str(
+                profile.get("text_fallback_model")
+                or snapshot_models.get("text_fallback")
+                or ""
+            )
+            endpoint = str(profile.get("text_fallback_base_url") or "")
+            worker_count = profile.get("text_fallback_worker_count")
+            concurrency = profile.get("text_fallback_concurrency")
+            deployment = str(
+                profile.get("text_fallback_deployment") or "cloud"
+            )
+            enabled = bool(
+                profile.get("text_fallback_enabled") and model and endpoint
+            )
+        elif kind == "review":
+            model = str(profile.get("review_model") or profile.get("text_model") or snapshot_models.get("review") or "")
+            endpoint = str(profile.get("review_base_url") or profile.get("text_base_url") or profile.get("llm_base_url") or "")
+            provider = str(profile.get("review_runtime") or profile.get("runtime") or "openai_compatible")
+            enabled = bool(profile.get("review_enabled", True) and model)
+            if not profile.get("review_model"):
+                inherited_from = "text"
+        elif kind == "study":
+            model = str(profile.get("study_card_model") or profile.get("text_model") or snapshot_models.get("study") or "")
+            endpoint = str(profile.get("study_card_llm_base_url") or profile.get("text_base_url") or "")
+            provider = "openai_compatible"
+            enabled = bool(profile.get("study_card_enabled", True) and model)
+            if not profile.get("study_card_model"):
+                inherited_from = "text"
+        elif kind == "triage":
+            model = str(profile.get("triage_model") or profile.get("study_card_model") or profile.get("text_model") or "")
+            endpoint = str(
+                profile.get("triage_llm_base_url")
+                or profile.get("study_card_llm_base_url")
+                or profile.get("text_base_url")
+                or ""
+            )
+            provider = "openai_compatible"
+            enabled = bool(profile.get("triage_enabled", True) and model)
+            if not profile.get("triage_model"):
+                inherited_from = "study" if profile.get("study_card_model") else "text"
+        elif kind == "image":
+            provider = str(profile.get("image_provider") or snapshot_models.get("image") or "")
+            model = str(profile.get("image_model") or provider)
+            endpoint = str(profile.get("image_base_url") or "")
+            enabled = bool(profile.get("image_enabled", True) and provider not in {"", "none", "disabled"})
+        elif kind in {"asr_fallback", "diarization_fallback"}:
+            fallback = profile.get("audio_cloud_fallback") or {}
+            config = fallback.get("asr" if kind == "asr_fallback" else "diarization") or {}
+            provider = str(config.get("protocol") or config.get("provider") or "")
+            model = str(
+                config.get("model")
+                or config.get("name")
+                or snapshot_models.get(kind)
+                or ""
+            )
+            endpoints = config.get("endpoints") or []
+            endpoint = str(config.get("endpoint") or (endpoints[0] if endpoints else ""))
+            worker_count = (config.get("options") or {}).get("worker_count")
+            concurrency = (config.get("options") or {}).get("concurrency")
+            deployment = str(config.get("deployment") or "云端")
+            enabled = bool(fallback.get("enabled") and provider not in {"", "none"})
+        elif kind == "selector":
+            provider = "openai_compatible"
+            model = str(
+                profile.get("template_selector_model")
+                or snapshot_models.get("selector")
+                or ""
+            )
+            endpoint = str(
+                profile.get("template_selector_base_url")
+                or profile.get("study_card_llm_base_url")
+                or ""
+            )
+            enabled = bool(profile.get("template_selector_enabled", True) and model)
+
+        deployment = deployment or self.execution_endpoint_deployment(endpoint)
+        label = model or provider or role_labels.get(kind, kind)
+        if kind == "diarization" and provider and model and provider.lower() != model.lower():
+            label = f"{provider} · {model}"
+        return {
+            "role": kind,
+            "role_label": role_labels.get(kind, kind),
+            "resource_id": profile.get(resource_fields.get(kind, "")) if resource_fields.get(kind) else None,
+            "provider": provider or None,
+            "model": model or None,
+            "label": label,
+            "endpoint": endpoint or None,
+            "deployment": deployment,
+            "worker_count": worker_count,
+            "concurrency": concurrency,
+            "enabled": enabled,
+            "inherited_from": inherited_from,
+        }
+
+    @staticmethod
+    def execution_endpoint_deployment(endpoint: str) -> str:
+        if not endpoint:
+            return "未指定"
+        try:
+            hostname = (urlparse(endpoint).hostname or "").lower()
+        except Exception:
+            hostname = ""
+        if hostname in {"127.0.0.1", "localhost", "::1"}:
+            return "本机"
+        if hostname.endswith(".taild500c8.ts.net") or hostname.startswith("100."):
+            return "远程设备"
+        return "云端"
+
+    def execution_node_artifacts(
+        self,
+        run_dir: Path | None,
+        node: dict[str, Any],
+        job_id: str,
+    ) -> list[dict[str, Any]]:
+        if not run_dir:
+            return []
+        candidates = []
+        if node.get("artifact_path"):
+            candidates.append(str(node["artifact_path"]))
+        candidates.extend(EXECUTION_NODE_ARTIFACTS.get(str(node.get("id") or ""), ()))
+        artifacts = []
+        seen = set()
+        for relative in candidates:
+            if relative in seen:
+                continue
+            seen.add(relative)
+            path = run_dir / relative
+            if path.is_file() and path.stat().st_size > 0:
+                artifacts.append(
+                    {
+                        "path": relative,
+                        "type": "file",
+                        "size_bytes": path.stat().st_size,
+                        "url": self.resource_url(job_id, relative) if job_id else None,
+                    }
+                )
+            elif path.is_dir():
+                files = [candidate for candidate in path.rglob("*") if candidate.is_file()]
+                if files:
+                    artifacts.append(
+                        {
+                            "path": relative,
+                            "type": "directory",
+                            "file_count": len(files),
+                            "size_bytes": sum(candidate.stat().st_size for candidate in files),
+                            "url": None,
+                        }
+                    )
+        return artifacts
+
+    def execution_node_state(
+        self,
+        job: dict[str, Any],
+        node: dict[str, Any],
+        model: dict[str, Any] | None,
+        artifacts: list[dict[str, Any]],
+        core_progress: dict[str, Any],
+        stage_progress: dict[str, Any],
+        node_states: dict[str, Any],
+    ) -> dict[str, Any]:
+        node_id = str(node.get("id") or "")
+        stage = str(node.get("stage") or "")
+        stage_info = (job.get("stages") or {}).get(stage) or {}
+        stage_status = str(stage_info.get("status") or "pending")
+        if node.get("node_kind") == "output":
+            if artifacts:
+                return {"status": "succeeded", "message": "最终文档已生成"}
+            if stage_status == "failed":
+                return {"status": "failed", "message": stage_info.get("error") or "最终文档未生成"}
+            if stage not in self.stage_order_for_job(job):
+                return {"status": "skipped", "message": "当前分析深度不生成该文档"}
+            return {"status": "pending", "message": "等待最终发布"}
+
+        exact_state = node_states.get(node_id)
+        if isinstance(exact_state, dict):
+            return {
+                "status": str(exact_state.get("status") or "pending"),
+                "message": exact_state.get("message"),
+                "started_at": exact_state.get("started_at"),
+                "finished_at": exact_state.get("finished_at"),
+                "progress": exact_state.get("progress"),
+            }
+        if model and not model.get("enabled"):
+            return {"status": "skipped", "message": "该模型能力未启用"}
+
+        if stage == "analyze-core":
+            if stage_status in {"succeeded", "skipped", "failed"}:
+                return {"status": stage_status, "message": stage_info.get("error")}
+            progress_step = str(node.get("progress_step") or "")
+            steps = {
+                str(step.get("id")): step
+                for step in core_progress.get("steps") or []
+            }
+            step = steps.get(progress_step)
+            if step:
+                status = str(step.get("status") or "pending")
+                if node_id == "diarization" and status == "pending":
+                    asr_status = str((steps.get("asr") or {}).get("status") or "pending")
+                    if asr_status == "running":
+                        status = "running"
+                return {
+                    "status": status,
+                    "message": step.get("message"),
+                    "progress": (
+                        (core_progress.get("vl") or {}).get("percent")
+                        if progress_step == "vl"
+                        else None
+                    ),
+                }
+            if node_id == "diarization":
+                asr_status = str((steps.get("asr") or {}).get("status") or "pending")
+                if asr_status == "running":
+                    return {"status": "running", "message": "与 ASR 并行执行"}
+            if artifacts:
+                return {"status": "succeeded", "message": "已从现有产物确认完成"}
+            if stage_status == "queued":
+                return {"status": "queued", "message": stage_info.get("queued_for") or "等待核心资源"}
+            return {"status": "pending", "message": "等待核心分析"}
+
+        if stage not in self.stage_order_for_job(job):
+            return {"status": "skipped", "message": "当前分析深度跳过该节点"}
+        if stage_status in {"succeeded", "skipped"}:
+            return {"status": stage_status, "message": "阶段已完成"}
+        if stage_status == "failed":
+            return {"status": "failed", "message": stage_info.get("error") or "阶段失败"}
+        stage_step = str(node.get("stage_step") or "")
+        if stage_step and stage_progress.get("stage") == stage:
+            step = next(
+                (
+                    item
+                    for item in stage_progress.get("steps") or []
+                    if str(item.get("id")) == stage_step
+                ),
+                None,
+            )
+            if step:
+                return {
+                    "status": str(step.get("status") or stage_status),
+                    "message": step.get("message"),
+                    "progress": (stage_progress.get("position") or {}).get("percent"),
+                }
+        if artifacts and stage_status == "pending":
+            return {"status": "succeeded", "message": "已从现有产物确认完成"}
+        return {
+            "status": stage_status,
+            "message": stage_info.get("error")
+            or stage_info.get("warning")
+            or ("正在处理" if stage_status == "running" else "等待前序节点"),
+            "started_at": stage_info.get("started_at") or stage_info.get("queued_at"),
+            "finished_at": stage_info.get("finished_at"),
+            "progress": stage_progress.get("percent") if stage_progress.get("stage") == stage else None,
+        }
+
+    def execution_node_duration(
+        self,
+        node: dict[str, Any],
+        state: dict[str, Any],
+        timings: dict[str, Any],
+        diarization_report: dict[str, Any],
+        job: dict[str, Any],
+    ) -> float | None:
+        started = parse_iso_timestamp(state.get("started_at"))
+        finished = parse_iso_timestamp(state.get("finished_at"))
+        if started:
+            return round(max(0.0, (finished or time.time()) - started), 3)
+        timing_keys = {
+            "asr": "asr_seconds",
+            "frame_extract": "candidate_frame_extraction_seconds",
+            "ocr": "ocr_seconds",
+            "vision": "vl_seconds",
+            "visual_evidence": "vl_seconds",
+            "text": "manual_generation_seconds",
+        }
+        if node.get("id") == "diarization":
+            value = diarization_report.get("elapsed_seconds")
+            if isinstance(value, (int, float)):
+                return round(float(value), 3)
+        timing = timings.get(timing_keys.get(str(node.get("id") or "")))
+        if isinstance(timing, (int, float)):
+            return round(float(timing), 3)
+        stage = str(node.get("stage") or "")
+        stage_duration = ((job.get("stages") or {}).get(stage) or {}).get("duration_seconds")
+        if stage != "analyze-core" and isinstance(stage_duration, (int, float)):
+            return round(float(stage_duration), 3)
+        return None
+
+    @staticmethod
+    def execution_node_metrics(
+        node_id: str,
+        summary: dict[str, Any],
+        diarization_report: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        counts = summary.get("core_counts") or {}
+        metrics = {
+            "frame_extract": [("候选帧", counts.get("frames_extracted"))],
+            "ocr": [
+                ("OCR 帧", counts.get("ocr_keyframes")),
+                ("文本事件", counts.get("ocr_text_events")),
+            ],
+            "vision": [("VL 帧", counts.get("vl_frames"))],
+            "diarization": [
+                (
+                    "说话人数",
+                    diarization_report.get("final_speaker_count")
+                    or diarization_report.get("detected_speaker_count"),
+                )
+            ],
+            "documents": [
+                ("章节", (summary.get("multidoc") or {}).get("chapter_count"))
+            ],
+            "qa_index": [
+                ("证据切片", (summary.get("qa") or {}).get("chunk_count"))
+            ],
+            "image": [("最终图片", len(summary.get("final_images") or []))],
+        }.get(node_id, [])
+        return [
+            {"label": label, "value": value}
+            for label, value in metrics
+            if value is not None
+        ]
+
+    @staticmethod
+    def execution_json_artifact(run_dir: Path | None, relative: str) -> dict[str, Any]:
+        if not run_dir:
+            return {}
+        path = run_dir / relative
+        if not path.is_file():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def execution_flow_mermaid(
+        self,
+        nodes: list[dict[str, Any]],
+        edges: list[dict[str, Any]],
+    ) -> str:
+        def safe(value: Any, limit: int = 52) -> str:
+            text = re.sub(r"\s+", " ", str(value or "")).strip()
+            if len(text) > limit:
+                text = text[: limit - 1] + "…"
+            return text.replace('"', "'")
+
+        status_labels = {
+            "pending": "等待",
+            "queued": "排队",
+            "running": "运行中",
+            "succeeded": "完成",
+            "skipped": "跳过",
+            "failed": "失败",
+            "stopped": "停止",
+        }
+        lines = ["flowchart LR"]
+        for node in nodes:
+            model = node.get("model") or {}
+            model_label = safe(model.get("label"), 38) if model else ""
+            status = str(node.get("status") or "pending")
+            footer = status_labels.get(status, status)
+            if node.get("artifact_count"):
+                footer += f" · {node['artifact_count']} 个产物"
+            label_parts = [safe(node.get("title"))]
+            if model_label:
+                label_parts.append(model_label)
+            elif node.get("subtitle"):
+                label_parts.append(safe(node.get("subtitle"), 42))
+            label_parts.append(footer)
+            lines.append(f'  {node["id"]}["{"<br/>".join(label_parts)}"]')
+        for edge in edges:
+            label = safe(edge.get("label"), 28)
+            connector = f" -->|{label}| " if label else " --> "
+            lines.append(f"  {edge['from']}{connector}{edge['to']}")
+        lines.extend(
+            [
+                "  classDef pending fill:#ffffff,stroke:#cbd5e1,color:#344054;",
+                "  classDef queued fill:#fffbeb,stroke:#d97706,color:#92400e;",
+                "  classDef running fill:#eff6ff,stroke:#2563eb,color:#1d4ed8,stroke-width:2px;",
+                "  classDef succeeded fill:#f0fdf4,stroke:#16a34a,color:#166534;",
+                "  classDef skipped fill:#f8fafc,stroke:#94a3b8,color:#64748b,stroke-dasharray:4 3;",
+                "  classDef failed fill:#fff1f2,stroke:#e11d48,color:#9f1239,stroke-width:2px;",
+                "  classDef stopped fill:#fff7ed,stroke:#ea580c,color:#9a3412;",
+            ]
+        )
+        for node in nodes:
+            status = str(node.get("status") or "pending")
+            lines.append(f"  class {node['id']} {status};")
+        return "\n".join(lines)
 
     def audio_prompt_template_actual(self, run_dir: Path) -> dict[str, Any] | None:
         for path in (run_dir / "audio_template_analysis.json", run_dir / "analysis.json"):
@@ -5527,6 +6555,19 @@ class VideoLinkStatusServer:
         current_label = next((step.get("label") for step in steps if step.get("id") == current_step), None)
         visible_steps = [step for step in steps if step.get("status") != "pending"]
         last_signal = visible_steps[-1] if visible_steps else None
+        position = progress.get("position")
+        if not position and current_step:
+            current = next((step for step in steps if step.get("id") == current_step), None)
+            position = {
+                "kind": "step",
+                "label": current_label or current_step,
+                "current": None,
+                "total": None,
+                "unit": "step",
+                "percent": progress.get("percent"),
+                "eta_seconds": None,
+                "detail": (current or {}).get("message"),
+            }
         progress.update(
             {
                 "stage": stage,
@@ -5538,6 +6579,7 @@ class VideoLinkStatusServer:
                 "last_signal_label": last_signal.get("label") if last_signal else None,
                 "stale": bool(status == "queued" and visible_steps and not live),
                 "summary": self.stage_progress_summary(job, stage, status, live, current_label),
+                "position": position,
             }
         )
         return progress
@@ -6048,6 +7090,7 @@ class VideoLinkStatusServer:
                 "ocr": resolved_profile.get("ocr_model") or resolved_profile.get("ocr_provider"),
                 "vision": resolved_profile.get("vision_model"),
                 "text": resolved_profile.get("text_model"),
+                "text_fallback": resolved_profile.get("text_fallback_model"),
                 "review": resolved_profile.get("review_model") or resolved_profile.get("text_model"),
                 "study": resolved_profile.get("study_card_model") or resolved_profile.get("text_model"),
                 "image": resolved_profile.get("image_provider") or "codex_imagegen",
@@ -6388,6 +7431,8 @@ def merge_core_progress_snapshot(
             merged["details"] = details
         if vl_progress:
             merged["vl"] = vl_progress
+        if isinstance(snapshot.get("node_states"), dict):
+            merged["node_states"] = snapshot["node_states"]
         return merged
 
     snapshot_status = str(snapshot.get("status") or "running")
@@ -6432,6 +7477,38 @@ def merge_core_progress_snapshot(
         )
         completed_weight += CORE_PROGRESS_WEIGHTS.get("vl", 0) * fraction
         merged["percent"] = min(99, max(0, int(round(completed_weight / total_weight * 100))))
+        current_frame = vl_progress.get("current_frame_number")
+        frame_label = f" · 帧 #{current_frame}" if current_frame is not None else ""
+        merged["position"] = {
+            "kind": "frame",
+            "label": f"VL {completed}/{total}{frame_label}",
+            "current": completed,
+            "total": total,
+            "unit": "frame",
+            "percent": round(fraction * 100, 1) if total else None,
+            "eta_seconds": vl_progress.get("eta_seconds"),
+            "detail": (
+                f"当前帧 #{current_frame}"
+                if current_frame is not None
+                else str(snapshot.get("message") or "")
+            )
+            or None,
+        }
+    elif merged.get("current_step"):
+        current = next(
+            (step for step in steps if step.get("id") == merged.get("current_step")),
+            None,
+        )
+        merged["position"] = {
+            "kind": "step",
+            "label": (current or {}).get("label") or merged.get("current_step"),
+            "current": None,
+            "total": None,
+            "unit": "step",
+            "percent": merged.get("percent"),
+            "eta_seconds": None,
+            "detail": str(snapshot.get("message") or (current or {}).get("message") or "") or None,
+        }
     merged["steps"] = steps
     merged["source"] = "progress_json"
     merged["progress_updated_at"] = snapshot.get("updated_at")
@@ -6439,11 +7516,102 @@ def merge_core_progress_snapshot(
         merged["details"] = details
     if vl_progress:
         merged["vl"] = vl_progress
+    if isinstance(snapshot.get("node_states"), dict):
+        merged["node_states"] = snapshot["node_states"]
     return merged
 
 
 def parse_stage_progress(stage: str, text: str, stage_status: str) -> dict[str, Any]:
-    return parse_progress_steps(text, stage_status, STAGE_PROGRESS_STEPS.get(stage, []))
+    progress = parse_progress_steps(text, stage_status, STAGE_PROGRESS_STEPS.get(stage, []))
+    position = extract_stage_progress_position(stage, text, progress)
+    if position:
+        progress["position"] = position
+    return progress
+
+
+def extract_stage_progress_position(
+    stage: str,
+    text: str,
+    progress: dict[str, Any],
+) -> dict[str, Any] | None:
+    if stage == "prepare" and progress.get("current_step") == "download":
+        matches = list(
+            re.finditer(
+                r"^\[download\]\s+(\d+(?:\.\d+)?)%.*?(?:\sat\s+(.+?))?\s+ETA\s+(\d+:\d+(?::\d+)?)\s*$",
+                text,
+                flags=re.MULTILINE,
+            )
+        )
+        if matches:
+            match = matches[-1]
+            percent = max(0.0, min(float(match.group(1)), 100.0))
+            speed = str(match.group(2) or "").strip()
+            eta_text = match.group(3)
+            return {
+                "kind": "download",
+                "label": f"下载 {percent:g}%",
+                "current": percent,
+                "total": 100,
+                "unit": "percent",
+                "percent": percent,
+                "eta_seconds": parse_clock_duration(eta_text),
+                "detail": f"{speed} · ETA {eta_text}" if speed else f"ETA {eta_text}",
+            }
+
+    if stage == "deep-v2" and progress.get("current_step") == "chapters":
+        matches = list(
+            re.finditer(
+                r"\[(?:run|skip)\]\s+chapter\s+(\d+)/(\d+)(?::\s*(.*))?",
+                text,
+            )
+        )
+        if matches:
+            match = matches[-1]
+            current = max(int(match.group(1)), 0)
+            total = max(int(match.group(2)), 0)
+            return {
+                "kind": "chapter",
+                "label": f"章节 {current}/{total}",
+                "current": current,
+                "total": total,
+                "unit": "chapter",
+                "percent": round(min(current / total, 1.0) * 100, 1) if total else None,
+                "eta_seconds": None,
+                "detail": str(match.group(3) or "").strip() or None,
+            }
+
+    current_step = progress.get("current_step")
+    current = next(
+        (step for step in progress.get("steps") or [] if step.get("id") == current_step),
+        None,
+    )
+    if current_step and current:
+        return {
+            "kind": "step",
+            "label": current.get("label") or current_step,
+            "current": None,
+            "total": None,
+            "unit": "step",
+            "percent": progress.get("percent"),
+            "eta_seconds": None,
+            "detail": current.get("message"),
+        }
+    return None
+
+
+def parse_clock_duration(value: str) -> int | None:
+    parts = str(value or "").strip().split(":")
+    if len(parts) not in {2, 3}:
+        return None
+    try:
+        numbers = [int(part) for part in parts]
+    except ValueError:
+        return None
+    if len(numbers) == 2:
+        minutes, seconds = numbers
+        return minutes * 60 + seconds
+    hours, minutes, seconds = numbers
+    return hours * 3600 + minutes * 60 + seconds
 
 
 def stage_progress_text(stage: str, job: dict[str, Any], stage_info: dict[str, Any]) -> str:
@@ -8309,6 +9477,21 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/skill-projects":
                 self.write_json(self.server_app.list_skill_projects())
                 return
+            if path == "/api/skill-projects/workbench":
+                query = parse_qs(parsed.query)
+                self.write_json(
+                    self.server_app.skill_project_workbench(
+                        query.get("project_id", [""])[0]
+                    )
+                )
+                return
+            match = re.fullmatch(r"/api/skill-projects/([a-f0-9]{32})/packages/preview", path)
+            if match:
+                package_id = parse_qs(parsed.query).get("package_id", [""])[0]
+                self.write_json(
+                    self.server_app.preview_skill_project_package(match.group(1), package_id)
+                )
+                return
             match = re.fullmatch(r"/api/skill-projects/([a-f0-9]{32})", path)
             if match:
                 self.write_json(self.server_app.get_skill_project(match.group(1)))
@@ -8473,6 +9656,12 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             if match:
                 self.write_json(
                     self.server_app.add_skill_project_source(match.group(1), payload)
+                )
+                return
+            match = re.fullmatch(r"/api/skill-projects/([a-f0-9]{32})/packages", path)
+            if match:
+                self.write_json(
+                    self.server_app.import_skill_project_package(match.group(1), payload)
                 )
                 return
             match = re.fullmatch(r"/api/skill-projects/([a-f0-9]{32})/assess", path)

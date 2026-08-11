@@ -1,5 +1,6 @@
 import importlib.util
 import io
+import json
 import sys
 import tempfile
 import types
@@ -392,6 +393,18 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertNotIn("用 Flash 继续", main_js)
         self.assertNotIn("resumeProfile", main_js)
         self.assertIn('id="stageDurationSummary"', html)
+        self.assertIn('id="consoleStageFlowViewport"', html)
+        self.assertIn('id="consoleStageFlow"', html)
+        self.assertIn('id="consoleStageInspector"', html)
+        self.assertIn('id="consoleStageLogButton"', html)
+        self.assertIn('id="consoleFlowZoomOut"', html)
+        self.assertIn('id="consoleFlowFit"', html)
+        self.assertIn('id="consoleFlowZoomIn"', html)
+        self.assertIn('id="consoleStageInspectorArtifacts"', html)
+        self.assertIn("模型执行与文档推导", html)
+        self.assertIn('id="consoleSummaryGrid"', html)
+        self.assertIn('id="consoleResultSummary"', html)
+        self.assertIn('class="stage-table-details"', html)
         self.assertIn('id="coreDiagnosticsPanel"', html)
         self.assertNotIn('id="previewView"', html)
         self.assertNotIn('id="previewGrid"', html)
@@ -414,6 +427,13 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn('id="skillProjectsWorkspace"', html)
         self.assertIn('id="skillProjectForm"', html)
         self.assertIn('id="createTargetedSkillProjectButton"', html)
+        self.assertIn('id="skillProjectPackageId"', html)
+        self.assertIn('id="previewSkillProjectPackageButton"', html)
+        self.assertIn('id="importSkillProjectPackageButton"', html)
+        self.assertIn('id="skillProjectFlow"', html)
+        self.assertIn('id="skillProjectInspectorTitle"', html)
+        self.assertIn('id="skillProjectLogText"', html)
+        self.assertNotIn('id="skillProjectImportText"', html)
         self.assertIn('id="skillLibraryWorkspace"', html)
         self.assertIn('id="skillEditor"', html)
         self.assertIn('id="openSkillsWorkspaceButton"', html)
@@ -478,14 +498,21 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn("enableSkillCandidate", main_js)
         self.assertIn("loadCurrentSkillsWorkspace", main_js)
         self.assertIn("loadSkillProjects", main_js)
+        self.assertIn("/api/skill-projects/workbench", main_js)
+        self.assertIn("previewSkillProjectPackage", main_js)
         self.assertIn("startSkillProjectDistillation", main_js)
         self.assertIn("syncSkillProjectPolling", main_js)
+        self.assertIn("importSkillProjectPackage", main_js)
+        self.assertIn("video_analyzer_package", main_js)
+        self.assertIn("secondary_action", main_js)
+        self.assertIn("尚未开始蒸馏。点击“开始蒸馏”后，此处会显示实时阶段日志。", main_js)
         self.assertIn("renderSkillProjectCandidateReview", main_js)
         self.assertIn("skillProjectCandidateDrafts", main_js)
         self.assertIn("data-project-candidate-confirm", main_js)
         self.assertIn("loadSkillProjectLog", main_js)
         self.assertIn("data-skill-project-log-stage", main_js)
         self.assertIn("skill-project-log-console", styles_css)
+        self.assertIn("skill-project-flow-node", styles_css)
         self.assertIn("skill-project-spinner", styles_css)
         self.assertIn(".skill-project-candidate-review", styles_css)
         self.assertIn("/api/skill-projects", main_js)
@@ -602,6 +629,24 @@ class VideoAnalyzerUITests(unittest.TestCase):
             ui.video_link.skill_projects = status_server.SkillProjectStore(
                 repo_root / "var" / "skill-projects"
             )
+            run_dir = (
+                repo_root
+                / "downloads"
+                / "url-videos"
+                / "UI-package-001"
+                / "operation-manual-001"
+            )
+            orin = run_dir / "orin"
+            orin.mkdir(parents=True)
+            run_dir.joinpath("operation_manual.md").write_text("# 操作手册\n\n执行并验证。", encoding="utf-8")
+            orin.joinpath("transcript.json").write_text(
+                json.dumps({"segments": [{"start": 0, "end": 3, "text": "执行并验证。"}]}),
+                encoding="utf-8",
+            )
+            orin.joinpath("ocr_events.json").write_text(
+                json.dumps([{"timestamp": 1, "frame_number": 1, "text": "完成"}]),
+                encoding="utf-8",
+            )
             client = ui.app.test_client()
 
             created = client.post(
@@ -611,6 +656,14 @@ class VideoAnalyzerUITests(unittest.TestCase):
             project_id = created.get_json()["id"]
             listed = client.get("/api/skill-projects")
             assessed = client.post(f"/api/skill-projects/{project_id}/assess", json={})
+            preview = client.get(
+                f"/api/skill-projects/{project_id}/packages/preview?package_id=UI-package-001"
+            )
+            imported = client.post(
+                f"/api/skill-projects/{project_id}/packages",
+                json={"package_id": "UI-package-001"},
+            )
+            workbench = client.get(f"/api/skill-projects/workbench?project_id={project_id}")
             updated = client.patch(
                 f"/api/skill-projects/{project_id}",
                 json={"expected_output": "给出检查步骤"},
@@ -619,6 +672,14 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertEqual(created.status_code, 201)
         self.assertEqual(listed.get_json()["count"], 1)
         self.assertEqual(assessed.get_json()["assessment"]["verdict"], "needs_materials")
+        self.assertEqual(preview.status_code, 200)
+        self.assertTrue(preview.get_json()["can_import"])
+        self.assertTrue(imported.get_json()["created"])
+        self.assertEqual(workbench.get_json()["selected_project_id"], project_id)
+        self.assertEqual(
+            [node["id"] for node in workbench.get_json()["flow"]["nodes"]],
+            ["goal", "packages", "readiness", "overview", "candidates", "build", "enable"],
+        )
         self.assertEqual(updated.get_json()["brief"]["expected_output"], "给出检查步骤")
 
     def test_skill_library_routes_cover_edit_and_state_changes(self):
@@ -948,10 +1009,25 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn("durationMinutes", js)
         self.assertIn("stageDurationSummary", js)
         self.assertIn("原视频长度", js)
+        self.assertIn("renderConsoleStageFlow", js)
+        self.assertIn("renderConsoleExecutionDiagram", js)
+        self.assertIn("consoleFlowAncestors", js)
+        self.assertIn("execution_flow", js)
+        self.assertIn("renderConsoleStageInspector", js)
+        self.assertIn("renderConsoleSummary", js)
+        self.assertIn("normalizedStagePosition", js)
+        self.assertIn("updateConsoleElapsedClock", js)
+        self.assertIn("data-console-elapsed-start", js)
         self.assertIn("stop-action", js)
         self.assertIn("play-action", js)
         self.assertIn("'stop'", js)
         self.assertIn(".stage-duration-summary", css)
+        self.assertIn(".console-stage-flow", css)
+        self.assertIn(".console-stage-flow .node.status-running", css)
+        self.assertIn(".console-stage-inspector-artifacts", css)
+        self.assertIn(".console-stage-inspector", css)
+        self.assertIn(".console-summary-grid", css)
+        self.assertIn(".console-result-summary", css)
         self.assertIn("button.play-action", css)
         self.assertIn("button.stop-action", css)
         self.assertIn(".core-diagnostics-panel", css)

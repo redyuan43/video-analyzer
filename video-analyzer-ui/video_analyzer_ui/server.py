@@ -35,7 +35,7 @@ class VideoAnalyzerUI:
         port=5000,
         dev_mode=False,
         jobs_dir=DEFAULT_JOBS_DIR,
-        video_link_auto_resume=True,
+        video_link_auto_resume=None,
         debug_console_enabled=True,
     ):
         package_dir = Path(__file__).resolve().parent
@@ -49,7 +49,14 @@ class VideoAnalyzerUI:
         self.dev_mode = dev_mode
         self.sessions = {}
         self.runtime_identity = RuntimeIdentity(VIDEO_LINK_REPO_ROOT)
-        self.video_link = VideoLinkStatusServer(Path(jobs_dir), VIDEO_LINK_REPO_ROOT, auto_resume=video_link_auto_resume)
+        resolved_jobs_dir = Path(jobs_dir).resolve()
+        if video_link_auto_resume is None:
+            video_link_auto_resume = resolved_jobs_dir == DEFAULT_JOBS_DIR.resolve()
+        self.video_link = VideoLinkStatusServer(
+            resolved_jobs_dir,
+            VIDEO_LINK_REPO_ROOT,
+            auto_resume=bool(video_link_auto_resume),
+        )
         self.debug_console = WebDebugConsole(
             self.app,
             VIDEO_LINK_REPO_ROOT,
@@ -736,6 +743,17 @@ class VideoAnalyzerUI:
             except BridgeError as exc:
                 return jsonify({'error': exc.message}), int(exc.status)
 
+        @self.app.route('/api/skill-projects/workbench')
+        def skill_projects_workbench():
+            try:
+                return jsonify(
+                    self.video_link.skill_project_workbench(
+                        request.args.get('project_id', '')
+                    )
+                )
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
         @self.app.route('/api/skill-projects', methods=['POST'])
         def skill_projects_create():
             try:
@@ -769,6 +787,30 @@ class VideoAnalyzerUI:
             try:
                 return jsonify(
                     self.video_link.add_skill_project_source(
+                        project_id,
+                        request.get_json(silent=True) or {},
+                    )
+                )
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/skill-projects/<project_id>/packages/preview')
+        def skill_projects_preview_package(project_id):
+            try:
+                return jsonify(
+                    self.video_link.preview_skill_project_package(
+                        project_id,
+                        request.args.get('package_id', ''),
+                    )
+                )
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/skill-projects/<project_id>/packages', methods=['POST'])
+        def skill_projects_import_package(project_id):
+            try:
+                return jsonify(
+                    self.video_link.import_skill_project_package(
                         project_id,
                         request.get_json(silent=True) or {},
                     )

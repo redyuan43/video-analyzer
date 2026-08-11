@@ -141,16 +141,45 @@ class ModelSettingsTests(unittest.TestCase):
         node_ids = {item["id"] for item in flow["nodes"]}
         edges = {(item["from"], item["to"]) for item in flow["edges"]}
         models = {item["id"]: item for item in settings["models"]}
-        self.assertEqual(flow["version"], 1)
-        self.assertTrue({"asr", "diarization", "ocr", "vision", "evidence_merge", "final_publish"} <= node_ids)
-        self.assertIn(("input", "audio_extract"), edges)
-        self.assertIn(("input", "frame_extract"), edges)
+        self.assertEqual(flow["version"], 3)
+        self.assertTrue(
+            {
+                "asr",
+                "diarization",
+                "transcript_merge",
+                "ocr",
+                "vision",
+                "visual_evidence",
+                "evidence_merge",
+                "text_fallback",
+                "deep_report",
+                "deep_review",
+                "web_evidence",
+                "final_publish",
+                "operation_manual_doc",
+            }
+            <= node_ids
+        )
+        self.assertIn(("input", "prepare"), edges)
+        self.assertIn(("prepare", "audio_extract"), edges)
+        self.assertIn(("prepare", "frame_extract"), edges)
         self.assertIn(("audio_extract", "asr"), edges)
         self.assertIn(("audio_extract", "diarization"), edges)
         self.assertNotIn(("asr", "diarization"), edges)
-        self.assertIn(("asr", "evidence_merge"), edges)
-        self.assertIn(("vision", "evidence_merge"), edges)
+        self.assertIn(("asr", "transcript_merge"), edges)
+        self.assertIn(("diarization", "transcript_merge"), edges)
+        self.assertIn(("ocr", "vision"), edges)
+        self.assertNotIn(("frame_extract", "vision"), edges)
+        self.assertIn(("visual_evidence", "evidence_merge"), edges)
+        self.assertIn(("text", "text_fallback"), edges)
+        self.assertIn(("text_fallback", "core_verify"), edges)
+        self.assertIn(("final_publish", "operation_manual_doc"), edges)
         self.assertEqual(models["vision-disabled"]["protocol"], "none")
+        self.assertEqual(models["text-disabled"]["protocol"], "none")
+        self.assertEqual(
+            models["text-deepseek-v4-pro"]["model"],
+            "deepseek-v4-pro",
+        )
         self.assertEqual(models["review-inherit-text"]["protocol"], "inherit_text")
         self.assertEqual(models["image-disabled"]["protocol"], "none")
 
@@ -213,6 +242,43 @@ class ModelSettingsTests(unittest.TestCase):
         self.assertEqual(profile["text_model"], "prism-ml/bonsai-27b")
         self.assertEqual(profile["reasoning_effort"], "none")
         self.assertEqual(profile["text_timeout_seconds"], 900)
+
+    def test_video_profile_can_enable_or_disable_text_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_repo(root)
+            settings = store.public_settings()
+            source = settings["profiles"][0]
+            models = {
+                slot: source[spec["field"]]
+                for slot, spec in settings["schema"]["workflows"][
+                    "video_operation_manual"
+                ]["model_fields"].items()
+                if spec["field"] in source
+            }
+            models["text_fallback"] = "text-deepseek-v4-pro"
+            store.save_profile(
+                "with-fallback",
+                {"label": "With fallback", "models": models, "settings": {}},
+            )
+            _defaults, _user, merged = store.load()
+            enabled = get_runtime_profile(merged, "with-fallback")
+
+            models["text_fallback"] = "text-disabled"
+            store.save_profile(
+                "without-fallback",
+                {"label": "Without fallback", "models": models, "settings": {}},
+            )
+            _defaults, _user, merged = store.load()
+            disabled = get_runtime_profile(merged, "without-fallback")
+
+        self.assertTrue(enabled["text_fallback_enabled"])
+        self.assertEqual(enabled["text_fallback_model"], "deepseek-v4-pro")
+        self.assertEqual(
+            enabled["text_fallback_api_key_env"],
+            "DEEPSEEK_API_KEY",
+        )
+        self.assertFalse(disabled["text_fallback_enabled"])
 
     def test_local_firered_profile_expands_to_local_runtime_fields(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -442,10 +508,14 @@ class ModelSettingsTests(unittest.TestCase):
                 result = store.test_profile({"profile_name": "draft", "mode": "quick", "models": models})
 
         self.assertTrue(result["ok"])
-        self.assertEqual(result["summary"]["total"], 17)
+        self.assertEqual(
+            result["summary"]["total"],
+            len(settings["schema"]["profile_flow"]["nodes"]),
+        )
         self.assertEqual(set(result["results"]), {item["id"] for item in settings["schema"]["profile_flow"]["nodes"]})
         self.assertEqual(result["results"]["input"]["status"], "configured")
         self.assertEqual(result["results"]["text"]["status"], "reachable")
+        self.assertEqual(result["results"]["documents"]["reused_slot_result"], "text")
 
     def test_pathway_profile_test_prepares_local_model_stages(self):
         with tempfile.TemporaryDirectory() as tmp:

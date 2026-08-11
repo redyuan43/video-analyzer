@@ -201,6 +201,20 @@ class Config:
             for extra_key in ("deepseek_thinking", "reasoning_effort"):
                 if profile.get(extra_key):
                     manual_config[extra_key] = profile[extra_key]
+            for fallback_key in (
+                "text_fallback_enabled",
+                "text_fallback_base_url",
+                "text_fallback_model",
+                "text_fallback_api_key_env",
+                "text_fallback_text_temperature",
+                "text_fallback_text_timeout_seconds",
+                "text_fallback_deepseek_thinking",
+                "text_fallback_reasoning_effort",
+            ):
+                if fallback_key in profile:
+                    manual_config[fallback_key] = copy.deepcopy(
+                        profile[fallback_key]
+                    )
             if profile.get("api_key_env"):
                 self.config["clients"]["openai_api"]["api_key_env"] = profile["api_key_env"]
             self.config["clients"]["default"] = "openai_api"

@@ -7,6 +7,7 @@ import os
 import subprocess
 import tempfile
 import threading
+from functools import wraps
 from pathlib import Path
 
 from flask import Flask, jsonify, request
@@ -18,10 +19,29 @@ MODEL_LOCK = threading.Lock()
 MODEL_DIR = os.environ.get("FIRERED_ASR2_MODEL", "/home/ai/models/firered/FireRedASR2-AED")
 
 
+def install_forced_align_dtype_compat() -> None:
+    import torch
+    import torchaudio
+
+    original = torchaudio.functional.forced_align
+    if getattr(original, "_firered_dtype_compat", False):
+        return
+
+    @wraps(original)
+    def compatible_forced_align(log_probs, *args, **kwargs):
+        if log_probs.dtype not in {torch.float16, torch.float32, torch.float64}:
+            log_probs = log_probs.float()
+        return original(log_probs, *args, **kwargs)
+
+    compatible_forced_align._firered_dtype_compat = True
+    torchaudio.functional.forced_align = compatible_forced_align
+
+
 def load_model():
     global MODEL
     with MODEL_LOCK:
         if MODEL is None:
+            install_forced_align_dtype_compat()
             from fireredasr2s.fireredasr2 import FireRedAsr2, FireRedAsr2Config
 
             MODEL = FireRedAsr2.from_pretrained(

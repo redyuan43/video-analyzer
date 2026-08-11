@@ -1,16 +1,95 @@
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
+from video_analyzer.audio_processor import AudioTranscript
 from video_analyzer.cli import append_evidence_boundary_section
 from video_analyzer.manual import (
+    build_operation_manual_prompt,
     embed_step_images,
+    generate_operation_manual,
     render_raw_evidence_text,
     render_text_evidence_map,
+    resolve_manual_prompt_char_budget,
     review_operation_manual_markdown,
 )
+from video_analyzer.ocr import OCREvent
 
 
 class ManualQualityTests(unittest.TestCase):
+    def test_long_manual_prompt_respects_context_derived_character_budget(self):
+        budget = resolve_manual_prompt_char_budget(100_000)
+        transcript = AudioTranscript(
+            text="这是长访谈内容。" * 20_000,
+            segments=[
+                {"start": index, "end": index + 1, "text": "逐段转写内容" * 30}
+                for index in range(400)
+            ],
+            language="zh-CN",
+        )
+        frames = [
+            SimpleNamespace(number=index, timestamp=float(index), path=Path(f"/tmp/frame_{index}.jpg"))
+            for index in range(100)
+        ]
+        analyses = [{"response": "视觉分析" * 500} for _ in frames]
+        ocr_events = [
+            OCREvent(index, float(index), "test", "ok", "OCR文本" * 300, [])
+            for index in range(100)
+        ]
+
+        prompt = build_operation_manual_prompt(
+            analyses,
+            frames,
+            transcript,
+            {"strategy": "deep"},
+            ocr_events,
+            "页面上下文" * 10_000,
+            "zh-CN",
+            {index: f"manual_assets/frame_{index:03d}.jpg" for index in range(100)},
+            max_prompt_chars=budget,
+        )
+
+        self.assertLessEqual(len(prompt), budget)
+        self.assertIn("Return Markdown with these sections:", prompt)
+        self.assertIn("Transcript已压缩", prompt)
+
+    def test_manual_generation_uses_configured_fallback_after_primary_error(self):
+        primary = MagicMock()
+        primary.generate.side_effect = RuntimeError("context exceeded")
+        fallback = MagicMock()
+        fallback.generate.return_value = {
+            "response": "# 操作手册\n\n## 概览\n\n完成。",
+            "context": "not persisted",
+        }
+        callback = MagicMock()
+
+        result = generate_operation_manual(
+            client=primary,
+            text_model="local-model",
+            frame_analyses=[],
+            frames=[],
+            transcript=None,
+            asr_metadata={},
+            ocr_events=[],
+            page_context="",
+            language="zh-CN",
+            temperature=0.2,
+            fallback_client=fallback,
+            fallback_model="deepseek-v4-pro",
+            fallback_temperature=1.0,
+            fallback_status_callback=callback,
+        )
+
+        self.assertTrue(result["fallback_used"])
+        self.assertEqual(result["fallback_model"], "deepseek-v4-pro")
+        self.assertNotIn("context", result)
+        fallback.generate.assert_called_once()
+        callback.assert_any_call(
+            "succeeded",
+            "fallback model deepseek-v4-pro completed",
+        )
+
     def test_error_placeholder_fails_quality_gate(self):
         issues = review_operation_manual_markdown("Error generating operation manual: timed out")
 

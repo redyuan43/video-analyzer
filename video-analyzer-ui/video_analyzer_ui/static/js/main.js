@@ -35,6 +35,13 @@ const skillTestPhaseNames = {
 const initialParams = new URLSearchParams(window.location.search);
 let selectedJobId = initialParams.get('job') || document.querySelector('.app-shell')?.dataset.initialJob || null;
 let selectedLogStage = null;
+let selectedConsoleStage = '';
+let selectedConsoleNodeId = '';
+let consoleFlowJobId = '';
+let consoleFlowCenteredKey = '';
+let consoleFlowRenderKey = '';
+let consoleFlowRenderSequence = 0;
+let consoleFlowScale = 1;
 let refreshTimer = null;
 let currentJob = null;
 let latestJobs = [];
@@ -66,11 +73,20 @@ let selectedLibrarySkillId = '';
 let currentLibrarySkill = null;
 let currentSkillEditorTab = 'edit';
 let skillLibrarySearchTimer = null;
+let skillLibraryProjectSkillNames = null;
 let selectedSkillProjectId = initialParams.get('project') || '';
 let currentSkillProject = null;
 let currentSkillProjectWorkspace = null;
+let currentSkillProjectFlow = null;
 let skillProjectPollTimer = null;
 let skillProjectPollInFlight = false;
+let skillProjectWorkbenchLoading = false;
+let skillProjectListSignature = '';
+let skillProjectDetailSignature = '';
+let selectedSkillProjectFlowNodeId = '';
+let skillProjectPackagePreview = null;
+let skillProjectPackageBusy = '';
+let skillProjectFlowActionBusy = '';
 let settingsData = null;
 let settingsSection = 'models';
 let selectedSettingsModelId = '';
@@ -237,6 +253,24 @@ const nodes = {
     errorPanel: document.getElementById('errorPanel'),
     errorTitle: document.getElementById('errorTitle'),
     errorMessage: document.getElementById('errorMessage'),
+    consoleFlowPanel: document.getElementById('consoleFlowPanel'),
+    consoleFlowSummary: document.getElementById('consoleFlowSummary'),
+    consoleFlowPrevious: document.getElementById('consoleFlowPrevious'),
+    consoleFlowZoomOut: document.getElementById('consoleFlowZoomOut'),
+    consoleFlowFit: document.getElementById('consoleFlowFit'),
+    consoleFlowZoomIn: document.getElementById('consoleFlowZoomIn'),
+    consoleFlowCurrent: document.getElementById('consoleFlowCurrent'),
+    consoleFlowNext: document.getElementById('consoleFlowNext'),
+    consoleStageFlowViewport: document.getElementById('consoleStageFlowViewport'),
+    consoleStageFlow: document.getElementById('consoleStageFlow'),
+    consoleStageInspector: document.getElementById('consoleStageInspector'),
+    consoleStageInspectorKicker: document.getElementById('consoleStageInspectorKicker'),
+    consoleStageInspectorTitle: document.getElementById('consoleStageInspectorTitle'),
+    consoleStageInspectorStatus: document.getElementById('consoleStageInspectorStatus'),
+    consoleStageInspectorMetrics: document.getElementById('consoleStageInspectorMetrics'),
+    consoleStageInspectorMessage: document.getElementById('consoleStageInspectorMessage'),
+    consoleStageInspectorArtifacts: document.getElementById('consoleStageInspectorArtifacts'),
+    consoleStageLogButton: document.getElementById('consoleStageLogButton'),
     detailUrl: document.getElementById('detailUrl'),
     detailRunDir: document.getElementById('detailRunDir'),
     detailMode: document.getElementById('detailMode'),
@@ -248,6 +282,10 @@ const nodes = {
     corePanel: document.getElementById('corePanel'),
     corePanelTitle: document.getElementById('corePanelTitle'),
     coreRows: document.getElementById('coreRows'),
+    consoleSummaryPanel: document.getElementById('consoleSummaryPanel'),
+    consoleSummaryHeadline: document.getElementById('consoleSummaryHeadline'),
+    consoleSummaryGrid: document.getElementById('consoleSummaryGrid'),
+    consoleResultSummary: document.getElementById('consoleResultSummary'),
     coreDiagnosticsPanel: document.getElementById('coreDiagnosticsPanel'),
     coreDiagnosticsSummary: document.getElementById('coreDiagnosticsSummary'),
     coreDiagnosticsStatus: document.getElementById('coreDiagnosticsStatus'),
@@ -348,14 +386,22 @@ const nodes = {
     skillProjectTitle: document.getElementById('skillProjectTitle'),
     skillProjectGoal: document.getElementById('skillProjectGoal'),
     createSkillProjectButton: document.getElementById('createSkillProjectButton'),
-    assessSkillProjectButton: document.getElementById('assessSkillProjectButton'),
-    startSkillProjectButton: document.getElementById('startSkillProjectButton'),
+    skillProjectFlowSummary: document.getElementById('skillProjectFlowSummary'),
+    skillProjectFlowStatus: document.getElementById('skillProjectFlowStatus'),
+    skillProjectFlow: document.getElementById('skillProjectFlow'),
+    skillProjectInspectorTitle: document.getElementById('skillProjectInspectorTitle'),
+    skillProjectInspectorMeta: document.getElementById('skillProjectInspectorMeta'),
     skillProjectDetail: document.getElementById('skillProjectDetail'),
-    addCurrentJobSkillSourceButton: document.getElementById('addCurrentJobSkillSourceButton'),
     skillProjectSources: document.getElementById('skillProjectSources'),
-    skillProjectImportFile: document.getElementById('skillProjectImportFile'),
-    skillProjectImportText: document.getElementById('skillProjectImportText'),
-    importSkillProjectSourceButton: document.getElementById('importSkillProjectSourceButton'),
+    skillProjectPackageId: document.getElementById('skillProjectPackageId'),
+    previewSkillProjectPackageButton: document.getElementById('previewSkillProjectPackageButton'),
+    skillProjectPackageStatus: document.getElementById('skillProjectPackageStatus'),
+    skillProjectPackagePreview: document.getElementById('skillProjectPackagePreview'),
+    importSkillProjectPackageButton: document.getElementById('importSkillProjectPackageButton'),
+    skillProjectLogSummary: document.getElementById('skillProjectLogSummary'),
+    skillProjectLogTabs: document.getElementById('skillProjectLogTabs'),
+    copySkillProjectLogButton: document.getElementById('copySkillProjectLogButton'),
+    skillProjectLogText: document.getElementById('skillProjectLogText'),
     skillLibraryWorkspace: document.getElementById('skillLibraryWorkspace'),
     skillLibraryGrid: document.getElementById('skillLibraryGrid'),
     skillsCurrentCount: document.getElementById('skillsCurrentCount'),
@@ -468,8 +514,11 @@ function durationMinutes(value) {
 
 function totalStageDuration(job) {
     return (job.stage_order || []).reduce((total, stage) => {
-        const value = Number(job.stages?.[stage]?.duration_seconds);
-        return Number.isFinite(value) && value > 0 ? total + value : total;
+        const info = job.stages?.[stage] || {};
+        const value = Number(info.duration_seconds);
+        if (Number.isFinite(value) && value > 0) return total + value;
+        const live = info.status === 'running' ? elapsedSeconds(info.started_at) : null;
+        return live != null ? total + live : total;
     }, 0);
 }
 
@@ -487,6 +536,38 @@ function formatClock(value) {
     const remaining = seconds % 60;
     if (hours) return `${hours}:${String(minutes).padStart(2, '0')}:${String(remaining).padStart(2, '0')}`;
     return `${minutes}:${String(remaining).padStart(2, '0')}`;
+}
+
+function timestampMilliseconds(value) {
+    if (!value) return null;
+    const normalized = String(value).replace(/([+-]\d{2})(\d{2})$/, '$1:$2');
+    const parsed = Date.parse(normalized);
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
+function elapsedSeconds(startedAt, finishedAt = null) {
+    const started = timestampMilliseconds(startedAt);
+    const finished = timestampMilliseconds(finishedAt) ?? Date.now();
+    if (started == null || finished < started) return null;
+    return Math.max(0, (finished - started) / 1000);
+}
+
+function consoleElapsedMarkup(startedAt, finishedAt, prefix) {
+    const seconds = elapsedSeconds(startedAt, finishedAt);
+    if (seconds == null) return '-';
+    const live = !finishedAt;
+    const attributes = live
+        ? ` data-console-elapsed-start="${escapeHtml(startedAt)}" data-console-elapsed-prefix="${escapeHtml(prefix)}"`
+        : '';
+    return `<span class="console-live-elapsed"${attributes}>${escapeHtml(prefix)}${escapeHtml(formatClock(seconds))}</span>`;
+}
+
+function updateConsoleElapsedClock() {
+    document.querySelectorAll('[data-console-elapsed-start]').forEach(node => {
+        const seconds = elapsedSeconds(node.dataset.consoleElapsedStart);
+        if (seconds == null) return;
+        node.textContent = `${node.dataset.consoleElapsedPrefix || ''}${formatClock(seconds)}`;
+    });
 }
 
 function clampPercent(value) {
@@ -1064,7 +1145,8 @@ function setProfileModelSelections(profile = null) {
         const items = settingsModels(spec.kind);
         const requested = profile?.[spec.field] || profileModelSelections[slot] || '';
         const selected = items.find(item => item.id === requested)
-            || items.find(item => !spec.required || item.protocol !== 'none')
+            || (!spec.required ? items.find(item => item.protocol === 'none') : null)
+            || items.find(item => item.protocol !== 'none')
             || null;
         next[slot] = selected?.id || '';
     });
@@ -1267,7 +1349,7 @@ function profileFlowParameter(node) {
     if (node.model_kind === 'vision') {
         return { label: 'VL 并发', target: nodes.profileVlConcurrency, type: 'number', min: '1' };
     }
-    if (node.model_kind === 'text') {
+    if (node.model_kind === 'text' && node.model_slot !== 'text_fallback') {
         return { label: '文本超时秒数', target: nodes.profileTextTimeout, type: 'number', min: '1' };
     }
     return null;
@@ -1356,6 +1438,14 @@ function renderProfileFlowInspector(nodeId = selectedProfileFlowNodeId) {
 function renderProfileFlow() {
     if (!nodes.profileFlowNodes) return;
     const schema = profileFlowSchema();
+    const maxColumn = Math.max(1, ...(schema.nodes || []).map(node => Number(node.column) || 1));
+    const maxRow = Math.max(1, ...(schema.nodes || []).map(node => Number(node.row) || 1));
+    nodes.profileFlowCanvas.style.setProperty('--profile-flow-columns', String(maxColumn));
+    nodes.profileFlowCanvas.style.setProperty('--profile-flow-rows', String(maxRow));
+    nodes.profileFlowCanvas.style.setProperty(
+        '--profile-flow-height',
+        `${72 + (maxRow * 142) + (Math.max(0, maxRow - 1) * 54)}px`
+    );
     const lanes = Object.fromEntries((schema.lanes || []).map(item => [item.id, item.label]));
     nodes.profileFlowLegend.innerHTML = (schema.lanes || []).map(lane => (
         `<span class="profile-flow-legend-item lane-${escapeHtml(lane.id)}">${escapeHtml(lane.label)}</span>`
@@ -1747,6 +1837,9 @@ function setResourceView(view, updateUrl = true) {
 
 function setSkillsScope(scope, updateUrl = true) {
     currentSkillsScope = ['projects', 'enabled', 'disabled', 'trash'].includes(scope) ? scope : 'current';
+    if (currentSkillsScope !== 'enabled') {
+        skillLibraryProjectSkillNames = null;
+    }
     nodes.skillsScopeTabs.forEach(button => {
         button.classList.toggle('active', button.dataset.skillsScope === currentSkillsScope);
     });
@@ -1972,6 +2065,11 @@ function bindJobButtons() {
 
 function renderEmpty() {
     currentJob = null;
+    consoleFlowJobId = '';
+    selectedConsoleStage = '';
+    selectedConsoleNodeId = '';
+    consoleFlowCenteredKey = '';
+    consoleFlowRenderKey = '';
     nodes.runButton.disabled = true;
     nodes.runButton.classList.remove('success-action', 'play-action', 'stop-action');
     nodes.runButton.dataset.action = 'run';
@@ -1980,11 +2078,17 @@ function renderEmpty() {
     nodes.selectedTitle.textContent = '未选择任务';
     nodes.selectedSubtitle.textContent = '创建或选择一个任务后查看进度。';
     nodes.stageDurationSummary.textContent = '原视频长度：- · 阶段总耗时：-';
+    renderConsoleEmptyState('选择任务后显示执行流程');
     renderQaPanel(null);
 }
 
 function renderServiceOffline(error) {
     currentJob = null;
+    consoleFlowJobId = '';
+    selectedConsoleStage = '';
+    selectedConsoleNodeId = '';
+    consoleFlowCenteredKey = '';
+    consoleFlowRenderKey = '';
     nodes.runButton.disabled = true;
     nodes.runButton.classList.remove('success-action', 'play-action', 'stop-action');
     nodes.runButton.dataset.action = 'run';
@@ -1999,6 +2103,7 @@ function renderServiceOffline(error) {
     nodes.stageDurationSummary.textContent = '原视频长度：- · 阶段总耗时：-';
     nodes.progressText.textContent = '0/0 · 0%';
     nodes.progressBar.style.width = '0%';
+    renderConsoleEmptyState('服务恢复连接后显示执行流程');
     renderQaPanel(null);
 }
 
@@ -2020,6 +2125,14 @@ function jobIsActive(job) {
 
 function renderJob(job) {
     currentJob = job;
+    if (consoleFlowJobId !== job.job_id) {
+        consoleFlowJobId = job.job_id;
+        selectedConsoleStage = '';
+        selectedConsoleNodeId = '';
+        consoleFlowCenteredKey = '';
+        consoleFlowRenderKey = '';
+        consoleFlowScale = 1;
+    }
     if (sourcePlayerState.jobId && sourcePlayerState.jobId !== job.job_id) {
         sourcePlayerState.jobId = job.job_id;
         sourcePlayerState.seconds = null;
@@ -2109,8 +2222,9 @@ function renderJob(job) {
     } else {
         nodes.errorPanel.hidden = true;
     }
-    renderStages(job);
+    renderStages(job, stageProgress);
     renderStageProgress(stageProgress);
+    renderConsoleSummary(job);
     renderCoreDiagnostics(job.core_diagnostics);
     renderArtifacts(job.summary || {});
     renderConsoleSkillPanel(job);
@@ -2119,7 +2233,116 @@ function renderJob(job) {
     loadSelectedLog(job);
 }
 
-function renderStages(job) {
+function stageStatusLabel(status) {
+    return {
+        pending: '等待',
+        queued: '排队',
+        running: '运行中',
+        succeeded: '成功',
+        skipped: '跳过',
+        failed: '失败',
+        stopped: '已停止',
+        created: '待启动'
+    }[status] || status || '等待';
+}
+
+function preferredConsoleStage(job) {
+    const order = job.stage_order || [];
+    if (selectedConsoleStage && order.includes(selectedConsoleStage)) return selectedConsoleStage;
+    const failed = order.find(stage => job.stages?.[stage]?.status === 'failed');
+    const completed = [...order].reverse().find(stage => ['succeeded', 'skipped'].includes(job.stages?.[stage]?.status));
+    return job.current_stage || failed || job.next_stage || completed || order[0] || '';
+}
+
+function stageProgressFor(stage, progress) {
+    return progress?.stage === stage ? progress : null;
+}
+
+function normalizedStagePosition(progress) {
+    if (!progress) return {};
+    if (progress.position?.label) return progress.position;
+    const vl = progress.vl || progress.details?.vl;
+    const completed = Number(vl?.completed);
+    const total = Number(vl?.total_selected);
+    if (Number.isFinite(completed) && Number.isFinite(total) && total > 0) {
+        const currentFrame = vl.current_frame_number;
+        return {
+            kind: 'frame',
+            label: `VL ${completed}/${total}${currentFrame != null ? ` · 帧 #${currentFrame}` : ''}`,
+            current: completed,
+            total,
+            unit: 'frame',
+            percent: clampPercent((completed / total) * 100),
+            eta_seconds: vl.eta_seconds,
+            detail: currentFrame != null ? `当前帧 #${currentFrame}` : ''
+        };
+    }
+    const current = (progress.steps || []).find(step => step.id === progress.current_step);
+    const message = current?.message || '';
+    const chapter = message.match(/\[(?:run|skip)\]\s+chapter\s+(\d+)\/(\d+)(?::\s*(.*))?/i);
+    if (chapter) {
+        return {
+            kind: 'chapter',
+            label: `章节 ${chapter[1]}/${chapter[2]}`,
+            current: Number(chapter[1]),
+            total: Number(chapter[2]),
+            unit: 'chapter',
+            percent: clampPercent((Number(chapter[1]) / Number(chapter[2])) * 100),
+            detail: chapter[3] || ''
+        };
+    }
+    const download = message.match(/^\[download\]\s+(\d+(?:\.\d+)?)%.*?(?:\sat\s+(.+?))?\s+ETA\s+(\d+:\d+(?::\d+)?)\s*$/i);
+    if (download) {
+        return {
+            kind: 'download',
+            label: `下载 ${download[1]}%`,
+            current: Number(download[1]),
+            total: 100,
+            unit: 'percent',
+            percent: Number(download[1]),
+            detail: [download[2], `ETA ${download[3]}`].filter(Boolean).join(' · ')
+        };
+    }
+    return {};
+}
+
+function stagePositionText(job, stage, info, progress) {
+    const activeProgress = stageProgressFor(stage, progress);
+    const position = normalizedStagePosition(activeProgress);
+    if (position.label) return position.label;
+    if (activeProgress?.current_label) return activeProgress.current_label;
+    if (info.status === 'queued') {
+        const position = info.queue_position || job.queue?.position;
+        const size = job.queue?.size;
+        const resource = info.queued_for || job.queue?.resource || '资源';
+        return `等待 ${resource}${position ? ` #${position}${size ? `/${size}` : ''}` : ''}`;
+    }
+    if (info.status === 'failed') return info.error || '阶段失败';
+    if (info.status === 'running') return '正在处理';
+    if (info.status === 'succeeded') return '阶段已完成';
+    if (info.status === 'skipped') return '无需执行';
+    return '等待前序阶段';
+}
+
+function stageElapsedMarkup(job, stage, info) {
+    const status = info.status || 'pending';
+    if (status === 'running') {
+        const startedAt = info.started_at || (job.current_stage === stage ? job.runner?.started_at : null);
+        return startedAt ? consoleElapsedMarkup(startedAt, null, '已运行 ') : '运行中';
+    }
+    if (status === 'queued') {
+        const queuedAt = info.queued_at || (job.current_stage === stage ? job.runner?.updated_at : null);
+        return queuedAt ? consoleElapsedMarkup(queuedAt, null, '已等待 ') : '等待资源';
+    }
+    const seconds = Number(info.duration_seconds);
+    if (Number.isFinite(seconds) && seconds >= 0) return `耗时 ${formatClock(seconds)}`;
+    if (status === 'skipped') return '已跳过';
+    if (status === 'failed') return '执行中断';
+    return '尚未开始';
+}
+
+function renderStages(job, stageProgress) {
+    renderConsoleStageFlow(job, stageProgress);
     nodes.stageRows.innerHTML = (job.stage_order || []).map(stage => {
         const info = job.stages?.[stage] || {};
         const status = info.status || 'pending';
@@ -2139,10 +2362,375 @@ function renderStages(job) {
     document.querySelectorAll('.log-link').forEach(button => {
         button.addEventListener('click', () => {
             selectedLogStage = button.dataset.stage;
+            selectedConsoleStage = button.dataset.stage;
+            const matchingNode = (job.execution_flow?.nodes || []).find(node => node.stage === selectedConsoleStage);
+            if (matchingNode) selectedConsoleNodeId = matchingNode.id;
+            renderConsoleStageFlow(job, stageProgress);
             loadSelectedLog(job);
         });
     });
     nodes.stageDurationSummary.textContent = stageDurationSummary(job);
+}
+
+function renderConsoleStageFlow(job, stageProgress) {
+    const flow = job.execution_flow;
+    if (!flow?.nodes?.length) {
+        renderConsoleEmptyState('当前任务没有可显示的执行拓扑');
+        return;
+    }
+    selectedConsoleNodeId = preferredConsoleNode(job);
+    const selectedNode = flow.nodes.find(node => node.id === selectedConsoleNodeId);
+    selectedConsoleStage = selectedNode?.stage || preferredConsoleStage(job);
+    nodes.consoleFlowSummary.innerHTML = consoleFlowHeadline(job, stageProgress);
+    renderConsoleStageInspector(job, stageProgress);
+    void renderConsoleExecutionDiagram(job);
+}
+
+function consoleFlowHeadline(job, stageProgress) {
+    const flow = job.execution_flow || {};
+    const active = (flow.active_node_ids || [])
+        .map(nodeId => (flow.nodes || []).find(node => node.id === nodeId)?.title)
+        .filter(Boolean);
+    const failed = (flow.failed_node_ids || [])
+        .map(nodeId => (flow.nodes || []).find(node => node.id === nodeId)?.title)
+        .filter(Boolean);
+    const location = active.length
+        ? `正在执行：${active.join('、')}`
+        : failed.length
+            ? `失败节点：${failed.join('、')}`
+            : job.status === 'succeeded'
+                ? '模型执行与文档生成均已完成'
+                : job.next_stage
+                    ? `下一阶段：${stageNames[job.next_stage] || job.next_stage}`
+                    : '等待继续运行';
+    const runner = job.runner || {};
+    const elapsed = runner.started_at
+        ? consoleElapsedMarkup(runner.started_at, runner.finished_at, runner.finished_at ? '总耗时 ' : '已运行 ')
+        : '-';
+    return `<span>${escapeHtml(location)}</span><span class="console-flow-summary-time">${elapsed}</span>`;
+}
+
+function preferredConsoleNode(job) {
+    const flow = job.execution_flow || {};
+    const flowNodes = flow.nodes || [];
+    if (selectedConsoleNodeId && flowNodes.some(node => node.id === selectedConsoleNodeId)) {
+        return selectedConsoleNodeId;
+    }
+    return flow.active_node_ids?.[0]
+        || flow.failed_node_ids?.[0]
+        || (job.status === 'succeeded'
+            ? flowNodes.find(node => node.id === 'input')?.id
+            : flowNodes.find(node => node.status === 'pending')?.id)
+        || [...flowNodes].reverse().find(node => node.status === 'succeeded')?.id
+        || flowNodes[0]?.id
+        || '';
+}
+
+function consoleFlowNodeElement(nodeId) {
+    if (!nodeId || !nodes.consoleStageFlow) return null;
+    return Array.from(nodes.consoleStageFlow.querySelectorAll('g.node')).find(node => {
+        const id = node.getAttribute('id') || '';
+        return id === nodeId
+            || id.startsWith(`flowchart-${nodeId}-`)
+            || id.includes(`-${nodeId}-`);
+    }) || null;
+}
+
+async function renderConsoleExecutionDiagram(job) {
+    const flow = job.execution_flow || {};
+    const source = String(flow.mermaid || '').trim();
+    const renderKey = `${job.job_id}:${source}`;
+    if (renderKey === consoleFlowRenderKey && nodes.consoleStageFlow.querySelector('svg')) {
+        applyConsoleFlowSelection(job);
+        applyConsoleFlowScale();
+        return;
+    }
+    if (!source) {
+        nodes.consoleStageFlow.innerHTML = '<div class="console-stage-flow-empty">当前任务没有执行图定义</div>';
+        return;
+    }
+    const fallback = renderSimpleMermaidFlowchart(source);
+    if (!initializeMermaid()) {
+        nodes.consoleStageFlow.innerHTML = fallback || '<div class="console-stage-flow-empty">Mermaid 渲染器未加载</div>';
+        return;
+    }
+    const sequence = ++consoleFlowRenderSequence;
+    nodes.consoleStageFlow.classList.add('loading');
+    nodes.consoleStageFlow.innerHTML = '<div class="console-stage-flow-empty">执行图渲染中...</div>';
+    try {
+        const result = await window.mermaid.render(`console-execution-${Date.now()}-${sequence}`, source);
+        if (sequence !== consoleFlowRenderSequence || currentJob?.job_id !== job.job_id) return;
+        nodes.consoleStageFlow.classList.remove('loading');
+        nodes.consoleStageFlow.innerHTML = result?.svg || fallback;
+        consoleFlowRenderKey = renderKey;
+        bindConsoleFlowDiagram(job);
+        applyConsoleFlowScale();
+        applyConsoleFlowSelection(job);
+        const currentNodeId = flow.active_node_ids?.[0] || selectedConsoleNodeId;
+        const centerKey = `${job.job_id}:${currentNodeId}`;
+        if (currentNodeId && centerKey !== consoleFlowCenteredKey) {
+            consoleFlowCenteredKey = centerKey;
+            window.requestAnimationFrame(() => scrollConsoleNodeIntoView(currentNodeId, 'auto'));
+        }
+    } catch (error) {
+        console.warn('Console execution flow render failed', error);
+        if (sequence !== consoleFlowRenderSequence) return;
+        nodes.consoleStageFlow.classList.remove('loading');
+        nodes.consoleStageFlow.innerHTML = `${fallback || ''}<div class="console-stage-flow-empty">执行图渲染失败：${escapeHtml(error?.message || String(error))}</div>`;
+    }
+}
+
+function bindConsoleFlowDiagram(job) {
+    const flow = job.execution_flow || {};
+    (flow.nodes || []).forEach(flowNode => {
+        const graphNode = consoleFlowNodeElement(flowNode.id);
+        if (!graphNode) return;
+        graphNode.dataset.consoleNodeId = flowNode.id;
+        graphNode.classList.add('console-flow-svg-node', `status-${flowNode.status || 'pending'}`);
+        if (flowNode.node_kind) graphNode.classList.add(`kind-${flowNode.node_kind}`);
+        graphNode.setAttribute('role', 'button');
+        graphNode.setAttribute('tabindex', '0');
+        graphNode.setAttribute(
+            'aria-label',
+            `${flowNode.title || flowNode.id}，${stageStatusLabel(flowNode.status)}`
+        );
+        const select = () => selectConsoleFlowNode(job, flowNode.id);
+        graphNode.addEventListener('click', select);
+        graphNode.addEventListener('keydown', event => {
+            if (event.key !== 'Enter' && event.key !== ' ') return;
+            event.preventDefault();
+            select();
+        });
+    });
+    const edgeElements = Array.from(nodes.consoleStageFlow.querySelectorAll('g.edgePath'));
+    edgeElements.forEach((element, index) => {
+        const edge = (flow.edges || [])[index];
+        if (!edge) return;
+        element.dataset.edgeFrom = edge.from;
+        element.dataset.edgeTo = edge.to;
+    });
+    const edgeLabels = Array.from(nodes.consoleStageFlow.querySelectorAll('g.edgeLabel'));
+    edgeLabels.forEach((element, index) => {
+        const edge = (flow.edges || [])[index];
+        if (!edge) return;
+        element.dataset.edgeFrom = edge.from;
+        element.dataset.edgeTo = edge.to;
+    });
+}
+
+function selectConsoleFlowNode(job, nodeId) {
+    selectedConsoleNodeId = nodeId;
+    const flowNode = (job.execution_flow?.nodes || []).find(node => node.id === nodeId);
+    selectedConsoleStage = flowNode?.stage || '';
+    applyConsoleFlowSelection(job);
+    renderConsoleStageInspector(job, job.stage_progress);
+    scrollConsoleNodeIntoView(nodeId);
+}
+
+function consoleFlowAncestors(flow, nodeId) {
+    const related = new Set([nodeId]);
+    let changed = true;
+    while (changed) {
+        changed = false;
+        (flow.edges || []).forEach(edge => {
+            if (related.has(edge.to) && !related.has(edge.from)) {
+                related.add(edge.from);
+                changed = true;
+            }
+        });
+    }
+    return related;
+}
+
+function applyConsoleFlowSelection(job) {
+    const flow = job.execution_flow || {};
+    const selected = (flow.nodes || []).find(node => node.id === selectedConsoleNodeId);
+    const showLineage = selected?.node_kind === 'output';
+    const related = showLineage ? consoleFlowAncestors(flow, selectedConsoleNodeId) : null;
+    (flow.nodes || []).forEach(flowNode => {
+        const graphNode = consoleFlowNodeElement(flowNode.id);
+        if (!graphNode) return;
+        graphNode.classList.toggle('selected', flowNode.id === selectedConsoleNodeId);
+        graphNode.classList.toggle('lineage-related', Boolean(related?.has(flowNode.id)));
+        graphNode.classList.toggle('lineage-dimmed', Boolean(related && !related.has(flowNode.id)));
+    });
+    nodes.consoleStageFlow.querySelectorAll('[data-edge-from][data-edge-to]').forEach(edge => {
+        const inLineage = related?.has(edge.dataset.edgeFrom) && related?.has(edge.dataset.edgeTo);
+        edge.classList.toggle('lineage-related', Boolean(inLineage));
+        edge.classList.toggle('lineage-dimmed', Boolean(related && !inLineage));
+    });
+}
+
+function scrollConsoleNodeIntoView(nodeId, behavior = 'smooth') {
+    if (!nodes.consoleStageFlowViewport || !nodeId) return;
+    const target = consoleFlowNodeElement(nodeId);
+    if (!target) return;
+    const viewportRect = nodes.consoleStageFlowViewport.getBoundingClientRect();
+    const targetRect = target.getBoundingClientRect();
+    const left = nodes.consoleStageFlowViewport.scrollLeft
+        + targetRect.left
+        - viewportRect.left
+        - Math.max(0, (viewportRect.width - targetRect.width) / 2);
+    nodes.consoleStageFlowViewport.scrollTo({ left: Math.max(0, left), behavior });
+}
+
+function applyConsoleFlowScale() {
+    const svg = nodes.consoleStageFlow?.querySelector('svg');
+    if (!svg) return;
+    const viewBoxWidth = Number(svg.viewBox?.baseVal?.width) || 2200;
+    const width = Math.max(960, viewBoxWidth * consoleFlowScale);
+    svg.style.width = `${width}px`;
+    svg.style.maxWidth = 'none';
+    svg.style.height = 'auto';
+}
+
+function fitConsoleFlow() {
+    const svg = nodes.consoleStageFlow?.querySelector('svg');
+    if (!svg || !nodes.consoleStageFlowViewport) return;
+    const viewBoxWidth = Number(svg.viewBox?.baseVal?.width) || 2200;
+    consoleFlowScale = Math.max(0.55, Math.min(1, (nodes.consoleStageFlowViewport.clientWidth - 24) / viewBoxWidth));
+    applyConsoleFlowScale();
+    nodes.consoleStageFlowViewport.scrollTo({ left: 0, behavior: 'smooth' });
+}
+
+function renderConsoleStageInspector(job, stageProgress) {
+    const flow = job.execution_flow || {};
+    const flowNode = (flow.nodes || []).find(node => node.id === preferredConsoleNode(job));
+    if (!flowNode) {
+        nodes.consoleStageInspector.hidden = true;
+        return;
+    }
+    selectedConsoleNodeId = flowNode.id;
+    const stage = flowNode.stage || '';
+    selectedConsoleStage = stage;
+    const order = job.stage_order || [];
+    const info = job.stages?.[stage] || {};
+    const status = flowNode.status || info.status || 'pending';
+    const model = flowNode.model || {};
+    const nodeDuration = Number(flowNode.duration_seconds);
+    const elapsed = Number.isFinite(nodeDuration)
+        ? formatClock(nodeDuration)
+        : flowNode.started_at
+            ? consoleElapsedMarkup(flowNode.started_at, flowNode.finished_at, '')
+            : '-';
+    const workerText = [
+        model.worker_count != null ? `${model.worker_count} worker` : '',
+        model.concurrency != null ? `并发 ${model.concurrency}` : ''
+    ].filter(Boolean).join(' · ') || '-';
+    const metrics = [
+        ['节点状态', stageStatusLabel(status)],
+        ['使用模型', model.label || (flowNode.node_kind === 'output' ? '文档产物' : '规则处理')],
+        ['提供方', model.provider || '-'],
+        ['部署位置', model.deployment || '-'],
+        ['Worker / 并发', workerText],
+        ['所属阶段', stageNames[stage] || stage || '输出'],
+        ['节点耗时', elapsed],
+        ['节点进度', flowNode.progress != null ? `${flowNode.progress}%` : '-']
+    ];
+    const message = [
+        flowNode.message,
+        model.inherited_from ? `模型继承自 ${model.inherited_from}` : '',
+        ...(flowNode.metrics || []).map(metric => `${metric.label} ${metric.value}`),
+        info.retry_reason,
+        info.warning
+    ].filter(Boolean).join('；');
+    nodes.consoleStageInspector.hidden = false;
+    nodes.consoleStageInspectorKicker.textContent = flowNode.node_kind === 'output'
+        ? '最终文档推导'
+        : model.role_label || `第 ${Math.max(1, order.indexOf(stage) + 1)} / ${order.length} 阶段`;
+    nodes.consoleStageInspectorTitle.textContent = flowNode.title || flowNode.id;
+    nodes.consoleStageInspectorStatus.innerHTML = `<span class="status ${escapeHtml(status)}">${escapeHtml(stageStatusLabel(status))}</span>`;
+    nodes.consoleStageInspectorMetrics.innerHTML = metrics.map(([label, value]) => `<div>
+        <span>${escapeHtml(label)}</span>
+        <strong>${label === '节点耗时' ? value : escapeHtml(value)}</strong>
+    </div>`).join('');
+    nodes.consoleStageInspectorMessage.textContent = message || flowNode.subtitle || '当前节点暂无额外运行信号。';
+    nodes.consoleStageInspectorArtifacts.innerHTML = (flowNode.artifacts || []).length
+        ? (flowNode.artifacts || []).map(artifact => artifact.url
+            ? `<a class="secondary-link" href="${escapeHtml(artifact.url)}" target="_blank" rel="noreferrer">${escapeHtml(artifact.path)}</a>`
+            : `<span>${escapeHtml(artifact.path)}${artifact.file_count != null ? ` · ${escapeHtml(artifact.file_count)} 个文件` : ''}</span>`
+        ).join('')
+        : '<span class="muted">暂无节点产物</span>';
+    nodes.consoleStageLogButton.disabled = !info.log_path;
+    nodes.consoleStageLogButton.dataset.stage = stage;
+}
+
+function renderConsoleSummary(job) {
+    const order = job.stage_order || [];
+    const completed = order.filter(stage => ['succeeded', 'skipped'].includes(job.stages?.[stage]?.status)).length;
+    const failedStage = order.find(stage => job.stages?.[stage]?.status === 'failed');
+    const totalSeconds = totalStageDuration(job);
+    const queueSeconds = order.reduce((total, stage) => {
+        const info = job.stages?.[stage] || {};
+        const seconds = info.queued_at
+            ? elapsedSeconds(info.queued_at, info.started_at || info.finished_at || (info.status === 'queued' ? null : job.updated_at))
+            : null;
+        return seconds == null ? total : total + seconds;
+    }, 0);
+    const bottleneck = order
+        .map(stage => {
+            const info = job.stages?.[stage] || {};
+            const recorded = Number(info.duration_seconds);
+            const seconds = Number.isFinite(recorded)
+                ? recorded
+                : (info.status === 'running' ? elapsedSeconds(info.started_at) : null);
+            return { stage, seconds };
+        })
+        .filter(item => Number.isFinite(item.seconds) && item.seconds >= 0)
+        .sort((left, right) => right.seconds - left.seconds)[0];
+    const runner = job.runner || {};
+    const overallElapsed = runner.started_at
+        ? consoleElapsedMarkup(runner.started_at, runner.finished_at, runner.finished_at ? '' : '')
+        : '-';
+    const coreCounts = job.summary?.core_counts || {};
+    const chapterCount = job.summary?.multidoc?.chapter_count ?? job.summary?.study?.chapter_count;
+    const markdownCount = (job.summary?.markdown_files || []).length;
+    const imageCount = (job.summary?.final_images || []).length;
+    const warningCount = (job.warnings || []).length;
+    const metrics = [
+        ['本轮耗时', overallElapsed, runner.started_at ? (runner.finished_at ? '本轮已结束' : '持续更新中') : '尚未启动'],
+        ['阶段完成', `${completed} / ${order.length}`, `${job.progress?.percent || 0}%`],
+        ['处理耗时', totalSeconds > 0 ? formatClock(totalSeconds) : '-', '各阶段执行时间合计'],
+        ['排队等待', queueSeconds > 0 ? formatClock(queueSeconds) : '0:00', '可识别的资源等待时间'],
+        ['最耗时阶段', bottleneck ? stageNames[bottleneck.stage] || bottleneck.stage : '-', bottleneck ? formatClock(bottleneck.seconds) : '暂无'],
+        ['视频长度', durationMinutes(Number(job.preview?.duration_seconds)), '源素材时长'],
+        ['文档产物', String(markdownCount), `${imageCount} 张最终图片`],
+        ['流程信号', failedStage ? '存在失败' : (warningCount ? `${warningCount} 条警告` : '正常'), failedStage ? stageNames[failedStage] || failedStage : '']
+    ];
+    nodes.consoleSummaryHeadline.textContent = failedStage
+        ? `流程停止在 ${stageNames[failedStage] || failedStage}，下方保留失败前的处理数据。`
+        : (job.status === 'succeeded'
+            ? `全部 ${order.length} 个阶段已处理完成。`
+            : `已完成 ${completed} / ${order.length} 个阶段，数据会随任务运行持续更新。`);
+    nodes.consoleSummaryGrid.innerHTML = metrics.map(([label, value, detail]) => `<div class="console-summary-metric">
+        <span>${escapeHtml(label)}</span>
+        <strong>${label === '本轮耗时' ? value : escapeHtml(value)}</strong>
+        <small>${escapeHtml(detail || '')}</small>
+    </div>`).join('');
+
+    const results = [
+        ['扫描帧', coreCounts.scan_frames],
+        ['候选帧', coreCounts.frames_extracted],
+        ['OCR候选', coreCounts.ocr_candidate_frames],
+        ['OCR帧', coreCounts.ocr_keyframes],
+        ['OCR事件', coreCounts.ocr_text_events],
+        ['VL帧', coreCounts.vl_frames],
+        ['章节', chapterCount],
+        ['最终图片', imageCount]
+    ].filter(([, value]) => value != null && (job.status === 'succeeded' || Number(value) > 0));
+    nodes.consoleResultSummary.innerHTML = results.length
+        ? results.map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join('')
+        : '<div class="console-result-empty">处理量与产物统计将在核心分析写出结果后显示。</div>';
+}
+
+function renderConsoleEmptyState(message) {
+    if (nodes.consoleFlowSummary) nodes.consoleFlowSummary.textContent = message;
+    if (nodes.consoleStageFlow) nodes.consoleStageFlow.innerHTML = `<div class="console-stage-flow-empty">${escapeHtml(message)}</div>`;
+    if (nodes.consoleStageInspector) nodes.consoleStageInspector.hidden = true;
+    if (nodes.consoleStageInspectorArtifacts) nodes.consoleStageInspectorArtifacts.innerHTML = '';
+    if (nodes.consoleSummaryHeadline) nodes.consoleSummaryHeadline.textContent = '选择任务后查看耗时、处理量和产物概况';
+    if (nodes.consoleSummaryGrid) nodes.consoleSummaryGrid.innerHTML = '';
+    if (nodes.consoleResultSummary) nodes.consoleResultSummary.innerHTML = '<div class="console-result-empty">暂无运行数据</div>';
 }
 
 function renderStageProgress(progress) {
@@ -2640,7 +3228,9 @@ function renderSkillsWorkspace(job) {
     nodes.skillLibrarySearchLabel.hidden = currentSkillsScope === 'current' || currentSkillsScope === 'projects';
     window.requestAnimationFrame(constrainSkillsLayouts);
     if (currentSkillsScope === 'projects') {
-        loadSkillProjects();
+        if (!currentSkillProject && !skillProjectWorkbenchLoading) {
+            void loadSkillProjects();
+        }
         syncSkillProjectPolling();
         return;
     }
@@ -2663,218 +3253,344 @@ function renderSkillsWorkspace(job) {
 
 async function loadSkillProjects(preferredProjectId = selectedSkillProjectId) {
     if (currentSkillsScope !== 'projects') return;
+    if (skillProjectWorkbenchLoading) return;
+    skillProjectWorkbenchLoading = true;
     try {
-        const payload = await getJson('/api/skill-projects');
-        const items = payload.items || [];
-        nodes.skillProjectsCount.textContent = `${items.length} 项`;
-        if (!items.length) {
-            selectedSkillProjectId = '';
-            currentSkillProject = null;
-            currentSkillProjectWorkspace = null;
-            nodes.skillProjectsList.innerHTML = '<div class="skills-empty">暂无项目</div>';
-            renderSkillProjectDetail();
-            return;
-        }
-        if (!items.some(item => item.id === preferredProjectId)) {
-            preferredProjectId = items[0].id;
-        }
-        selectedSkillProjectId = preferredProjectId;
-        nodes.skillProjectsList.innerHTML = items.map(item => `
-            <button class="skills-item ${item.id === selectedSkillProjectId ? 'active' : ''}" type="button" data-skill-project-id="${escapeHtml(item.id)}">
-                <strong>${escapeHtml(item.title || item.goal || item.id)}</strong>
-                <span>${escapeHtml(item.status || 'draft')} · ${escapeHtml(item.skill_type || '-')}</span>
-                <small>${escapeHtml(item.assessment?.summary || item.goal || '')}</small>
-            </button>
-        `).join('');
-        nodes.skillProjectsList.querySelectorAll('[data-skill-project-id]').forEach(button => {
-            button.addEventListener('click', () => selectSkillProject(button.dataset.skillProjectId));
-        });
-        await selectSkillProject(selectedSkillProjectId, false);
+        const payload = await getJson(
+            `/api/skill-projects/workbench?project_id=${encodeURIComponent(preferredProjectId || '')}`
+        );
+        if (currentSkillsScope !== 'projects') return;
+        applySkillProjectWorkbench(payload);
     } catch (error) {
         nodes.skillProjectsList.innerHTML = `<div class="skills-empty error-text">加载失败：${escapeHtml(error.message)}</div>`;
+    } finally {
+        skillProjectWorkbenchLoading = false;
     }
 }
 
-async function selectSkillProject(projectId, refreshList = true) {
-    if (!projectId) {
-        currentSkillProject = null;
-        currentSkillProjectWorkspace = null;
-        renderSkillProjectDetail();
-        return;
-    }
+async function selectSkillProject(projectId) {
     selectedSkillProjectId = projectId;
-    try {
-        const [project, workspace] = await Promise.all([
-            getJson(`/api/skill-projects/${projectId}`),
-            getJson(`/api/skill-projects/${projectId}/workspace`)
-        ]);
-        if (selectedSkillProjectId !== projectId || currentSkillsScope !== 'projects') return;
-        currentSkillProject = project;
-        currentSkillProjectWorkspace = workspace;
-        renderSkillProjectDetail();
-        void loadSkillProjectLog(projectId);
-        if (refreshList) loadSkillProjects(projectId);
-    } catch (error) {
-        currentSkillProject = null;
-        currentSkillProjectWorkspace = null;
-        nodes.skillProjectDetail.innerHTML = `<div class="skills-empty error-text">加载失败：${escapeHtml(error.message)}</div>`;
-    }
+    selectedSkillProjectFlowNodeId = '';
+    skillProjectPackagePreview = null;
+    await loadSkillProjects(projectId);
 }
 
-function renderSkillProjectDetail() {
+const skillProjectFlowStatusLabels = {
+    pending: '未开始',
+    needs_action: '需要操作',
+    limited: '可继续但有限制',
+    waiting: '等待确认',
+    running: '运行中',
+    succeeded: '已完成',
+    failed: '失败',
+    interrupted: '可继续',
+    cancelled: '已取消',
+    cancelling: '正在停止',
+    waiting_resource_decision: '需要资源裁定'
+};
+
+function skillProjectListKey(items, selectedId) {
+    return JSON.stringify((items || []).map(item => [
+        item.id,
+        item.revision,
+        item.status,
+        item.assessment?.summary || '',
+        item.id === selectedId
+    ]));
+}
+
+function applySkillProjectWorkbench(payload) {
+    const items = payload.items || [];
+    const selectedId = payload.selected_project_id || '';
+    const listKey = skillProjectListKey(items, selectedId);
+    selectedSkillProjectId = selectedId;
+    currentSkillProject = payload.project || null;
+    currentSkillProjectWorkspace = payload.workspace || null;
+    currentSkillProjectFlow = payload.flow || null;
+    if (listKey !== skillProjectListSignature) {
+        skillProjectListSignature = listKey;
+        nodes.skillProjectsCount.textContent = `${items.length} 项`;
+        nodes.skillProjectsList.innerHTML = items.length
+            ? items.map(item => `
+                <button class="skills-item ${item.id === selectedSkillProjectId ? 'active' : ''}" type="button" data-skill-project-id="${escapeHtml(item.id)}">
+                    <strong>${escapeHtml(item.title || item.goal || item.id)}</strong>
+                    <span>${escapeHtml(item.status || 'draft')} · ${escapeHtml(item.skill_type || '-')}</span>
+                    <small>${escapeHtml(item.assessment?.summary || item.goal || '')}</small>
+                </button>
+            `).join('')
+            : '<div class="skills-empty">暂无项目</div>';
+        nodes.skillProjectsList.querySelectorAll('[data-skill-project-id]').forEach(button => {
+            button.addEventListener('click', () => {
+                void selectSkillProject(button.dataset.skillProjectId || '');
+            });
+        });
+    }
+    renderSkillProjectWorkbench(payload.snapshot_version || '');
+}
+
+function renderSkillProjectWorkbench(snapshotVersion = '') {
     const project = currentSkillProject;
     const workspace = currentSkillProjectWorkspace;
-    const currentJobAvailable = Boolean(currentJob?.job_id);
-    nodes.assessSkillProjectButton.disabled = !project;
-    nodes.startSkillProjectButton.disabled = !project;
-    nodes.addCurrentJobSkillSourceButton.disabled = !project || !currentJobAvailable;
-    nodes.importSkillProjectSourceButton.disabled = !project;
     if (!project) {
+        skillProjectDetailSignature = '';
+        selectedSkillProjectFlowNodeId = '';
+        nodes.skillProjectFlowSummary.textContent = '创建一个目标，然后导入 Video Analyzer 资料包。';
+        nodes.skillProjectFlowStatus.textContent = '未选择';
+        nodes.skillProjectFlowStatus.className = 'skill-project-flow-status';
+        nodes.skillProjectFlow.innerHTML = '<div class="skills-empty">创建或选择一个 Skill 项目</div>';
+        nodes.skillProjectInspectorTitle.textContent = '流程详情';
+        nodes.skillProjectInspectorMeta.textContent = '选择流程节点查看当前状态';
         nodes.skillProjectDetail.innerHTML = '<div class="skills-empty">创建或选择一个 Skill 项目</div>';
         nodes.skillProjectSources.innerHTML = '暂无资料';
+        nodes.previewSkillProjectPackageButton.disabled = true;
+        nodes.importSkillProjectPackageButton.disabled = true;
+        nodes.skillProjectPackagePreview.textContent = '输入资料包 ID 后检查。';
+        renderSkillProjectLogControls();
         return;
     }
     const assessment = project.assessment || {};
-    const workspaceSummary = workspace?.summary || {};
     const sources = project.sources || [];
-    const materialRequests = assessment.material_requests || [];
-    const checks = project.capability_checks || [];
-    const candidates = workspace?.candidates || [];
-    const waitingOverview = workspaceSummary.status === 'waiting_overview_review';
-    const waitingCandidates = workspaceSummary.status === 'waiting_candidate_review';
-    const running = workspaceSummary.status === 'running';
-    const runnerKnown = typeof workspace?.runner?.active === 'boolean';
-    const workerActive = Boolean(workspace?.runner?.active);
-    const progress = workspaceSummary.progress || {};
-    const stage = workspaceSummary.current_stage || '';
-    const stageInfo = progress.stages?.[stage] || {};
-    const startedAt = stageInfo.started_at || workspaceSummary.updated_at;
-    const elapsed = startedAt
-        ? formatSkillElapsed(Math.max(0, (Date.now() - new Date(startedAt).getTime()) / 1000))
-        : '';
-    const displayStatus = workspaceSummary.status === 'running'
-        ? '运行中'
-        : (project.status || 'draft');
-    const stageLabel = skillStageNames[stage] || stage || '准备中';
-    const progressPercent = Math.max(0, Math.min(Number(progress.percent || 0), 100));
-    const logStages = Object.keys(progress.stages || {});
-    const logStage = chooseSkillProjectLogStage(logStages, stage);
-    const canStart = ['ready', 'ready_limited'].includes(assessment.verdict);
-    nodes.startSkillProjectButton.disabled = !canStart || running;
-    nodes.startSkillProjectButton.textContent = assessment.verdict === 'ready_limited'
-        ? '接受限制后蒸馏'
-        : '开始蒸馏';
-    const projectActions = [
-        waitingOverview ? '<button type="button" data-project-action="review-overview">确认骨架</button>' : '',
-        ['failed', 'interrupted', 'cancelled', 'ready'].includes(workspaceSummary.status)
-            ? '<button class="secondary" type="button" data-project-action="resume">继续</button>' : '',
-        workspaceSummary.status === 'running'
-            ? '<button class="secondary" type="button" data-project-action="cancel">取消</button>' : '',
-        workspaceSummary.status === 'succeeded'
-            ? '<button type="button" data-project-action="enable">启用 Skills</button>' : ''
-    ].join('');
-    nodes.skillProjectDetail.innerHTML = `
-        <section>
-            <h3>${escapeHtml(project.title || project.goal)}</h3>
-            <p>${escapeHtml(project.brief?.goal || '')}</p>
-            <p>状态：${escapeHtml(displayStatus)} · 评估：${escapeHtml(assessment.verdict || '未评估')}</p>
-            <div class="skill-actions">${projectActions}</div>
-        </section>
-        <section class="skill-project-run ${running ? 'running' : ''}">
-            <div class="skill-project-run-head">
-                ${running ? '<span class="skill-project-spinner" aria-hidden="true"></span>' : ''}
-                <div>
-                    <h4>${running ? `正在${escapeHtml(stageLabel)}` : '蒸馏进度'}</h4>
-                    <p>${running
-                        ? (workerActive
-                            ? `后台线程存活${elapsed ? ` · 已持续 ${elapsed}` : ''}`
-                            : (runnerKnown
-                                ? '状态仍显示运行，但当前服务未检测到后台线程'
-                                : `流程状态运行中${elapsed ? ` · 已持续 ${elapsed}` : ''}`))
-                        : escapeHtml(workspaceSummary.status || '尚未开始')}</p>
-                </div>
-                <strong>${progressPercent}%</strong>
-            </div>
-            <div class="skill-project-progress" aria-label="Skill 项目蒸馏进度">
-                <span style="width:${progressPercent}%"></span>
-            </div>
-            ${renderSkillProjectStageRail(progress, stage)}
-        </section>
-        ${waitingCandidates ? renderSkillProjectCandidateReview(project.id, candidates) : ''}
-        <section>
-            <h4>评估</h4>
-            <p>${escapeHtml(assessment.summary || '尚未评估')}</p>
-            ${(assessment.questions || []).length ? `<ul>${assessment.questions.map(item => `<li>${escapeHtml(item)}</li>`).join('')}</ul>` : ''}
-            ${(materialRequests || []).length ? `<ul>${materialRequests.map(item => `<li>${escapeHtml(item.reason || '')}；${escapeHtml(item.acceptance || '')}</li>`).join('')}</ul>` : ''}
-        </section>
-        <section>
-            <h4>蒸馏</h4>
-            <p>${escapeHtml(workspaceSummary.status || '尚未开始')} · ${escapeHtml(workspaceSummary.current_stage || '-')}</p>
-            <p>候选 ${candidates.length} · 成品 ${(workspace?.generated_skills || []).length}</p>
-        </section>
-        <section class="skill-project-log-console">
-            <div class="skill-project-log-head">
-                <div>
-                    <h4>实时日志</h4>
-                    <p>当前显示 ${escapeHtml(skillStageNames[logStage] || logStage || '暂无阶段')} 的日志尾部</p>
-                </div>
-                <button class="secondary tiny" type="button" data-skill-project-log-copy>复制完整日志</button>
-            </div>
-            <div class="skill-project-log-tabs" role="tablist">
-                ${logStages.map(name => `
-                    <button class="secondary tiny ${name === logStage ? 'active' : ''}" type="button"
-                        data-skill-project-log-stage="${escapeHtml(name)}">${escapeHtml(skillStageNames[name] || name)}</button>
-                `).join('')}
-            </div>
-            <pre id="skillProjectLogText" class="skill-project-log-text">加载日志中…</pre>
-        </section>
-        <section>
-            <h4>能力检查</h4>
-            ${checks.length ? checks.map(check => `
-                <p>${escapeHtml(check.label || check.id)}：${escapeHtml(check.status || 'unknown')}
-                    ${check.smoke_test ? `<button class="secondary tiny" type="button" data-capability-check="${escapeHtml(check.id)}">验证</button>` : ''}
-                </p>
-            `).join('') : '<p>当前目标不要求额外执行能力。</p>'}
-        </section>
-    `;
+    const flow = currentSkillProjectFlow || { nodes: [], active_node: 'packages' };
+    const flowNodes = flow.nodes || [];
+    if (!selectedSkillProjectFlowNodeId || !flowNodes.some(node => node.id === selectedSkillProjectFlowNodeId)) {
+        const enableNode = flowNodes.find(node => node.id === 'enable' && node.status === 'succeeded');
+        selectedSkillProjectFlowNodeId = enableNode?.id || flow.active_node || flowNodes[0]?.id || '';
+    }
+    const currentNode = flowNodes.find(node => node.id === selectedSkillProjectFlowNodeId) || flowNodes[0] || null;
+    const status = currentNode?.status || project.status || 'pending';
+    nodes.skillProjectFlowSummary.textContent = `${project.title || project.goal} · ${sources.length} 个资料来源`;
+    nodes.skillProjectFlowStatus.textContent = skillProjectFlowStatusLabels[status] || status;
+    nodes.skillProjectFlowStatus.className = `skill-project-flow-status ${status}`;
+    const flowKey = JSON.stringify(flowNodes.map(node => [
+        node.id,
+        node.status,
+        node.subtitle,
+        node.action,
+        node.secondary_action,
+        node.id === selectedSkillProjectFlowNodeId
+    ]));
+    if (flowKey !== nodes.skillProjectFlow.dataset.flowKey) {
+        nodes.skillProjectFlow.dataset.flowKey = flowKey;
+        nodes.skillProjectFlow.innerHTML = flowNodes.map((node, index) => `
+            <button class="skill-project-flow-node ${escapeHtml(node.status || 'pending')} ${node.id === selectedSkillProjectFlowNodeId ? 'active' : ''}"
+                type="button" data-skill-project-flow-node="${escapeHtml(node.id)}" aria-pressed="${node.id === selectedSkillProjectFlowNodeId ? 'true' : 'false'}">
+                <span class="skill-project-flow-node-top">
+                    <span class="skill-project-flow-step">${escapeHtml(String(node.step || index + 1))}</span>
+                    <span>${escapeHtml(skillProjectFlowStatusLabels[node.status] || node.status || '未开始')}</span>
+                </span>
+                <strong>${escapeHtml(node.title || node.id)}</strong>
+                <small>${escapeHtml(node.subtitle || '')}</small>
+            </button>
+            ${index < flowNodes.length - 1 ? '<span class="skill-project-flow-arrow" aria-hidden="true">→</span>' : ''}
+        `).join('');
+        nodes.skillProjectFlow.querySelectorAll('[data-skill-project-flow-node]').forEach(button => {
+            button.addEventListener('click', () => {
+                selectedSkillProjectFlowNodeId = button.dataset.skillProjectFlowNode || '';
+                renderSkillProjectWorkbench(snapshotVersion);
+            });
+        });
+    }
     nodes.skillProjectSources.innerHTML = sources.length
         ? sources.map(source => `<div>
             <strong>${escapeHtml(source.label || source.filename || source.job_id || source.id)}</strong>
-            <small>${escapeHtml(source.kind || '')}</small>
+            <small>${escapeHtml(source.kind === 'video_analyzer_package'
+                ? `${source.run_dir || ''} · 原始证据 ${Array.from(new Set((source.raw_evidence || []).map(item => item.type))).join(' / ') || '-'} · 辅助资料 ${(source.reference_documents || []).map(item => item.label).join(' / ') || '-'}`
+                : source.kind || '')}</small>
             <button class="secondary tiny" type="button" data-remove-skill-source="${escapeHtml(source.id)}">移除</button>
         </div>`).join('')
         : '暂无资料';
-    nodes.skillProjectDetail.querySelectorAll('[data-project-action]').forEach(button => {
-        button.addEventListener('click', () => runSkillProjectAction(button.dataset.projectAction));
+    nodes.skillProjectSources.querySelectorAll('[data-remove-skill-source]').forEach(button => {
+        button.addEventListener('click', () => {
+            void removeSkillProjectSource(button.dataset.removeSkillSource || '');
+        });
+    });
+    renderSkillProjectInspector(currentNode, snapshotVersion);
+    renderSkillProjectPackageControls(project);
+    renderSkillProjectLogControls();
+    void loadSkillProjectLog(project.id);
+    syncSkillProjectPolling();
+}
+
+function renderSkillProjectPackageControls(project) {
+    const preview = skillProjectPackagePreview;
+    const belongsToProject = preview?.project_id === project.id;
+    nodes.previewSkillProjectPackageButton.disabled = Boolean(skillProjectPackageBusy);
+    nodes.previewSkillProjectPackageButton.textContent = skillProjectPackageBusy === 'preview' ? '检查中...' : '检查';
+    nodes.importSkillProjectPackageButton.disabled = (
+        skillProjectPackageBusy !== ''
+        || !belongsToProject
+        || !preview?.can_import
+    );
+    nodes.importSkillProjectPackageButton.textContent = skillProjectPackageBusy === 'import'
+        ? '正在导入...'
+        : preview?.already_imported
+            ? '资料包已导入'
+            : '导入此资料包';
+    if (!belongsToProject) return;
+    const packageInfo = preview.package || {};
+    nodes.skillProjectPackagePreview.innerHTML = `
+        <strong>${escapeHtml(packageInfo.label || packageInfo.package_id || '')}</strong>
+        <small>${escapeHtml(packageInfo.run_dir || '')}</small>
+        <small>原始证据：${escapeHtml(Array.from(new Set((packageInfo.raw_evidence || []).map(item => item.type))).join(' / ') || '-')}</small>
+        <small>辅助资料：${escapeHtml((packageInfo.reference_documents || []).map(item => item.label).join(' / ') || '-')}</small>
+    `;
+}
+
+function renderSkillProjectInspector(node, snapshotVersion = '') {
+    const project = currentSkillProject;
+    const workspace = currentSkillProjectWorkspace || {};
+    if (!project || !node) return;
+    const assessment = project.assessment || {};
+    const candidates = workspace.candidates || [];
+    const generatedSkills = workspace.generated_skills || [];
+    const progress = workspace.summary?.progress || {};
+    const detailKey = JSON.stringify([
+        snapshotVersion,
+        node.id,
+        project.revision,
+        workspace.summary?.status,
+        workspace.summary?.current_stage,
+        progress.percent,
+        node.action,
+        node.secondary_action,
+        skillProjectFlowActionBusy,
+        candidates.map(item => [item.id, item.group, item.selected]),
+        generatedSkills.map(item => [item.name, item.status, item.pass_rate])
+    ]);
+    if (detailKey === skillProjectDetailSignature) return;
+    skillProjectDetailSignature = detailKey;
+    nodes.skillProjectInspectorTitle.textContent = node.title || '流程详情';
+    nodes.skillProjectInspectorMeta.textContent = skillProjectFlowStatusLabels[node.status] || node.status || '';
+    const actionLabels = {
+        package: '前往导入资料包',
+        assess: '更新证据评估',
+        start: assessment.verdict === 'ready_limited' ? '接受限制后蒸馏' : '开始蒸馏',
+        resume: '继续未完成流程',
+        cancel: '取消运行',
+        'review-overview': '确认骨架',
+        'review-candidates': '确认候选',
+        enable: '启用 Skills'
+    };
+    const actionButtons = [
+        node.action
+            ? `<button type="button" data-skill-project-flow-action="${escapeHtml(node.action)}" ${skillProjectFlowActionBusy ? 'disabled' : ''}>${escapeHtml(actionLabels[node.action] || node.action)}</button>`
+            : '',
+        node.secondary_action
+            ? `<button class="secondary" type="button" data-skill-project-flow-action="${escapeHtml(node.secondary_action)}" ${skillProjectFlowActionBusy ? 'disabled' : ''}>${escapeHtml(actionLabels[node.secondary_action] || node.secondary_action)}</button>`
+            : ''
+    ].filter(Boolean).join('');
+    const action = actionButtons ? `<div class="skill-actions">${actionButtons}</div>` : '';
+    if (node.id === 'goal') {
+        nodes.skillProjectDetail.innerHTML = `
+            <section>
+                <h4>${escapeHtml(project.title || project.goal)}</h4>
+                <p>${escapeHtml(project.brief?.goal || '')}</p>
+                <p>新项目不会自动关联当前任务。导入资料包后才会进入证据评估。</p>
+            </section>`;
+    } else if (node.id === 'packages') {
+        nodes.skillProjectDetail.innerHTML = `
+            <section>
+                <h4>资料包来源</h4>
+                <p>先检查资料包，确认实际选中的运行目录和原始证据后再导入。</p>
+                <p>当前已导入 ${(project.sources || []).filter(item => item.kind === 'video_analyzer_package').length} 个资料包。</p>
+                ${action}
+            </section>`;
+    } else if (node.id === 'readiness') {
+        const requests = assessment.material_requests || [];
+        nodes.skillProjectDetail.innerHTML = `
+            <section>
+                <h4>${escapeHtml(assessment.summary || '尚未完成证据评估')}</h4>
+                <p>原始证据 ${escapeHtml(String(assessment.source_coverage?.high_confidence_records || 0))} 条 · 独立案例 ${escapeHtml(String(assessment.source_coverage?.independent_learning_cases || 0))} 个</p>
+                ${requests.length ? `<ul>${requests.map(item => `<li>${escapeHtml(item.reason || '')}；${escapeHtml(item.acceptance || '')}</li>`).join('')}</ul>` : '<p>当前没有额外资料缺口。</p>'}
+                ${node.action === 'start' ? '<p>资料已满足条件，可以开始蒸馏。</p>' : ''}
+                ${action}
+            </section>`;
+    } else if (node.id === 'overview') {
+        nodes.skillProjectDetail.innerHTML = `
+            <section>
+                <h4>${escapeHtml(workspace.summary?.overview?.title || '方法骨架')}</h4>
+                <p>${escapeHtml(workspace.summary?.overview?.summary || '骨架生成后会在这里等待人工确认。')}</p>
+                ${action}
+            </section>`;
+    } else if (node.id === 'candidates') {
+        nodes.skillProjectDetail.innerHTML = workspace.summary?.status === 'waiting_candidate_review'
+            ? renderSkillProjectCandidateReview(project.id, candidates)
+            : `<section><h4>候选 Review</h4><p>候选 ${candidates.length} 个。流程到达此处后可在这里选择可构建候选。</p>${action}</section>`;
+    } else if (node.id === 'build') {
+        const currentStage = workspace.summary?.current_stage || '-';
+        const runner = workspace.runner || {};
+        nodes.skillProjectDetail.innerHTML = `
+            <section class="skill-project-run ${node.status === 'running' ? 'running' : ''}">
+                <div class="skill-project-run-head">
+                    ${node.status === 'running' ? '<span class="skill-project-spinner" aria-hidden="true"></span>' : ''}
+                    <div>
+                        <h4>${escapeHtml(skillStageNames[currentStage] || currentStage)}</h4>
+                        <p>${runner.active ? '后台线程存活' : (runner.status || '等待下一次操作')}</p>
+                    </div>
+                    <strong>${escapeHtml(String(progress.percent || 0))}%</strong>
+                </div>
+                <div class="skill-project-progress"><span style="width:${escapeHtml(String(progress.percent || 0))}%"></span></div>
+                <p>${escapeHtml(workspace.summary?.error || runner.error || '')}</p>
+                ${action}
+            </section>`;
+    } else {
+        const enabledSkills = generatedSkills.filter(item => item.status === 'passed');
+        const failedSkills = generatedSkills.filter(item => item.status !== 'passed');
+        nodes.skillProjectDetail.innerHTML = `
+            <section>
+                <h4>启用生成的 Skills</h4>
+                <p>以下 ${enabledSkills.length} 项已通过压力测试并写入项目 Skills 目录。</p>
+                ${enabledSkills.length ? `
+                    <div class="skill-project-enabled-list">
+                        ${enabledSkills.map(item => `
+                            <article class="skill-project-enabled-item">
+                                <strong>${escapeHtml(item.title || item.name)}</strong>
+                                <span>${escapeHtml(item.name)} · 通过率 ${escapeHtml(formatPercent(item.pass_rate))}</span>
+                            </article>
+                        `).join('')}
+                    </div>
+                    <div class="skill-actions">
+                        <button type="button" data-open-project-enabled-skills>打开这 ${enabledSkills.length} 项</button>
+                    </div>
+                ` : '<p>尚无通过压力测试的 Skill。</p>'}
+                ${failedSkills.length ? `<p>另有 ${failedSkills.length} 项未通过压力测试，未启用。</p>` : ''}
+                ${action}
+            </section>`;
+    }
+    nodes.skillProjectDetail.querySelectorAll('[data-skill-project-flow-action]').forEach(button => {
+        button.addEventListener('click', () => {
+            void runSkillProjectFlowAction(button.dataset.skillProjectFlowAction || '');
+        });
+    });
+    nodes.skillProjectDetail.querySelectorAll('[data-open-project-enabled-skills]').forEach(button => {
+        button.addEventListener('click', () => {
+            skillLibraryProjectSkillNames = new Set(
+                (currentSkillProjectWorkspace?.generated_skills || [])
+                    .filter(item => item.status === 'passed' && item.name)
+                    .map(item => item.name)
+            );
+            nodes.skillLibrarySearch.value = '';
+            setSkillsScope('enabled');
+        });
     });
     nodes.skillProjectDetail.querySelectorAll('[data-skill-project-candidate]').forEach(input => {
         input.addEventListener('change', updateSkillProjectCandidateDraft);
     });
     nodes.skillProjectDetail.querySelectorAll('[data-skill-project-selection]').forEach(button => {
         button.addEventListener('click', () => {
-            setSkillProjectCandidateSelection(button.dataset.skillProjectSelection);
+            setSkillProjectCandidateSelection(button.dataset.skillProjectSelection || 'none');
         });
     });
     nodes.skillProjectDetail.querySelectorAll('[data-project-candidate-confirm]').forEach(button => {
-        button.addEventListener('click', () => runSkillProjectAction('review-candidates'));
-    });
-    nodes.skillProjectDetail.querySelectorAll('[data-skill-project-log-stage]').forEach(button => {
         button.addEventListener('click', () => {
-            selectedSkillProjectLogStage = button.dataset.skillProjectLogStage || '';
-            renderSkillProjectDetail();
-            void loadSkillProjectLog(project.id, selectedSkillProjectLogStage);
+            void runSkillProjectAction('review-candidates');
         });
     });
-    nodes.skillProjectDetail.querySelector('[data-skill-project-log-copy]')?.addEventListener('click', () => {
-        void copySkillProjectLog(project.id);
-    });
     nodes.skillProjectDetail.querySelectorAll('[data-capability-check]').forEach(button => {
-        button.addEventListener('click', () => runSkillProjectCapabilityCheck(button.dataset.capabilityCheck));
+        button.addEventListener('click', () => {
+            void runSkillProjectCapabilityCheck(button.dataset.capabilityCheck || '');
+        });
     });
-    nodes.skillProjectSources.querySelectorAll('[data-remove-skill-source]').forEach(button => {
-        button.addEventListener('click', () => removeSkillProjectSource(button.dataset.removeSkillSource));
-    });
-    syncSkillProjectPolling();
 }
 
 function chooseSkillProjectLogStage(stages, currentStage) {
@@ -2905,7 +3621,7 @@ function formatSkillProjectLog(text) {
 }
 
 async function loadSkillProjectLog(projectId, requestedStage = '') {
-    const logText = document.getElementById('skillProjectLogText');
+    const logText = nodes.skillProjectLogText;
     const progress = currentSkillProjectWorkspace?.summary?.progress || {};
     const stage = requestedStage || chooseSkillProjectLogStage(
         Object.keys(progress.stages || {}),
@@ -2915,12 +3631,18 @@ async function loadSkillProjectLog(projectId, requestedStage = '') {
     const requestId = ++skillProjectLogRequestId;
     try {
         const response = await fetch(
-            `/api/skill-projects/${projectId}/resource?path=${encodeURIComponent(skillProjectLogPath(stage))}`
+            `/api/skill-projects/${projectId}/resource?path=${encodeURIComponent(skillProjectLogPath(stage))}`,
+            { cache: 'no-store' }
         );
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const text = await response.text();
         if (requestId !== skillProjectLogRequestId || selectedSkillProjectId !== projectId) return;
-        logText.textContent = formatSkillProjectLog(text);
+        const formatted = formatSkillProjectLog(text);
+        if (logText.textContent !== formatted) {
+            const stickToBottom = logText.scrollHeight - logText.scrollTop - logText.clientHeight < 24;
+            logText.textContent = formatted;
+            if (stickToBottom) logText.scrollTop = logText.scrollHeight;
+        }
     } catch (error) {
         if (requestId !== skillProjectLogRequestId || selectedSkillProjectId !== projectId) return;
         logText.textContent = `日志暂不可用：${error.message}`;
@@ -2934,7 +3656,7 @@ async function copySkillProjectLog(projectId) {
         currentSkillProjectWorkspace?.summary?.current_stage || ''
     );
     if (!projectId || !stage) return;
-    const button = nodes.skillProjectDetail.querySelector('[data-skill-project-log-copy]');
+    const button = nodes.copySkillProjectLogButton;
     try {
         const response = await fetch(
             `/api/skill-projects/${projectId}/resource?path=${encodeURIComponent(skillProjectLogPath(stage))}`
@@ -2945,6 +3667,49 @@ async function copySkillProjectLog(projectId) {
     } catch (error) {
         if (button) button.textContent = '复制失败';
     }
+}
+
+function renderSkillProjectLogControls() {
+    const workspace = currentSkillProjectWorkspace;
+    if (!workspace || !selectedSkillProjectId) {
+        nodes.skillProjectLogSummary.textContent = '选择项目后显示当前阶段记录。';
+        nodes.skillProjectLogTabs.innerHTML = '';
+        nodes.skillProjectLogText.textContent = '暂无运行记录';
+        nodes.copySkillProjectLogButton.disabled = true;
+        return;
+    }
+    const progress = workspace.summary?.progress || {};
+    const stages = Object.keys(progress.stages || {});
+    const stage = chooseSkillProjectLogStage(stages, workspace.summary?.current_stage || '');
+    if (!stages.length) {
+        const starting = skillProjectFlowActionBusy === 'start';
+        nodes.skillProjectLogSummary.textContent = starting
+            ? '正在启动蒸馏，等待后台建立首个阶段日志。'
+            : '尚未开始蒸馏。点击“开始蒸馏”后，此处会显示实时阶段日志。';
+        nodes.skillProjectLogTabs.dataset.tabsKey = `${selectedSkillProjectId}|`;
+        nodes.skillProjectLogTabs.innerHTML = '';
+        nodes.skillProjectLogText.textContent = starting ? '正在启动蒸馏...' : '尚未开始蒸馏。';
+        nodes.copySkillProjectLogButton.disabled = true;
+        return;
+    }
+    nodes.skillProjectLogSummary.textContent = stage
+        ? `当前显示 ${skillStageNames[stage] || stage} 的日志尾部`
+        : '流程尚未写入阶段日志。';
+    nodes.copySkillProjectLogButton.disabled = !stage;
+    const tabsKey = `${selectedSkillProjectId}|${stage}|${stages.join('|')}`;
+    if (nodes.skillProjectLogTabs.dataset.tabsKey === tabsKey) return;
+    nodes.skillProjectLogTabs.dataset.tabsKey = tabsKey;
+    nodes.skillProjectLogTabs.innerHTML = stages.map(name => `
+        <button class="secondary tiny ${name === stage ? 'active' : ''}" type="button"
+            data-skill-project-log-stage="${escapeHtml(name)}">${escapeHtml(skillStageNames[name] || name)}</button>
+    `).join('');
+    nodes.skillProjectLogTabs.querySelectorAll('[data-skill-project-log-stage]').forEach(button => {
+        button.addEventListener('click', () => {
+            selectedSkillProjectLogStage = button.dataset.skillProjectLogStage || '';
+            renderSkillProjectLogControls();
+            void loadSkillProjectLog(selectedSkillProjectId, selectedSkillProjectLogStage);
+        });
+    });
 }
 
 function skillProjectCandidateDraft(projectId, candidates) {
@@ -3053,7 +3818,11 @@ function updateSkillProjectCandidateDraft(event) {
     } else {
         draft.selected.delete(candidateId);
     }
-    renderSkillProjectDetail();
+    skillProjectDetailSignature = '';
+    renderSkillProjectInspector(
+        (currentSkillProjectFlow?.nodes || []).find(node => node.id === 'candidates'),
+        ''
+    );
 }
 
 function setSkillProjectCandidateSelection(action) {
@@ -3064,17 +3833,11 @@ function setSkillProjectCandidateSelection(action) {
     } else {
         draft.selected.clear();
     }
-    renderSkillProjectDetail();
-}
-
-function renderSkillProjectStageRail(progress, currentStage) {
-    const stages = progress.stages || {};
-    const rows = Object.entries(stages);
-    if (!rows.length) return '<div class="skill-project-stage-rail">等待开始</div>';
-    return `<div class="skill-project-stage-rail">${rows.map(([name, item]) => {
-        const status = item.status || (name === currentStage ? 'running' : 'pending');
-        return `<span class="${escapeHtml(status)}">${escapeHtml(skillStageNames[name] || name)}</span>`;
-    }).join('')}</div>`;
+    skillProjectDetailSignature = '';
+    renderSkillProjectInspector(
+        (currentSkillProjectFlow?.nodes || []).find(node => node.id === 'candidates'),
+        ''
+    );
 }
 
 function syncSkillProjectPolling() {
@@ -3091,10 +3854,15 @@ function syncSkillProjectPolling() {
     }
     if (skillProjectPollTimer) return;
     skillProjectPollTimer = window.setInterval(async () => {
-        if (skillProjectPollInFlight || currentSkillsScope !== 'projects' || !selectedSkillProjectId) return;
+        if (
+            skillProjectPollInFlight
+            || document.hidden
+            || currentSkillsScope !== 'projects'
+            || !selectedSkillProjectId
+        ) return;
         skillProjectPollInFlight = true;
         try {
-            await selectSkillProject(selectedSkillProjectId, false);
+            await loadSkillProjects(selectedSkillProjectId);
         } finally {
             skillProjectPollInFlight = false;
         }
@@ -3110,8 +3878,7 @@ async function createSkillProject(event) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
             title: nodes.skillProjectTitle.value.trim(),
-            goal,
-            job_id: currentJob?.job_id || ''
+            goal
         })
     });
     nodes.skillProjectTitle.value = '';
@@ -3127,37 +3894,65 @@ async function assessSkillProject() {
         headers: { 'Content-Type': 'application/json' },
         body: '{}'
     });
-    await selectSkillProject(selectedSkillProjectId);
+    await loadSkillProjects(selectedSkillProjectId);
 }
 
-async function addCurrentJobSkillSource() {
-    if (!selectedSkillProjectId || !currentJob?.job_id) return;
-    await getJson(`/api/skill-projects/${selectedSkillProjectId}/sources`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ kind: 'job', job_id: currentJob.job_id, include_qa: true })
-    });
-    await selectSkillProject(selectedSkillProjectId);
-}
-
-async function importSkillProjectSource() {
+async function previewSkillProjectPackage() {
     if (!selectedSkillProjectId) return;
-    let content = nodes.skillProjectImportText.value;
-    let filename = 'conversation.md';
-    const file = nodes.skillProjectImportFile.files?.[0];
-    if (file) {
-        filename = file.name;
-        content = await file.text();
+    const packageId = nodes.skillProjectPackageId.value.trim();
+    if (!packageId) return;
+    skillProjectPackageBusy = 'preview';
+    nodes.skillProjectPackageStatus.textContent = '正在检查资料包与原始证据...';
+    renderSkillProjectPackageControls(currentSkillProject);
+    try {
+        const preview = await getJson(
+            `/api/skill-projects/${selectedSkillProjectId}/packages/preview?package_id=${encodeURIComponent(packageId)}`
+        );
+        if (selectedSkillProjectId !== currentSkillProject?.id) return;
+        skillProjectPackagePreview = { ...preview, project_id: selectedSkillProjectId };
+        nodes.skillProjectPackageStatus.textContent = preview.already_imported
+            ? '该资料包已导入，可以继续使用。'
+            : '检查完成，确认后导入。';
+    } catch (error) {
+        skillProjectPackagePreview = null;
+        nodes.skillProjectPackagePreview.textContent = '未找到可导入的完整资料包。';
+        nodes.skillProjectPackageStatus.textContent = `检查失败：${error.message}`;
+    } finally {
+        skillProjectPackageBusy = '';
+        renderSkillProjectPackageControls(currentSkillProject);
     }
-    if (!content.trim()) return;
-    await getJson(`/api/skill-projects/${selectedSkillProjectId}/sources`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ kind: 'conversation', filename, content })
-    });
-    nodes.skillProjectImportText.value = '';
-    nodes.skillProjectImportFile.value = '';
-    await selectSkillProject(selectedSkillProjectId);
+}
+
+async function importSkillProjectPackage() {
+    if (!selectedSkillProjectId || !skillProjectPackagePreview?.can_import) return;
+    const packageId = nodes.skillProjectPackageId.value.trim();
+    if (!packageId) return;
+    skillProjectPackageBusy = 'import';
+    nodes.skillProjectPackageStatus.textContent = '正在冻结资料包参考信息并更新证据评估...';
+    renderSkillProjectPackageControls(currentSkillProject);
+    try {
+        const result = await getJson(`/api/skill-projects/${selectedSkillProjectId}/packages`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ package_id: packageId })
+        });
+        skillProjectPackagePreview = {
+            package: result.source,
+            project_id: selectedSkillProjectId,
+            already_imported: !result.created,
+            can_import: false
+        };
+        nodes.skillProjectPackageStatus.textContent = result.created
+            ? '资料包已导入，证据评估已更新。'
+            : '资料包已经存在，已保留原来的证据来源。';
+        nodes.skillProjectPackageId.value = '';
+        applySkillProjectWorkbench(result.workbench);
+    } catch (error) {
+        nodes.skillProjectPackageStatus.textContent = `导入失败：${error.message}`;
+    } finally {
+        skillProjectPackageBusy = '';
+        renderSkillProjectPackageControls(currentSkillProject);
+    }
 }
 
 async function removeSkillProjectSource(sourceId) {
@@ -3167,19 +3962,53 @@ async function removeSkillProjectSource(sourceId) {
         headers: { 'Content-Type': 'application/json' },
         body: '{}'
     });
-    await selectSkillProject(selectedSkillProjectId);
+    await loadSkillProjects(selectedSkillProjectId);
 }
 
 async function startSkillProjectDistillation() {
     if (!selectedSkillProjectId || !currentSkillProject) return;
     const limited = currentSkillProject.assessment?.verdict === 'ready_limited';
     if (limited && !window.confirm('该项目存在已显示的资料或能力限制。确认接受限制并开始蒸馏？')) return;
-    await getJson(`/api/skill-projects/${selectedSkillProjectId}/distillation/start`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ profile: 'deepseek_v4_pro', accept_limitations: limited })
-    });
-    await selectSkillProject(selectedSkillProjectId);
+    skillProjectFlowActionBusy = 'start';
+    skillProjectDetailSignature = '';
+    renderSkillProjectInspector(
+        (currentSkillProjectFlow?.nodes || []).find(node => node.id === selectedSkillProjectFlowNodeId),
+        ''
+    );
+    renderSkillProjectLogControls();
+    try {
+        await getJson(`/api/skill-projects/${selectedSkillProjectId}/distillation/start`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ profile: 'deepseek_v4_pro', accept_limitations: limited })
+        });
+        await loadSkillProjects(selectedSkillProjectId);
+    } finally {
+        skillProjectFlowActionBusy = '';
+        skillProjectDetailSignature = '';
+        renderSkillProjectWorkbench('');
+    }
+}
+
+async function runSkillProjectFlowAction(action) {
+    try {
+        if (action === 'package') {
+            nodes.skillProjectPackageId.focus();
+            return;
+        }
+        if (action === 'assess') {
+            await assessSkillProject();
+            return;
+        }
+        if (action === 'start') {
+            await startSkillProjectDistillation();
+            return;
+        }
+        await runSkillProjectAction(action);
+    } catch (error) {
+        nodes.skillProjectInspectorMeta.textContent = `操作失败：${error.message}`;
+        nodes.skillProjectLogSummary.textContent = `操作失败：${error.message}`;
+    }
 }
 
 async function runSkillProjectAction(action) {
@@ -3210,7 +4039,7 @@ async function runSkillProjectAction(action) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
     });
-    await selectSkillProject(selectedSkillProjectId);
+    await loadSkillProjects(selectedSkillProjectId);
 }
 
 async function runSkillProjectCapabilityCheck(checkId) {
@@ -3227,7 +4056,7 @@ async function runSkillProjectCapabilityCheck(checkId) {
             })
         }
     );
-    await selectSkillProject(selectedSkillProjectId);
+    await loadSkillProjects(selectedSkillProjectId);
 }
 
 async function loadCurrentSkillsWorkspace(jobId, workspaceKey) {
@@ -3458,13 +4287,19 @@ async function loadSkillLibrary() {
     if (currentResourceView !== 'skills' || currentSkillsScope === 'current') return;
     const query = nodes.skillLibrarySearch.value.trim();
     const labels = { enabled: '已启用 Skills', disabled: '已禁用 Skills', trash: '回收站' };
-    nodes.skillLibraryTitle.textContent = labels[currentSkillsScope] || '项目 Skills';
+    const projectNames = skillLibraryProjectSkillNames ? new Set(skillLibraryProjectSkillNames) : null;
+    nodes.skillLibraryTitle.textContent = projectNames
+        ? '本项目已启用 Skills'
+        : labels[currentSkillsScope] || '项目 Skills';
     nodes.skillLibraryList.innerHTML = '<div class="skills-empty">正在加载...</div>';
     try {
         const data = await getJson(`/api/skills?state=${encodeURIComponent(currentSkillsScope)}&query=${encodeURIComponent(query)}`);
         if (data.state !== currentSkillsScope) return;
-        nodes.skillLibraryCount.textContent = `${data.count || 0} 项`;
-        renderSkillLibraryList(data.items || []);
+        const items = projectNames
+            ? (data.items || []).filter(item => projectNames.has(item.name))
+            : data.items || [];
+        nodes.skillLibraryCount.textContent = `${items.length} 项`;
+        renderSkillLibraryList(items);
     } catch (error) {
         nodes.skillLibraryList.innerHTML = `<div class="skills-empty error-text">加载失败：${escapeHtml(error.message)}</div>`;
     }
@@ -6224,7 +7059,10 @@ async function boot() {
         nodes.skillProjectGoal.focus();
     });
     nodes.skillsScopeTabs.forEach(button => {
-        button.addEventListener('click', () => setSkillsScope(button.dataset.skillsScope || 'current'));
+        button.addEventListener('click', () => {
+            skillLibraryProjectSkillNames = null;
+            setSkillsScope(button.dataset.skillsScope || 'current');
+        });
     });
     nodes.skillsDetailTabs.forEach(button => {
         button.addEventListener('click', () => setCurrentSkillDetailTab(button.dataset.skillDetailTab || 'evidence'));
@@ -6283,25 +7121,30 @@ async function boot() {
             nodes.skillProjectDetail.innerHTML = `<div class="skills-empty error-text">创建失败：${escapeHtml(error.message)}</div>`;
         });
     });
-    nodes.assessSkillProjectButton.addEventListener('click', () => {
-        assessSkillProject().catch(error => {
-            nodes.skillProjectDetail.innerHTML = `<div class="skills-empty error-text">评估失败：${escapeHtml(error.message)}</div>`;
+    nodes.previewSkillProjectPackageButton.addEventListener('click', () => {
+        previewSkillProjectPackage().catch(error => {
+            nodes.skillProjectPackageStatus.textContent = `检查失败：${error.message}`;
         });
     });
-    nodes.startSkillProjectButton.addEventListener('click', () => {
-        startSkillProjectDistillation().catch(error => {
-            nodes.skillProjectDetail.innerHTML = `<div class="skills-empty error-text">启动失败：${escapeHtml(error.message)}</div>`;
+    nodes.skillProjectPackageId.addEventListener('keydown', event => {
+        if (event.key !== 'Enter') return;
+        event.preventDefault();
+        previewSkillProjectPackage().catch(error => {
+            nodes.skillProjectPackageStatus.textContent = `检查失败：${error.message}`;
         });
     });
-    nodes.addCurrentJobSkillSourceButton.addEventListener('click', () => {
-        addCurrentJobSkillSource().catch(error => {
-            nodes.skillProjectSources.textContent = `关联失败：${error.message}`;
+    nodes.importSkillProjectPackageButton.addEventListener('click', () => {
+        importSkillProjectPackage().catch(error => {
+            nodes.skillProjectPackageStatus.textContent = `导入失败：${error.message}`;
         });
     });
-    nodes.importSkillProjectSourceButton.addEventListener('click', () => {
-        importSkillProjectSource().catch(error => {
-            nodes.skillProjectSources.textContent = `导入失败：${error.message}`;
-        });
+    nodes.copySkillProjectLogButton.addEventListener('click', () => {
+        copySkillProjectLog(selectedSkillProjectId).catch(() => {});
+    });
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden && currentSkillsScope === 'projects' && selectedSkillProjectId) {
+            void loadSkillProjects(selectedSkillProjectId);
+        }
     });
     nodes.startVscodeButton.addEventListener('click', () => ensureVscodeSession(false));
     nodes.restartVscodeButton.addEventListener('click', () => ensureVscodeSession(true));
@@ -6309,6 +7152,38 @@ async function boot() {
     nodes.docPreviewClose.addEventListener('click', closeDocPreview);
     nodes.qaSourcePlayerStopButton?.addEventListener('click', pauseSourcePlayer);
     nodes.sourcePlayerStopButton?.addEventListener('click', pauseSourcePlayer);
+    nodes.consoleFlowPrevious?.addEventListener('click', () => {
+        nodes.consoleStageFlowViewport?.scrollBy({
+            left: -Math.max(260, nodes.consoleStageFlowViewport.clientWidth * 0.7),
+            behavior: 'smooth'
+        });
+    });
+    nodes.consoleFlowNext?.addEventListener('click', () => {
+        nodes.consoleStageFlowViewport?.scrollBy({
+            left: Math.max(260, nodes.consoleStageFlowViewport.clientWidth * 0.7),
+            behavior: 'smooth'
+        });
+    });
+    nodes.consoleFlowZoomOut?.addEventListener('click', () => {
+        consoleFlowScale = Math.max(0.55, consoleFlowScale - 0.1);
+        applyConsoleFlowScale();
+    });
+    nodes.consoleFlowFit?.addEventListener('click', fitConsoleFlow);
+    nodes.consoleFlowZoomIn?.addEventListener('click', () => {
+        consoleFlowScale = Math.min(1.6, consoleFlowScale + 0.1);
+        applyConsoleFlowScale();
+    });
+    nodes.consoleFlowCurrent?.addEventListener('click', () => {
+        const nodeId = currentJob?.execution_flow?.active_node_ids?.[0] || selectedConsoleNodeId;
+        scrollConsoleNodeIntoView(nodeId);
+    });
+    nodes.consoleStageLogButton?.addEventListener('click', () => {
+        const stage = nodes.consoleStageLogButton.dataset.stage || selectedConsoleStage;
+        if (!currentJob || !stage) return;
+        selectedLogStage = stage;
+        loadSelectedLog(currentJob);
+        nodes.logText?.closest('.panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
     nodes.runButton.addEventListener('click', runSelectedJob);
     nodes.copyLogButton.addEventListener('click', copySelectedLog);
     bindImageViewer();
@@ -6326,6 +7201,7 @@ async function boot() {
     await refreshJobs();
     if (selectedJobId) await refreshSelectedJob();
     window.setInterval(updateSkillLiveClock, 1000);
+    window.setInterval(updateConsoleElapsedClock, 1000);
     refreshTimer = setInterval(() => {
         if (selectedJobId) {
             refreshSelectedJob();

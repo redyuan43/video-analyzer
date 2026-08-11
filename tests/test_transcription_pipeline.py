@@ -69,6 +69,7 @@ class TranscriptionPipelineTests(unittest.TestCase):
 
     def test_standalone_diarization_runs_in_parallel_with_asr(self):
         barrier = threading.Barrier(2, timeout=1)
+        progress_events = []
         transcript = transcription_pipeline.AudioTranscript(
             text="hello",
             segments=[{"start": 0, "end": 1, "text": "hello"}],
@@ -127,6 +128,9 @@ class TranscriptionPipelineTests(unittest.TestCase):
                     FakeConfig(),
                     use_asr_strategy=False,
                     logger=logging.getLogger(__name__),
+                    progress_callback=lambda node_id, status, message: progress_events.append(
+                        (node_id, status, message)
+                    ),
                 )
             )
 
@@ -136,6 +140,16 @@ class TranscriptionPipelineTests(unittest.TestCase):
         self.assertEqual(
             apply_mock.call_args.kwargs["prepared_assignment"][0][0]["speaker"],
             "speaker-1",
+        )
+        self.assertIn(("asr", "running", "running firered_asr2 ASR"), progress_events)
+        self.assertTrue(
+            any(node_id == "diarization" and status == "running" for node_id, status, _ in progress_events)
+        )
+        self.assertTrue(
+            any(node_id == "asr" and status == "succeeded" for node_id, status, _ in progress_events)
+        )
+        self.assertTrue(
+            any(node_id == "diarization" and status == "succeeded" for node_id, status, _ in progress_events)
         )
 
     def test_combined_provider_keeps_its_internal_parallel_pipeline(self):

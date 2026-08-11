@@ -145,7 +145,9 @@ def main() -> int:
                 prepared_assignment=prepared_assignment,
             )
     if transcript is None or not transcript.text.strip():
-        raise RuntimeError("Required ASR transcript was not produced for uploaded audio")
+        raise RuntimeError(
+            "No recognizable speech was produced by ASR for uploaded audio"
+        )
     if asr_result:
         asr_result.transcript = transcript
     transcript_path = write_transcript_markdown(transcript, output_dir / "transcript.md")

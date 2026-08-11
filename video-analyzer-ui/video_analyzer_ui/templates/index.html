@@ -185,6 +185,41 @@
                     <p id="errorMessage"></p>
                 </section>
 
+                <section id="consoleFlowPanel" class="panel console-flow-panel">
+                    <div class="panel-head console-flow-head">
+                        <div>
+                            <h2>模型执行与文档推导</h2>
+                            <p id="consoleFlowSummary">选择任务后查看完整模型执行和文档生成关系</p>
+                        </div>
+                        <div class="console-flow-controls">
+                            <button id="consoleFlowPrevious" class="icon-button light" type="button" title="向左查看" aria-label="向左查看流程">‹</button>
+                            <button id="consoleFlowZoomOut" class="icon-button light" type="button" title="缩小" aria-label="缩小流程图">−</button>
+                            <button id="consoleFlowFit" class="icon-button light" type="button" title="适应宽度" aria-label="流程图适应宽度">↔</button>
+                            <button id="consoleFlowZoomIn" class="icon-button light" type="button" title="放大" aria-label="放大流程图">+</button>
+                            <button id="consoleFlowCurrent" class="icon-button light" type="button" title="定位当前阶段" aria-label="定位当前阶段">◎</button>
+                            <button id="consoleFlowNext" class="icon-button light" type="button" title="向右查看" aria-label="向右查看流程">›</button>
+                        </div>
+                    </div>
+                    <div id="consoleStageFlowViewport" class="console-stage-flow-viewport" tabindex="0" aria-label="模型执行与文档推导流程">
+                        <div id="consoleStageFlow" class="console-stage-flow">
+                            <div class="console-stage-flow-empty">选择任务后显示执行流程</div>
+                        </div>
+                    </div>
+                    <section id="consoleStageInspector" class="console-stage-inspector" hidden>
+                        <div class="console-stage-inspector-head">
+                            <div>
+                                <span id="consoleStageInspectorKicker">阶段详情</span>
+                                <h3 id="consoleStageInspectorTitle">-</h3>
+                            </div>
+                            <div id="consoleStageInspectorStatus"></div>
+                        </div>
+                        <div id="consoleStageInspectorMetrics" class="console-stage-inspector-metrics"></div>
+                        <p id="consoleStageInspectorMessage" class="console-stage-inspector-message"></p>
+                        <div id="consoleStageInspectorArtifacts" class="console-stage-inspector-artifacts"></div>
+                        <button id="consoleStageLogButton" class="secondary" type="button" disabled>查看阶段日志</button>
+                    </section>
+                </section>
+
                 <section class="panel">
                     <h2>任务信息</h2>
                     <div class="info-grid">
@@ -197,17 +232,21 @@
                     </div>
                 </section>
 
-                <section class="panel">
-                    <h2>阶段</h2>
-                    <div class="table-wrap">
-                        <table>
-                            <thead>
-                                <tr><th>阶段</th><th>状态</th><th>耗时</th><th>队列</th><th>日志</th></tr>
-                            </thead>
-                            <tbody id="stageRows"></tbody>
-                        </table>
-                    </div>
-                    <div id="stageDurationSummary" class="stage-duration-summary">原视频长度：- · 阶段总耗时：-</div>
+                <section class="panel stage-table-panel">
+                    <details class="stage-table-details">
+                        <summary>
+                            <span>阶段详细列表</span>
+                            <span id="stageDurationSummary" class="stage-duration-summary">原视频长度：- · 阶段总耗时：-</span>
+                        </summary>
+                        <div class="table-wrap">
+                            <table>
+                                <thead>
+                                    <tr><th>阶段</th><th>状态</th><th>耗时</th><th>队列</th><th>日志</th></tr>
+                                </thead>
+                                <tbody id="stageRows"></tbody>
+                            </table>
+                        </div>
+                    </details>
                 </section>
 
                 <section id="corePanel" class="panel" hidden>
@@ -220,6 +259,17 @@
                             <tbody id="coreRows"></tbody>
                         </table>
                     </div>
+                </section>
+
+                <section id="consoleSummaryPanel" class="panel console-summary-panel">
+                    <div class="panel-head">
+                        <div>
+                            <h2>运行与结果总结</h2>
+                            <p id="consoleSummaryHeadline">选择任务后查看耗时、处理量和产物概况</p>
+                        </div>
+                    </div>
+                    <div id="consoleSummaryGrid" class="console-summary-grid"></div>
+                    <div id="consoleResultSummary" class="console-result-summary"></div>
                 </section>
 
                 <section id="coreDiagnosticsPanel" class="panel core-diagnostics-panel" hidden>
@@ -647,29 +697,59 @@
                                 <textarea id="skillProjectGoal" rows="4" placeholder="要沉淀成 Skill 的目标"></textarea>
                                 <div class="skill-actions">
                                     <button id="createSkillProjectButton" type="submit">新建项目</button>
-                                    <button id="assessSkillProjectButton" class="secondary" type="button" disabled>评估</button>
-                                    <button id="startSkillProjectButton" type="button" disabled>开始蒸馏</button>
                                 </div>
                             </form>
-                            <section id="skillProjectDetail" class="skill-project-detail">
-                                <div class="skills-empty">创建或选择一个 Skill 项目</div>
+                            <section class="skill-project-flow-panel" aria-label="目标蒸馏流程">
+                                <div class="skill-project-flow-heading">
+                                    <div>
+                                        <h3>目标蒸馏流程</h3>
+                                        <p id="skillProjectFlowSummary">选择一个项目查看从资料包到启用的流程。</p>
+                                    </div>
+                                    <span id="skillProjectFlowStatus" class="skill-project-flow-status">未选择</span>
+                                </div>
+                                <div id="skillProjectFlow" class="skill-project-flow" aria-live="polite">
+                                    <div class="skills-empty">创建或选择一个 Skill 项目</div>
+                                </div>
                             </section>
                         </section>
                         <aside class="skills-inspector-pane">
                             <section>
-                                <h3>资料来源</h3>
-                                <div class="skill-actions">
-                                    <button id="addCurrentJobSkillSourceButton" class="secondary" type="button" disabled>关联当前任务</button>
+                                <div class="skill-project-inspector-heading">
+                                    <div>
+                                        <h3 id="skillProjectInspectorTitle">流程详情</h3>
+                                        <p id="skillProjectInspectorMeta">选择流程节点查看当前状态</p>
+                                    </div>
                                 </div>
-                                <div id="skillProjectSources" class="skill-project-sources">暂无资料</div>
+                                <div id="skillProjectDetail" class="skill-project-detail">
+                                    <div class="skills-empty">创建或选择一个 Skill 项目</div>
+                                </div>
+                            </section>
+                            <section class="skill-project-package-panel">
+                                <h3>导入 Video Analyzer 资料包</h3>
+                                <div class="skill-project-package-controls">
+                                    <input id="skillProjectPackageId" type="text" maxlength="160" placeholder="资料包 ID，例如 BV18Zu46DE3p">
+                                    <button id="previewSkillProjectPackageButton" class="secondary" type="button" disabled>检查</button>
+                                </div>
+                                <div id="skillProjectPackageStatus" class="skill-project-package-status" aria-live="polite"></div>
+                                <div id="skillProjectPackagePreview" class="skill-project-package-preview">输入资料包 ID 后检查。</div>
+                                <button id="importSkillProjectPackageButton" type="button" disabled>导入此资料包</button>
                             </section>
                             <section>
-                                <h3>导入对话</h3>
-                                <input id="skillProjectImportFile" type="file" accept=".txt,.md,.json,.jsonl">
-                                <textarea id="skillProjectImportText" rows="6" placeholder="粘贴本地对话或案例"></textarea>
-                                <button id="importSkillProjectSourceButton" class="secondary" type="button" disabled>导入</button>
+                                <h3>资料来源</h3>
+                                <div id="skillProjectSources" class="skill-project-sources">暂无资料</div>
                             </section>
                         </aside>
+                        <section class="skill-project-log-console">
+                            <div class="skill-project-log-head">
+                                <div>
+                                    <h3>实时运行记录</h3>
+                                    <p id="skillProjectLogSummary">选择项目后显示当前阶段记录。</p>
+                                </div>
+                                <button id="copySkillProjectLogButton" class="secondary tiny" type="button" disabled>复制完整日志</button>
+                            </div>
+                            <div id="skillProjectLogTabs" class="skill-project-log-tabs" role="tablist"></div>
+                            <pre id="skillProjectLogText" class="skill-project-log-text">暂无运行记录</pre>
+                        </section>
                     </div>
                 </section>
 
