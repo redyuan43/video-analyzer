@@ -7,7 +7,10 @@ from PIL import Image, ImageDraw
 
 from video_analyzer.audio_processor import AudioTranscript
 from video_analyzer.frame import Frame
-from video_analyzer.frame_dedup_audit import audit_frame_deduplication
+from video_analyzer.frame_dedup_audit import (
+    audit_frame_deduplication,
+    select_audited_frames,
+)
 from video_analyzer.ocr import OCREvent
 from video_analyzer.review_artifacts import write_run_manifest, write_visual_review
 
@@ -29,6 +32,37 @@ class ReviewArtifactTests(unittest.TestCase):
         self.assertEqual(audit["summary"]["treatment_drop_count"], 1)
         self.assertEqual(audit["records"][1]["treatment_action"], "drop")
         self.assertEqual(audit["ab_test"]["name"], "frame_dedup_sliding_window_rgb_diff")
+
+    def test_dedup_audit_repairs_large_timeline_gaps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            frames = []
+            for index in range(7):
+                path = root / f"frame_{index}.jpg"
+                Image.new("RGB", (80, 60), "white").save(path)
+                frames.append(Frame(index, path, index * 30.0, float(index)))
+
+            audit = audit_frame_deduplication(frames)
+            selected = select_audited_frames(frames, audit)
+
+        timestamps = [frame.timestamp for frame in selected]
+        self.assertEqual(timestamps[0], 0.0)
+        self.assertEqual(timestamps[-1], 180.0)
+        self.assertLessEqual(
+            max(right - left for left, right in zip(timestamps, timestamps[1:])),
+            50.0,
+        )
+        self.assertGreater(audit["summary"]["coverage_promoted_count"], 0)
+
+    def test_dedup_audit_fails_open_when_disabled(self):
+        frames = [Frame(0, Path("/missing.jpg"), 0.0, 0.0)]
+
+        selected = select_audited_frames(
+            frames,
+            {"enabled": False, "records": []},
+        )
+
+        self.assertEqual(selected, frames)
 
     def test_visual_review_and_run_manifest_are_written_with_ab_metrics(self):
         with tempfile.TemporaryDirectory() as tmp:

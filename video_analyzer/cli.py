@@ -18,7 +18,7 @@ from .artifacts import write_json, write_orin_artifacts, write_transcript_markdo
 from .candidate_frame_strategies import parse_candidate_frame_strategy
 from .config import Config, build_openai_extra_body, get_client, get_model, resolve_api_key, resolve_temperature
 from .frame import VideoProcessor
-from .frame_dedup_audit import write_frame_dedup_audit
+from .frame_dedup_audit import select_audited_frames, write_frame_dedup_audit
 from .frame_selection import (
     AUTO,
     FrameDecision,
@@ -811,6 +811,12 @@ def main():
         help="Resize OCR images to this longest side before upload; <=0 disables resizing",
     )
     parser.add_argument(
+        "--ocr-image-mode",
+        choices=["gundam", "base"],
+        default=None,
+        help="Unlimited-OCR image preprocessing mode",
+    )
+    parser.add_argument(
         "--ocr-retry-endpoints",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -1336,7 +1342,11 @@ def main():
                     },
                 )
             timings["candidate_frame_extraction_seconds"] = round(time.perf_counter() - stage_started, 3)
+            audit_started = time.perf_counter()
             frame_dedup_audit_path, frame_dedup_audit = write_frame_dedup_audit(frames, output_dir)
+            audited_ocr_frames = select_audited_frames(frames, frame_dedup_audit)
+            audit_summary = frame_dedup_audit.get("summary") or {}
+            timings["ocr_frame_audit_seconds"] = round(time.perf_counter() - audit_started, 3)
             frame_dedup_audit_metadata = {
                 key: value
                 for key, value in frame_dedup_audit.items()
@@ -1344,6 +1354,25 @@ def main():
             }
 
             if task == "operation_manual":
+                audit_message = (
+                    f"OCR frame audit retained {len(audited_ocr_frames)} of {len(frames)} "
+                    f"candidate frames; max gap "
+                    f"{float(audit_summary.get('max_kept_gap_seconds') or 0):.1f}s"
+                )
+                logger.info(audit_message)
+                write_analysis_progress(
+                    output_dir,
+                    "ocr_audit",
+                    message=audit_message,
+                    artifacts={"frame_dedup_audit": str(frame_dedup_audit_path)},
+                    node_updates={
+                        "frame_audit": {
+                            "status": "succeeded",
+                            "message": audit_message,
+                            "duration_seconds": timings["ocr_frame_audit_seconds"],
+                        },
+                    },
+                )
                 current_progress_step = "ocr"
                 write_analysis_progress(
                     output_dir,
@@ -1358,7 +1387,7 @@ def main():
                 ocr_config = config.get("ocr", {})
                 ocr_base_urls = ocr_config.get("base_urls")
                 selected_ocr_frames, ocr_keyframe_decisions, ocr_keyframe_metadata = select_ocr_keyframes(
-                    frames=frames,
+                    frames=audited_ocr_frames,
                     transcript=transcript,
                     video_duration_seconds=frame_selection_metadata.get("video_duration_seconds", config.get("duration") or 0.0),
                     pipeline_mode=args.pipeline_mode,
@@ -1366,9 +1395,14 @@ def main():
                     budget=args.ocr_keyframe_budget,
                     scan_frames_count=scan_frames_count_from_metadata(frame_extraction_metadata),
                 )
+                ocr_keyframe_metadata["source_candidate_frames_count"] = len(frames)
+                ocr_keyframe_metadata["audited_candidate_frames_count"] = len(audited_ocr_frames)
+                ocr_keyframe_metadata["audit_max_gap_seconds"] = audit_summary.get("max_kept_gap_seconds")
                 logger.info(
-                    "Selected %s OCR keyframes from %s candidate frames after scanning %s preview frames",
+                    "Selected %s OCR keyframes from %s audited frames (%s original) "
+                    "after scanning %s preview frames",
                     len(selected_ocr_frames),
+                    len(audited_ocr_frames),
                     len(frames),
                     ocr_keyframe_metadata.get("scan_frames_count"),
                 )
@@ -1435,6 +1469,7 @@ def main():
                                 warmup_retry_interval_seconds=ocr_config.get("warmup_retry_interval_seconds", 5),
                                 cache_mode=ocr_config.get("cache", "on"),
                                 cache_dir=ocr_config.get("cache_dir", ".cache/video-analyzer/ocr"),
+                                image_mode=ocr_config.get("image_mode", "gundam"),
                                 progress_callback=save_ocr_event,
                             )
                 else:

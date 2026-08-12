@@ -141,12 +141,13 @@ class ModelSettingsTests(unittest.TestCase):
         node_ids = {item["id"] for item in flow["nodes"]}
         edges = {(item["from"], item["to"]) for item in flow["edges"]}
         models = {item["id"]: item for item in settings["models"]}
-        self.assertEqual(flow["version"], 3)
+        self.assertEqual(flow["version"], 4)
         self.assertTrue(
             {
                 "asr",
                 "diarization",
                 "transcript_merge",
+                "frame_audit",
                 "ocr",
                 "vision",
                 "visual_evidence",
@@ -168,6 +169,8 @@ class ModelSettingsTests(unittest.TestCase):
         self.assertNotIn(("asr", "diarization"), edges)
         self.assertIn(("asr", "transcript_merge"), edges)
         self.assertIn(("diarization", "transcript_merge"), edges)
+        self.assertIn(("frame_extract", "frame_audit"), edges)
+        self.assertIn(("frame_audit", "ocr"), edges)
         self.assertIn(("ocr", "vision"), edges)
         self.assertNotIn(("frame_extract", "vision"), edges)
         self.assertIn(("visual_evidence", "evidence_merge"), edges)
@@ -204,6 +207,11 @@ class ModelSettingsTests(unittest.TestCase):
             models["diarization-wespeaker-cn-local"]["protocol"],
             "wespeaker_diarization",
         )
+        self.assertEqual(models["ocr-unlimited-local"]["protocol"], "unlimited_ocr_openai")
+        self.assertEqual(models["ocr-unlimited-local"]["options"]["max_tokens"], 8192)
+        self.assertEqual(models["ocr-unlimited-local"]["options"]["max_image_long_side"], 0)
+        self.assertEqual(models["ocr-unlimited-local"]["options"]["image_mode"], "gundam")
+        self.assertEqual(models["ocr-dots-local"]["protocol"], "dots_ocr_openai")
         self.assertEqual(models["ocr-unlimited-local"]["model"], "baidu/Unlimited-OCR")
         self.assertEqual(models["ocr-dots-local"]["model"], "rednote-hilab/dots.ocr")
         self.assertEqual(
