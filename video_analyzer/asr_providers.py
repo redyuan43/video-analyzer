@@ -242,10 +242,12 @@ def transcribe_with_qwen3_asr(
 def transcribe_with_firered_asr2(
     audio_path: Path,
     url: str,
+    options: Optional[Dict[str, object]] = None,
 ) -> Optional[AudioTranscript]:
     return transcribe_with_http_asr(
         audio_path,
         url,
+        extra_data=dict(options or {}),
         timeout=_http_timeout_for_audio(_wav_duration(audio_path)),
     )
 
@@ -474,6 +476,7 @@ def transcribe_with_provider_result(
                 lambda: transcribe_with_firered_asr2(
                     audio_path,
                     url=str(vibevoice_config.get("firered_asr2_url") or ""),
+                    options=dict(vibevoice_config.get("firered_asr2_options") or {}),
                 ),
             )
         elif candidate == "qwen3_asr":

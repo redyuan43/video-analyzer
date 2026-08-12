@@ -231,6 +231,16 @@ class Config:
             profile_vibevoice_urls = normalize_string_list(profile.get("vibevoice_urls") or profile.get("vibevoice_url"))
             if profile_vibevoice_urls and not getattr(args, "vibevoice_url", None):
                 vibevoice["deep_remote_urls"] = profile_vibevoice_urls
+            for key in (
+                "worker_count",
+                "use_native_chunking",
+                "single_pass_max_duration_sec",
+                "chunk_duration_sec",
+                "chunk_overlap_sec",
+                "chunk_parallel_workers",
+            ):
+                if key in profile:
+                    vibevoice[key] = copy.deepcopy(profile[key])
             profile_remote_urls = normalize_string_list(profile.get("remote_asr_urls") or profile.get("remote_asr_url"))
             if profile_remote_urls and not getattr(args, "remote_asr_url", None):
                 vibevoice["remote_urls"] = profile_remote_urls

@@ -61,6 +61,35 @@ MODEL_KIND_PROTOCOLS = {
     "image": {"codex_imagegen", "none"},
 }
 
+ASR_CHUNK_MODES = {"model_default", "custom"}
+ASR_SEGMENTATION_MODES = {"native", "fixed", "vad"}
+ASR_CHUNK_OPTION_FIELDS = (
+    "single_pass_max_duration_sec",
+    "chunk_duration_sec",
+    "chunk_overlap_sec",
+)
+ASR_CHUNK_DEFAULTS = {
+    "vibevoice_http": {
+        "segmentation_mode": "native",
+        "single_pass_max_duration_sec": 900,
+        "chunk_duration_sec": 370,
+        "chunk_overlap_sec": 10,
+    },
+    "qwen3_asr_http": {
+        "segmentation_mode": "fixed",
+        "single_pass_max_duration_sec": 150,
+        "chunk_duration_sec": 120,
+        "chunk_overlap_sec": 10,
+    },
+    "firered_asr2_http": {
+        "segmentation_mode": "vad",
+        "vad_max_segment_sec": 50,
+        "single_pass_max_duration_sec": 35,
+        "chunk_duration_sec": 30,
+        "chunk_overlap_sec": 3,
+    },
+}
+
 PROFILE_MODEL_FIELDS = {
     "asr": "asr_model_id",
     "diarization": "diarization_model_id",
@@ -463,7 +492,11 @@ def _add_builtin_model_resources(
                 services.get("vibevoice_local_url")
                 or "http://127.0.0.1:18012/api/asr/transcribe"
             ),
-            "options": {"deployment": "local", "worker_count": 5},
+            "options": {
+                "deployment": "local",
+                "worker_count": 5,
+                **ASR_CHUNK_DEFAULTS["vibevoice_http"],
+            },
         },
         "asr-qwen3-1_7b-local": {
             "name": "Qwen3-ASR-1.7B（本地 P40）",
@@ -477,12 +510,11 @@ def _add_builtin_model_resources(
             "options": {
                 "deployment": "local",
                 "worker_count": 5,
-                "chunk_duration_sec": 120,
-                "chunk_overlap_sec": 10,
+                **ASR_CHUNK_DEFAULTS["qwen3_asr_http"],
             },
         },
         "asr-firered2-local": {
-            "name": "FireRedASR2-AED（本地 P40）",
+            "name": "FireRedASR2-AED（本地 P40 · Ray）",
             "kind": "asr",
             "protocol": "firered_asr2_http",
             "model": "firered_asr2_aed",
@@ -493,8 +525,10 @@ def _add_builtin_model_resources(
             "options": {
                 "deployment": "local",
                 "worker_count": 5,
-                "chunk_duration_sec": 30,
-                "chunk_overlap_sec": 3,
+                "concurrency": 5,
+                "gpu_ids": [0, 1, 2, 4, 5],
+                "dispatch_mode": "ray",
+                **ASR_CHUNK_DEFAULTS["firered_asr2_http"],
             },
         },
         "diarization-3dspeaker-local": {
@@ -924,6 +958,9 @@ def build_settings_document(config: dict[str, Any]) -> dict[str, Any]:
             "profile_model_fields": PROFILE_MODEL_FIELDS,
             "profile_flow": VIDEO_PROFILE_FLOW,
             "workflows": PROFILE_WORKFLOWS,
+            "asr_chunk_modes": sorted(ASR_CHUNK_MODES),
+            "asr_segmentation_modes": sorted(ASR_SEGMENTATION_MODES),
+            "asr_chunk_defaults": copy.deepcopy(ASR_CHUNK_DEFAULTS),
         },
     }
 
@@ -950,6 +987,22 @@ def expand_runtime_profile(config: dict[str, Any], profile: dict[str, Any]) -> d
         protocol = asr.get("protocol")
         endpoints = normalize_string_list(asr.get("endpoints"))
         options = dict(asr.get("options") or {})
+        if expanded.get("asr_chunk_mode") == "custom":
+            options.update(
+                {
+                    key: expanded[key]
+                    for key in ASR_CHUNK_OPTION_FIELDS
+                    if expanded.get(key) is not None
+                }
+            )
+        if expanded.get("asr_worker_count") is not None:
+            options["worker_count"] = expanded["asr_worker_count"]
+            options["concurrency"] = expanded["asr_worker_count"]
+        if protocol == "firered_asr2_http":
+            if expanded.get("asr_segmentation_mode"):
+                options["segmentation_mode"] = expanded["asr_segmentation_mode"]
+            if expanded.get("vad_max_segment_sec") is not None:
+                options["vad_max_segment_sec"] = expanded["vad_max_segment_sec"]
         provider = {
             "vibevoice_http": "vibevoice",
             "qwen3_asr_http": "qwen3_asr",
@@ -1153,8 +1206,61 @@ def validate_profile(
     if not workflow:
         raise SettingsValidationError(f"unknown workflow: {workflow_id}")
     cleaned["workflow_id"] = workflow_id
+    try:
+        asr_worker_count = int(cleaned.get("asr_worker_count") or 5)
+    except (TypeError, ValueError) as exc:
+        raise SettingsValidationError("asr_worker_count must be an integer") from exc
+    if not 1 <= asr_worker_count <= 5:
+        raise SettingsValidationError("asr_worker_count must be between 1 and 5")
+    cleaned["asr_worker_count"] = asr_worker_count
+    asr_segmentation_mode = str(
+        cleaned.get("asr_segmentation_mode") or ""
+    ).strip().lower()
+    if asr_segmentation_mode and asr_segmentation_mode not in ASR_SEGMENTATION_MODES:
+        raise SettingsValidationError(
+            f"unsupported ASR segmentation mode: {asr_segmentation_mode}"
+        )
+    if asr_segmentation_mode:
+        cleaned["asr_segmentation_mode"] = asr_segmentation_mode
+    try:
+        vad_max_segment_sec = float(cleaned.get("vad_max_segment_sec") or 50)
+    except (TypeError, ValueError) as exc:
+        raise SettingsValidationError("vad_max_segment_sec must be a number") from exc
+    if not 1 <= vad_max_segment_sec <= 55:
+        raise SettingsValidationError(
+            "vad_max_segment_sec must be between 1 and 55"
+        )
+    cleaned["vad_max_segment_sec"] = vad_max_segment_sec
+    asr_chunk_mode = str(cleaned.get("asr_chunk_mode") or "model_default").strip()
+    if asr_chunk_mode not in ASR_CHUNK_MODES:
+        raise SettingsValidationError(f"unsupported ASR chunk mode: {asr_chunk_mode}")
+    if asr_chunk_mode == "custom":
+        normalized_chunk_options: dict[str, float] = {}
+        for key in ASR_CHUNK_OPTION_FIELDS:
+            try:
+                value = float(cleaned.get(key))
+            except (TypeError, ValueError) as exc:
+                raise SettingsValidationError(f"{key} must be a positive number") from exc
+            if value < 0 or (key != "chunk_overlap_sec" and value == 0):
+                raise SettingsValidationError(
+                    f"{key} must be a non-negative number"
+                )
+            normalized_chunk_options[key] = value
+        if (
+            normalized_chunk_options["chunk_overlap_sec"]
+            >= normalized_chunk_options["chunk_duration_sec"]
+        ):
+            raise SettingsValidationError(
+                "chunk_overlap_sec must be smaller than chunk_duration_sec"
+            )
+        cleaned.update(normalized_chunk_options)
+    else:
+        for key in ASR_CHUNK_OPTION_FIELDS:
+            cleaned.pop(key, None)
+    cleaned["asr_chunk_mode"] = asr_chunk_mode
     models = payload.get("models") if isinstance(payload.get("models"), dict) else {}
     catalog = build_settings_document(config)["models"]
+    selected_asr: dict[str, Any] | None = None
     for slot, spec in workflow["model_fields"].items():
         field = spec["field"]
         kind = spec["kind"]
@@ -1182,7 +1288,37 @@ def validate_profile(
             )
         if spec.get("required") and resource.get("protocol") == "none":
             raise SettingsValidationError(f"{slot} model cannot be disabled")
+        if slot == "asr":
+            selected_asr = resource
         cleaned[field] = model_id
+    if selected_asr:
+        protocol = str(selected_asr.get("protocol") or "")
+        default_segmentation = str(
+            (selected_asr.get("options") or {}).get("segmentation_mode")
+            or ("fixed" if protocol == "qwen3_asr_http" else "native")
+        )
+        segmentation = str(
+            cleaned.get("asr_segmentation_mode") or default_segmentation
+        )
+        allowed = {
+            "firered_asr2_http": {"fixed", "vad"},
+            "qwen3_asr_http": {"fixed"},
+            "vibevoice_http": {"native"},
+        }.get(protocol)
+        if allowed and segmentation not in allowed:
+            raise SettingsValidationError(
+                f"{protocol} does not support ASR segmentation mode: {segmentation}"
+            )
+        cleaned["asr_segmentation_mode"] = segmentation
+        if protocol == "firered_asr2_http" and asr_chunk_mode == "custom":
+            if normalized_chunk_options["single_pass_max_duration_sec"] > 55:
+                raise SettingsValidationError(
+                    "FireRedASR2 single-pass duration must not exceed 55 seconds"
+                )
+            if normalized_chunk_options["chunk_duration_sec"] > 55:
+                raise SettingsValidationError(
+                    "FireRedASR2 chunk duration must not exceed 55 seconds"
+                )
     cleaned["label"] = str(payload.get("label") or profile_name).strip()[:120]
     cleaned["description"] = str(payload.get("description") or "").strip()[:500]
     return expand_runtime_profile(config, cleaned)
@@ -1354,6 +1490,12 @@ class RuntimeSettingsStore:
         for key in (
             "vibevoice_url",
             "vibevoice_urls",
+            "worker_count",
+            "use_native_chunking",
+            "single_pass_max_duration_sec",
+            "chunk_duration_sec",
+            "chunk_overlap_sec",
+            "chunk_parallel_workers",
             "qwen3_asr_url",
             "qwen3_asr_model",
             "qwen3_asr_options",

@@ -207,9 +207,30 @@ def prepare_local_model_stage(stage: str, config: dict, logger: logging.Logger) 
         provider = str(asr.get("provider") or "vibevoice")
         vibevoice = asr.get("vibevoice") or {}
         env["ASR_ENGINE"] = provider
-        if provider == "qwen3_asr":
+        if provider == "vibevoice":
+            env["VIBEVOICE_WORKER_COUNT"] = str(
+                vibevoice.get("chunk_parallel_workers")
+                or vibevoice.get("worker_count")
+                or 5
+            )
+            if vibevoice.get("single_pass_max_duration_sec") is not None:
+                env["VIBEVOICE_SINGLE_PASS_MAX_DURATION_SEC"] = str(
+                    vibevoice["single_pass_max_duration_sec"]
+                )
+            if vibevoice.get("chunk_duration_sec") is not None:
+                env["VIBEVOICE_CHUNK_DURATION_SEC"] = str(
+                    vibevoice["chunk_duration_sec"]
+                )
+            if vibevoice.get("chunk_overlap_sec") is not None:
+                env["VIBEVOICE_CHUNK_OVERLAP_SEC"] = str(
+                    vibevoice["chunk_overlap_sec"]
+                )
+        elif provider == "qwen3_asr":
             options = vibevoice.get("qwen3_asr_options") or {}
             env["QWEN3_ASR_WORKER_COUNT"] = str(options.get("worker_count") or 5)
+            gpu_ids = options.get("gpu_ids")
+            if gpu_ids:
+                env["QWEN3_ASR_GPU_IDS"] = ",".join(str(item) for item in gpu_ids)
             configured_model_path = options.get("model_path")
             if not configured_model_path:
                 candidate = str(vibevoice.get("qwen3_asr_model") or "").strip()
@@ -217,13 +238,40 @@ def prepare_local_model_stage(stage: str, config: dict, logger: logging.Logger) 
                     configured_model_path = candidate
             if configured_model_path:
                 env["QWEN3_ASR_MODEL"] = str(Path(configured_model_path).expanduser())
+            if options.get("single_pass_max_duration_sec") is not None:
+                env["QWEN3_ASR_SINGLE_PASS_SECONDS"] = str(
+                    options["single_pass_max_duration_sec"]
+                )
+            if options.get("chunk_duration_sec") is not None:
+                env["QWEN3_ASR_CHUNK_SECONDS"] = str(options["chunk_duration_sec"])
+            if options.get("chunk_overlap_sec") is not None:
+                env["QWEN3_ASR_CHUNK_OVERLAP_SECONDS"] = str(
+                    options["chunk_overlap_sec"]
+                )
         elif provider == "firered_asr2":
             options = vibevoice.get("firered_asr2_options") or {}
             env["FIRERED_ASR2_WORKER_COUNT"] = str(options.get("worker_count") or 5)
+            gpu_ids = options.get("gpu_ids")
+            if gpu_ids:
+                env["FIRERED_ASR2_GPU_IDS"] = ",".join(str(item) for item in gpu_ids)
             env["FIRERED_ASR2_CHUNK_SECONDS"] = str(options.get("chunk_duration_sec") or 30)
             env["FIRERED_ASR2_CHUNK_OVERLAP_SECONDS"] = str(
                 options.get("chunk_overlap_sec") or 3
             )
+            if options.get("single_pass_max_duration_sec") is not None:
+                env["FIRERED_ASR2_SINGLE_PASS_SECONDS"] = str(
+                    options["single_pass_max_duration_sec"]
+                )
+            env["FIRERED_ASR2_SEGMENTATION_MODE"] = str(
+                options.get("segmentation_mode") or "vad"
+            )
+            env["FIRERED_VAD_MAX_SEGMENT_SECONDS"] = str(
+                options.get("vad_max_segment_sec") or 50
+            )
+            if options.get("vad_model_path"):
+                env["FIRERED_VAD_MODEL"] = str(
+                    Path(options["vad_model_path"]).expanduser()
+                )
     elif stage == "ocr":
         ocr = config.get("ocr") or {}
         env["OCR_ENGINE"] = str(ocr.get("engine") or ocr.get("provider") or "unlimited")

@@ -312,6 +312,115 @@ class ModelSettingsTests(unittest.TestCase):
             "http://127.0.0.1:18014/api/asr/transcribe",
         )
         self.assertEqual(profile["firered_asr2_options"]["worker_count"], 5)
+        self.assertEqual(profile["firered_asr2_options"]["gpu_ids"], [0, 1, 2, 4, 5])
+        self.assertEqual(
+            profile["firered_asr2_options"]["segmentation_mode"],
+            "vad",
+        )
+        self.assertEqual(
+            profile["firered_asr2_options"]["vad_max_segment_sec"],
+            50,
+        )
+
+    def test_profile_custom_asr_chunk_settings_override_supported_local_models(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_repo(root)
+            settings = store.public_settings()
+            source = settings["profiles"][0]
+            base_models = {
+                kind: source[field]
+                for kind, field in settings["schema"]["profile_model_fields"].items()
+            }
+            cases = (
+                ("vibevoice", "asr-vibevoice-local", None, 180),
+                ("qwen3", "asr-qwen3-1_7b-local", "qwen3_asr_options", 180),
+                ("firered", "asr-firered2-local", "firered_asr2_options", 50),
+            )
+            for suffix, model_id, options_field, chunk_seconds in cases:
+                models = dict(base_models)
+                models["asr"] = model_id
+                store.save_profile(
+                    f"chunk-{suffix}",
+                    {
+                        "label": f"Chunk {suffix}",
+                        "models": models,
+                        "settings": {
+                            "asr_chunk_mode": "custom",
+                            "single_pass_max_duration_sec": chunk_seconds,
+                            "chunk_duration_sec": chunk_seconds,
+                            "chunk_overlap_sec": 5,
+                        },
+                    },
+                )
+                _defaults, _user, merged = store.load()
+                profile = get_runtime_profile(merged, f"chunk-{suffix}")
+                effective = profile[options_field] if options_field else profile
+                self.assertEqual(
+                    effective["single_pass_max_duration_sec"],
+                    chunk_seconds,
+                )
+                self.assertEqual(effective["chunk_duration_sec"], chunk_seconds)
+                self.assertEqual(effective["chunk_overlap_sec"], 5)
+
+    def test_firered_profile_accepts_vad_ray_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_repo(root)
+            source = store.public_settings()["profiles"][0]
+            models = {
+                kind: source[field]
+                for kind, field in store.public_settings()["schema"][
+                    "profile_model_fields"
+                ].items()
+            }
+            models["asr"] = "asr-firered2-local"
+            store.save_profile(
+                "firered-vad",
+                {
+                    "label": "FireRed VAD",
+                    "models": models,
+                    "settings": {
+                        "asr_segmentation_mode": "vad",
+                        "asr_worker_count": 5,
+                        "vad_max_segment_sec": 50,
+                    },
+                },
+            )
+            _defaults, _user, merged = store.load()
+            profile = get_runtime_profile(merged, "firered-vad")
+
+        options = profile["firered_asr2_options"]
+        self.assertEqual(options["segmentation_mode"], "vad")
+        self.assertEqual(options["worker_count"], 5)
+        self.assertEqual(options["vad_max_segment_sec"], 50)
+
+    def test_profile_rejects_asr_chunk_overlap_not_smaller_than_chunk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.make_repo(Path(tmp))
+            settings = store.public_settings()
+            source = settings["profiles"][0]
+            models = {
+                kind: source[field]
+                for kind, field in settings["schema"]["profile_model_fields"].items()
+            }
+            with self.assertRaisesRegex(
+                SettingsValidationError,
+                "chunk_overlap_sec must be smaller",
+            ):
+                store.save_profile(
+                    "invalid-chunks",
+                    {
+                        "label": "Invalid chunks",
+                        "models": models,
+                        "settings": {
+                            "asr_chunk_mode": "custom",
+                            "single_pass_max_duration_sec": 240,
+                            "chunk_duration_sec": 60,
+                            "chunk_overlap_sec": 60,
+                        },
+                    },
+                )
 
     def test_settings_expose_audio_workflow_and_builtin_profile(self):
         with tempfile.TemporaryDirectory() as tmp:

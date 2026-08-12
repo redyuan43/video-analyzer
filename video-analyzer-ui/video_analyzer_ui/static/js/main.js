@@ -93,6 +93,15 @@ let selectedSettingsModelId = '';
 let selectedSettingsProfileName = '';
 let selectedProfileFlowNodeId = 'asr';
 let profileModelSelections = {};
+let profileAsrChunkSettings = {
+    mode: 'model_default',
+    segmentationMode: 'native',
+    workerCount: 5,
+    vadMaxSegmentSeconds: 50,
+    singlePassSeconds: null,
+    chunkSeconds: null,
+    overlapSeconds: null
+};
 let profileFlowDrawFrame = null;
 let profileFlowResizeObserver = null;
 let profileTestReport = null;
@@ -1100,7 +1109,12 @@ function profileAdvancedSettings(profile) {
         ...Object.values(settingsData?.schema?.profile_model_fields || {}),
         ...workflowFields,
         'asr_provider', 'vibevoice_url', 'vibevoice_urls', 'remote_asr_url', 'remote_asr_urls',
-        'firered_3dspeaker_url', 'openai_audio_url', 'openai_audio_model', 'asr_api_key_env',
+        'qwen3_asr_url', 'qwen3_asr_model', 'qwen3_asr_options',
+        'firered_asr2_url', 'firered_asr2_options', 'firered_3dspeaker_url',
+        'openai_audio_url', 'openai_audio_model', 'asr_api_key_env',
+        'asr_chunk_mode', 'asr_segmentation_mode', 'asr_worker_count',
+        'vad_max_segment_sec', 'single_pass_max_duration_sec',
+        'chunk_duration_sec', 'chunk_overlap_sec',
         'speaker_diarization', 'ocr_provider', 'ocr_base_url', 'ocr_base_urls', 'ocr_model',
         'vision_base_url', 'vision_model', 'vision_api_key_env',
         'llm_base_url', 'text_base_url', 'text_model', 'text_api_key_env',
@@ -1162,6 +1176,135 @@ function selectedProfileModel(flowNode) {
     const kind = flowNode?.model_kind || workflowModelFields()[slot]?.kind || '';
     const modelId = profileModelSelections[slot] || '';
     return settingsModels(kind).find(item => item.id === modelId) || null;
+}
+
+function asrChunkDefaults(model) {
+    const defaults = settingsData?.schema?.asr_chunk_defaults?.[model?.protocol] || {};
+    return {
+        segmentationMode: String(defaults.segmentation_mode || model?.options?.segmentation_mode || 'native'),
+        workerCount: Number(model?.options?.worker_count || 1),
+        vadMaxSegmentSeconds: Number(defaults.vad_max_segment_sec || model?.options?.vad_max_segment_sec || 50),
+        singlePassSeconds: Number(defaults.single_pass_max_duration_sec || 0) || null,
+        chunkSeconds: Number(defaults.chunk_duration_sec || 0) || null,
+        overlapSeconds: Number(defaults.chunk_overlap_sec || 0) || null
+    };
+}
+
+function selectedAsrModel() {
+    const asrNode = profileFlowSchema().nodes.find(item => (
+        item.model_kind === 'asr' && (item.model_slot || item.model_kind) === 'asr'
+    ));
+    return asrNode ? selectedProfileModel(asrNode) : null;
+}
+
+function loadProfileAsrChunkSettings(profile = null) {
+    const defaults = asrChunkDefaults(selectedAsrModel());
+    const hasLegacyOverride = [
+        'single_pass_max_duration_sec',
+        'chunk_duration_sec',
+        'chunk_overlap_sec'
+    ].some(key => profile?.[key] != null);
+    profileAsrChunkSettings = {
+        mode: profile?.asr_chunk_mode || (hasLegacyOverride ? 'custom' : 'model_default'),
+        segmentationMode: profile?.asr_segmentation_mode || defaults.segmentationMode,
+        workerCount: Number(profile?.asr_worker_count || defaults.workerCount || 1),
+        vadMaxSegmentSeconds: Number(profile?.vad_max_segment_sec || defaults.vadMaxSegmentSeconds || 50),
+        singlePassSeconds: Number(profile?.single_pass_max_duration_sec || defaults.singlePassSeconds || 0) || null,
+        chunkSeconds: Number(profile?.chunk_duration_sec || defaults.chunkSeconds || 0) || null,
+        overlapSeconds: Number(profile?.chunk_overlap_sec ?? defaults.overlapSeconds ?? 0)
+    };
+}
+
+function asrChunkEditorMarkup(model) {
+    const defaults = asrChunkDefaults(model);
+    if (!defaults.chunkSeconds) {
+        return '<p class="profile-flow-note">该协议的分块由服务端管理，当前运行方案不覆盖。</p>';
+    }
+    const custom = profileAsrChunkSettings.mode === 'custom';
+    const values = custom ? profileAsrChunkSettings : defaults;
+    const protocol = model?.protocol || '';
+    const segmentationOptions = protocol === 'firered_asr2_http'
+        ? [
+            ['vad', 'FireRedVAD'],
+            ['fixed', '固定时长']
+        ]
+        : protocol === 'qwen3_asr_http'
+            ? [['fixed', '固定时长']]
+            : [['native', '模型原生']];
+    const segmentationMode = profileAsrChunkSettings.segmentationMode
+        || defaults.segmentationMode;
+    const vadMode = protocol === 'firered_asr2_http' && segmentationMode === 'vad';
+    return `<section class="profile-asr-chunk-settings" aria-label="ASR 分块设置">
+        <div class="profile-asr-chunk-head">
+            <strong>ASR 分块策略</strong>
+            <span>${vadMode
+                ? `VAD 最大语音段 ${escapeHtml(String(values.vadMaxSegmentSeconds))} 秒`
+                : `模型推荐：${escapeHtml(String(defaults.chunkSeconds))} 秒，重叠 ${escapeHtml(String(defaults.overlapSeconds))} 秒`}</span>
+        </div>
+        <div class="profile-asr-chunk-grid">
+            <label>
+                <span>参数来源</span>
+                <select data-asr-chunk-field="mode">
+                    <option value="model_default" ${custom ? '' : 'selected'}>跟随模型推荐值</option>
+                    <option value="custom" ${custom ? 'selected' : ''}>统一自定义</option>
+                </select>
+            </label>
+            <label>
+                <span>分段策略</span>
+                <select data-asr-chunk-field="segmentationMode">
+                    ${segmentationOptions.map(([value, label]) => (
+                        `<option value="${value}" ${value === segmentationMode ? 'selected' : ''}>${label}</option>`
+                    )).join('')}
+                </select>
+            </label>
+            <label>
+                <span>Ray Worker 数</span>
+                <input data-asr-chunk-field="workerCount" type="number" min="1" max="5" step="1" value="${escapeHtml(String(profileAsrChunkSettings.workerCount || defaults.workerCount || 1))}">
+            </label>
+            ${vadMode ? `<label>
+                <span>最大语音段秒数</span>
+                <input data-asr-chunk-field="vadMaxSegmentSeconds" type="number" min="1" max="55" step="1" value="${escapeHtml(String(profileAsrChunkSettings.vadMaxSegmentSeconds || defaults.vadMaxSegmentSeconds || 50))}">
+            </label>` : `
+                <label>
+                    <span>分块秒数</span>
+                    <input data-asr-chunk-field="chunkSeconds" type="number" min="1" step="1" value="${escapeHtml(String(values.chunkSeconds || ''))}" ${custom ? '' : 'disabled'}>
+                </label>
+                <label>
+                    <span>重叠秒数</span>
+                    <input data-asr-chunk-field="overlapSeconds" type="number" min="0" step="1" value="${escapeHtml(String(values.overlapSeconds ?? ''))}" ${custom ? '' : 'disabled'}>
+                </label>
+                <label>
+                    <span>单段直跑上限</span>
+                    <input data-asr-chunk-field="singlePassSeconds" type="number" min="1" step="1" value="${escapeHtml(String(values.singlePassSeconds || ''))}" ${custom ? '' : 'disabled'}>
+                </label>`}
+        </div>
+        <p>${vadMode
+            ? 'FireRedVAD 在 CPU 上生成自然语音段，再由 Ray 动态分发到五张 P40。'
+            : '固定分块由 Ray 动态分发；统一自定义值会随运行方案保存。'}</p>
+    </section>`;
+}
+
+function bindAsrChunkEditor(model) {
+    const editor = nodes.profileFlowInspectorBody.querySelector('.profile-asr-chunk-settings');
+    if (!editor) return;
+    editor.querySelector('[data-asr-chunk-field="mode"]')?.addEventListener('change', event => {
+        const mode = event.target.value;
+        if (mode === 'custom' && profileAsrChunkSettings.mode !== 'custom') {
+            profileAsrChunkSettings = { mode, ...asrChunkDefaults(model) };
+        } else {
+            profileAsrChunkSettings.mode = mode;
+        }
+        renderProfileFlowInspector();
+    });
+    editor.querySelector('[data-asr-chunk-field="segmentationMode"]')?.addEventListener('change', event => {
+        profileAsrChunkSettings.segmentationMode = event.target.value;
+        renderProfileFlowInspector();
+    });
+    editor.querySelectorAll('[data-asr-chunk-field]:not(select)').forEach(input => {
+        input.addEventListener('input', event => {
+            profileAsrChunkSettings[event.target.dataset.asrChunkField] = Number(event.target.value);
+        });
+    });
 }
 
 function profileFlowSource(model) {
@@ -1377,6 +1520,12 @@ function renderProfileFlowInspector(nodeId = selectedProfileFlowNodeId) {
     const concurrency = model?.options?.concurrency;
     const parameter = profileFlowParameter(flowNode);
     const testResult = profileNodeTestResult(flowNode.id);
+    const asrChunkEditor = (
+        flowNode.model_kind === 'asr'
+        && (flowNode.model_slot || flowNode.model_kind) === 'asr'
+    )
+        ? asrChunkEditorMarkup(model)
+        : '';
     nodes.profileFlowInspectorBody.innerHTML = `
         <dl class="profile-flow-details">
             <div><dt>当前模型</dt><dd>${escapeHtml(model?.name || '未选择')}</dd></div>
@@ -1391,6 +1540,7 @@ function renderProfileFlowInspector(nodeId = selectedProfileFlowNodeId) {
             <span>${escapeHtml(parameter.label)}</span>
             <input data-flow-parameter="${escapeHtml(flowNode.id)}" type="${parameter.type}" min="${parameter.min}" value="${escapeHtml(parameter.target.value)}">
         </label>` : ''}
+        ${asrChunkEditor}
         ${profileFlowDisabled(model) ? '<p class="profile-flow-warning">此节点已禁用，运行时会跳过对应的模型能力。</p>' : ''}
         ${testResult ? `<p class="profile-flow-node-result ${testResult.ok ? 'passed' : 'failed'}">
             ${escapeHtml(profileTestStatusLabel(testResult))}：${escapeHtml(testResult.detail || '')}
@@ -1404,6 +1554,7 @@ function renderProfileFlowInspector(nodeId = selectedProfileFlowNodeId) {
     nodes.profileFlowInspectorBody.querySelector('[data-flow-parameter]')?.addEventListener('input', event => {
         parameter.target.value = event.target.value;
     });
+    bindAsrChunkEditor(model);
     nodes.profileFlowInspectorActions.querySelector('[data-flow-edit]')?.addEventListener('click', () => {
         if (!model) return;
         setSettingsSection('models');
@@ -1496,6 +1647,21 @@ function renderProfileFlow() {
         selectNode?.addEventListener('change', event => {
             event.stopPropagation();
             profileModelSelections[event.target.dataset.flowModelSlot] = event.target.value;
+            if (event.target.dataset.flowModelSlot === 'asr') {
+                const defaults = asrChunkDefaults(selectedAsrModel());
+                if (profileAsrChunkSettings.mode !== 'custom') {
+                    loadProfileAsrChunkSettings();
+                } else {
+                    const allowed = selectedAsrModel()?.protocol === 'firered_asr2_http'
+                        ? ['vad', 'fixed']
+                        : selectedAsrModel()?.protocol === 'qwen3_asr_http'
+                            ? ['fixed']
+                            : ['native'];
+                    if (!allowed.includes(profileAsrChunkSettings.segmentationMode)) {
+                        profileAsrChunkSettings.segmentationMode = defaults.segmentationMode;
+                    }
+                }
+            }
             selectedProfileFlowNodeId = node.dataset.flowNode;
             renderProfileFlow();
         });
@@ -1535,6 +1701,7 @@ function resetProfileEditor(source = null) {
     nodes.profileDescription.value = source?.description || '';
     profileModelSelections = {};
     setProfileModelSelections(source);
+    loadProfileAsrChunkSettings(source);
     selectedProfileFlowNodeId = profileFlowSchema().nodes[0]?.id || '';
     nodes.profilePipelineMode.value = source?.pipeline_mode || 'balanced';
     nodes.profileVlConcurrency.value = source?.vl_concurrency ?? 5;
@@ -1567,6 +1734,7 @@ function selectSettingsProfile(profileName) {
     nodes.profileDescription.value = profile.description || '';
     profileModelSelections = {};
     setProfileModelSelections(profile);
+    loadProfileAsrChunkSettings(profile);
     selectedProfileFlowNodeId = profileFlowSchema().nodes[0]?.id || '';
     nodes.profilePipelineMode.value = profile.pipeline_mode || 'balanced';
     nodes.profileVlConcurrency.value = profile.vl_concurrency ?? 5;
@@ -1592,6 +1760,19 @@ async function saveProfileSettings(event) {
     settings.vl_concurrency = Number(nodes.profileVlConcurrency.value || 1);
     settings.ocr_concurrency = nodes.profileOcrConcurrency.value.trim() || 'auto';
     settings.text_timeout_seconds = Number(nodes.profileTextTimeout.value || 600);
+    settings.asr_chunk_mode = profileAsrChunkSettings.mode;
+    settings.asr_segmentation_mode = profileAsrChunkSettings.segmentationMode;
+    settings.asr_worker_count = Number(profileAsrChunkSettings.workerCount || 1);
+    settings.vad_max_segment_sec = Number(profileAsrChunkSettings.vadMaxSegmentSeconds || 50);
+    if (profileAsrChunkSettings.mode === 'custom') {
+        settings.single_pass_max_duration_sec = Number(profileAsrChunkSettings.singlePassSeconds);
+        settings.chunk_duration_sec = Number(profileAsrChunkSettings.chunkSeconds);
+        settings.chunk_overlap_sec = Number(profileAsrChunkSettings.overlapSeconds);
+    } else {
+        delete settings.single_pass_max_duration_sec;
+        delete settings.chunk_duration_sec;
+        delete settings.chunk_overlap_sec;
+    }
     const models = currentProfileModelRefs();
     const payload = {
         name: profileName,
@@ -7001,6 +7182,9 @@ async function boot() {
         profileTestReport = null;
         profileModelSelections = {};
         setProfileModelSelections();
+        if (profileAsrChunkSettings.mode !== 'custom') {
+            loadProfileAsrChunkSettings();
+        }
         selectedProfileFlowNodeId = profileFlowSchema().nodes[0]?.id || '';
         renderProfileFlow();
         renderProfileTestSummary();

@@ -97,7 +97,12 @@ class LocalModelRuntimeTests(unittest.TestCase):
                 "vibevoice": {
                     "qwen3_asr_url": "http://127.0.0.1:18013/api/asr/transcribe",
                     "qwen3_asr_model": "Qwen/Qwen3-ASR-1.7B",
-                    "qwen3_asr_options": {"worker_count": 5},
+                    "qwen3_asr_options": {
+                        "worker_count": 5,
+                        "single_pass_max_duration_sec": 240,
+                        "chunk_duration_sec": 180,
+                        "chunk_overlap_sec": 12,
+                    },
                 },
             },
             "local_model_runtime": {
@@ -107,8 +112,71 @@ class LocalModelRuntimeTests(unittest.TestCase):
 
         prepare_local_model_stage("asr", config, logger=__import__("logging").getLogger(__name__))
 
-        self.assertNotIn("QWEN3_ASR_MODEL", run.call_args.kwargs["env"])
-        self.assertEqual(run.call_args.kwargs["env"]["QWEN3_ASR_WORKER_COUNT"], "5")
+        env = run.call_args.kwargs["env"]
+        self.assertNotIn("QWEN3_ASR_MODEL", env)
+        self.assertEqual(env["QWEN3_ASR_WORKER_COUNT"], "5")
+        self.assertEqual(env["QWEN3_ASR_SINGLE_PASS_SECONDS"], "240")
+        self.assertEqual(env["QWEN3_ASR_CHUNK_SECONDS"], "180")
+        self.assertEqual(env["QWEN3_ASR_CHUNK_OVERLAP_SECONDS"], "12")
+
+    @patch("video_analyzer.local_model_runtime.subprocess.run")
+    def test_vibevoice_asr_chunk_settings_are_forwarded(self, run):
+        config = {
+            "asr": {
+                "provider": "vibevoice",
+                "vibevoice": {
+                    "deep_remote_urls": ["http://127.0.0.1:18012/api/asr/transcribe"],
+                    "worker_count": 6,
+                    "chunk_parallel_workers": 5,
+                    "single_pass_max_duration_sec": 240,
+                    "chunk_duration_sec": 180,
+                    "chunk_overlap_sec": 12,
+                },
+            },
+            "local_model_runtime": {
+                "stage_commands": {"asr": ["/bin/echo", "asr"]},
+            },
+        }
+
+        prepare_local_model_stage("asr", config, logger=__import__("logging").getLogger(__name__))
+
+        env = run.call_args.kwargs["env"]
+        self.assertEqual(env["VIBEVOICE_WORKER_COUNT"], "5")
+        self.assertEqual(env["VIBEVOICE_SINGLE_PASS_MAX_DURATION_SEC"], "240")
+        self.assertEqual(env["VIBEVOICE_CHUNK_DURATION_SEC"], "180")
+        self.assertEqual(env["VIBEVOICE_CHUNK_OVERLAP_SEC"], "12")
+
+    @patch("video_analyzer.local_model_runtime.subprocess.run")
+    def test_firered_asr_chunk_settings_are_forwarded(self, run):
+        config = {
+            "asr": {
+                "provider": "firered_asr2",
+                "vibevoice": {
+                    "firered_asr2_url": "http://127.0.0.1:18014/api/asr/transcribe",
+                    "firered_asr2_options": {
+                        "worker_count": 5,
+                        "single_pass_max_duration_sec": 50,
+                        "chunk_duration_sec": 30,
+                        "chunk_overlap_sec": 3,
+                        "segmentation_mode": "vad",
+                        "vad_max_segment_sec": 50,
+                    },
+                },
+            },
+            "local_model_runtime": {
+                "stage_commands": {"asr": ["/bin/echo", "asr"]},
+            },
+        }
+
+        prepare_local_model_stage("asr", config, logger=__import__("logging").getLogger(__name__))
+
+        env = run.call_args.kwargs["env"]
+        self.assertEqual(env["FIRERED_ASR2_WORKER_COUNT"], "5")
+        self.assertEqual(env["FIRERED_ASR2_SINGLE_PASS_SECONDS"], "50")
+        self.assertEqual(env["FIRERED_ASR2_CHUNK_SECONDS"], "30")
+        self.assertEqual(env["FIRERED_ASR2_CHUNK_OVERLAP_SECONDS"], "3")
+        self.assertEqual(env["FIRERED_ASR2_SEGMENTATION_MODE"], "vad")
+        self.assertEqual(env["FIRERED_VAD_MAX_SEGMENT_SECONDS"], "50")
 
     @patch("video_analyzer.local_model_runtime.subprocess.run")
     def test_qwen3_asr_explicit_local_model_path_is_forwarded(self, run):
