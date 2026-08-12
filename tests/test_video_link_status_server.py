@@ -4497,6 +4497,10 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(nodes["diarization"]["metrics"][0]["value"], 2)
         self.assertEqual(nodes["ocr"]["model"]["label"], "baidu/Unlimited-OCR")
         self.assertEqual(nodes["vision"]["model"]["label"], "minicpm-v-4.5-v100")
+        self.assertEqual(nodes["asr"]["duration_seconds"], 10.0)
+        self.assertEqual(nodes["asr"]["duration_scope"], "node")
+        self.assertEqual(nodes["study"]["duration_seconds"], 1.0)
+        self.assertEqual(nodes["study"]["duration_scope"], "stage")
         self.assertEqual(nodes["image"]["status"], "skipped")
         self.assertEqual(nodes["operation_manual_doc"]["status"], "succeeded")
         self.assertTrue(nodes["operation_manual_doc"]["artifacts"][0]["url"].endswith("/operation_manual.md"))
@@ -4508,6 +4512,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             any(edge["from"] == "frame_extract" and edge["to"] == "vision" for edge in flow["edges"])
         )
         self.assertIn("flowchart LR", flow["mermaid"])
+        self.assertIn("阶段耗时 00:00:00", flow["mermaid"])
 
     def test_execution_flow_exposes_parallel_asr_and_diarization_node_states(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4516,16 +4521,22 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             loaded = server.load_job(job["job_id"])
             run_dir = Path(tmp) / "run"
             run_dir.mkdir()
+            started_at = server_mod.iso_from_timestamp(time.time() - 12)
             (run_dir / "progress.json").write_text(
                 json.dumps(
                     {
                         "current_step": "asr",
                         "status": "running",
                         "node_states": {
-                            "asr": {"status": "running", "message": "five workers"},
+                            "asr": {
+                                "status": "running",
+                                "message": "five workers",
+                                "started_at": started_at,
+                            },
                             "diarization": {
                                 "status": "running",
                                 "message": "running in parallel with ASR",
+                                "started_at": started_at,
                             },
                         },
                     }
@@ -4541,7 +4552,56 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         nodes = {node["id"]: node for node in flow["nodes"]}
         self.assertEqual(nodes["asr"]["status"], "running")
         self.assertEqual(nodes["diarization"]["status"], "running")
+        self.assertEqual(nodes["asr"]["duration_scope"], "node")
+        self.assertGreaterEqual(nodes["asr"]["duration_seconds"], 11.0)
+        self.assertLess(nodes["asr"]["duration_seconds"], 20.0)
+        self.assertEqual(nodes["asr"]["started_at"], started_at)
         self.assertEqual(set(flow["active_node_ids"]), {"asr", "diarization"})
+
+    def test_execution_flow_separates_stage_queue_and_execution_timing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            loaded["stages"]["prepare"] = {
+                "status": "succeeded",
+                "queued_at": "2026-08-11T10:00:00+0800",
+                "started_at": "2026-08-11T10:00:10+0800",
+                "finished_at": "2026-08-11T10:00:40+0800",
+                "duration_seconds": 30.0,
+            }
+
+            flow = server.execution_flow(loaded)
+
+        prepare = next(node for node in flow["nodes"] if node["id"] == "prepare")
+        self.assertEqual(prepare["duration_scope"], "stage")
+        self.assertEqual(prepare["duration_seconds"], 30.0)
+        self.assertEqual(prepare["queue_duration_seconds"], 10.0)
+        self.assertEqual(prepare["queued_at"], "2026-08-11T10:00:00+0800")
+        self.assertEqual(prepare["started_at"], "2026-08-11T10:00:10+0800")
+        self.assertEqual(prepare["finished_at"], "2026-08-11T10:00:40+0800")
+
+    def test_stage_start_preserves_resource_queue_duration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            queued = server.load_job(job["job_id"])
+            queued_at = server_mod.iso_from_timestamp(time.time() - 5)
+            queued["stages"]["probe"] = {
+                "status": "queued",
+                "queued_at": queued_at,
+                "queued_for": "probe",
+            }
+            server.save_job(queued)
+
+            with patch.object(server, "stage_probe", return_value={"artifacts": {}}):
+                result = server._run_stage_locked(job["job_id"], "probe")
+
+        probe = result["stages"]["probe"]
+        self.assertEqual(probe["queued_at"], queued_at)
+        self.assertGreaterEqual(probe["queue_duration_seconds"], 4.0)
+        self.assertLess(probe["queue_duration_seconds"], 10.0)
+        self.assertEqual(probe["status"], "succeeded")
 
     def test_core_progress_parses_current_substep_and_durations(self):
         text = "\n".join(

@@ -2042,6 +2042,7 @@ class VideoLinkStatusServer:
             return self.public_job(job)
 
         start = time.time()
+        started_at = iso_now()
         attempt = max(1, int(previous_stage_info.get("attempt") or 0) + 1)
         log_path, attempt_log_paths = self.prepare_stage_log_attempt(
             job_id,
@@ -2051,7 +2052,7 @@ class VideoLinkStatusServer:
         )
         stage_info = {
             "status": "running",
-            "started_at": iso_now(),
+            "started_at": started_at,
             "finished_at": None,
             "exit_code": None,
             "attempt": attempt,
@@ -2060,6 +2061,16 @@ class VideoLinkStatusServer:
             "artifacts": {},
             "queued_for": job_stage_resource(job, stage),
         }
+        queued_at = previous_stage_info.get("queued_at")
+        if queued_at:
+            stage_info["queued_at"] = queued_at
+            queued_timestamp = parse_iso_timestamp(queued_at)
+            started_timestamp = parse_iso_timestamp(started_at)
+            if queued_timestamp and started_timestamp:
+                stage_info["queue_duration_seconds"] = round(
+                    max(0.0, started_timestamp - queued_timestamp),
+                    3,
+                )
         failure_path = self.stage_failure_path(job_id, stage, attempt)
         if failure_path.exists():
             failure_path.unlink()
@@ -2123,6 +2134,7 @@ class VideoLinkStatusServer:
             stage_info["failure"] = failure
             if retry_reason:
                 stage_info["queued_at"] = stage_info["finished_at"]
+                stage_info.pop("queue_duration_seconds", None)
                 stage_info["queued_for"] = job_stage_resource(job, stage)
                 stage_info["retry_reason"] = retry_reason
                 stage_info["last_error"] = self.exception_text(exc) or str(exc)
@@ -2286,6 +2298,7 @@ class VideoLinkStatusServer:
         )
         stage_info.pop("finished_at", None)
         stage_info.pop("exit_code", None)
+        stage_info.pop("queue_duration_seconds", None)
         job.setdefault("stages", {})[stage] = stage_info
         job["status"] = "queued"
         runner = dict(job.get("runner") or {})
@@ -2758,7 +2771,12 @@ class VideoLinkStatusServer:
         )
 
     def multidoc_command(self, job: dict[str, Any]) -> list[str]:
-        return ["tools/run_multidoc_analysis.sh", str(self.require_run_dir(job)), "--profile", job["options"]["profile"]]
+        profile = (runtime_config().get("runtime_profiles") or {}).get(job["options"]["profile"]) or {}
+        command = ["tools/run_multidoc_analysis.sh", str(self.require_run_dir(job)), "--profile", job["options"]["profile"]]
+        concurrency = profile.get("multidoc_chapter_concurrency")
+        if concurrency:
+            command.extend(["--chapter-concurrency", str(concurrency)])
+        return command
 
     def deep_v2_command(self, job: dict[str, Any]) -> list[str]:
         return [
@@ -5448,13 +5466,13 @@ class VideoLinkStatusServer:
             node["model"] = model
             node["artifacts"] = artifacts
             node["artifact_count"] = len(artifacts)
-            node["duration_seconds"] = self.execution_node_duration(
+            node.update(self.execution_node_timing(
                 node,
                 state,
                 timings,
                 diarization_report,
                 job,
-            )
+            ))
             node["metrics"] = self.execution_node_metrics(
                 node["id"],
                 summary,
@@ -5595,8 +5613,8 @@ class VideoLinkStatusServer:
             provider = str(profile.get("runtime") or "openai_compatible")
             model = str(profile.get("text_model") or snapshot_models.get("text") or "")
             endpoint = str(profile.get("text_base_url") or profile.get("llm_base_url") or "")
-            worker_count = profile.get("worker_count")
-            concurrency = profile.get("concurrency")
+            worker_count = profile.get("text_worker_count") or profile.get("worker_count")
+            concurrency = profile.get("text_concurrency") or profile.get("concurrency")
             deployment = str(profile.get("deployment") or "")
             enabled = bool(model)
         elif kind == "text_fallback":
@@ -5779,8 +5797,12 @@ class VideoLinkStatusServer:
             return {
                 "status": str(exact_state.get("status") or "pending"),
                 "message": exact_state.get("message"),
+                "queued_at": exact_state.get("queued_at"),
                 "started_at": exact_state.get("started_at"),
                 "finished_at": exact_state.get("finished_at"),
+                "duration_seconds": exact_state.get("duration_seconds"),
+                "queue_duration_seconds": exact_state.get("queue_duration_seconds"),
+                "duration_scope": "node",
                 "progress": exact_state.get("progress"),
             }
         if model and not model.get("enabled"):
@@ -5817,7 +5839,11 @@ class VideoLinkStatusServer:
             if artifacts:
                 return {"status": "succeeded", "message": "已从现有产物确认完成"}
             if stage_status == "queued":
-                return {"status": "queued", "message": stage_info.get("queued_for") or "等待核心资源"}
+                return {
+                    "status": "queued",
+                    "message": stage_info.get("queued_for") or "等待核心资源",
+                    "queued_at": stage_info.get("queued_at"),
+                }
             return {"status": "pending", "message": "等待核心分析"}
 
         if stage not in self.stage_order_for_job(job):
@@ -5849,43 +5875,124 @@ class VideoLinkStatusServer:
             "message": stage_info.get("error")
             or stage_info.get("warning")
             or ("正在处理" if stage_status == "running" else "等待前序节点"),
+            "queued_at": stage_info.get("queued_at"),
             "started_at": stage_info.get("started_at") or stage_info.get("queued_at"),
             "finished_at": stage_info.get("finished_at"),
+            "duration_seconds": stage_info.get("duration_seconds"),
+            "queue_duration_seconds": stage_info.get("queue_duration_seconds"),
+            "duration_scope": "stage",
             "progress": stage_progress.get("percent") if stage_progress.get("stage") == stage else None,
         }
 
-    def execution_node_duration(
+    def execution_node_timing(
         self,
         node: dict[str, Any],
         state: dict[str, Any],
         timings: dict[str, Any],
         diarization_report: dict[str, Any],
         job: dict[str, Any],
-    ) -> float | None:
-        started = parse_iso_timestamp(state.get("started_at"))
-        finished = parse_iso_timestamp(state.get("finished_at"))
-        if started:
-            return round(max(0.0, (finished or time.time()) - started), 3)
+    ) -> dict[str, Any]:
+        stage = str(node.get("stage") or "")
+        stage_info = ((job.get("stages") or {}).get(stage) or {})
+        status = str(state.get("status") or "pending")
+        scope = str(state.get("duration_scope") or "")
+        queued_at = state.get("queued_at")
+        started_at = state.get("started_at")
+        finished_at = state.get("finished_at")
+        duration = state.get("duration_seconds")
+        queue_duration = state.get("queue_duration_seconds")
+
+        if not isinstance(duration, (int, float)):
+            duration = None
+        if not isinstance(queue_duration, (int, float)):
+            queue_duration = None
+
+        if scope == "stage":
+            queued_at = queued_at or stage_info.get("queued_at")
+            started_at = started_at or stage_info.get("started_at")
+            finished_at = finished_at or stage_info.get("finished_at")
+
+        started = parse_iso_timestamp(started_at)
+        finished = parse_iso_timestamp(finished_at)
+        if duration is None and started:
+            if finished:
+                duration = max(0.0, finished - started)
+            elif status == "running":
+                duration = max(0.0, time.time() - started)
+            if duration is not None:
+                scope = scope or "node"
+
         timing_keys = {
             "asr": "asr_seconds",
             "frame_extract": "candidate_frame_extraction_seconds",
+            "frame_audit": "ocr_frame_audit_seconds",
             "ocr": "ocr_seconds",
             "vision": "vl_seconds",
             "visual_evidence": "vl_seconds",
             "text": "manual_generation_seconds",
         }
-        if node.get("id") == "diarization":
+        if duration is None and node.get("id") == "diarization":
             value = diarization_report.get("elapsed_seconds")
             if isinstance(value, (int, float)):
-                return round(float(value), 3)
+                duration = float(value)
+                scope = "node"
         timing = timings.get(timing_keys.get(str(node.get("id") or "")))
-        if isinstance(timing, (int, float)):
-            return round(float(timing), 3)
-        stage = str(node.get("stage") or "")
+        if duration is None and isinstance(timing, (int, float)):
+            duration = float(timing)
+            scope = "node"
         stage_duration = ((job.get("stages") or {}).get(stage) or {}).get("duration_seconds")
-        if stage != "analyze-core" and isinstance(stage_duration, (int, float)):
-            return round(float(stage_duration), 3)
-        return None
+        if duration is None and stage != "analyze-core" and isinstance(stage_duration, (int, float)):
+            duration = float(stage_duration)
+            scope = "stage"
+            queued_at = queued_at or stage_info.get("queued_at")
+            started_at = started_at or stage_info.get("started_at")
+            finished_at = finished_at or stage_info.get("finished_at")
+        elif (
+            duration is None
+            and stage != "analyze-core"
+            and status == "running"
+            and stage_info.get("started_at")
+        ):
+            started_at = stage_info.get("started_at")
+            finished_at = stage_info.get("finished_at")
+            started = parse_iso_timestamp(started_at)
+            finished = parse_iso_timestamp(finished_at)
+            if started:
+                duration = max(0.0, (finished or time.time()) - started)
+                scope = "stage"
+
+        if status == "queued":
+            started_at = None
+            finished_at = None
+            duration = None
+            queued_at = queued_at or stage_info.get("queued_at")
+
+        if queue_duration is None and scope == "stage":
+            value = stage_info.get("queue_duration_seconds")
+            if isinstance(value, (int, float)):
+                queue_duration = float(value)
+        queued = parse_iso_timestamp(queued_at)
+        if queue_duration is None and queued:
+            queue_end = (
+                time.time()
+                if status == "queued"
+                else parse_iso_timestamp(started_at)
+            )
+            if queue_end:
+                queue_duration = max(0.0, queue_end - queued)
+
+        return {
+            "queued_at": queued_at,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "duration_seconds": round(float(duration), 3) if duration is not None else None,
+            "queue_duration_seconds": (
+                round(float(queue_duration), 3)
+                if queue_duration is not None
+                else None
+            ),
+            "duration_scope": scope or "none",
+        }
 
     @staticmethod
     def execution_node_metrics(
@@ -5976,6 +6083,7 @@ class VideoLinkStatusServer:
             elif node.get("subtitle"):
                 label_parts.append(safe(node.get("subtitle"), 42))
             label_parts.append(footer)
+            label_parts.append("阶段耗时 00:00:00")
             lines.append(f'  {node["id"]}["{"<br/>".join(label_parts)}"]')
         for edge in edges:
             label = safe(edge.get("label"), 28)

@@ -18,6 +18,14 @@ SOURCES_DIR = "sources"
 FROZEN_SOURCES_FILE = "source_snapshot.json"
 MAX_IMPORTED_SOURCE_BYTES = 1_000_000
 ALLOWED_IMPORT_SUFFIXES = {".txt", ".md", ".json", ".jsonl"}
+VIDEO_ANALYZER_PACKAGES_RELATIVE = Path("downloads") / "url-videos"
+VIDEO_ANALYZER_PACKAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{3,160}$")
+VIDEO_ANALYZER_REFERENCE_DOCUMENTS = (
+    ("operation_manual", "操作手册", Path("operation_manual.md")),
+    ("study_guide", "学习提纲", Path("study_guide.json")),
+    ("knowledge_notes", "学习笔记", Path("docs_analysis_chapters") / "knowledge_notes_v2.md"),
+)
+MAX_REFERENCE_DOCUMENT_CHARS = 16_000
 PROJECT_ID_PATTERN = re.compile(r"^[a-f0-9]{32}$")
 SOURCE_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 KNOWN_CAPABILITIES = {
@@ -106,6 +114,13 @@ def _credential_warning(text: str) -> str | None:
     return None
 
 
+def _truncate_text(text: str, limit: int = MAX_REFERENCE_DOCUMENT_CHARS) -> str:
+    value = str(text or "").strip()
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}\n\n[内容已截断，仅作为辅助理解资料]"
+
+
 def _goal_kind(goal: str) -> str:
     value = goal.lower()
     tool_markers = ("脚本", "命令", "命令行", "api", "接口", "服务", "docker", "cli", "工具")
@@ -139,6 +154,136 @@ class SkillProjectStore:
         if not PROJECT_ID_PATTERN.fullmatch(str(project_id or "")):
             raise FileNotFoundError("Skill project is not available")
         return self.root / project_id
+
+    @property
+    def video_analyzer_packages_root(self) -> Path:
+        return (self.root.parents[1] / VIDEO_ANALYZER_PACKAGES_RELATIVE).resolve()
+
+    def resolve_video_analyzer_package(self, package_id: str) -> dict[str, Any]:
+        normalized_id = str(package_id or "").strip()
+        if not VIDEO_ANALYZER_PACKAGE_ID_PATTERN.fullmatch(normalized_id):
+            raise SkillProjectError("Video Analyzer package id is invalid")
+        packages_root = self.video_analyzer_packages_root
+        package_root = (packages_root / normalized_id).resolve()
+        try:
+            package_root.relative_to(packages_root)
+        except ValueError as exc:
+            raise SkillProjectError("Video Analyzer package id is invalid") from exc
+        if not package_root.is_dir() or package_root.is_symlink():
+            raise FileNotFoundError("Video Analyzer material package is not available")
+
+        candidates = [
+            item
+            for item in (
+                self._video_analyzer_package_summary(normalized_id, run_dir)
+                for run_dir in package_root.glob("operation-manual-*")
+            )
+            if item is not None
+        ]
+        if not candidates:
+            raise FileNotFoundError(
+                "No completed Video Analyzer material package with substantive evidence is available"
+            )
+        candidates.sort(
+            key=lambda item: (int(item["modified_at_ns"]), str(item["run_name"])),
+            reverse=True,
+        )
+        selected = dict(candidates[0])
+        selected.pop("modified_at_ns", None)
+        return selected
+
+    def _video_analyzer_package_summary(
+        self,
+        package_id: str,
+        run_dir: Path,
+    ) -> dict[str, Any] | None:
+        packages_root = self.video_analyzer_packages_root
+        if not run_dir.is_dir() or run_dir.is_symlink():
+            return None
+        resolved = run_dir.resolve()
+        try:
+            resolved.relative_to(packages_root)
+        except ValueError:
+            return None
+        manual_path = resolved / "operation_manual.md"
+        if not manual_path.is_file() or manual_path.stat().st_size <= 0:
+            return None
+        raw_evidence = []
+        for kind, relative in (
+            ("transcript", Path("orin") / "transcript.json"),
+            ("ocr", Path("orin") / "ocr_events.json"),
+            ("visual", Path("orin") / "frame_analyses.json"),
+            ("visual", Path("orin") / "visual_events.json"),
+        ):
+            path = resolved / relative
+            if path.is_file() and path.stat().st_size > 0:
+                raw_evidence.append({"type": kind, "path": relative.as_posix(), "bytes": path.stat().st_size})
+        if not raw_evidence:
+            return None
+        references = []
+        for key, label, relative in VIDEO_ANALYZER_REFERENCE_DOCUMENTS:
+            path = resolved / relative
+            if path.is_file() and path.stat().st_size > 0:
+                references.append(
+                    {
+                        "id": key,
+                        "label": label,
+                        "path": relative.as_posix(),
+                        "bytes": path.stat().st_size,
+                    }
+                )
+        relative_run_dir = resolved.relative_to(self.root.parents[1]).as_posix()
+        return {
+            "package_id": package_id,
+            "run_name": resolved.name,
+            "run_dir": relative_run_dir,
+            "label": f"{package_id} · {resolved.name}",
+            "modified_at": datetime.fromtimestamp(resolved.stat().st_mtime, UTC).isoformat(),
+            "modified_at_ns": resolved.stat().st_mtime_ns,
+            "raw_evidence": raw_evidence,
+            "reference_documents": references,
+        }
+
+    @staticmethod
+    def _video_analyzer_reference_documents(run_dir: Path) -> list[dict[str, Any]]:
+        documents = []
+        for key, label, relative in VIDEO_ANALYZER_REFERENCE_DOCUMENTS:
+            path = run_dir / relative
+            if not path.is_file() or path.stat().st_size <= 0:
+                continue
+            try:
+                if path.suffix == ".json":
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    if key == "study_guide":
+                        payload = {
+                            "overview": (payload or {}).get("overview") or {},
+                            "chapters": [
+                                {
+                                    field: item.get(field)
+                                    for field in ("title", "summary", "goals", "key_points")
+                                    if item.get(field)
+                                }
+                                for item in ((payload or {}).get("chapters") or [])
+                                if isinstance(item, dict)
+                            ],
+                        }
+                    text = json.dumps(payload, ensure_ascii=False, indent=2)
+                else:
+                    text = path.read_text(encoding="utf-8")
+            except (OSError, json.JSONDecodeError):
+                continue
+            text = _truncate_text(text)
+            if not text:
+                continue
+            documents.append(
+                {
+                    "id": key,
+                    "label": label,
+                    "path": relative.as_posix(),
+                    "text": text,
+                }
+            )
+        return documents
 
     def list(self) -> list[dict[str, Any]]:
         projects = []
@@ -174,8 +319,10 @@ class SkillProjectStore:
         origin_job_id = str(payload.get("job_id") or "").strip()
         if not goal:
             raise SkillProjectError("goal is required")
-        if origin_job_id and not re.fullmatch(r"[a-f0-9]{32}", origin_job_id):
-            raise SkillProjectError("job_id is invalid")
+        if origin_job_id:
+            raise SkillProjectError(
+                "New Skill projects accept Video Analyzer material packages only; import a package after creating the goal"
+            )
         requested_capabilities = payload.get("required_capabilities") or []
         if not isinstance(requested_capabilities, list):
             raise SkillProjectError("required_capabilities must be a list")
@@ -191,8 +338,8 @@ class SkillProjectStore:
         project_id = uuid.uuid4().hex
         project = {
             "id": project_id,
-            "origin": "job" if origin_job_id else "global",
-            "origin_job_id": origin_job_id or None,
+            "origin": "global",
+            "origin_job_id": None,
             "title": title or goal[:80],
             "brief": {
                 "goal": goal,
@@ -215,8 +362,6 @@ class SkillProjectStore:
         }
         with self._lock:
             self.save(project)
-            if origin_job_id:
-                self.add_source(project_id, {"kind": "job", "job_id": origin_job_id})
         return self.load(project_id)
 
     def update(self, project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -263,8 +408,8 @@ class SkillProjectStore:
 
     def add_source(self, project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         kind = str(payload.get("kind") or "").strip().lower()
-        if kind not in {"job", "conversation"}:
-            raise SkillProjectError("source kind must be job or conversation")
+        if kind not in {"job", "conversation", "video_analyzer_package"}:
+            raise SkillProjectError("source kind must be job, conversation, or video_analyzer_package")
         with self._lock:
             project = self.load(project_id)
             source_id = _source_id()
@@ -286,7 +431,7 @@ class SkillProjectStore:
                         "label": str(payload.get("label") or f"任务 {job_id[:8]}").strip()[:160],
                     }
                 )
-            else:
+            elif kind == "conversation":
                 content = str(payload.get("content") or "")
                 encoded = content.encode("utf-8")
                 if not content.strip():
@@ -313,11 +458,99 @@ class SkillProjectStore:
                         "bytes": len(encoded),
                     }
                 )
+            else:
+                package = self.resolve_video_analyzer_package(
+                    str(payload.get("package_id") or "")
+                )
+                if any(
+                    item.get("kind") == "video_analyzer_package"
+                    and item.get("run_dir") == package["run_dir"]
+                    for item in project["sources"]
+                ):
+                    raise SkillProjectError("Video Analyzer material package is already a source for this project")
+                run_dir = (self.root.parents[1] / package["run_dir"]).resolve()
+                documents = self._video_analyzer_reference_documents(run_dir)
+                data_path = self.project_dir(project_id) / SOURCES_DIR / f"{source_id}.json"
+                _atomic_write_json(
+                    data_path,
+                    {"reference_documents": documents},
+                )
+                source.update(
+                    {
+                        **package,
+                        "data_file": str(data_path.relative_to(self.project_dir(project_id))),
+                    }
+                )
             project["sources"].append(source)
             self._invalidate_assessment(project)
             self._touch(project)
             self.save(project)
             return project
+
+    def preview_video_analyzer_package(
+        self,
+        project_id: str,
+        package_id: str,
+    ) -> dict[str, Any]:
+        """Resolve a package without mutating project state."""
+
+        project = self.load(project_id)
+        package = self.resolve_video_analyzer_package(package_id)
+        existing = next(
+            (
+                item
+                for item in project.get("sources") or []
+                if item.get("kind") == "video_analyzer_package"
+                and item.get("run_dir") == package.get("run_dir")
+            ),
+            None,
+        )
+        return {
+            "package": package,
+            "already_imported": existing is not None,
+            "existing_source_id": existing.get("id") if existing else None,
+            "can_import": existing is None,
+        }
+
+    def import_video_analyzer_package(
+        self,
+        project_id: str,
+        package_id: str,
+    ) -> tuple[dict[str, Any], dict[str, Any], bool]:
+        """Atomically import a package, returning an existing source on retry."""
+
+        with self._lock:
+            project = self.load(project_id)
+            package = self.resolve_video_analyzer_package(package_id)
+            existing = next(
+                (
+                    item
+                    for item in project.get("sources") or []
+                    if item.get("kind") == "video_analyzer_package"
+                    and item.get("run_dir") == package.get("run_dir")
+                ),
+                None,
+            )
+            if existing:
+                return project, dict(existing), False
+
+            source_id = _source_id()
+            run_dir = (self.root.parents[1] / package["run_dir"]).resolve()
+            documents = self._video_analyzer_reference_documents(run_dir)
+            data_path = self.project_dir(project_id) / SOURCES_DIR / f"{source_id}.json"
+            _atomic_write_json(data_path, {"reference_documents": documents})
+            source = {
+                "id": source_id,
+                "kind": "video_analyzer_package",
+                "created_at": iso_now(),
+                **package,
+                "data_file": str(data_path.relative_to(self.project_dir(project_id))),
+            }
+            project["sources"].append(source)
+            self._invalidate_assessment(project)
+            self._touch(project)
+            self.save(project)
+            return project, source, True
 
     def remove_source(self, project_id: str, source_id: str) -> dict[str, Any]:
         source_id = _safe_id(source_id, field="source_id")
@@ -367,6 +600,7 @@ class SkillProjectStore:
             "fingerprint": bundle.get("fingerprint"),
             "sources": bundle.get("sources") or [],
             "records": bundle.get("records") or [],
+            "reference_documents": bundle.get("reference_documents") or [],
         }
         _atomic_write_json(project_dir / FROZEN_SOURCES_FILE, snapshot)
         return snapshot
@@ -390,11 +624,13 @@ def build_source_bundle(
     *,
     job_records: Callable[[str], tuple[list[dict[str, Any]], list[dict[str, Any]]]],
     qa_history: Callable[[str], list[dict[str, Any]]],
+    package_records: Callable[[str], tuple[list[dict[str, Any]], list[dict[str, Any]]]] | None = None,
 ) -> dict[str, Any]:
     """Materialize project references as immutable, namespaced pipeline records."""
 
     records: list[dict[str, Any]] = []
     source_summaries: list[dict[str, Any]] = []
+    reference_documents: list[dict[str, Any]] = []
     for source in project.get("sources") or []:
         source_id = str(source.get("id") or "")
         kind = str(source.get("kind") or "")
@@ -478,12 +714,78 @@ def build_source_bundle(
                     "records": len(chunks),
                 }
             )
+            continue
+        if kind == "video_analyzer_package":
+            if package_records is None:
+                raise SkillProjectError("Video Analyzer package reader is not configured")
+            package_id = str(source.get("package_id") or "")
+            run_name = str(source.get("run_name") or "")
+            run_dir = str(source.get("run_dir") or "")
+            if not package_id or not run_name or not run_dir:
+                raise SkillProjectError("Video Analyzer material package metadata is invalid")
+            raw_records, raw_sources = package_records(run_dir)
+            if not raw_records:
+                raise FileNotFoundError("Video Analyzer material package has no substantive evidence")
+            for index, raw in enumerate(raw_records):
+                item = _json_copy(raw)
+                original_id = str(item.get("id") or f"record-{index:04d}")
+                item["id"] = f"package:{package_id}:{run_name}:{original_id}"
+                item["path"] = f"{run_dir}/{item.get('path') or original_id}"
+                item["case_id"] = f"package:{package_id}:{run_name}"
+                item["event_id"] = f"package:{package_id}:{run_name}:event:{index:05d}"
+                item["project_source_id"] = source_id
+                records.append(item)
+            relative = str(source.get("data_file") or "")
+            data_path = (project_dir / relative).resolve()
+            try:
+                data_path.relative_to(project_dir.resolve())
+            except ValueError as exc:
+                raise SkillProjectError("Package reference data path escapes project") from exc
+            if data_path.is_file():
+                try:
+                    payload = json.loads(data_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise SkillProjectError("Package reference data is invalid") from exc
+                for document in (payload or {}).get("reference_documents") or []:
+                    if not isinstance(document, dict) or not str(document.get("text") or "").strip():
+                        continue
+                    reference_documents.append(
+                        {
+                            "source_id": source_id,
+                            "package_id": package_id,
+                            "run_name": run_name,
+                            "id": str(document.get("id") or ""),
+                            "label": str(document.get("label") or ""),
+                            "path": str(document.get("path") or ""),
+                            "text": str(document.get("text") or ""),
+                        }
+                    )
+            source_summaries.append(
+                {
+                    "id": source_id,
+                    "kind": "video_analyzer_package",
+                    "package_id": package_id,
+                    "run_name": run_name,
+                    "run_dir": run_dir,
+                    "records": len(raw_records),
+                    "raw_sources": raw_sources,
+                    "reference_documents": list(source.get("reference_documents") or []),
+                }
+            )
     canonical = json.dumps(records, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return {
         "project_revision": project.get("revision"),
         "records": records,
         "sources": source_summaries,
-        "fingerprint": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "reference_documents": reference_documents,
+        "fingerprint": hashlib.sha256(
+            json.dumps(
+                {"records": records, "reference_documents": reference_documents},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
     }
 
 

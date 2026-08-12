@@ -136,6 +136,19 @@ class AudioTemplateCatalogTests(unittest.TestCase):
 
 
 class AudioTemplateLongTextTests(unittest.TestCase):
+    def test_asr_preflight_recognizes_only_speech_text(self):
+        self.assertFalse(run_audio_template_analysis.has_meaningful_speech(""))
+        self.assertFalse(run_audio_template_analysis.has_meaningful_speech("[Music]"))
+        self.assertFalse(run_audio_template_analysis.has_meaningful_speech("[Environmental Sounds]"))
+        self.assertTrue(run_audio_template_analysis.has_meaningful_speech("今天我们讨论项目计划"))
+
+    def test_asr_preflight_samples_full_long_audio_span(self):
+        offsets = run_audio_template_analysis.preflight_offsets(10_800)
+
+        self.assertEqual(len(offsets), 5)
+        self.assertEqual(offsets[0], 0.0)
+        self.assertEqual(offsets[-1], 10_770)
+
     def test_short_transcript_keeps_single_content_call(self):
         client = FakeClient(lambda _prompt, _call: "短文本总结")
         summary = run_audio_template_analysis.summarize_with_template(

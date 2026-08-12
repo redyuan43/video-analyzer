@@ -33,14 +33,26 @@ class FakeClient:
                     "limitations": [],
                 }
             )
-        if "全局理解" in prompt:
+        if "全局理解" in prompt and "提取器" not in prompt:
             return response(
                 {
                     "title": "Demo Workflow",
                     "summary": "从需求澄清到结果验证的完整流程。",
                     "source_kind": "video",
-                    "structure": [],
-                    "methods": [],
+                    "structure": [
+                        {
+                            "title": "执行流程",
+                            "summary": "先定义目标和完成标准，再执行并验证结果。",
+                            "source_ids": ["transcript:0000", "page:0000"],
+                        }
+                    ],
+                    "methods": [
+                        {
+                            "title": "先定义完成标准",
+                            "summary": "实施前明确可观察结果和验证方式。",
+                            "source_ids": ["transcript:0000", "page:0000"],
+                        }
+                    ],
                     "concepts": [],
                     "cases": [],
                     "failures": [],
@@ -243,6 +255,40 @@ class SkillDistillationTests(unittest.TestCase):
             self.assertEqual(pipeline.state["skills"]["items"][0]["name"], "existing-skill")
             self.assertEqual(pipeline.state["skills"]["items"][0]["status"], "built")
 
+    def test_verification_without_candidate_frames_does_not_wait_for_local_vision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            write_raw_evidence(run_dir)
+            runtime = fake_runtime()
+            runtime = distill.ModelRuntime(
+                **{
+                    **runtime.__dict__,
+                    "vision_base_url": "http://127.0.0.1:18082/v1",
+                    "vision_model": "minicpm-test",
+                    "vision_client": FakeClient(),
+                }
+            )
+
+            with patch.object(distill, "resolve_model_runtime", return_value=runtime):
+                distill.initialize_distillation(run_dir)
+                pipeline = distill.SkillDistillationPipeline(run_dir)
+                pipeline.run_until_pause()
+                pipeline.review_overview("confirm")
+                with patch.object(distill, "skill_local_model_stage") as local_stage:
+                    result = pipeline.run_until_pause()
+
+            self.assertEqual(result["status"], "waiting_candidate_review")
+            local_stage.assert_not_called()
+            self.assertTrue(
+                (distill.pack_dir(run_dir) / "verification_batches" / "batch_001.json").is_file()
+            )
+            log = (distill.pack_dir(run_dir) / "logs" / "verify.jsonl").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("review_batch_done", log)
+            self.assertIn("所有候选均无可复核帧", log)
+
     def test_manifest_only_run_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "run"
@@ -349,6 +395,33 @@ class SkillDistillationTests(unittest.TestCase):
 
         self.assertEqual([item["title"] for item in normalized["structure"]], ["Core"])
         self.assertEqual(len(normalized["critique"]), 1)
+
+    def test_overview_requires_substantive_evidence_grounded_content(self):
+        self.assertFalse(
+            distill.overview_has_substantive_content(
+                {
+                    "title": "Only a title",
+                    "summary": "Only a summary",
+                    "structure": [],
+                    "methods": [],
+                    "concepts": [],
+                    "cases": [],
+                    "failures": [],
+                }
+            )
+        )
+        self.assertTrue(
+            distill.overview_has_substantive_content(
+                {
+                    "methods": [
+                        {
+                            "title": "Method",
+                            "source_ids": ["transcript:0000"],
+                        }
+                    ]
+                }
+            )
+        )
 
     def test_normalize_tests_adds_missing_sibling_confusion_case(self):
         tests = distill.normalize_tests(

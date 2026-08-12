@@ -227,6 +227,11 @@ class ModelSettingsTests(unittest.TestCase):
         )
         self.assertEqual(amd_text["options"]["runtime"], "lm_studio")
         self.assertEqual(amd_text["options"]["reasoning_effort"], "none")
+        local_text = models["text-local-bonsai-27b-6gpu"]
+        self.assertEqual(local_text["options"]["text_gpu_ids"], [0, 1, 2, 4, 5])
+        self.assertEqual(local_text["options"]["text_worker_count"], 5)
+        self.assertEqual(local_text["options"]["text_concurrency"], 5)
+        self.assertIn("五张 P40", local_text["name"])
 
     def test_amd_lmstudio_text_model_expands_to_runtime_profile(self):
         with tempfile.TemporaryDirectory() as tmp:

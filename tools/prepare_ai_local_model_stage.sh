@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STAGE="${1:-}"
 
 usage() {
-  echo "Usage: $0 asr|ocr|vl|stop" >&2
+  echo "Usage: $0 asr|ocr|vl|text|stop" >&2
 }
 
 stop_pids() {
@@ -59,6 +59,14 @@ stop_firered_asr2() {
 
 stop_minicpm() {
   "${ROOT_DIR}/tools/start_minicpm_p40_service.sh" stop >/dev/null 2>&1 || true
+}
+
+stop_bonsai() {
+  "${ROOT_DIR}/.venv/bin/python" "${ROOT_DIR}/tools/bonsai_local_pool.py" stop >/dev/null 2>&1 || true
+}
+
+start_bonsai() {
+  "${ROOT_DIR}/.venv/bin/python" "${ROOT_DIR}/tools/bonsai_local_pool.py" start
 }
 
 start_vibevoice() {
@@ -123,11 +131,13 @@ start_minicpm() {
 
 case "${STAGE}" in
   asr)
+    stop_bonsai
     stop_minicpm
     stop_ocr
     start_asr
     ;;
   ocr)
+    stop_bonsai
     stop_minicpm
     stop_vibevoice
     stop_qwen3_asr
@@ -135,13 +145,23 @@ case "${STAGE}" in
     start_ocr
     ;;
   vl)
+    stop_bonsai
     stop_ocr
     stop_vibevoice
     stop_qwen3_asr
     stop_firered_asr2
     start_minicpm
     ;;
+  text)
+    stop_ocr
+    stop_vibevoice
+    stop_qwen3_asr
+    stop_firered_asr2
+    stop_minicpm
+    start_bonsai
+    ;;
   stop)
+    stop_bonsai
     stop_ocr
     stop_vibevoice
     stop_qwen3_asr

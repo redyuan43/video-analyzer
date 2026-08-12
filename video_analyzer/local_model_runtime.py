@@ -278,11 +278,26 @@ def prepare_local_model_stage(stage: str, config: dict, logger: logging.Logger) 
         if ocr.get("worker_count"):
             env["UNLIMITED_OCR_WORKER_COUNT"] = str(ocr["worker_count"])
             env["DOTS_MOCR_WORKER_COUNT"] = str(ocr["worker_count"])
+        gpu_ids = ocr.get("gpu_ids")
+        if gpu_ids:
+            env["UNLIMITED_OCR_GPU_IDS"] = ",".join(str(item) for item in gpu_ids)
     elif stage == "vl":
         runtime_options = (config.get("operation_manual") or {}).get("vision_runtime") or {}
         env["VISION_ENGINE"] = str(runtime_options.get("engine") or "minicpm_v45")
         if runtime_options.get("worker_count"):
             env["MINICPM_WORKER_COUNT"] = str(runtime_options["worker_count"])
+        gpu_ids = runtime_options.get("gpu_ids")
+        if gpu_ids:
+            env["MINICPM_GPU_IDS"] = ",".join(str(item) for item in gpu_ids)
+    elif stage == "text":
+        manual = config.get("operation_manual") or {}
+        env["BONSAI_LOCAL_PORT"] = str(manual.get("text_port") or 18103)
+        worker_count = manual.get("text_worker_count")
+        if worker_count:
+            env["BONSAI_LOCAL_WORKER_COUNT"] = str(worker_count)
+        gpu_ids = manual.get("text_gpu_ids")
+        if gpu_ids:
+            env["BONSAI_LOCAL_GPU_IDS"] = ",".join(str(item) for item in gpu_ids)
     timeout = int(runtime.get("stage_timeout_seconds") or 900)
     logger.info("Preparing local GPU model stage '%s' with %s", stage, " ".join(command_args))
     subprocess.run(command_args, cwd=REPO_ROOT, env=env, timeout=timeout, check=True)

@@ -863,6 +863,37 @@ th {
     color: #475467;
     font-size: 12px;
     font-weight: 400;
+    font-variant-numeric: tabular-nums;
+}
+
+.stage-timing,
+.console-live-elapsed {
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.stage-timing {
+    color: #344054;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.stage-queue-timing {
+    display: grid;
+    gap: 2px;
+    min-width: 96px;
+}
+
+.stage-queue-timing span {
+    color: #667085;
+    font-size: 11px;
+}
+
+.stage-queue-timing strong {
+    color: #92400e;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
 }
 
 .stage-table-details > summary {
@@ -977,6 +1008,12 @@ th {
     transition: opacity 140ms ease, filter 140ms ease;
 }
 
+.console-stage-flow .nodeLabel,
+.console-stage-flow .flow-node.has-node-timing {
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0;
+}
+
 .console-stage-flow .node rect,
 .console-stage-flow .node polygon,
 .console-stage-flow .node path {
@@ -999,6 +1036,35 @@ th {
 .console-stage-flow .node.status-running polygon,
 .console-stage-flow .node.status-running path {
     animation: console-flow-node-pulse 1.4s ease-in-out infinite;
+}
+
+.console-stage-flow .flow-node.console-flow-svg-node {
+    cursor: pointer;
+}
+
+.console-stage-flow .flow-node.status-running {
+    border-color: #2563eb;
+    background: #eff6ff;
+    color: #1d4ed8;
+    animation: console-flow-node-pulse 1.4s ease-in-out infinite;
+}
+
+.console-stage-flow .flow-node.status-queued {
+    border-color: #d97706;
+    background: #fffbeb;
+    color: #92400e;
+}
+
+.console-stage-flow .flow-node.status-succeeded {
+    border-color: #16a34a;
+    background: #f0fdf4;
+    color: #166534;
+}
+
+.console-stage-flow .flow-node.status-failed {
+    border-color: #e11d48;
+    background: #fff1f2;
+    color: #9f1239;
 }
 
 .console-stage-flow .node.kind-output rect,

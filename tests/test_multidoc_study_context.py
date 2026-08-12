@@ -1,5 +1,7 @@
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -181,6 +183,74 @@ class MultidocStudyContextTests(unittest.TestCase):
 
         self.assertGreater(multidoc.chapter_output_budget(large), multidoc.chapter_output_budget(small))
         self.assertLessEqual(multidoc.chapter_output_budget(large), multidoc.MAX_CHAPTER_OUTPUT_TOKENS)
+
+    def test_chapter_generation_runs_concurrently_and_keeps_chapter_order(self):
+        class ParallelClient:
+            def __init__(self):
+                self.active = 0
+                self.max_active = 0
+                self.lock = threading.Lock()
+
+            def generate(self, *, prompt, **_kwargs):
+                with self.lock:
+                    self.active += 1
+                    self.max_active = max(self.max_active, self.active)
+                try:
+                    time.sleep(0.04)
+                    chapter_id = "chapter_01" if "第一章" in prompt else "chapter_02"
+                    return {
+                        "response": json.dumps(
+                            {
+                                "chapter_summary": chapter_id,
+                                "key_facts": [],
+                                "analysis": [],
+                                "manual_review": [],
+                                "cautions": [],
+                                "citations": [],
+                            },
+                            ensure_ascii=False,
+                        )
+                    }
+                finally:
+                    with self.lock:
+                        self.active -= 1
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "orin").mkdir()
+            (run_dir / "analysis.json").write_text("{}", encoding="utf-8")
+            (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
+            chapter_dir = run_dir / "study_chapters"
+            chapter_dir.mkdir()
+            for index, title in ((1, "第一章"), (2, "第二章")):
+                (chapter_dir / f"chapter_{index:02d}.json").write_text(
+                    json.dumps(
+                        {
+                            "chapter_id": f"chapter_{index:02d}",
+                            "index": index,
+                            "title": title,
+                            "start": "00:00:00",
+                            "end": "00:00:30",
+                            "summary": title,
+                            "key_points": [],
+                            "evidence": [],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+            client = ParallelClient()
+            result = multidoc.run_multidoc_analysis(
+                run_dir,
+                client=client,
+                text_model="test",
+                chapter_concurrency=2,
+            )
+
+            self.assertEqual(client.max_active, 2)
+            self.assertEqual(result["generation"]["chapter_concurrency"], 2)
+            rendered = (run_dir / "docs_analysis" / "knowledge_notes.md").read_text(encoding="utf-8")
+            self.assertLess(rendered.index("chapter_01"), rendered.index("chapter_02"))
 
     def test_truncated_json_response_never_leaks_into_markdown(self):
         packet = {

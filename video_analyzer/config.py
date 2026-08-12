@@ -170,20 +170,65 @@ class Config:
         if self.config.get("task") == "operation_manual" and not args.client:
             manual_config = self.config.setdefault("operation_manual", {})
             profile = self.get_runtime_profile(getattr(args, "profile", None))
+            user_manual_config = (getattr(self, "user_config_data", {}).get("operation_manual") or {})
+            user_ocr_config = (getattr(self, "user_config_data", {}).get("ocr") or {})
+
+            ocr_config = self.config.setdefault("ocr", {})
+            for profile_key, runtime_key, cli_key in (
+                ("ocr_provider", "provider", "ocr_provider"),
+                ("ocr_base_url", "base_url", "ocr_base_url"),
+                ("ocr_base_urls", "base_urls", "ocr_base_url"),
+                ("ocr_concurrency", "concurrency", "ocr_concurrency"),
+                ("ocr_cache", "cache", "ocr_cache"),
+                ("ocr_timeout_seconds", "timeout_seconds", "ocr_timeout_seconds"),
+                ("ocr_max_tokens", "max_tokens", "ocr_max_tokens"),
+                ("ocr_max_image_long_side", "max_image_long_side", "ocr_max_image_long_side"),
+                ("ocr_image_mode", "image_mode", "ocr_image_mode"),
+            ):
+                if getattr(args, cli_key, None) is not None:
+                    continue
+                if runtime_key in user_ocr_config:
+                    continue
+                if profile.get(profile_key) is not None:
+                    ocr_config[runtime_key] = copy.deepcopy(profile[profile_key])
+
+            def profile_value(manual_key: str, profile_key: str, cli_key: str | None = None, fallback: Any = None) -> Any:
+                if cli_key and getattr(args, cli_key, None) is not None:
+                    return manual_config.get(manual_key)
+                if manual_key in user_manual_config:
+                    return manual_config.get(manual_key)
+                return profile.get(profile_key, manual_config.get(manual_key, fallback))
+
             default_llm_base_url = (self.config.get("endpoints") or {}).get("services", {}).get(
                 "amd_fast_base_url"
             )
-            llm_base_url = manual_config.get("llm_base_url") or profile.get(
-                "llm_base_url", default_llm_base_url
+            llm_base_url = profile_value(
+                "llm_base_url",
+                "llm_base_url",
+                "llm_base_url",
+                default_llm_base_url,
             )
-            vision_base_url = manual_config.get("vision_base_url") or profile.get("vision_base_url") or llm_base_url
-            text_base_url = manual_config.get("text_base_url") or profile.get("text_base_url") or llm_base_url
-            vision_model = manual_config.get("vision_model") or profile.get(
-                "vision_model", "hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive"
+            vision_base_url = profile_value(
+                "vision_base_url",
+                "vision_base_url",
+                "vision_base_url",
+                llm_base_url,
             )
-            text_model = manual_config.get("text_model") or profile.get("text_model") or vision_model
-            text_temperature = manual_config.get("text_temperature", profile.get("text_temperature"))
-            text_timeout_seconds = manual_config.get("text_timeout_seconds", profile.get("text_timeout_seconds"))
+            text_base_url = profile_value(
+                "text_base_url",
+                "text_base_url",
+                "text_base_url",
+                llm_base_url,
+            )
+            vision_model = profile_value(
+                "vision_model",
+                "vision_model",
+                "vision_model",
+                "hauhaucs/qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive",
+            )
+            text_model = profile_value("text_model", "text_model", "text_model", vision_model)
+            text_temperature = profile_value("text_temperature", "text_temperature")
+            text_timeout_seconds = profile_value("text_timeout_seconds", "text_timeout_seconds")
             manual_config["llm_base_url"] = llm_base_url
             manual_config["vision_base_url"] = vision_base_url
             manual_config["text_base_url"] = text_base_url
@@ -203,6 +248,8 @@ class Config:
             for extra_key in ("deepseek_thinking", "reasoning_effort"):
                 if profile.get(extra_key):
                     manual_config[extra_key] = profile[extra_key]
+            if "extra_body" in profile:
+                manual_config["extra_body"] = copy.deepcopy(profile["extra_body"])
             for fallback_key in (
                 "text_fallback_enabled",
                 "text_fallback_base_url",
