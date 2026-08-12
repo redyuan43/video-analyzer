@@ -662,6 +662,32 @@ def _add_builtin_model_resources(
                 "text_timeout_seconds": 900,
             },
         },
+        "text-local-bonsai-27b-6gpu": {
+            "name": "BONSAI 27B（本地五张 P40 按需池）",
+            "kind": "text",
+            "protocol": "openai_compatible",
+            "model": "prism-ml/bonsai-27b",
+            "endpoints": ["http://127.0.0.1:18103/v1"],
+            "options": {
+                "deployment": "local",
+                "runtime": "llama.cpp",
+                "text_gpu_ids": [0, 1, 2, 4, 5],
+                "text_worker_count": 5,
+                "text_concurrency": 5,
+                "worker_count": 5,
+                "concurrency": 5,
+                "quantization": "Q1_0",
+                "context_length": 128405,
+                "cache_type_k": "f16",
+                "cache_type_v": "f16",
+                "text_temperature": 0.7,
+                "top_k": 20,
+                "top_p": 0.95,
+                "enable_thinking": True,
+                "preserve_thinking": False,
+                "text_timeout_seconds": 1800,
+            },
+        },
         "text-deepseek-v4-pro": {
             "name": "DeepSeek V4 Pro（云端）",
             "kind": "text",
@@ -1234,6 +1260,7 @@ def validate_profile(
     asr_chunk_mode = str(cleaned.get("asr_chunk_mode") or "model_default").strip()
     if asr_chunk_mode not in ASR_CHUNK_MODES:
         raise SettingsValidationError(f"unsupported ASR chunk mode: {asr_chunk_mode}")
+    cleaned["asr_chunk_mode"] = asr_chunk_mode
     if asr_chunk_mode == "custom":
         normalized_chunk_options: dict[str, float] = {}
         for key in ASR_CHUNK_OPTION_FIELDS:
@@ -1257,7 +1284,6 @@ def validate_profile(
     else:
         for key in ASR_CHUNK_OPTION_FIELDS:
             cleaned.pop(key, None)
-    cleaned["asr_chunk_mode"] = asr_chunk_mode
     models = payload.get("models") if isinstance(payload.get("models"), dict) else {}
     catalog = build_settings_document(config)["models"]
     selected_asr: dict[str, Any] | None = None

@@ -35,6 +35,10 @@ def parse_args() -> argparse.Namespace:
 def prepare_text_runtime_config(config: Config, profile_name: str | None) -> dict:
     profile = config.get_runtime_profile(profile_name)
     manual = config.config.setdefault("operation_manual", {})
+    for key in ("text_base_url", "llm_base_url", "text_worker_count", "text_gpu_ids", "text_port"):
+        value = profile.get(key)
+        if value is not None:
+            manual[key] = value
     text_base_url = profile.get("text_base_url") or profile.get("llm_base_url")
     if text_base_url:
         manual["text_base_url"] = text_base_url

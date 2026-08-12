@@ -74,6 +74,40 @@ class GenericOpenAIAPIClientTests(unittest.TestCase):
         self.assertEqual(vibevoice["chunk_duration_sec"], 180)
         self.assertEqual(vibevoice["chunk_overlap_sec"], 12)
 
+    def test_runtime_profile_overrides_default_operation_manual_text_settings(self):
+        config = Config()
+        profile = dict(config.config["runtime_profiles"]["deepseek_v4_pro"])
+        profile.update(
+            {
+                "text_base_url": "http://127.0.0.1:18103/v1",
+                "llm_base_url": "http://127.0.0.1:18103/v1",
+                "text_model": "prism-ml/bonsai-27b",
+                "text_temperature": 0.7,
+                "extra_body": {"top_k": 20, "top_p": 0.95},
+            }
+        )
+        config.config["runtime_profiles"]["local-bonsai-test"] = profile
+
+        config.update_from_args(
+            self._operation_manual_args(
+                profile="local-bonsai-test",
+                llm_base_url=None,
+                text_base_url=None,
+                vision_base_url=None,
+                text_model=None,
+                vision_model=None,
+            )
+        )
+
+        manual_config = config.get("operation_manual")
+        self.assertEqual(manual_config["text_base_url"], "http://127.0.0.1:18103/v1")
+        self.assertEqual(manual_config["text_model"], "prism-ml/bonsai-27b")
+        self.assertEqual(manual_config["text_temperature"], 0.7)
+        self.assertEqual(
+            build_openai_extra_body(manual_config, manual_config["text_base_url"]),
+            {"top_k": 20, "top_p": 0.95},
+        )
+
     def test_tailscale_cgnat_bypasses_env_proxy(self):
         client = GenericOpenAIAPIClient("0", "http://100.90.114.26:18081/v1")
 

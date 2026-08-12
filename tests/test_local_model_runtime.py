@@ -90,6 +90,31 @@ class LocalModelRuntimeTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["timeout"], 7)
 
     @patch("video_analyzer.local_model_runtime.subprocess.run")
+    def test_text_stage_forwards_local_bonsai_topology(self, run):
+        config = {
+            "operation_manual": {
+                "text_base_url": "http://127.0.0.1:18103/v1",
+                "text_port": 18103,
+                "text_worker_count": 5,
+                "text_gpu_ids": [0, 1, 2, 4, 5],
+            },
+            "local_model_runtime": {
+                "stage_commands": {"text": ["/bin/echo", "text"]},
+            },
+        }
+
+        prepare_local_model_stage(
+            "text",
+            config,
+            logger=__import__("logging").getLogger(__name__),
+        )
+
+        env = run.call_args.kwargs["env"]
+        self.assertEqual(env["BONSAI_LOCAL_PORT"], "18103")
+        self.assertEqual(env["BONSAI_LOCAL_WORKER_COUNT"], "5")
+        self.assertEqual(env["BONSAI_LOCAL_GPU_IDS"], "0,1,2,4,5")
+
+    @patch("video_analyzer.local_model_runtime.subprocess.run")
     def test_qwen3_asr_model_id_does_not_override_local_model_path(self, run):
         config = {
             "asr": {

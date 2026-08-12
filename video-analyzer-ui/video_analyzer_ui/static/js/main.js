@@ -12,6 +12,8 @@ const stageNames = {
     'final-publish': '最终定稿/发布'
 };
 
+const consoleFlowTimerPlaceholder = '阶段耗时 00:00:00';
+
 const skillStageNames = {
     source: '整理原始证据',
     overview: '整体理解',
@@ -513,6 +515,12 @@ function duration(value) {
     return value == null ? '-' : `${value}s`;
 }
 
+function finiteSeconds(value) {
+    if (value == null || value === '') return null;
+    const seconds = Number(value);
+    return Number.isFinite(seconds) && seconds >= 0 ? seconds : null;
+}
+
 function durationMinutes(value) {
     const seconds = Number(value);
     if (!Number.isFinite(seconds) || seconds <= 0) return '-';
@@ -524,8 +532,8 @@ function durationMinutes(value) {
 function totalStageDuration(job) {
     return (job.stage_order || []).reduce((total, stage) => {
         const info = job.stages?.[stage] || {};
-        const value = Number(info.duration_seconds);
-        if (Number.isFinite(value) && value > 0) return total + value;
+        const value = finiteSeconds(info.duration_seconds);
+        if (value != null && value > 0) return total + value;
         const live = info.status === 'running' ? elapsedSeconds(info.started_at) : null;
         return live != null ? total + live : total;
     }, 0);
@@ -577,6 +585,10 @@ function updateConsoleElapsedClock() {
         if (seconds == null) return;
         node.textContent = `${node.dataset.consoleElapsedPrefix || ''}${formatClock(seconds)}`;
     });
+    if (currentJob) {
+        updateConsoleFlowNodeTimers(currentJob);
+        nodes.stageDurationSummary.textContent = stageDurationSummary(currentJob);
+    }
 }
 
 function clampPercent(value) {
@@ -2512,13 +2524,84 @@ function stageElapsedMarkup(job, stage, info) {
         return startedAt ? consoleElapsedMarkup(startedAt, null, '已运行 ') : '运行中';
     }
     if (status === 'queued') {
-        const queuedAt = info.queued_at || (job.current_stage === stage ? job.runner?.updated_at : null);
-        return queuedAt ? consoleElapsedMarkup(queuedAt, null, '已等待 ') : '等待资源';
+        return '尚未运行';
     }
-    const seconds = Number(info.duration_seconds);
-    if (Number.isFinite(seconds) && seconds >= 0) return `耗时 ${formatClock(seconds)}`;
     if (status === 'skipped') return '已跳过';
-    if (status === 'failed') return '执行中断';
+    const seconds = finiteSeconds(info.duration_seconds);
+    if (seconds != null && status === 'failed') return `中断于 ${formatClock(seconds)}`;
+    if (seconds != null) return `耗时 ${formatClock(seconds)}`;
+    if (status === 'failed') return '已中断';
+    return '尚未开始';
+}
+
+function queueElapsedSeconds(info) {
+    if (info.status === 'queued' && info.queued_at) {
+        return elapsedSeconds(info.queued_at);
+    }
+    const recorded = finiteSeconds(info.queue_duration_seconds);
+    if (recorded != null) return recorded;
+    if (!info.queued_at) return null;
+    return elapsedSeconds(info.queued_at, info.started_at || info.finished_at);
+}
+
+function stageQueueMarkup(job, stage, info) {
+    const resource = info.queue_position
+        ? `${info.queued_for || '资源'} #${info.queue_position}`
+        : (info.queued_for || '');
+    const queuedAt = info.queued_at;
+    let timing = '';
+    if (info.status === 'queued' && queuedAt) {
+        timing = consoleElapsedMarkup(queuedAt, null, '已等待 ');
+    } else {
+        const seconds = queueElapsedSeconds(info);
+        if (seconds != null && seconds > 0) timing = `等待 ${formatClock(seconds)}`;
+    }
+    if (!resource && !timing) return '-';
+    return `<div class="stage-queue-timing">
+        ${resource ? `<span>${escapeHtml(resource)}</span>` : ''}
+        ${timing ? `<strong>${timing}</strong>` : ''}
+    </div>`;
+}
+
+function flowNodeDurationMarkup(flowNode) {
+    const status = flowNode.status || 'pending';
+    if (status === 'running' && flowNode.started_at) {
+        return consoleElapsedMarkup(flowNode.started_at, null, '');
+    }
+    const seconds = finiteSeconds(flowNode.duration_seconds);
+    if (seconds == null) return status === 'skipped' ? '已跳过' : '-';
+    const prefix = flowNode.duration_scope === 'stage' ? '阶段 ' : '';
+    return `${prefix}${formatClock(seconds)}`;
+}
+
+function flowNodeQueueMarkup(flowNode) {
+    if (flowNode.status === 'queued' && flowNode.queued_at) {
+        return consoleElapsedMarkup(flowNode.queued_at, null, '');
+    }
+    const seconds = queueElapsedSeconds(flowNode);
+    return seconds != null && seconds > 0 ? formatClock(seconds) : '-';
+}
+
+function consoleFlowNodeTimingLabel(flowNode) {
+    const status = flowNode.status || 'pending';
+    if (status === 'queued') {
+        const seconds = queueElapsedSeconds(flowNode);
+        return seconds == null ? '等待资源' : `已等待 ${formatClock(seconds)}`;
+    }
+    const seconds = status === 'running'
+        ? elapsedSeconds(flowNode.started_at)
+        : finiteSeconds(flowNode.duration_seconds);
+    if (status === 'running') {
+        return seconds == null ? '运行中' : `已运行 ${formatClock(seconds)}`;
+    }
+    if (status === 'failed' || status === 'stopped') {
+        return seconds == null ? '已中断' : `中断于 ${formatClock(seconds)}`;
+    }
+    if (status === 'succeeded') {
+        if (seconds == null) return '无独立计时';
+        return `${flowNode.duration_scope === 'stage' ? '阶段耗时' : '耗时'} ${formatClock(seconds)}`;
+    }
+    if (status === 'skipped') return '已跳过';
     return '尚未开始';
 }
 
@@ -2527,7 +2610,6 @@ function renderStages(job, stageProgress) {
     nodes.stageRows.innerHTML = (job.stage_order || []).map(stage => {
         const info = job.stages?.[stage] || {};
         const status = info.status || 'pending';
-        const queue = info.queue_position ? `${info.queued_for || ''} #${info.queue_position}` : (info.queued_for || '-');
         const error = info.error ? `<div class="row-error">${escapeHtml(info.error)}</div>` : '';
         const warning = info.warning ? `<div class="row-warning">${escapeHtml(info.warning)}</div>` : '';
         const retry = info.retry_reason ? `<div class="muted">${escapeHtml(info.retry_reason)}</div>` : '';
@@ -2535,8 +2617,8 @@ function renderStages(job, stageProgress) {
         return `<tr class="stage-row ${escapeHtml(status)}">
             <td>${escapeHtml(stageNames[stage] || stage)}${error}${warning}${retry}</td>
             <td>${statusBadge(status)}</td>
-            <td>${escapeHtml(duration(info.duration_seconds))}</td>
-            <td>${escapeHtml(queue)}</td>
+            <td><span class="stage-timing">${stageElapsedMarkup(job, stage, info)}</span></td>
+            <td>${stageQueueMarkup(job, stage, info)}</td>
             <td>${log}</td>
         </tr>`;
     }).join('');
@@ -2609,7 +2691,8 @@ function preferredConsoleNode(job) {
 
 function consoleFlowNodeElement(nodeId) {
     if (!nodeId || !nodes.consoleStageFlow) return null;
-    return Array.from(nodes.consoleStageFlow.querySelectorAll('g.node')).find(node => {
+    return Array.from(nodes.consoleStageFlow.querySelectorAll('g.node, [data-mermaid-node-id]')).find(node => {
+        if (node.dataset.mermaidNodeId === nodeId) return true;
         const id = node.getAttribute('id') || '';
         return id === nodeId
             || id.startsWith(`flowchart-${nodeId}-`)
@@ -2621,7 +2704,8 @@ async function renderConsoleExecutionDiagram(job) {
     const flow = job.execution_flow || {};
     const source = String(flow.mermaid || '').trim();
     const renderKey = `${job.job_id}:${source}`;
-    if (renderKey === consoleFlowRenderKey && nodes.consoleStageFlow.querySelector('svg')) {
+    if (renderKey === consoleFlowRenderKey && nodes.consoleStageFlow.querySelector('svg, .mobile-flowchart')) {
+        updateConsoleFlowNodeTimers(job);
         applyConsoleFlowSelection(job);
         applyConsoleFlowScale();
         return;
@@ -2633,6 +2717,9 @@ async function renderConsoleExecutionDiagram(job) {
     const fallback = renderSimpleMermaidFlowchart(source);
     if (!initializeMermaid()) {
         nodes.consoleStageFlow.innerHTML = fallback || '<div class="console-stage-flow-empty">Mermaid 渲染器未加载</div>';
+        consoleFlowRenderKey = renderKey;
+        bindConsoleFlowDiagram(job);
+        applyConsoleFlowSelection(job);
         return;
     }
     const sequence = ++consoleFlowRenderSequence;
@@ -2658,7 +2745,50 @@ async function renderConsoleExecutionDiagram(job) {
         if (sequence !== consoleFlowRenderSequence) return;
         nodes.consoleStageFlow.classList.remove('loading');
         nodes.consoleStageFlow.innerHTML = `${fallback || ''}<div class="console-stage-flow-empty">执行图渲染失败：${escapeHtml(error?.message || String(error))}</div>`;
+        consoleFlowRenderKey = renderKey;
+        bindConsoleFlowDiagram(job);
+        applyConsoleFlowSelection(job);
     }
+}
+
+function consoleFlowTimingTarget(graphNode) {
+    const cached = graphNode?._consoleFlowTimingTarget;
+    if (cached?.node?.isConnected) return cached;
+    if (!graphNode) return null;
+    const walker = document.createTreeWalker(graphNode, NodeFilter.SHOW_TEXT);
+    let textNode = walker.nextNode();
+    while (textNode) {
+        const value = textNode.nodeValue || '';
+        const index = value.indexOf(consoleFlowTimerPlaceholder);
+        if (index !== -1) {
+            const target = {
+                node: textNode,
+                prefix: value.slice(0, index),
+                suffix: value.slice(index + consoleFlowTimerPlaceholder.length)
+            };
+            graphNode._consoleFlowTimingTarget = target;
+            graphNode.classList.add('has-node-timing');
+            return target;
+        }
+        textNode = walker.nextNode();
+    }
+    return null;
+}
+
+function updateConsoleFlowNodeTimers(job) {
+    const flow = job?.execution_flow || {};
+    (flow.nodes || []).forEach(flowNode => {
+        const graphNode = consoleFlowNodeElement(flowNode.id);
+        const target = consoleFlowTimingTarget(graphNode);
+        const timing = consoleFlowNodeTimingLabel(flowNode);
+        if (target) target.node.nodeValue = `${target.prefix}${timing}${target.suffix}`;
+        if (graphNode) {
+            graphNode.setAttribute(
+                'aria-label',
+                `${flowNode.title || flowNode.id}，${stageStatusLabel(flowNode.status)}，${timing}`
+            );
+        }
+    });
 }
 
 function bindConsoleFlowDiagram(job) {
@@ -2683,6 +2813,7 @@ function bindConsoleFlowDiagram(job) {
             select();
         });
     });
+    updateConsoleFlowNodeTimers(job);
     const edgeElements = Array.from(nodes.consoleStageFlow.querySelectorAll('g.edgePath'));
     edgeElements.forEach((element, index) => {
         const edge = (flow.edges || [])[index];
@@ -2788,12 +2919,8 @@ function renderConsoleStageInspector(job, stageProgress) {
     const info = job.stages?.[stage] || {};
     const status = flowNode.status || info.status || 'pending';
     const model = flowNode.model || {};
-    const nodeDuration = Number(flowNode.duration_seconds);
-    const elapsed = Number.isFinite(nodeDuration)
-        ? formatClock(nodeDuration)
-        : flowNode.started_at
-            ? consoleElapsedMarkup(flowNode.started_at, flowNode.finished_at, '')
-            : '-';
+    const elapsed = flowNodeDurationMarkup(flowNode);
+    const queued = flowNodeQueueMarkup(flowNode);
     const workerText = [
         model.worker_count != null ? `${model.worker_count} worker` : '',
         model.concurrency != null ? `并发 ${model.concurrency}` : ''
@@ -2805,7 +2932,8 @@ function renderConsoleStageInspector(job, stageProgress) {
         ['部署位置', model.deployment || '-'],
         ['Worker / 并发', workerText],
         ['所属阶段', stageNames[stage] || stage || '输出'],
-        ['节点耗时', elapsed],
+        ['排队等待', queued],
+        ['执行耗时', elapsed],
         ['节点进度', flowNode.progress != null ? `${flowNode.progress}%` : '-']
     ];
     const message = [
@@ -2823,7 +2951,7 @@ function renderConsoleStageInspector(job, stageProgress) {
     nodes.consoleStageInspectorStatus.innerHTML = `<span class="status ${escapeHtml(status)}">${escapeHtml(stageStatusLabel(status))}</span>`;
     nodes.consoleStageInspectorMetrics.innerHTML = metrics.map(([label, value]) => `<div>
         <span>${escapeHtml(label)}</span>
-        <strong>${label === '节点耗时' ? value : escapeHtml(value)}</strong>
+        <strong>${['排队等待', '执行耗时'].includes(label) ? value : escapeHtml(value)}</strong>
     </div>`).join('');
     nodes.consoleStageInspectorMessage.textContent = message || flowNode.subtitle || '当前节点暂无额外运行信号。';
     nodes.consoleStageInspectorArtifacts.innerHTML = (flowNode.artifacts || []).length
@@ -5500,7 +5628,7 @@ function previewableDocs(job) {
         path: DOCUMENT_DERIVATION_PATH,
         title: '文档推导脑图',
         description: '理解重点文档、证据文件和过程文件之间的递进关系',
-        group: 'mindmap',
+        group: 'process',
         kind: 'mindmap',
         previewable: true
     }] : [];
@@ -5511,7 +5639,6 @@ function previewableDocs(job) {
 function docGroupDefinitions(docs) {
     const groups = [
         ['primary', '重点阅读', '最终用户最应该先看的结论文档'],
-        ['mindmap', '文档推导', '这些文件如何一步步生成'],
         ['evidence', '证据审计', '抽帧、OCR/VL、发布判断等可追溯证据'],
         ['process', '过程文件', '中间分析、QA、调试与结构化产物'],
         ['assets', '素材目录', '帧图、截图和报告素材目录']
@@ -6404,7 +6531,7 @@ function renderSimpleMermaidFlowchart(diagram) {
             const shape = shapes.get(node) === 'decision' ? ' decision' : '';
             const circle = shapes.get(node) === 'circle' ? ' circle' : '';
             const label = mermaidLabelHtml(labels.get(node) || node);
-            parts.push(`<div class="flow-node${shape}${circle}"><span class="flow-index">${index}</span>${label}</div>`);
+            parts.push(`<div class="flow-node${shape}${circle}" data-mermaid-node-id="${escapeHtml(node)}"><span class="flow-index">${index}</span>${label}</div>`);
             index += 1;
         });
         parts.push('</div>');

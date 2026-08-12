@@ -7,6 +7,7 @@ import argparse
 import json
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text-model", default=None)
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--output", help="Output directory; default RUN_DIR/docs_analysis")
+    parser.add_argument("--chapter-concurrency", type=int, help="Concurrent chapter requests; default from profile or 1")
     parser.add_argument("--refresh", action="store_true", help="Regenerate completed chapter checkpoints")
     return parser.parse_args()
 
@@ -71,6 +73,7 @@ def main() -> int:
         api_key_env=profile.get("text_api_key_env") or profile.get("api_key_env"),
         extra_body=build_openai_extra_body(profile, llm_base_url),
         refresh=args.refresh,
+        chapter_concurrency=args.chapter_concurrency or int(profile.get("multidoc_chapter_concurrency") or 1),
     )
     return 0
 
@@ -87,6 +90,7 @@ def run_multidoc_analysis(
     extra_body: dict[str, Any] | None = None,
     client: Any | None = None,
     refresh: bool = False,
+    chapter_concurrency: int = 1,
 ) -> dict[str, Any]:
     run_dir = run_dir.expanduser().resolve()
     validate_run_dir(run_dir)
@@ -124,7 +128,9 @@ def run_multidoc_analysis(
         "planned_prompt_chars_total": 0,
         "planned_output_token_budget_total": 0,
     }
-    chapter_results = []
+    chapter_concurrency = max(1, min(int(chapter_concurrency), len(chapter_packets)))
+    chapter_results_by_id: dict[str, dict[str, Any]] = {}
+    pending: list[tuple[dict[str, Any], Path, Path, str, int]] = []
     for packet in chapter_packets:
         checkpoint = chapter_dir / f"{packet['chapter_id']}.json"
         raw_path = chapter_dir / f"{packet['chapter_id']}.raw.md"
@@ -137,26 +143,38 @@ def run_multidoc_analysis(
             result = repair_cached_chapter_result(cached, raw_path, packet)
             if result != cached:
                 write_json(checkpoint, result)
-            chapter_results.append(result)
+            chapter_results_by_id[packet["chapter_id"]] = result
             generation_metrics["checkpoint_hits"] += 1
             generation_metrics["chapter_checkpoint_hits"] += 1
             continue
+        pending.append((packet, checkpoint, raw_path, prompt, output_budget))
 
-        generation_metrics["model_calls"] += 1
-        generation_metrics["prompt_chars_total"] += len(prompt)
-        generation_metrics["prompt_chars_max"] = max(generation_metrics["prompt_chars_max"], len(prompt))
-        generation_metrics["output_token_budget_total"] += output_budget
-        response = client.generate(
-            prompt=prompt,
-            model=model,
-            temperature=temperature,
-            num_predict=output_budget,
-        )
-        raw_text = str(response.get("response") or "").strip()
-        raw_path.write_text(raw_text + "\n", encoding="utf-8")
-        result = normalize_chapter_result(raw_text, packet)
-        write_json(checkpoint, result)
-        chapter_results.append(result)
+    if pending:
+        def generate_chapter(item: tuple[dict[str, Any], Path, Path, str, int]) -> tuple[str, dict[str, Any], int, int]:
+            packet, checkpoint, raw_path, prompt, output_budget = item
+            response = client.generate(
+                prompt=prompt,
+                model=model,
+                temperature=temperature,
+                num_predict=output_budget,
+            )
+            raw_text = str(response.get("response") or "").strip()
+            raw_path.write_text(raw_text + "\n", encoding="utf-8")
+            result = normalize_chapter_result(raw_text, packet)
+            write_json(checkpoint, result)
+            return packet["chapter_id"], result, len(prompt), output_budget
+
+        with ThreadPoolExecutor(max_workers=chapter_concurrency) as executor:
+            futures = [executor.submit(generate_chapter, item) for item in pending]
+            for future in as_completed(futures):
+                chapter_id, result, prompt_chars, output_budget = future.result()
+                chapter_results_by_id[chapter_id] = result
+                generation_metrics["model_calls"] += 1
+                generation_metrics["prompt_chars_total"] += prompt_chars
+                generation_metrics["prompt_chars_max"] = max(generation_metrics["prompt_chars_max"], prompt_chars)
+                generation_metrics["output_token_budget_total"] += output_budget
+
+    chapter_results = [chapter_results_by_id[packet["chapter_id"]] for packet in chapter_packets]
 
     overview_path = orin_dir / "overview.json"
     overview_prompt = build_cross_chapter_overview_prompt(chapter_results, language)
@@ -220,6 +238,7 @@ def run_multidoc_analysis(
             "overview": str(overview_path),
             "review": str(orin_dir / "round_04_review.json"),
             "resumable": True,
+            "chapter_concurrency": chapter_concurrency,
             "metrics": generation_metrics,
         },
         "outputs": final_docs,

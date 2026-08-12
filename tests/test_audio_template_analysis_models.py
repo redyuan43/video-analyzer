@@ -112,12 +112,14 @@ class AudioTemplateAnalysisModelTests(unittest.TestCase):
                 patch.object(run_audio_template_analysis, 'write_operation_manual', return_value=output / 'operation_manual.md'),
                 patch.object(run_audio_template_analysis, 'write_manual_evidence', return_value=output / 'manual_evidence.md'),
                 patch.object(run_audio_template_analysis, 'write_analysis_json', return_value=output / 'analysis.json'),
+                patch.object(run_audio_template_analysis, 'local_model_stage') as text_stage,
             ):
                 self.assertEqual(run_audio_template_analysis.main(), 0)
 
         extract_mock.assert_not_called()
         asr_mock.assert_not_called()
         diarization_mock.assert_not_called()
+        self.assertEqual(text_stage.call_args.args[0], 'text')
         self.assertEqual(result.strategy, 'provided_transcript')
         self.assertEqual(result.providers_run, [])
 

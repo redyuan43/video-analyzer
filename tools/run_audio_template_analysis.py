@@ -9,8 +9,10 @@ import hashlib
 import json
 import logging
 import re
+import subprocess
 import sys
 import time
+import wave
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -54,6 +56,9 @@ CLASSIFICATION_CANDIDATE_LIMIT = 48
 SUMMARY_SINGLE_PASS_CHARS = 24000
 SUMMARY_MAP_CHUNK_CHARS = 20000
 SUMMARY_REDUCE_BATCH_CHARS = 48000
+ASR_PREFLIGHT_MIN_DURATION_SECONDS = 20 * 60
+ASR_PREFLIGHT_SAMPLE_SECONDS = 30
+ASR_PREFLIGHT_SAMPLE_COUNT = 5
 CLIENT_TEMPLATE_BLOCK_RE = re.compile(r"【模板指令开始】[\s\S]*?【模板指令结束】\s*")
 CLIENT_USER_SUPPLEMENT_MARKER = "【用户补充】"
 logger = logging.getLogger("audio_template_analysis")
@@ -155,33 +160,34 @@ def main() -> int:
     selector_client, selector_model, selector_base_url, _selector_temperature = build_template_selector_client(config)
     content_client, content_model, content_base_url, content_temperature = build_content_analysis_client(config, args.profile)
     analysis_transcript = format_transcript_for_analysis(transcript)
-    selected, classification = choose_template(
-        client=selector_client,
-        model=selector_model,
-        templates=templates,
-        transcript_text=analysis_transcript,
-        focus_prompt=focus_prompt,
-        explicit_template_id=args.template_id,
-    )
-    summary = summarize_with_template(
-        client=content_client,
-        model=content_model,
-        template=selected,
-        transcript_text=analysis_transcript,
-        focus_prompt=focus_prompt,
-        language=args.language,
-        temperature=content_temperature,
-        source_name=args.source_name or media_path.name,
-    )
+    with local_model_stage("text", config.config, logger, str(output_dir)):
+        selected, classification = choose_template(
+            client=selector_client,
+            model=selector_model,
+            templates=templates,
+            transcript_text=analysis_transcript,
+            focus_prompt=focus_prompt,
+            explicit_template_id=args.template_id,
+        )
+        summary = summarize_with_template(
+            client=content_client,
+            model=content_model,
+            template=selected,
+            transcript_text=analysis_transcript,
+            focus_prompt=focus_prompt,
+            language=args.language,
+            temperature=content_temperature,
+            source_name=args.source_name or media_path.name,
+        )
+        study_guide_path = build_light_study_guide(
+            content_client,
+            content_model,
+            output_dir,
+            transcript,
+            summary,
+            content_temperature,
+        )
     write_audio_only_manifest(output_dir, media_path, audio_path)
-    study_guide_path = build_light_study_guide(
-        content_client,
-        content_model,
-        output_dir,
-        transcript,
-        summary,
-        content_temperature,
-    )
 
     manual_path = write_operation_manual(output_dir, selected, classification, summary, focus_prompt)
     evidence_path = write_manual_evidence(output_dir, media_path, transcript_path, selected, classification, asr_result)
@@ -326,6 +332,7 @@ def transcribe_audio(audio_path: Path, output_dir: Path, config: Config) -> tupl
     with local_model_runtime_session(config.config, logger, str(output_dir)):
         with asr_lock:
             with local_model_stage("asr", config.config, logger, str(output_dir)):
+                preflight_long_audio(audio_path, output_dir, config)
                 if provider == "auto":
                     strategy = asr_config.get("strategy", "balanced")
                     speaker_config = config.get("speaker_diarization") or {}
@@ -369,6 +376,107 @@ def transcribe_audio(audio_path: Path, output_dir: Path, config: Config) -> tupl
             providers_run=[] if provider == "none" else [provider],
         )
     return transcript, asr_result
+
+
+def preflight_long_audio(audio_path: Path, output_dir: Path, config: Config) -> None:
+    duration = wav_duration_seconds(audio_path)
+    if duration < ASR_PREFLIGHT_MIN_DURATION_SECONDS:
+        return
+    provider = str((config.get("asr") or {}).get("provider") or "faster_whisper")
+    if provider == "none":
+        return
+
+    sample_dir = output_dir / "asr-preflight"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    def sample_once(index: int, offset: float) -> dict[str, Any]:
+        sample_path = sample_dir / f"sample-{index:02d}.wav"
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-ss",
+                f"{offset:.3f}",
+                "-t",
+                str(ASR_PREFLIGHT_SAMPLE_SECONDS),
+                "-i",
+                str(audio_path),
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "-c:a",
+                "pcm_s16le",
+                "-y",
+                str(sample_path),
+            ],
+            check=True,
+            timeout=120,
+        )
+        result = transcribe_with_provider_result(
+            provider=provider,
+            audio_path=sample_path,
+            language=config.get("audio", {}).get("language", ""),
+            whisper_model=config.get("audio", {}).get("whisper_model", "medium"),
+            device=config.get("audio", {}).get("device", "cpu"),
+            vibevoice_config=(config.get("asr") or {}).get("vibevoice", {}),
+        )
+        text = str((result.transcript.text if result.transcript else "") or "").strip()
+        return {
+            "offset_seconds": round(offset, 3),
+            "text": text,
+            "meaningful_speech": has_meaningful_speech(text),
+        }
+
+    offsets = preflight_offsets(duration)
+    with ThreadPoolExecutor(max_workers=len(offsets)) as executor:
+        records = list(
+            executor.map(
+                lambda item: sample_once(*item),
+                enumerate(offsets, 1),
+            )
+        )
+
+    report_path = output_dir / "asr-preflight.json"
+    write_json(
+        report_path,
+        {
+            "provider": provider,
+            "audio_duration_seconds": round(duration, 3),
+            "sample_duration_seconds": ASR_PREFLIGHT_SAMPLE_SECONDS,
+            "samples": records,
+        },
+    )
+    if not any(record["meaningful_speech"] for record in records):
+        raise RuntimeError(
+            f"ASR preflight found no recognizable speech; see {report_path}"
+        )
+
+
+def preflight_offsets(duration: float) -> list[float]:
+    last_start = max(0.0, duration - ASR_PREFLIGHT_SAMPLE_SECONDS)
+    if ASR_PREFLIGHT_SAMPLE_COUNT == 1:
+        return [last_start / 2]
+    return [
+        last_start * index / (ASR_PREFLIGHT_SAMPLE_COUNT - 1)
+        for index in range(ASR_PREFLIGHT_SAMPLE_COUNT)
+    ]
+
+
+def has_meaningful_speech(text: str) -> bool:
+    normalized = str(text or "").strip()
+    if not normalized or re.fullmatch(r"\[[^\]]+\]", normalized):
+        return False
+    return any(char.isalnum() or "\u4e00" <= char <= "\u9fff" for char in normalized)
+
+
+def wav_duration_seconds(audio_path: Path) -> float:
+    try:
+        with wave.open(str(audio_path), "rb") as wav_file:
+            rate = wav_file.getframerate()
+            return wav_file.getnframes() / rate if rate else 0.0
+    except (FileNotFoundError, wave.Error, OSError):
+        return 0.0
 
 
 def refine_audio_speakers(

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import logging
@@ -19,9 +21,11 @@ from typing import Any, Callable, Iterable
 from .clients.generic_openai_api import GenericOpenAIAPIClient
 from .config import Config, build_openai_extra_body, resolve_api_key, resolve_temperature
 from .local_model_runtime import (
+    DEFAULT_LOCK_PATH,
     is_loopback_endpoint,
-    local_model_runtime_lock,
-    local_model_stage,
+    local_model_stage_needed,
+    prepare_local_model_stage,
+    unload_local_model_stage,
 )
 
 
@@ -45,6 +49,8 @@ MAX_REPAIR_ROUNDS = 2
 DEFAULT_CHUNK_CHARS = 30000
 DEFAULT_EVENT_WINDOW_SECONDS = 30
 DEFAULT_MULTIMODAL_IMAGES = 3
+DEFAULT_VERIFICATION_BATCH_SIZE = 6
+DEFAULT_VERIFICATION_BATCH_MAX_TOKENS = 6000
 logger = logging.getLogger(__name__)
 
 PIPELINE_STAGES = (
@@ -88,6 +94,10 @@ class DistillationError(RuntimeError):
 
 class DistillationCancelled(DistillationError):
     """Raised when the caller cancels a running distillation."""
+
+
+class DistillationResourceConflict(DistillationError):
+    """Raised when a separate Skill worker would contend with a local model job."""
 
 
 @dataclass(frozen=True)
@@ -204,6 +214,7 @@ def initialize_distillation(
     target_brief: dict[str, Any] | None = None,
     assessment: dict[str, Any] | None = None,
     source_records: list[dict[str, Any]] | None = None,
+    reference_context: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     run_dir = run_dir.expanduser().resolve()
     if not run_dir.is_dir():
@@ -245,6 +256,7 @@ def initialize_distillation(
         "target_brief": dict(target_brief or {}),
         "assessment": dict(assessment or {}),
         "project_source_records_path": project_records_path,
+        "project_reference_context": list(reference_context or []),
     }
     save_state(run_dir, state)
     return state
@@ -348,6 +360,58 @@ def is_local_endpoint(base_url: str) -> bool:
     return is_loopback_endpoint(base_url)
 
 
+@contextlib.contextmanager
+def skill_local_model_stage(stage: str, config: dict, owner: str) -> Iterable[None]:
+    """Use a local model only when its shared runtime is currently idle.
+
+    Skill workers must not queue behind the primary Video Analyzer pipeline:
+    they persist a resource-conflict checkpoint and wait for an explicit user
+    decision instead.
+    """
+    if not local_model_stage_needed(stage, config):
+        yield
+        return
+    runtime = config.get("local_model_runtime") or {}
+    lock_path = Path(
+        os.environ.get("VIDEO_ANALYZER_LOCAL_MODEL_LOCK")
+        or runtime.get("lock_path")
+        or DEFAULT_LOCK_PATH
+    )
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    acquired = False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except BlockingIOError as exc:
+            try:
+                holder = json.loads(lock_path.read_text(encoding="utf-8") or "{}")
+            except (OSError, ValueError, json.JSONDecodeError):
+                holder = {}
+            details = "本地模型正在被主视频流程使用"
+            if holder.get("stage") or holder.get("owner"):
+                details += (
+                    f"（stage={holder.get('stage') or 'unknown'}"
+                    f"，owner={holder.get('owner') or 'unknown'}）"
+                )
+            raise DistillationResourceConflict(
+                f"{details}；Skill 已暂停，等待你的资源裁定。"
+            ) from exc
+        prepare_local_model_stage(stage, config, logger)
+        try:
+            yield
+        finally:
+            unload_local_model_stage(config, logger)
+    finally:
+        try:
+            if acquired:
+                os.ftruncate(fd, 0)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 class SkillDistillationPipeline:
     def __init__(
         self,
@@ -370,21 +434,34 @@ class SkillDistillationPipeline:
             config_dir=config_dir,
             client_factory=client_factory,
         )
+        self._cancel_event: threading.Event | None = None
 
     def run_until_pause(
         self,
         *,
         cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
-        if is_loopback_endpoint(self.runtime.base_url):
-            with local_model_runtime_lock(
-                self.config,
-                logger,
-                owner=f"skill-distillation:{self.run_dir}",
-                stage="skill-distillation",
-            ):
-                return self._run_until_pause_locked(cancel_event)
-        return self._run_until_pause_locked(cancel_event)
+        self._cancel_event = cancel_event
+        try:
+            if is_loopback_endpoint(self.runtime.base_url):
+                raise DistillationResourceConflict(
+                    "当前 Skill 文本模型使用本地共享运行时；Skill 已暂停，等待你的资源裁定。"
+                )
+            return self._run_until_pause_locked(cancel_event)
+        except DistillationResourceConflict as exc:
+            self._set_state(
+                status="waiting_resource_decision",
+                retryable=True,
+                error=str(exc),
+            )
+            self._append_log(
+                str(self.state.get("current_stage") or "pipeline"),
+                "resource_conflict",
+                str(exc),
+            )
+            return self.state
+        finally:
+            self._cancel_event = None
 
     def _run_until_pause_locked(
         self,
@@ -435,6 +512,14 @@ class SkillDistillationPipeline:
                 if not stage:
                     return self.state
                 raise DistillationError(f"Unknown distillation stage: {stage}")
+        except DistillationResourceConflict as exc:
+            self._set_state(
+                status="waiting_resource_decision",
+                retryable=True,
+                error=str(exc),
+            )
+            self._append_log(str(self.state.get("current_stage") or "pipeline"), "resource_conflict", str(exc))
+            return self.state
         except DistillationCancelled:
             self._set_state(status="cancelled", retryable=True, error="distillation cancelled")
             return self.state
@@ -599,17 +684,30 @@ class SkillDistillationPipeline:
             digests.append(digest)
             self._append_log("overview", "chunk", f"{index}/{len(chunks)}")
         feedback = str((self.state.get("overview") or {}).get("feedback") or "")
-        overview = call_json(
+        generated_overview = call_json(
             self.runtime.generation_client,
             self.runtime.generation_model,
-            overview_synthesis_prompt(digests, feedback, self._target_brief()),
+            overview_synthesis_prompt(
+                digests,
+                feedback,
+                self._target_brief(),
+                self._reference_context(),
+            ),
             self.runtime.generation_temperature,
             7000,
         )
         overview = normalize_overview(
-            overview,
+            generated_overview,
             {record["id"]: record for record in records},
         )
+        declared_fields = ("structure", "methods", "concepts", "cases", "failures")
+        if (
+            all(field in generated_overview for field in declared_fields)
+            and not overview_has_substantive_content(overview)
+        ):
+            raise DistillationError(
+                "Overview synthesis did not produce evidence-grounded structure, methods, concepts, cases, or risks"
+            )
         overview["method"] = METHOD_NAME
         overview["source_fingerprint"] = self.state.get("source_fingerprint")
         write_json(self.root / OVERVIEW_JSON_NAME, overview)
@@ -701,13 +799,7 @@ class SkillDistillationPipeline:
         skill_candidates = [
             item for item in candidate_payloads if str(item.get("type") or "") != "term"
         ]
-        result = call_json(
-            self.runtime.review_client,
-            self.runtime.review_model,
-            verification_prompt(skill_candidates, self._target_brief()),
-            self.runtime.review_temperature,
-            10000,
-        )
+        result = self._review_candidate_batches(skill_candidates)
         audits = self._run_multimodal_candidate_audits(skill_candidates, records)
         verified = normalize_verification(
             result,
@@ -748,6 +840,99 @@ class SkillDistillationPipeline:
         )
         save_state(self.run_dir, self.state)
 
+    def _review_candidate_batches(
+        self,
+        candidates: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        settings = self.config.get("skill_distillation") or {}
+        batch_size = max(
+            1,
+            int(settings.get("verification_batch_size") or DEFAULT_VERIFICATION_BATCH_SIZE),
+        )
+        max_tokens = max(
+            1000,
+            int(
+                settings.get("verification_batch_max_tokens")
+                or DEFAULT_VERIFICATION_BATCH_MAX_TOKENS
+            ),
+        )
+        batches = [
+            candidates[index : index + batch_size]
+            for index in range(0, len(candidates), batch_size)
+        ]
+        if not batches:
+            self._append_log("verify", "review_skipped", "没有可评审候选")
+            return {"evaluations": []}
+        checkpoint_dir = self.root / "verification_batches"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        results: list[dict[str, Any]] = []
+        total = len(batches)
+        for index, batch in enumerate(batches, start=1):
+            self._check_cancel(self._cancel_event)
+            signature = hashlib.sha256(
+                json.dumps(
+                    {
+                        "candidates": batch,
+                        "target_brief": self._target_brief(),
+                        "review_model": self.runtime.review_model,
+                        "schema": 1,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+            checkpoint = checkpoint_dir / f"batch_{index:03d}.json"
+            cached = read_json(checkpoint) or {}
+            if cached.get("signature") == signature and cached.get("status") == "succeeded":
+                result = dict(cached.get("result") or {})
+                self._append_log(
+                    "verify",
+                    "review_batch_cached",
+                    f"文本评审批次 {index}/{total}",
+                )
+            else:
+                self._append_log(
+                    "verify",
+                    "review_batch_start",
+                    f"文本评审批次 {index}/{total} · {len(batch)} 个候选",
+                )
+                self._update_stage(
+                    "verify",
+                    progress_percent=round(((index - 1) / total) * 55),
+                    message=f"正在文本评审第 {index}/{total} 批",
+                )
+                result = call_json(
+                    self.runtime.review_client,
+                    self.runtime.review_model,
+                    verification_prompt(batch, self._target_brief()),
+                    self.runtime.review_temperature,
+                    max_tokens,
+                )
+                write_json(
+                    checkpoint,
+                    {
+                        "version": 1,
+                        "status": "succeeded",
+                        "signature": signature,
+                        "completed_at": utc_now(),
+                        "result": result,
+                    },
+                )
+                self._append_log(
+                    "verify",
+                    "review_batch_done",
+                    f"文本评审批次 {index}/{total}",
+                )
+            results.append(result)
+            self._update_stage(
+                "verify",
+                progress_percent=round((index / total) * 55),
+                message=f"文本评审已完成 {index}/{total} 批",
+            )
+        merged = merge_verification_batch_results(results)
+        write_json(self.root / "verification_review.json", merged)
+        return merged
+
     def _run_multimodal_candidate_audits(
         self,
         candidates: list[dict[str, Any]],
@@ -762,7 +947,7 @@ class SkillDistillationPipeline:
             )
         )
 
-        def audit(candidate: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        def plan(candidate: dict[str, Any]) -> dict[str, Any]:
             candidate_id = str(candidate.get("id") or "")
             evidence = [
                 records[evidence_id]
@@ -792,18 +977,24 @@ class SkillDistillationPipeline:
                 ).encode("utf-8")
             ).hexdigest()
             checkpoint = self.root / "multimodal_audits" / f"{safe_slug(candidate_id)}.json"
-            cached = read_json(checkpoint) or {}
-            if cached.get("signature") == signature and cached.get("status") == "succeeded":
-                return candidate_id, cached
-            if not image_paths:
-                result = {
-                    "status": "no_frames",
-                    "event_ids": event_ids,
-                    "image_paths": [],
-                    "signature": signature,
-                }
-                write_json(checkpoint, result)
-                return candidate_id, result
+            return {
+                "candidate": candidate,
+                "candidate_id": candidate_id,
+                "evidence": evidence,
+                "event_ids": event_ids,
+                "image_paths": image_paths,
+                "signature": signature,
+                "checkpoint": checkpoint,
+            }
+
+        def audit(item: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+            candidate = item["candidate"]
+            candidate_id = item["candidate_id"]
+            evidence = item["evidence"]
+            event_ids = item["event_ids"]
+            image_paths = item["image_paths"]
+            signature = item["signature"]
+            checkpoint = item["checkpoint"]
             try:
                 result = call_json(
                     self.runtime.vision_client,
@@ -837,18 +1028,59 @@ class SkillDistillationPipeline:
             },
         }
         audits: dict[str, dict[str, Any]] = {}
-        with local_model_stage(
+        pending: list[dict[str, Any]] = []
+        for candidate in candidates:
+            item = plan(candidate)
+            candidate_id = item["candidate_id"]
+            cached = read_json(item["checkpoint"]) or {}
+            if cached.get("signature") == item["signature"] and cached.get("status") == "succeeded":
+                audits[candidate_id] = cached
+                self._append_log("verify", "multimodal_cached", candidate_id)
+                continue
+            if not item["image_paths"]:
+                result = {
+                    "status": "no_frames",
+                    "event_ids": item["event_ids"],
+                    "image_paths": [],
+                    "signature": item["signature"],
+                }
+                write_json(item["checkpoint"], result)
+                audits[candidate_id] = result
+                self._append_log("verify", "multimodal_skipped", f"{candidate_id} · 无可复核帧")
+                continue
+            pending.append(item)
+        if not pending:
+            self._update_stage(
+                "verify",
+                progress_percent=100,
+                message="所有候选均无可复核帧，已跳过本地视觉模型",
+            )
+            self._append_log("verify", "multimodal_skipped", "所有候选均无可复核帧，不占用本地视觉模型")
+            return audits
+
+        self._append_log(
+            "verify",
+            "local_vision_check",
+            f"{len(pending)} 个候选需要视觉复核，正在检查本地视觉模型是否空闲",
+        )
+        with skill_local_model_stage(
             "vl",
             vision_config,
-            logger,
             f"skill-distillation-vision:{self.run_dir}",
         ):
+            self._append_log("verify", "local_vision_acquired", f"开始视觉复核 {len(pending)} 个候选")
             with ThreadPoolExecutor(max_workers=self.runtime.vision_concurrency) as executor:
-                futures = [executor.submit(audit, candidate) for candidate in candidates]
+                futures = [executor.submit(audit, item) for item in pending]
                 for future in as_completed(futures):
+                    self._check_cancel(self._cancel_event)
                     candidate_id, result = future.result()
                     audits[candidate_id] = result
                     self._append_log("verify", "multimodal", candidate_id)
+                    self._update_stage(
+                        "verify",
+                        progress_percent=55 + round((len(audits) / len(candidates)) * 45),
+                        message=f"视觉复核 {len(audits)}/{len(candidates)}",
+                    )
         return audits
 
     def _build_skills(self) -> None:
@@ -1235,6 +1467,13 @@ class SkillDistillationPipeline:
 
     def _target_brief(self) -> dict[str, Any]:
         return dict(self.state.get("target_brief") or {})
+
+    def _reference_context(self) -> list[dict[str, Any]]:
+        return [
+            dict(item)
+            for item in (self.state.get("project_reference_context") or [])
+            if isinstance(item, dict) and str(item.get("text") or "").strip()
+        ]
 
 
 def enable_distilled_skills(
@@ -1644,6 +1883,7 @@ def overview_synthesis_prompt(
     digests: list[dict[str, Any]],
     feedback: str,
     target_brief: dict[str, Any] | None = None,
+    reference_context: list[dict[str, Any]] | None = None,
 ) -> str:
     feedback_text = feedback or "无额外修订意见"
     return f"""你负责把一组视频证据摘要合成为面向 skill 蒸馏的全局理解。
@@ -1670,6 +1910,9 @@ source_ids 只能使用 transcript:/ocr:/visual:/page:/comments: 开头的真实
 
 目标约束（为空时保持通用蒸馏）：
 {json.dumps(target_brief or {}, ensure_ascii=False)}
+
+辅助资料（仅用于理解主题、学习结构和术语；不得作为事实依据或 source_ids）：
+{json.dumps(reference_context or [], ensure_ascii=False)}
 
 分块摘要：
 {json.dumps(digests, ensure_ascii=False)}
@@ -2065,6 +2308,40 @@ def normalize_overview(
     return normalized
 
 
+def overview_has_substantive_content(overview: dict[str, Any]) -> bool:
+    return any(
+        bool(overview.get(field))
+        for field in ("structure", "methods", "concepts", "cases", "failures")
+    )
+
+
+def merge_verification_batch_results(results: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    evaluations: list[dict[str, Any]] = []
+    legacy_rejected_ids: list[str] = []
+    for result in results:
+        payload = dict(result or {})
+        batch_evaluations = [
+            item for item in payload.get("evaluations") or [] if isinstance(item, dict)
+        ]
+        if batch_evaluations:
+            evaluations.extend(batch_evaluations)
+            continue
+        evaluations.extend(
+            item for item in payload.get("accepted") or [] if isinstance(item, dict)
+        )
+        for item in payload.get("rejected") or []:
+            if not isinstance(item, dict):
+                continue
+            evaluations.append(item)
+            candidate_id = str(item.get("id") or "").strip()
+            if candidate_id:
+                legacy_rejected_ids.append(candidate_id)
+    return {
+        "evaluations": evaluations,
+        "legacy_rejected_ids": unique_strings(legacy_rejected_ids),
+    }
+
+
 def normalize_verification(
     result: dict[str, Any],
     records: dict[str, dict[str, Any]],
@@ -2083,7 +2360,9 @@ def normalize_verification(
     audits = multimodal_audits or {}
     used_ids: set[str] = set()
     evaluations = list(result.get("evaluations") or [])
-    legacy_rejected_ids: set[str] = set()
+    legacy_rejected_ids: set[str] = set(
+        unique_strings(result.get("legacy_rejected_ids") or [])
+    )
     if not evaluations:
         evaluations.extend(result.get("accepted") or [])
         for raw in result.get("rejected") or []:
