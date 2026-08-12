@@ -3,7 +3,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from video_analyzer.asr_providers import merge_asr_transcripts, transcribe_with_http_asr
+from video_analyzer.asr_providers import (
+    merge_asr_transcripts,
+    transcribe_with_firered_asr2,
+    transcribe_with_http_asr,
+)
 from video_analyzer.audio_processor import AudioTranscript
 
 
@@ -51,6 +55,42 @@ class ASRProviderTests(unittest.TestCase):
         self.assertEqual(merged.metadata["source"], "merged_remote_http_vibevoice")
         self.assertEqual(merged.metadata["fast_transcript_metadata"]["provider"], "fast")
         self.assertEqual(merged.metadata["deep_transcript_metadata"]["quality_report"]["global_speaker_count"], 2)
+
+    def test_firered_asr_forwards_profile_chunk_settings(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio_path = Path(temp_dir) / "audio.wav"
+            audio_path.write_bytes(b"fake wav")
+            with (
+                patch(
+                    "video_analyzer.asr_providers._wav_duration",
+                    return_value=600,
+                ),
+                patch(
+                    "video_analyzer.asr_providers.transcribe_with_http_asr",
+                ) as transcribe,
+            ):
+                transcribe_with_firered_asr2(
+                    audio_path,
+                    "http://127.0.0.1:18014/api/asr/transcribe",
+                    options={
+                        "segmentation_mode": "vad",
+                        "vad_max_segment_sec": 50,
+                        "single_pass_max_duration_sec": 50,
+                        "chunk_duration_sec": 30,
+                        "chunk_overlap_sec": 3,
+                    },
+                )
+
+        self.assertEqual(
+            transcribe.call_args.kwargs["extra_data"],
+            {
+                "segmentation_mode": "vad",
+                "vad_max_segment_sec": 50,
+                "single_pass_max_duration_sec": 50,
+                "chunk_duration_sec": 30,
+                "chunk_overlap_sec": 3,
+            },
+        )
 
 
 if __name__ == "__main__":

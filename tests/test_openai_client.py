@@ -50,6 +50,30 @@ class GenericOpenAIAPIClientTests(unittest.TestCase):
 
         self.assertEqual(manual_config["text_api_key_env"], "DEEPSEEK_API_KEY")
 
+    def test_runtime_profile_forwards_vibevoice_chunk_settings(self):
+        config = Config()
+        profile = dict(config.config["runtime_profiles"]["deepseek_v4_pro"])
+        profile.update(
+            {
+                "asr_chunk_mode": "custom",
+                "asr_worker_count": 4,
+                "single_pass_max_duration_sec": 240,
+                "chunk_duration_sec": 180,
+                "chunk_overlap_sec": 12,
+            }
+        )
+        config.config["runtime_profiles"]["asr-custom"] = profile
+
+        config.update_from_args(
+            self._operation_manual_args(profile="asr-custom")
+        )
+
+        vibevoice = config.get("asr")["vibevoice"]
+        self.assertEqual(vibevoice["worker_count"], 4)
+        self.assertEqual(vibevoice["single_pass_max_duration_sec"], 240)
+        self.assertEqual(vibevoice["chunk_duration_sec"], 180)
+        self.assertEqual(vibevoice["chunk_overlap_sec"], 12)
+
     def test_tailscale_cgnat_bypasses_env_proxy(self):
         client = GenericOpenAIAPIClient("0", "http://100.90.114.26:18081/v1")
 

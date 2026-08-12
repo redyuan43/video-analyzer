@@ -10,12 +10,18 @@ import subprocess
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import requests
 from flask import Flask, jsonify, request
+import requests
 
+from tools.asr_ray_workers import (
+    audio_duration,
+    dispatch_asr_chunks,
+    materialize_fixed_chunks,
+    merge_asr_results,
+    request_float,
+)
 
 app = Flask("qwen3_asr_p40")
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,7 +49,7 @@ def parsed_workers() -> list[tuple[int, int]]:
         gpu_text, port_text = raw.strip().split(":", 1)
         gpu, port = int(gpu_text), int(port_text)
         if gpu == 3:
-            raise ValueError("GPU 3 is reserved for the Foundation-Sec security model")
+            raise ValueError("GPU 3 is reserved and must not run Qwen3-ASR")
         workers.append((gpu, port))
     if not workers:
         raise ValueError("at least one Qwen3-ASR worker is required")
@@ -131,125 +137,6 @@ def stop_workers() -> None:
 atexit.register(stop_workers)
 
 
-def audio_duration(path: Path) -> float:
-    completed = subprocess.run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(path),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    return float(completed.stdout.strip())
-
-
-def split_audio(
-    path: Path,
-    directory: Path,
-    duration: float,
-    *,
-    chunk_seconds: float = CHUNK_SECONDS,
-    overlap_seconds: float = CHUNK_OVERLAP_SECONDS,
-) -> list[tuple[Path, float, float]]:
-    step = max(1.0, chunk_seconds - overlap_seconds)
-    chunks = []
-    start = 0.0
-    index = 0
-    while start < duration:
-        length = min(chunk_seconds, duration - start)
-        output = directory / f"chunk-{index:04d}.wav"
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-v",
-                "error",
-                "-ss",
-                f"{start:.3f}",
-                "-t",
-                f"{length:.3f}",
-                "-i",
-                str(path),
-                "-ar",
-                "16000",
-                "-ac",
-                "1",
-                "-c:a",
-                "pcm_s16le",
-                "-y",
-                str(output),
-            ],
-            check=True,
-            timeout=120,
-        )
-        chunks.append((output, start, length))
-        index += 1
-        start += step
-    return chunks
-
-
-def post_audio(url: str, path: Path, form: dict[str, str]) -> dict:
-    session = requests.Session()
-    session.trust_env = False
-    try:
-        with path.open("rb") as audio:
-            response = session.post(
-                url,
-                files={"audio": (path.name, audio, "audio/wav")},
-                data=form,
-                timeout=(30, REQUEST_TIMEOUT),
-            )
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("success") is False or payload.get("error"):
-            raise RuntimeError(str(payload.get("error") or payload))
-        return payload
-    finally:
-        session.close()
-
-
-def dedupe_join(left: str, right: str) -> str:
-    left, right = left.strip(), right.strip()
-    if not left:
-        return right
-    if not right:
-        return left
-    limit = min(120, len(left), len(right))
-    for size in range(limit, 3, -1):
-        if left[-size:] == right[:size]:
-            return left + right[size:]
-    return f"{left}\n{right}"
-
-
-def offset_segments(payload: dict, start: float, duration: float) -> list[dict]:
-    segments = []
-    for source in payload.get("segments") or []:
-        if not isinstance(source, dict):
-            continue
-        item = dict(source)
-        if item.get("start") is not None:
-            item["start"] = round(float(item["start"]) + start, 3)
-        if item.get("end") is not None:
-            item["end"] = round(float(item["end"]) + start, 3)
-        segments.append(item)
-    if not segments and str(payload.get("text") or "").strip():
-        segments.append(
-            {
-                "start": round(start, 3),
-                "end": round(start + duration, 3),
-                "text": str(payload.get("text") or "").strip(),
-            }
-        )
-    return segments
-
-
 @app.get("/api/health")
 def health():
     workers = [
@@ -274,47 +161,70 @@ def transcribe():
         return jsonify({"success": False, "error": "audio file is required"}), 400
     ensure_workers()
     form = {key: str(value) for key, value in request.form.items()}
+    try:
+        chunk_seconds = request_float(
+            form,
+            "chunk_duration_sec",
+            CHUNK_SECONDS,
+            minimum=1.0,
+        )
+        overlap_seconds = request_float(
+            form,
+            "chunk_overlap_sec",
+            CHUNK_OVERLAP_SECONDS,
+            minimum=0.0,
+        )
+        single_pass_seconds = request_float(
+            form,
+            "single_pass_max_duration_sec",
+            SINGLE_PASS_SECONDS,
+            minimum=1.0,
+        )
+        if overlap_seconds >= chunk_seconds:
+            raise ValueError("chunk_overlap_sec must be smaller than chunk_duration_sec")
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
     suffix = Path(audio.filename).suffix or ".wav"
     with tempfile.TemporaryDirectory(prefix="qwen3_asr_") as temp:
         source = Path(temp) / f"audio{suffix}"
         audio.save(source)
         duration = audio_duration(source)
         workers = parsed_workers()
-        if len(workers) == 1 or duration <= SINGLE_PASS_SECONDS:
-            payload = post_audio(worker_url(workers[0][1]), source, form)
-            payload.update({"provider": "qwen3_asr", "worker_count": 1})
-            return jsonify(payload)
-        chunks = split_audio(source, Path(temp), duration)
-        results = []
-        with ThreadPoolExecutor(max_workers=len(workers)) as executor:
-            futures = {
-                executor.submit(
-                    post_audio,
-                    worker_url(workers[index % len(workers)][1]),
-                    chunk_path,
-                    form,
-                ): (index, start, length)
-                for index, (chunk_path, start, length) in enumerate(chunks)
-            }
-            for future in as_completed(futures):
-                index, start, length = futures[future]
-                results.append((index, start, length, future.result()))
-        text = ""
-        segments = []
-        for _index, start, length, payload in sorted(results):
-            text = dedupe_join(text, str(payload.get("text") or ""))
-            segments.extend(offset_segments(payload, start, length))
+        if duration <= single_pass_seconds:
+            chunks = materialize_fixed_chunks(
+                source,
+                Path(temp),
+                duration,
+                chunk_seconds=max(duration, 1.0),
+                overlap_seconds=0,
+            )
+        else:
+            chunks = materialize_fixed_chunks(
+                source,
+                Path(temp),
+                duration,
+                chunk_seconds=chunk_seconds,
+                overlap_seconds=overlap_seconds,
+            )
+        results = dispatch_asr_chunks(
+            [worker_url(port) for _gpu, port in workers],
+            chunks,
+            form,
+            request_timeout=REQUEST_TIMEOUT,
+        )
         return jsonify(
-            {
-                "success": True,
-                "provider": "qwen3_asr",
-                "text": text,
-                "segments": segments,
-                "language": "zh-CN",
-                "worker_count": len(workers),
-                "chunk_count": len(chunks),
-                "audio_duration_seconds": round(duration, 3),
-            }
+            merge_asr_results(
+                "qwen3_asr",
+                results,
+                segmentation_mode="fixed",
+                audio_duration_seconds=duration,
+                worker_count=len(workers),
+                segmentation_metadata={
+                    "chunk_duration_sec": chunk_seconds,
+                    "chunk_overlap_sec": overlap_seconds,
+                    "single_pass_max_duration_sec": single_pass_seconds,
+                },
+            )
         )
 
 

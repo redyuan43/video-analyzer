@@ -9,6 +9,7 @@ GPU_IDS="${QWEN3_ASR_GPU_IDS:-0,1,2,4,5}"
 WORKER_COUNT="${QWEN3_ASR_WORKER_COUNT:-5}"
 BASE_PORT="${QWEN3_ASR_BASE_WORKER_PORT:-18300}"
 PROXY_PORT="${QWEN3_ASR_PROXY_PORT:-18013}"
+PROXY_PYTHON="${QWEN3_ASR_PROXY_PYTHON:-/home/ai/vllm-p40-nightly-test/bin/python}"
 
 stop_python_script() {
   local script="$1"
@@ -43,14 +44,21 @@ stop_service() {
 start_service() {
   local count="${1:-${WORKER_COUNT}}"
   local ids=()
+  local gpu_name
   IFS=, read -r -a ids <<<"${GPU_IDS}"
   if (( count < 1 || count > ${#ids[@]} )); then
     echo "worker-count ${count} exceeds QWEN3_ASR_GPU_IDS (${GPU_IDS})" >&2
     exit 2
   fi
+  for ((index = 0; index < count; index++)); do
+    gpu_name="$(nvidia-smi --query-gpu=name --format=csv,noheader -i "${ids[index]}" 2>/dev/null || true)"
+    [[ "${gpu_name}" == *"Tesla P40"* ]] || {
+      echo "Qwen3-ASR requires Tesla P40; GPU ${ids[index]} is ${gpu_name:-unknown}" >&2
+      exit 2
+    }
+  done
   local specs=()
   for ((index = 0; index < count; index++)); do
-    [[ "${ids[index]}" == "3" ]] && { echo "GPU 3 is reserved" >&2; exit 2; }
     specs+=("${ids[index]}:$((BASE_PORT + index))")
   done
   local worker_spec
@@ -62,7 +70,7 @@ start_service() {
   QWEN3_ASR_PROXY_PORT="${PROXY_PORT}" \
   NO_PROXY="${NO_PROXY:-127.0.0.1,localhost}" \
   no_proxy="${no_proxy:-127.0.0.1,localhost}" \
-    setsid "${ROOT_DIR}/.venv/bin/python" "${ROOT_DIR}/tools/qwen3_asr_p40_proxy.py" \
+    setsid "${PROXY_PYTHON}" "${ROOT_DIR}/tools/qwen3_asr_p40_proxy.py" \
       >"${LOG_DIR}/proxy.log" 2>&1 < /dev/null &
   echo "$!" >"${PID_FILE}"
   for _ in $(seq 1 90); do
