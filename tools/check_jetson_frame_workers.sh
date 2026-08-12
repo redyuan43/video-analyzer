@@ -7,7 +7,7 @@ cd "$ROOT_DIR"
 if [[ "$#" -gt 0 ]]; then
   HOSTS=("$@")
 else
-  HOSTS=(nx1 nx2 nx3 nx4 agx)
+  HOSTS=(agx)
 fi
 
 check_host() {

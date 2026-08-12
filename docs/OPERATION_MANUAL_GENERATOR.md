@@ -138,16 +138,50 @@ For URL runs, install both the Python package and URL downloader in the project
 virtual environment:
 
 ```bash
-python3 -m venv .venv
+python3.11 -m venv .venv
 .venv/bin/python -m pip install -U pip setuptools wheel
 .venv/bin/python -m pip install -e .
-.venv/bin/python -m pip install yt-dlp
+.venv/bin/python -m pip install -U "yt-dlp[default]"
 sudo apt-get update && sudo apt-get install -y ffmpeg
 ```
 
 `tools/run_operation_manual_from_url.sh` adds `.venv/bin` to `PATH` before
 starting Python, so commands such as `yt-dlp` are found even when the shell has
 not manually activated the virtual environment.
+
+For YouTube, leave `--ytdlp-extractor-args` unset unless a specific runtime
+profile needs a deliberate override. The default yt-dlp client selection is
+more resilient than pinning a project-wide player client.
+
+Validate or update the local yt-dlp runtime with:
+
+```bash
+tools/ytdlp_runtime_maintenance.sh check
+tools/ytdlp_runtime_maintenance.sh update
+```
+
+The repository includes a daily user-systemd timer template. Install it only
+after reviewing the local service change:
+
+```bash
+mkdir -p ~/.config/systemd/user
+install -m 0644 tools/systemd/video-analyzer-ytdlp-maintenance.service ~/.config/systemd/user/
+install -m 0644 tools/systemd/video-analyzer-ytdlp-maintenance.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now video-analyzer-ytdlp-maintenance.timer
+```
+
+When the machine needs a local VPN proxy to reach package indexes, configure it
+outside the repository before enabling the timer:
+
+```bash
+mkdir -p ~/.config/video-analyzer
+printf '%s\n' \
+  'HTTP_PROXY=http://127.0.0.1:10808' \
+  'HTTPS_PROXY=http://127.0.0.1:10808' \
+  'ALL_PROXY=socks5://127.0.0.1:10808' \
+  > ~/.config/video-analyzer/ytdlp-maintenance.env
+```
 
 When the LLM endpoint is a shared remote LM Studio server with limited VRAM,
 only configure models that are already loaded on that server. Verify with the

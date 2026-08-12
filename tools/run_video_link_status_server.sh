@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNTIME_DIR="$ROOT_DIR/tmp/video-link-status"
 PID_FILE="$RUNTIME_DIR/server.pid"
 LOG_FILE="$RUNTIME_DIR/server.log"
+STATUS_FILE="$RUNTIME_DIR/supervisor.json"
 default_host() {
   if command -v tailscale >/dev/null 2>&1; then
     tailscale ip -4 2>/dev/null | head -n 1
@@ -67,9 +68,27 @@ start_server() {
     export JETSON_AGX_LAN_HOST="$AGX_LAN_HOST"
   fi
   PYTHONPATH="$ROOT_DIR/video-analyzer-ui:$ROOT_DIR:${PYTHONPATH:-}" \
-    setsid env JETSON_AGX_LAN_HOST="${JETSON_AGX_LAN_HOST:-}" "$PYTHON_BIN" -m video_analyzer_ui.server --host "$BIND_HOST" --port "$PORT" --jobs-dir "$RUNTIME_DIR/jobs" \
-    >"$LOG_FILE" 2>&1 < /dev/null &
-  echo "$!" >"$PID_FILE"
+    setsid --fork env JETSON_AGX_LAN_HOST="${JETSON_AGX_LAN_HOST:-}" "$PYTHON_BIN" tools/video_link_status_supervisor.py \
+      --repo-root "$ROOT_DIR" \
+      --python "$PYTHON_BIN" \
+      --host "$BIND_HOST" \
+      --port "$PORT" \
+      --jobs-dir "$RUNTIME_DIR/jobs" \
+      --status-file "$STATUS_FILE" \
+    >"$LOG_FILE" 2>&1 < /dev/null
+  local supervisor_pid=""
+  for _ in $(seq 1 40); do
+    supervisor_pid="$(pgrep -n -f "video_link_status_supervisor.py.*--repo-root $ROOT_DIR.*--port $PORT.*--jobs-dir $RUNTIME_DIR/jobs" || true)"
+    if [[ -n "$supervisor_pid" ]] && kill -0 "$supervisor_pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+  done
+  if [[ -z "$supervisor_pid" ]]; then
+    echo "video-link status supervisor did not stay running; inspect $LOG_FILE" >&2
+    return 1
+  fi
+  echo "$supervisor_pid" >"$PID_FILE"
   echo "video-link status server started: http://$PUBLIC_HOST:$PORT/ (bind: $BIND_HOST)"
   if [[ -n "${JETSON_AGX_LAN_HOST:-}" ]]; then
     echo "AGX LAN host: $JETSON_AGX_LAN_HOST"
@@ -86,7 +105,12 @@ stop_server() {
     return 0
   fi
   kill "$(cat "$PID_FILE")"
+  for _ in $(seq 1 50); do
+    kill -0 "$(cat "$PID_FILE")" 2>/dev/null || break
+    sleep 0.1
+  done
   rm -f "$PID_FILE"
+  rm -f "$STATUS_FILE"
   echo "video-link status server stopped"
 }
 
@@ -104,7 +128,22 @@ case "${1:-status}" in
   status)
     clear_stale_pid
     if is_running; then
-      echo "running: pid=$(cat "$PID_FILE") http://$PUBLIC_HOST:$PORT/ (bind: $BIND_HOST)"
+      if [[ -f "$STATUS_FILE" ]]; then
+        "$PYTHON_BIN" - "$STATUS_FILE" "$PUBLIC_HOST" "$PORT" "$BIND_HOST" <<'PY'
+import json
+import sys
+
+path, public_host, port, bind_host = sys.argv[1:]
+payload = json.load(open(path, encoding="utf-8"))
+print(
+    f"running: supervisor_pid={payload.get('supervisor_pid')} "
+    f"server_pid={payload.get('server_pid')} runtime_id={payload.get('runtime_id')} "
+    f"stale={payload.get('source_stale')} http://{public_host}:{port}/ (bind: {bind_host})"
+)
+PY
+      else
+        echo "running: supervisor_pid=$(cat "$PID_FILE") http://$PUBLIC_HOST:$PORT/ (bind: $BIND_HOST)"
+      fi
     else
       echo "not running"
       exit 1

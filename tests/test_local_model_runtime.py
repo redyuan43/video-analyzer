@@ -8,6 +8,7 @@ from unittest.mock import patch
 from video_analyzer.local_model_runtime import (
     has_loopback_endpoint,
     is_loopback_endpoint,
+    local_model_runtime_lock,
     local_model_runtime_session,
     local_model_stage,
     local_model_stage_needed,
@@ -26,12 +27,16 @@ class LocalModelRuntimeTests(unittest.TestCase):
         config = {
             "asr": {"vibevoice": {"deep_remote_urls": ["http://127.0.0.1:18012/api/asr/transcribe"]}},
             "ocr": {"base_urls": ["http://127.0.0.1:18088/v1"]},
-            "operation_manual": {"vision_base_url": "http://127.0.0.1:18082/v1"},
+            "operation_manual": {
+                "vision_base_url": "http://127.0.0.1:18082/v1",
+                "text_base_url": "http://127.0.0.1:18081/v1",
+            },
         }
 
         self.assertTrue(local_model_stage_needed("asr", config))
         self.assertTrue(local_model_stage_needed("ocr", config))
         self.assertTrue(local_model_stage_needed("vl", config))
+        self.assertTrue(local_model_stage_needed("text", config))
 
     def test_remote_endpoints_do_not_run_local_stage_switch(self):
         config = {
@@ -43,6 +48,30 @@ class LocalModelRuntimeTests(unittest.TestCase):
         self.assertFalse(local_model_stage_needed("asr", config))
         self.assertFalse(local_model_stage_needed("ocr", config))
         self.assertFalse(local_model_stage_needed("vl", config))
+        self.assertFalse(local_model_stage_needed("text", config))
+
+    @patch("video_analyzer.local_model_runtime.subprocess.run")
+    def test_local_model_stage_unloads_on_exit_when_enabled(self, run):
+        with TemporaryDirectory() as tmp:
+            config = {
+                "operation_manual": {"text_base_url": "http://127.0.0.1:18081/v1"},
+                "local_model_runtime": {
+                    "lock_path": str(Path(tmp) / "local.lock"),
+                    "stage_commands": {
+                        "text": ["/bin/echo", "text"],
+                        "stop": ["/bin/echo", "stop"],
+                    },
+                    "unload_on_stage_exit": True,
+                },
+            }
+
+            with local_model_stage("text", config, __import__("logging").getLogger(__name__), "text-job"):
+                pass
+
+            self.assertEqual(
+                [call.args[0] for call in run.call_args_list],
+                [["/bin/echo", "text"], ["/bin/echo", "stop"]],
+            )
 
     @patch("video_analyzer.local_model_runtime.subprocess.run")
     def test_prepare_stage_runs_configured_command(self, run):
@@ -59,6 +88,51 @@ class LocalModelRuntimeTests(unittest.TestCase):
         run.assert_called_once()
         self.assertEqual(run.call_args.args[0], ["/bin/echo", "ocr"])
         self.assertEqual(run.call_args.kwargs["timeout"], 7)
+
+    @patch("video_analyzer.local_model_runtime.subprocess.run")
+    def test_qwen3_asr_model_id_does_not_override_local_model_path(self, run):
+        config = {
+            "asr": {
+                "provider": "qwen3_asr",
+                "vibevoice": {
+                    "qwen3_asr_url": "http://127.0.0.1:18013/api/asr/transcribe",
+                    "qwen3_asr_model": "Qwen/Qwen3-ASR-1.7B",
+                    "qwen3_asr_options": {"worker_count": 5},
+                },
+            },
+            "local_model_runtime": {
+                "stage_commands": {"asr": ["/bin/echo", "asr"]},
+            },
+        }
+
+        prepare_local_model_stage("asr", config, logger=__import__("logging").getLogger(__name__))
+
+        self.assertNotIn("QWEN3_ASR_MODEL", run.call_args.kwargs["env"])
+        self.assertEqual(run.call_args.kwargs["env"]["QWEN3_ASR_WORKER_COUNT"], "5")
+
+    @patch("video_analyzer.local_model_runtime.subprocess.run")
+    def test_qwen3_asr_explicit_local_model_path_is_forwarded(self, run):
+        with TemporaryDirectory() as tmp:
+            config = {
+                "asr": {
+                    "provider": "qwen3_asr",
+                    "vibevoice": {
+                        "qwen3_asr_url": "http://127.0.0.1:18013/api/asr/transcribe",
+                        "qwen3_asr_model": "Qwen/Qwen3-ASR-1.7B",
+                        "qwen3_asr_options": {
+                            "worker_count": 5,
+                            "model_path": tmp,
+                        },
+                    },
+                },
+                "local_model_runtime": {
+                    "stage_commands": {"asr": ["/bin/echo", "asr"]},
+                },
+            }
+
+            prepare_local_model_stage("asr", config, logger=__import__("logging").getLogger(__name__))
+
+        self.assertEqual(run.call_args.kwargs["env"]["QWEN3_ASR_MODEL"], tmp)
 
     @patch("video_analyzer.local_model_runtime.subprocess.run")
     def test_local_model_stage_serializes_loopback_stages(self, run):
@@ -144,6 +218,39 @@ class LocalModelRuntimeTests(unittest.TestCase):
                     "second-core-acquired",
                 ],
             )
+
+    def test_runtime_session_allows_nested_diarization_lock(self):
+        with TemporaryDirectory() as tmp:
+            config = {
+                "operation_manual": {
+                    "vision_base_url": "http://127.0.0.1:18082/v1",
+                },
+                "local_model_runtime": {
+                    "lock_path": str(Path(tmp) / "local.lock"),
+                    "poll_seconds": 0.01,
+                    "log_interval_seconds": 0.01,
+                },
+            }
+            events: list[str] = []
+            logger = __import__("logging").getLogger(__name__)
+
+            def run_nested_lock():
+                with local_model_runtime_session(config, logger, "core-job"):
+                    events.append("core")
+                    with local_model_runtime_lock(
+                        config,
+                        logger,
+                        "speaker-diarization",
+                        stage="diarization",
+                    ):
+                        events.append("diarization")
+
+            thread = threading.Thread(target=run_nested_lock, daemon=True)
+            thread.start()
+            thread.join(timeout=1)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(events, ["core", "diarization"])
 
     @patch("video_analyzer.local_model_runtime.subprocess.run")
     def test_runtime_session_depth_is_thread_local(self, run):

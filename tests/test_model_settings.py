@@ -1,0 +1,665 @@
+import contextlib
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import requests
+
+from video_analyzer.config import Config, get_runtime_profile
+from video_analyzer.model_settings import RuntimeSettingsStore, SettingsValidationError
+
+
+class ModelSettingsTests(unittest.TestCase):
+    def make_repo(self, root: Path) -> RuntimeSettingsStore:
+        default_path = root / "video_analyzer" / "config" / "default_config.json"
+        default_path.parent.mkdir(parents=True)
+        (root / "config").mkdir()
+        default_path.write_text(
+            json.dumps(
+                {
+                    "active_runtime_profile": "default",
+                    "runtime_profiles": {
+                        "default": {
+                            "asr_provider": "vibevoice",
+                            "vibevoice_urls": ["http://127.0.0.1:18012/api/asr/transcribe"],
+                            "ocr_provider": "dots_mocr_vllm",
+                            "ocr_base_urls": ["http://127.0.0.1:18088/v1"],
+                            "ocr_model": "dots-mocr",
+                            "vision_base_url": "http://127.0.0.1:18082/v1",
+                            "vision_model": "minicpm",
+                            "text_base_url": "https://api.example.com/v1",
+                            "text_model": "text-model",
+                            "text_api_key_env": "TEXT_API_KEY",
+                        }
+                    },
+                    "speaker_diarization": {"enabled": True, "enable_3dspeaker": True},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return RuntimeSettingsStore(root)
+
+    def test_legacy_profile_is_exposed_as_reusable_model_resources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.make_repo(Path(tmp))
+            settings = store.public_settings()
+
+        self.assertEqual(settings["active_runtime_profile"], "default")
+        self.assertEqual(len(settings["profiles"]), 1)
+        profile = settings["profiles"][0]
+        self.assertTrue(profile["asr_model_id"])
+        self.assertTrue(profile["diarization_model_id"])
+        self.assertTrue(profile["ocr_model_id"])
+        self.assertTrue(profile["vision_model_id"])
+        self.assertTrue(profile["text_model_id"])
+
+    def test_model_save_keeps_only_api_key_environment_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_repo(root)
+            saved = store.save_model(
+                "cloud_text",
+                {
+                    "name": "Cloud Text",
+                    "kind": "text",
+                    "protocol": "openai_compatible",
+                    "model": "cloud-model",
+                    "endpoints": ["https://api.example.com/v1"],
+                    "api_key_env": "CLOUD_API_KEY",
+                    "api_key": "must-not-be-saved",
+                    "options": {"temperature": 0.2},
+                },
+            )
+            user_config = json.loads((root / "config" / "config.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(saved["api_key_env"], "CLOUD_API_KEY")
+        stored = user_config["model_catalog"]["cloud_text"]
+        self.assertEqual(stored["api_key_env"], "CLOUD_API_KEY")
+        self.assertNotIn("api_key", stored)
+        self.assertNotIn("must-not-be-saved", json.dumps(user_config))
+
+    def test_model_catalog_endpoint_placeholders_are_resolved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_repo(root)
+            default_path = root / "video_analyzer" / "config" / "default_config.json"
+            defaults = json.loads(default_path.read_text(encoding="utf-8"))
+            defaults["endpoints"] = {
+                "hosts": {"local_gpu": "127.0.0.1"},
+                "services": {"local_vl": "http://{local_gpu}:18082/v1"},
+            }
+            defaults["model_catalog"] = {
+                "vision-local": {
+                    "name": "Local Vision",
+                    "kind": "vision",
+                    "protocol": "openai_compatible",
+                    "model": "vision-model",
+                    "endpoints": ["{local_vl}"],
+                }
+            }
+            default_path.write_text(json.dumps(defaults), encoding="utf-8")
+
+            settings = store.public_settings()
+
+        model = next(item for item in settings["models"] if item["id"] == "vision-local")
+        self.assertEqual(model["endpoints"], ["http://127.0.0.1:18082/v1"])
+
+    def test_profile_refs_expand_to_existing_runtime_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_repo(root)
+            settings = store.public_settings()
+            source = settings["profiles"][0]
+            models = {
+                kind: source[field]
+                for kind, field in settings["schema"]["profile_model_fields"].items()
+            }
+            store.save_profile(
+                "custom",
+                {
+                    "label": "Custom",
+                    "models": models,
+                    "settings": {"pipeline_mode": "deep", "vl_concurrency": 4},
+                },
+            )
+            _defaults, _user, merged = store.load()
+            profile = get_runtime_profile(merged, "custom")
+
+        self.assertEqual(profile["pipeline_mode"], "deep")
+        self.assertEqual(profile["asr_provider"], "vibevoice")
+        self.assertEqual(profile["vision_model"], "minicpm")
+        self.assertEqual(profile["text_model"], "text-model")
+        self.assertEqual(profile["speaker_diarization"]["enabled"], True)
+
+    def test_settings_expose_fixed_branched_profile_flow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.make_repo(Path(tmp)).public_settings()
+
+        flow = settings["schema"]["profile_flow"]
+        node_ids = {item["id"] for item in flow["nodes"]}
+        edges = {(item["from"], item["to"]) for item in flow["edges"]}
+        models = {item["id"]: item for item in settings["models"]}
+        self.assertEqual(flow["version"], 4)
+        self.assertTrue(
+            {
+                "asr",
+                "diarization",
+                "transcript_merge",
+                "frame_audit",
+                "ocr",
+                "vision",
+                "visual_evidence",
+                "evidence_merge",
+                "text_fallback",
+                "deep_report",
+                "deep_review",
+                "web_evidence",
+                "final_publish",
+                "operation_manual_doc",
+            }
+            <= node_ids
+        )
+        self.assertIn(("input", "prepare"), edges)
+        self.assertIn(("prepare", "audio_extract"), edges)
+        self.assertIn(("prepare", "frame_extract"), edges)
+        self.assertIn(("audio_extract", "asr"), edges)
+        self.assertIn(("audio_extract", "diarization"), edges)
+        self.assertNotIn(("asr", "diarization"), edges)
+        self.assertIn(("asr", "transcript_merge"), edges)
+        self.assertIn(("diarization", "transcript_merge"), edges)
+        self.assertIn(("frame_extract", "frame_audit"), edges)
+        self.assertIn(("frame_audit", "ocr"), edges)
+        self.assertIn(("ocr", "vision"), edges)
+        self.assertNotIn(("frame_extract", "vision"), edges)
+        self.assertIn(("visual_evidence", "evidence_merge"), edges)
+        self.assertIn(("text", "text_fallback"), edges)
+        self.assertIn(("text_fallback", "core_verify"), edges)
+        self.assertIn(("final_publish", "operation_manual_doc"), edges)
+        self.assertEqual(models["vision-disabled"]["protocol"], "none")
+        self.assertEqual(models["text-disabled"]["protocol"], "none")
+        self.assertEqual(
+            models["text-deepseek-v4-pro"]["model"],
+            "deepseek-v4-pro",
+        )
+        self.assertEqual(models["review-inherit-text"]["protocol"], "inherit_text")
+        self.assertEqual(models["image-disabled"]["protocol"], "none")
+
+    def test_settings_expose_local_multiworker_model_catalog(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.make_repo(Path(tmp)).public_settings()
+
+        models = {item["id"]: item for item in settings["models"]}
+        self.assertEqual(models["asr-qwen3-1_7b-local"]["protocol"], "qwen3_asr_http")
+        self.assertEqual(models["asr-qwen3-1_7b-local"]["options"]["worker_count"], 5)
+        self.assertEqual(models["asr-firered2-local"]["protocol"], "firered_asr2_http")
+        self.assertEqual(
+            models["asr-firered2-local"]["endpoints"],
+            ["http://127.0.0.1:18014/api/asr/transcribe"],
+        )
+        self.assertEqual(models["asr-firered2-local"]["options"]["deployment"], "local")
+        self.assertEqual(
+            models["diarization-pyannote-community1-local"]["protocol"],
+            "pyannote_community",
+        )
+        self.assertEqual(
+            models["diarization-wespeaker-cn-local"]["protocol"],
+            "wespeaker_diarization",
+        )
+        self.assertEqual(models["ocr-unlimited-local"]["protocol"], "unlimited_ocr_openai")
+        self.assertEqual(models["ocr-unlimited-local"]["options"]["max_tokens"], 8192)
+        self.assertEqual(models["ocr-unlimited-local"]["options"]["max_image_long_side"], 0)
+        self.assertEqual(models["ocr-unlimited-local"]["options"]["image_mode"], "gundam")
+        self.assertEqual(models["ocr-dots-local"]["protocol"], "dots_ocr_openai")
+        self.assertEqual(models["ocr-unlimited-local"]["model"], "baidu/Unlimited-OCR")
+        self.assertEqual(models["ocr-dots-local"]["model"], "rednote-hilab/dots.ocr")
+        self.assertEqual(
+            models["vision-qwen3-vl-4b-local"]["options"]["engine"],
+            "qwen3_vl_4b",
+        )
+        amd_text = models["text-amd-lmstudio-bonsai-27b"]
+        self.assertEqual(amd_text["protocol"], "openai_compatible")
+        self.assertEqual(amd_text["model"], "prism-ml/bonsai-27b")
+        self.assertEqual(
+            amd_text["endpoints"],
+            ["http://100.90.114.26:18081/v1"],
+        )
+        self.assertEqual(amd_text["options"]["runtime"], "lm_studio")
+        self.assertEqual(amd_text["options"]["reasoning_effort"], "none")
+
+    def test_amd_lmstudio_text_model_expands_to_runtime_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_repo(root)
+            settings = store.public_settings()
+            source = settings["profiles"][0]
+            models = {
+                kind: source[field]
+                for kind, field in settings["schema"]["profile_model_fields"].items()
+            }
+            models["text"] = "text-amd-lmstudio-bonsai-27b"
+            store.save_profile(
+                "amd-lmstudio",
+                {"label": "AMD LM Studio", "models": models, "settings": {}},
+            )
+            _defaults, _user, merged = store.load()
+            profile = get_runtime_profile(merged, "amd-lmstudio")
+
+        self.assertEqual(profile["text_base_url"], "http://100.90.114.26:18081/v1")
+        self.assertEqual(profile["text_model"], "prism-ml/bonsai-27b")
+        self.assertEqual(profile["reasoning_effort"], "none")
+        self.assertEqual(profile["text_timeout_seconds"], 900)
+
+    def test_video_profile_can_enable_or_disable_text_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_repo(root)
+            settings = store.public_settings()
+            source = settings["profiles"][0]
+            models = {
+                slot: source[spec["field"]]
+                for slot, spec in settings["schema"]["workflows"][
+                    "video_operation_manual"
+                ]["model_fields"].items()
+                if spec["field"] in source
+            }
+            models["text_fallback"] = "text-deepseek-v4-pro"
+            store.save_profile(
+                "with-fallback",
+                {"label": "With fallback", "models": models, "settings": {}},
+            )
+            _defaults, _user, merged = store.load()
+            enabled = get_runtime_profile(merged, "with-fallback")
+
+            models["text_fallback"] = "text-disabled"
+            store.save_profile(
+                "without-fallback",
+                {"label": "Without fallback", "models": models, "settings": {}},
+            )
+            _defaults, _user, merged = store.load()
+            disabled = get_runtime_profile(merged, "without-fallback")
+
+        self.assertTrue(enabled["text_fallback_enabled"])
+        self.assertEqual(enabled["text_fallback_model"], "deepseek-v4-pro")
+        self.assertEqual(
+            enabled["text_fallback_api_key_env"],
+            "DEEPSEEK_API_KEY",
+        )
+        self.assertFalse(disabled["text_fallback_enabled"])
+
+    def test_local_firered_profile_expands_to_local_runtime_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_repo(root)
+            settings = store.public_settings()
+            source = settings["profiles"][0]
+            models = {
+                kind: source[field]
+                for kind, field in settings["schema"]["profile_model_fields"].items()
+            }
+            models["asr"] = "asr-firered2-local"
+            store.save_profile(
+                "firered-local",
+                {"label": "FireRed Local", "models": models, "settings": {}},
+            )
+            _defaults, _user, merged = store.load()
+            profile = get_runtime_profile(merged, "firered-local")
+
+        self.assertEqual(profile["asr_provider"], "firered_asr2")
+        self.assertEqual(
+            profile["firered_asr2_url"],
+            "http://127.0.0.1:18014/api/asr/transcribe",
+        )
+        self.assertEqual(profile["firered_asr2_options"]["worker_count"], 5)
+
+    def test_settings_expose_audio_workflow_and_builtin_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_repo(root)
+            default_path = root / "video_analyzer" / "config" / "default_config.json"
+            defaults = json.loads(default_path.read_text(encoding="utf-8"))
+            defaults["runtime_profiles"]["audio_nx1"] = {
+                **defaults["runtime_profiles"]["default"],
+                "workflow_id": "audio_nx1",
+                "asr_fallback_model_id": "asr-disabled",
+                "diarization_fallback_model_id": "diarization-disabled",
+            }
+            default_path.write_text(json.dumps(defaults), encoding="utf-8")
+            settings = store.public_settings()
+
+        workflow = settings["schema"]["workflows"]["audio_nx1"]
+        edges = {(item["from"], item["to"]) for item in workflow["flow"]["edges"]}
+        profile = next(
+            item for item in settings["profiles"] if item["name"] == "audio_nx1"
+        )
+        self.assertEqual(profile["workflow_id"], "audio_nx1")
+        self.assertEqual(
+            set(workflow["model_fields"]),
+            {
+                "asr",
+                "diarization",
+                "asr_fallback",
+                "diarization_fallback",
+                "selector",
+                "text",
+            },
+        )
+        self.assertEqual(profile["asr_fallback_model_id"], "asr-disabled")
+        self.assertEqual(
+            profile["diarization_fallback_model_id"],
+            "diarization-disabled",
+        )
+        self.assertIn(("audio_input", "asr"), edges)
+        self.assertIn(("audio_input", "diarization"), edges)
+        self.assertNotIn(("asr", "diarization"), edges)
+        self.assertIn(("asr", "template_selector"), edges)
+        self.assertIn(("diarization", "template_selector"), edges)
+
+    def test_audio_profile_can_be_saved_without_video_models(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_repo(root)
+            settings = store.public_settings()
+            source = settings["profiles"][0]
+            store.save_profile(
+                "audio-custom",
+                {
+                    "label": "Audio Custom",
+                    "workflow_id": "audio_nx1",
+                    "models": {
+                        "asr": source["asr_model_id"],
+                        "diarization": source["diarization_model_id"],
+                        "asr_fallback": "asr-disabled",
+                        "diarization_fallback": "diarization-disabled",
+                        "selector": "selector-inherit-text",
+                        "text": source["text_model_id"],
+                    },
+                    "settings": {},
+                },
+            )
+            saved = next(
+                item
+                for item in store.public_settings()["profiles"]
+                if item["name"] == "audio-custom"
+            )
+            stored_profile = json.loads(
+                (root / "config" / "config.json").read_text(encoding="utf-8")
+            )["runtime_profiles"]["audio-custom"]
+
+        self.assertEqual(saved["workflow_id"], "audio_nx1")
+        self.assertNotIn("ocr_model_id", stored_profile)
+
+    def test_disabled_visual_node_expands_to_no_frame_analysis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_repo(root)
+            settings = store.public_settings()
+            source = settings["profiles"][0]
+            models = {
+                kind: source[field]
+                for kind, field in settings["schema"]["profile_model_fields"].items()
+            }
+            models["vision"] = "vision-disabled"
+            store.save_profile("no-vision", {"label": "No Vision", "models": models, "settings": {}})
+            _defaults, _user, merged = store.load()
+            profile = get_runtime_profile(merged, "no-vision")
+            user_config = json.loads((root / "config" / "config.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(profile["vl_frame_policy"], "none")
+        self.assertEqual(profile["vision_model"], "")
+        self.assertNotIn("vision-disabled", user_config.get("model_catalog", {}))
+
+    def test_text_node_cannot_be_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_repo(root)
+            settings = store.public_settings()
+            source = settings["profiles"][0]
+            models = {
+                kind: source[field]
+                for kind, field in settings["schema"]["profile_model_fields"].items()
+            }
+            store.save_model(
+                "text-disabled",
+                {"name": "Disabled Text", "kind": "text", "protocol": "none"},
+            )
+            models["text"] = "text-disabled"
+            with self.assertRaisesRegex(SettingsValidationError, "cannot be disabled"):
+                store.save_profile("invalid", {"label": "Invalid", "models": models, "settings": {}})
+
+    def test_quick_test_treats_lazy_sleeping_proxy_as_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.make_repo(Path(tmp))
+            settings = store.public_settings()
+            vision_id = settings["profiles"][0]["vision_model_id"]
+            response = MagicMock()
+            response.status_code = 200
+            response.headers = {"Content-Type": "application/json"}
+            response.json.return_value = {"status": "sleeping", "ready": False}
+            response.raise_for_status.return_value = None
+            session = MagicMock()
+            session.get.return_value = response
+            with patch("video_analyzer.model_settings._test_session", return_value=session):
+                result = store.test_model(vision_id, "quick", force=True)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "sleeping")
+        self.assertIn("模型休眠", result["detail"])
+
+    def test_quick_test_treats_stopped_local_on_demand_service_as_sleeping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.make_repo(Path(tmp))
+            settings = store.public_settings()
+            vision_id = settings["profiles"][0]["vision_model_id"]
+            session = MagicMock()
+            session.get.side_effect = requests.exceptions.ConnectionError("connection refused")
+            with patch("video_analyzer.model_settings._test_session", return_value=session):
+                result = store.test_model(vision_id, "quick", force=True)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "sleeping")
+        self.assertIn("最小推理会自动冷启动", result["detail"])
+
+    def test_model_inference_prepares_selected_local_ocr_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.make_repo(Path(tmp))
+            settings = store.public_settings()
+            ocr_id = settings["profiles"][0]["ocr_model_id"]
+            captured = {}
+
+            def stage_context(stage, config, *_args, **_kwargs):
+                captured["stage"] = stage
+                captured["config"] = config
+                return contextlib.nullcontext()
+
+            with (
+                patch(
+                    "video_analyzer.local_model_runtime.local_model_stage",
+                    side_effect=stage_context,
+                ),
+                patch.object(
+                    store,
+                    "_inference_test_resource",
+                    return_value={"ok": True, "status": "passed", "detail": "test"},
+                ),
+            ):
+                result = store.test_model(ocr_id, "inference", force=True)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(captured["stage"], "ocr")
+        self.assertEqual(captured["config"]["ocr"]["base_urls"], ["http://127.0.0.1:18088/v1"])
+
+    def test_profile_test_returns_status_for_every_flow_node(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.make_repo(Path(tmp))
+            settings = store.public_settings()
+            profile = settings["profiles"][0]
+            models = {
+                kind: profile[field]
+                for kind, field in settings["schema"]["profile_model_fields"].items()
+            }
+
+            def fake_test(model_id, mode="quick", **_kwargs):
+                model = next(item for item in settings["models"] if item["id"] == model_id)
+                return {
+                    "ok": True,
+                    "status": "disabled" if model["protocol"] == "none" else "reachable",
+                    "detail": "test",
+                    "model_id": model_id,
+                    "kind": model["kind"],
+                    "mode": mode,
+                    "elapsed_ms": 1,
+                }
+
+            with patch.object(store, "test_model", side_effect=fake_test):
+                result = store.test_profile({"profile_name": "draft", "mode": "quick", "models": models})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            result["summary"]["total"],
+            len(settings["schema"]["profile_flow"]["nodes"]),
+        )
+        self.assertEqual(set(result["results"]), {item["id"] for item in settings["schema"]["profile_flow"]["nodes"]})
+        self.assertEqual(result["results"]["input"]["status"], "configured")
+        self.assertEqual(result["results"]["text"]["status"], "reachable")
+        self.assertEqual(result["results"]["documents"]["reused_slot_result"], "text")
+
+    def test_pathway_profile_test_prepares_local_model_stages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.make_repo(Path(tmp))
+            settings = store.public_settings()
+            profile = settings["profiles"][0]
+            models = {
+                kind: profile[field]
+                for kind, field in settings["schema"]["profile_model_fields"].items()
+            }
+
+            def fake_test(model_id, mode="quick", **_kwargs):
+                model = next(item for item in settings["models"] if item["id"] == model_id)
+                return {
+                    "ok": True,
+                    "status": "passed",
+                    "detail": "test",
+                    "model_id": model_id,
+                    "kind": model["kind"],
+                    "mode": mode,
+                    "elapsed_ms": 1,
+                }
+
+            with (
+                patch.object(store, "test_model", side_effect=fake_test),
+                patch(
+                    "video_analyzer.local_model_runtime.local_model_runtime_session",
+                    side_effect=lambda *_args, **_kwargs: contextlib.nullcontext(),
+                ) as runtime_session,
+                patch(
+                    "video_analyzer.local_model_runtime.local_model_stage",
+                    side_effect=lambda *_args, **_kwargs: contextlib.nullcontext(),
+                ) as model_stage,
+            ):
+                result = store.test_profile(
+                    {
+                        "profile_name": "default",
+                        "mode": "pathway",
+                        "models": models,
+                    }
+                )
+
+        self.assertTrue(result["ok"])
+        runtime_session.assert_called_once()
+        self.assertEqual(
+            [call.args[0] for call in model_stage.call_args_list],
+            ["asr", "ocr", "vl"],
+        )
+
+    def test_pathway_profile_test_reports_local_stage_start_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.make_repo(Path(tmp))
+            settings = store.public_settings()
+            profile = settings["profiles"][0]
+            models = {
+                kind: profile[field]
+                for kind, field in settings["schema"]["profile_model_fields"].items()
+            }
+
+            @contextlib.contextmanager
+            def failed_stage():
+                raise RuntimeError("vision files missing")
+                yield
+
+            def stage_context(stage, *_args, **_kwargs):
+                return failed_stage() if stage == "vl" else contextlib.nullcontext()
+
+            with (
+                patch.object(
+                    store,
+                    "test_model",
+                    return_value={
+                        "ok": True,
+                        "status": "passed",
+                        "detail": "test",
+                        "elapsed_ms": 1,
+                    },
+                ),
+                patch(
+                    "video_analyzer.local_model_runtime.local_model_runtime_session",
+                    side_effect=lambda *_args, **_kwargs: contextlib.nullcontext(),
+                ),
+                patch(
+                    "video_analyzer.local_model_runtime.local_model_stage",
+                    side_effect=stage_context,
+                ),
+            ):
+                result = store.test_profile(
+                    {
+                        "profile_name": "default",
+                        "mode": "pathway",
+                        "models": models,
+                    }
+                )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["results"]["vision"]["status"], "failed")
+        self.assertIn("vision files missing", result["results"]["vision"]["detail"])
+
+    def test_deleting_built_in_profile_disables_it_locally_and_save_restores_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_repo(root)
+            default_path = root / "video_analyzer" / "config" / "default_config.json"
+            defaults = json.loads(default_path.read_text(encoding="utf-8"))
+            defaults["runtime_profiles"]["keep"] = dict(defaults["runtime_profiles"]["default"])
+            defaults["active_runtime_profile"] = "keep"
+            default_path.write_text(json.dumps(defaults), encoding="utf-8")
+            before = store.public_settings()
+            source = next(item for item in before["profiles"] if item["name"] == "default")
+            models = {
+                kind: source[field]
+                for kind, field in before["schema"]["profile_model_fields"].items()
+            }
+
+            deleted = store.delete_profile("default")
+            after_delete = store.public_settings()
+            user = json.loads((root / "config" / "config.json").read_text(encoding="utf-8"))
+            (root / "config" / "default_config.json").write_text(
+                json.dumps(defaults),
+                encoding="utf-8",
+            )
+            loaded = Config(str(root / "config")).config
+
+            self.assertEqual(deleted["status"], "disabled")
+            self.assertIn("default", user["disabled_runtime_profiles"])
+            self.assertNotIn("default", {item["name"] for item in after_delete["profiles"]})
+            self.assertNotIn("default", loaded["runtime_profiles"])
+
+            store.save_profile("default", {"label": "Restored", "models": models, "settings": {}})
+            restored = store.public_settings()
+            user = json.loads((root / "config" / "config.json").read_text(encoding="utf-8"))
+
+        self.assertIn("default", {item["name"] for item in restored["profiles"]})
+        self.assertNotIn("default", user.get("disabled_runtime_profiles", []))
+
+
+if __name__ == "__main__":
+    unittest.main()

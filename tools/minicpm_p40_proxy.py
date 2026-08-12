@@ -410,6 +410,8 @@ def parse_workers(value: str, log_dir: Path) -> list[WorkerSpec]:
         gpu_text, port_text = item.split(":", 1)
         gpu = int(gpu_text)
         port = int(port_text)
+        if gpu == 3:
+            raise ValueError("GPU 3 is reserved for the Foundation-Sec security model")
         workers.append(WorkerSpec(gpu=gpu, port=port, log_path=log_dir / f"worker-gpu{gpu}-port{port}.log"))
     if not workers:
         raise ValueError("at least one worker is required")
@@ -421,7 +423,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default=os.getenv("MINICPM_PROXY_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.getenv("MINICPM_PROXY_PORT", "18082")))
     parser.add_argument("--backend-host", default=os.getenv("MINICPM_BACKEND_HOST", "127.0.0.1"))
-    parser.add_argument("--workers", default=os.getenv("MINICPM_WORKERS", "0:18182,1:18183,2:18184,3:18185,4:18186"))
+    parser.add_argument("--workers", default=os.getenv("MINICPM_WORKERS", "0:18182,1:18183,2:18184,4:18185,5:18186"))
     parser.add_argument("--log-dir", type=Path, default=Path(os.getenv("MINICPM_LOG_DIR", "tmp/minicpm-p40/logs")))
     parser.add_argument("--server-bin", type=Path, default=Path(os.getenv("MINICPM_SERVER_BIN", "/home/ai/mtp-q8/llama.cpp-mtp/build/bin/llama-server")))
     parser.add_argument("--model-path", type=Path, default=Path(os.getenv("MINICPM_MODEL_PATH", "/home/ai/.lmstudio/models/openbmb/MiniCPM-V-4_5-gguf/ggml-model-Q4_K_M.gguf")))

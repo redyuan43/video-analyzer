@@ -68,6 +68,156 @@ class MultidocStudyContextTests(unittest.TestCase):
         self.assertEqual(evidence_map["evidence_gap_count"], 1)
         self.assertEqual(evidence_map["publish_decision"], "publish_with_warnings")
 
+    def test_chapter_generation_is_resumable_and_uses_bounded_evidence_packets(self):
+        class FakeClient:
+            def __init__(self):
+                self.prompts = []
+
+            def generate(self, *, prompt, **_kwargs):
+                self.prompts.append(prompt)
+                if len(self.prompts) <= 2:
+                    return {
+                        "response": json.dumps(
+                            {
+                                "chapter_summary": f"章节 {len(self.prompts)} 摘要",
+                                "key_facts": [{"claim": "可验证事实", "evidence_ids": ["asr_001"]}],
+                                "analysis": ["分析结论"],
+                                "manual_review": ["补充说明"],
+                                "cautions": [],
+                                "citations": ["asr_001"],
+                            },
+                            ensure_ascii=False,
+                        )
+                    }
+                return {
+                    "response": json.dumps(
+                        {
+                            "overview": "全片总览",
+                            "cross_chapter_conclusions": ["跨章结论"],
+                            "limitations": ["存在转写误差"],
+                        },
+                        ensure_ascii=False,
+                    )
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "orin").mkdir()
+            (run_dir / "analysis.json").write_text("{}", encoding="utf-8")
+            (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
+            chapter_dir = run_dir / "study_chapters"
+            chapter_dir.mkdir()
+            for index in (1, 2):
+                (chapter_dir / f"chapter_{index:02d}.json").write_text(
+                    json.dumps(
+                        {
+                            "chapter_id": f"chapter_{index:02d}",
+                            "index": index,
+                            "title": f"章节 {index}",
+                            "start": f"00:0{index}:00",
+                            "end": f"00:0{index}:30",
+                            "summary": f"摘要 {index}",
+                            "key_points": ["要点"],
+                            "evidence": [
+                                {
+                                    "id": "asr_001",
+                                    "source_type": "asr",
+                                    "timestamp_label": "00:00:01",
+                                    "confidence": 0.75,
+                                    "text": "这是可验证的转写证据。",
+                                },
+                                {
+                                    "id": "manual_001",
+                                    "source_type": "manual",
+                                    "timestamp_label": "00:00:00",
+                                    "confidence": 0.7,
+                                    "text": "手册内容" * 5000,
+                                },
+                            ],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+
+            client = FakeClient()
+            result = multidoc.run_multidoc_analysis(run_dir, client=client, text_model="test")
+
+            self.assertEqual(result["generation"]["chapter_count"], 2)
+            self.assertEqual(len(client.prompts), 3)
+            self.assertTrue((run_dir / "docs_analysis" / "knowledge_notes.md").is_file())
+            self.assertTrue((run_dir / "docs_analysis_chapters" / "knowledge_notes_v2.md").is_file())
+            self.assertTrue((run_dir / "docs_analysis_chapters" / "deep_report_v2.md").is_file())
+            self.assertIn("全片总览", (run_dir / "docs_analysis" / "deep_report.md").read_text(encoding="utf-8"))
+            self.assertLess(len(client.prompts[0]), 20000)
+            metrics = result["generation"]["metrics"]
+            self.assertEqual(metrics["model_calls"], 3)
+            self.assertEqual(metrics["checkpoint_hits"], 0)
+            self.assertEqual(metrics["chapter_checkpoint_hits"], 0)
+            self.assertFalse(metrics["overview_checkpoint_hit"])
+            self.assertEqual(metrics["prompt_chars_total"], sum(len(prompt) for prompt in client.prompts))
+            self.assertEqual(metrics["prompt_chars_max"], max(len(prompt) for prompt in client.prompts))
+            self.assertGreater(metrics["output_token_budget_total"], 0)
+            self.assertEqual(metrics["planned_prompt_chars_total"], metrics["prompt_chars_total"])
+            self.assertEqual(metrics["planned_output_token_budget_total"], metrics["output_token_budget_total"])
+
+            cached_client = FakeClient()
+            cached_result = multidoc.run_multidoc_analysis(run_dir, client=cached_client, text_model="test")
+            self.assertEqual(cached_client.prompts, [])
+            cached_metrics = cached_result["generation"]["metrics"]
+            self.assertEqual(cached_metrics["model_calls"], 0)
+            self.assertEqual(cached_metrics["checkpoint_hits"], 3)
+            self.assertEqual(cached_metrics["chapter_checkpoint_hits"], 2)
+            self.assertTrue(cached_metrics["overview_checkpoint_hit"])
+            self.assertEqual(cached_metrics["prompt_chars_total"], 0)
+            self.assertEqual(cached_metrics["prompt_chars_max"], 0)
+            self.assertEqual(cached_metrics["output_token_budget_total"], 0)
+            self.assertGreater(cached_metrics["planned_prompt_chars_total"], 0)
+            self.assertGreater(cached_metrics["planned_output_token_budget_total"], 0)
+
+    def test_chapter_budget_grows_for_large_evidence(self):
+        small = {"evidence": [{"text": "短证据"}], "key_points": []}
+        large = {"evidence": [{"text": "长证据" * 5000}], "key_points": ["a"] * 10}
+
+        self.assertGreater(multidoc.chapter_output_budget(large), multidoc.chapter_output_budget(small))
+        self.assertLessEqual(multidoc.chapter_output_budget(large), multidoc.MAX_CHAPTER_OUTPUT_TOKENS)
+
+    def test_truncated_json_response_never_leaks_into_markdown(self):
+        packet = {
+            "chapter_id": "chapter_01",
+            "index": 1,
+            "title": "章节",
+            "start": "00:00:00",
+            "end": "00:00:30",
+            "summary": "已有章节摘要",
+            "key_points": ["已有关键点"],
+            "review_flags": [],
+            "evidence": [{"id": "asr_001", "text": "证据", "source_type": "asr"}],
+        }
+        raw = (
+            '{"chapter_summary":"模型已经完成的章节摘要",'
+            '"key_facts":[{"claim":"未完成'
+        )
+
+        result = multidoc.normalize_chapter_result(raw, packet)
+        rendered = multidoc.render_knowledge_notes([result], {"overview": "总览"})
+
+        self.assertEqual(result["chapter_summary"], "模型已经完成的章节摘要")
+        self.assertEqual(result["key_facts"][0]["claim"], "已有关键点")
+        self.assertNotIn('{"chapter_summary"', rendered)
+
+    def test_invalid_overview_response_falls_back_to_chapter_summaries(self):
+        chapters = [
+            {"chapter_summary": "第一章摘要"},
+            {"chapter_summary": "第二章摘要"},
+        ]
+        raw = '{"chapter_summary":"错误地返回了章节 JSON","key_facts":['
+
+        overview = multidoc.normalize_overview(raw, chapters)
+
+        self.assertEqual(overview["overview"], "第一章摘要\n第二章摘要")
+        self.assertNotIn('{"chapter_summary"', overview["overview"])
+
 
 if __name__ == "__main__":
     unittest.main()

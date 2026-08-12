@@ -3,13 +3,17 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="web-debug-token" content="{{ debug_console_token }}">
+    <link rel="icon" href="data:,">
     <title>Video Analyzer</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='vendor/katex/katex.min.css') }}?v={{ static_version }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}?v={{ static_version }}">
+    <link rel="stylesheet" href="{{ url_for('web_debug_console.static', filename='vendor/xterm/xterm.css') }}?v={{ static_version }}">
+    <link rel="stylesheet" href="{{ url_for('web_debug_console.static', filename='debug-console.css') }}?v={{ static_version }}">
 </head>
 <body>
     <main class="app-shell" data-initial-job="{{ request.args.get('job', '') }}">
-        <header class="topbar">
+        <header id="appTopbar" class="topbar">
             <div>
                 <h1>Video Analyzer</h1>
                 <p>URL workflow console</p>
@@ -18,6 +22,7 @@
                 <button id="consoleTab" class="view-tab active" type="button" data-view="console">控制台</button>
                 <button id="qaTab" class="view-tab" type="button" data-view="qa">问答</button>
                 <button id="vscodeTab" class="view-tab" type="button" data-view="vscode">学习/资源</button>
+                <button id="settingsTab" class="view-tab" type="button" data-view="settings">设置</button>
             </nav>
         </header>
 
@@ -84,7 +89,7 @@
                             <span>分析模式</span>
                             <select id="analysisMode" name="analysis_mode"></select>
                         </label>
-                        <label hidden>
+                        <label>
                             <span>运行配置</span>
                             <select id="profile" name="profile"></select>
                         </label>
@@ -131,7 +136,13 @@
                 <section class="panel">
                     <div class="panel-head">
                         <h2>最近任务</h2>
-                        <button id="refreshJobsButton" class="secondary" type="button">刷新</button>
+                        <div class="job-list-actions">
+                            <label class="check job-filter">
+                                <input id="showNonRerunFailures" type="checkbox">
+                                <span>显示无需续跑的失败</span>
+                            </label>
+                            <button id="refreshJobsButton" class="secondary" type="button">刷新</button>
+                        </div>
                     </div>
                     <div id="jobList" class="job-list"></div>
                 </section>
@@ -174,27 +185,68 @@
                     <p id="errorMessage"></p>
                 </section>
 
+                <section id="consoleFlowPanel" class="panel console-flow-panel">
+                    <div class="panel-head console-flow-head">
+                        <div>
+                            <h2>模型执行与文档推导</h2>
+                            <p id="consoleFlowSummary">选择任务后查看完整模型执行和文档生成关系</p>
+                        </div>
+                        <div class="console-flow-controls">
+                            <button id="consoleFlowPrevious" class="icon-button light" type="button" title="向左查看" aria-label="向左查看流程">‹</button>
+                            <button id="consoleFlowZoomOut" class="icon-button light" type="button" title="缩小" aria-label="缩小流程图">−</button>
+                            <button id="consoleFlowFit" class="icon-button light" type="button" title="适应宽度" aria-label="流程图适应宽度">↔</button>
+                            <button id="consoleFlowZoomIn" class="icon-button light" type="button" title="放大" aria-label="放大流程图">+</button>
+                            <button id="consoleFlowCurrent" class="icon-button light" type="button" title="定位当前阶段" aria-label="定位当前阶段">◎</button>
+                            <button id="consoleFlowNext" class="icon-button light" type="button" title="向右查看" aria-label="向右查看流程">›</button>
+                        </div>
+                    </div>
+                    <div id="consoleStageFlowViewport" class="console-stage-flow-viewport" tabindex="0" aria-label="模型执行与文档推导流程">
+                        <div id="consoleStageFlow" class="console-stage-flow">
+                            <div class="console-stage-flow-empty">选择任务后显示执行流程</div>
+                        </div>
+                    </div>
+                    <section id="consoleStageInspector" class="console-stage-inspector" hidden>
+                        <div class="console-stage-inspector-head">
+                            <div>
+                                <span id="consoleStageInspectorKicker">阶段详情</span>
+                                <h3 id="consoleStageInspectorTitle">-</h3>
+                            </div>
+                            <div id="consoleStageInspectorStatus"></div>
+                        </div>
+                        <div id="consoleStageInspectorMetrics" class="console-stage-inspector-metrics"></div>
+                        <p id="consoleStageInspectorMessage" class="console-stage-inspector-message"></p>
+                        <div id="consoleStageInspectorArtifacts" class="console-stage-inspector-artifacts"></div>
+                        <button id="consoleStageLogButton" class="secondary" type="button" disabled>查看阶段日志</button>
+                    </section>
+                </section>
+
                 <section class="panel">
                     <h2>任务信息</h2>
                     <div class="info-grid">
                         <div><span>视频链接</span><strong id="detailUrl">-</strong></div>
                         <div><span>运行目录</span><strong id="detailRunDir">-</strong></div>
                         <div><span>分析模式</span><strong id="detailMode">-</strong></div>
+                        <div><span>运行方案</span><strong id="detailProfile">-</strong></div>
+                        <div class="wide"><span>模型快照</span><strong id="detailModels">-</strong></div>
                         <div><span>更新时间</span><strong id="detailUpdated">-</strong></div>
                     </div>
                 </section>
 
-                <section class="panel">
-                    <h2>阶段</h2>
-                    <div class="table-wrap">
-                        <table>
-                            <thead>
-                                <tr><th>阶段</th><th>状态</th><th>耗时</th><th>队列</th><th>日志</th></tr>
-                            </thead>
-                            <tbody id="stageRows"></tbody>
-                        </table>
-                    </div>
-                    <div id="stageDurationSummary" class="stage-duration-summary">原视频长度：- · 阶段总耗时：-</div>
+                <section class="panel stage-table-panel">
+                    <details class="stage-table-details">
+                        <summary>
+                            <span>阶段详细列表</span>
+                            <span id="stageDurationSummary" class="stage-duration-summary">原视频长度：- · 阶段总耗时：-</span>
+                        </summary>
+                        <div class="table-wrap">
+                            <table>
+                                <thead>
+                                    <tr><th>阶段</th><th>状态</th><th>耗时</th><th>队列</th><th>日志</th></tr>
+                                </thead>
+                                <tbody id="stageRows"></tbody>
+                            </table>
+                        </div>
+                    </details>
                 </section>
 
                 <section id="corePanel" class="panel" hidden>
@@ -207,6 +259,17 @@
                             <tbody id="coreRows"></tbody>
                         </table>
                     </div>
+                </section>
+
+                <section id="consoleSummaryPanel" class="panel console-summary-panel">
+                    <div class="panel-head">
+                        <div>
+                            <h2>运行与结果总结</h2>
+                            <p id="consoleSummaryHeadline">选择任务后查看耗时、处理量和产物概况</p>
+                        </div>
+                    </div>
+                    <div id="consoleSummaryGrid" class="console-summary-grid"></div>
+                    <div id="consoleResultSummary" class="console-result-summary"></div>
                 </section>
 
                 <section id="coreDiagnosticsPanel" class="panel core-diagnostics-panel" hidden>
@@ -224,6 +287,16 @@
                 <section class="panel">
                     <h2>产物</h2>
                     <div id="artifactSummary" class="artifact-summary">-</div>
+                </section>
+
+                <section class="panel console-skill-panel">
+                    <div class="panel-head">
+                        <div>
+                            <h2>Skills 蒸馏</h2>
+                            <p id="consoleSkillSummary">选择任务后查看蒸馏状态</p>
+                        </div>
+                        <button id="openSkillsWorkspaceButton" class="secondary" type="button" disabled>打开工作台</button>
+                    </div>
                 </section>
 
                 <section class="panel">
@@ -278,27 +351,168 @@
                     <section class="qa-status-panel">
                         <h2>证据状态</h2>
                         <div id="qaWarnings" class="qa-warnings">等待问答索引</div>
-                        <div class="skill-candidate-panel">
-                            <h2>工具 Skill</h2>
-                            <div id="skillSummary" class="skill-summary">等待生成草稿</div>
-                            <div id="skillWarnings" class="skill-warnings"></div>
-                            <div class="skill-actions">
-                                <button id="generateSkillButton" class="secondary" type="button" disabled>生成草稿</button>
-                                <button id="enableSkillButton" type="button" disabled>审核启用</button>
-                            </div>
-                        </div>
                     </section>
                 </aside>
             </section>
         </section>
 
+        <section id="settingsView" class="settings-view view-panel" hidden>
+            <header class="settings-toolbar">
+                <div>
+                    <h2>模型设置</h2>
+                    <p id="settingsSummary">正在加载配置</p>
+                </div>
+                <div class="resource-view-tabs" role="tablist" aria-label="模型设置页面">
+                    <button id="settingsModelsTab" class="resource-view-tab active" type="button">模型资源库</button>
+                    <button id="settingsProfilesTab" class="resource-view-tab" type="button">运行方案</button>
+                </div>
+            </header>
+
+            <section id="settingsModelsView" class="settings-layout">
+                <aside class="settings-list-pane">
+                    <div class="settings-list-head">
+                        <select id="settingsModelKindFilter" aria-label="模型类型筛选"></select>
+                        <button id="newModelButton" class="icon-button light" type="button" title="新增模型" aria-label="新增模型">+</button>
+                    </div>
+                    <input id="settingsModelSearch" type="search" placeholder="搜索模型">
+                    <div id="settingsModelList" class="settings-item-list"></div>
+                </aside>
+                <form id="modelSettingsForm" class="settings-editor">
+                    <header>
+                        <div>
+                            <h3 id="modelEditorTitle">新增模型</h3>
+                            <span id="modelEditorMeta">选择类型和协议</span>
+                        </div>
+                        <div class="settings-actions">
+                            <button id="testModelButton" class="secondary" type="button" disabled>测试连接</button>
+                            <button id="deleteModelButton" class="secondary danger" type="button" disabled>删除</button>
+                            <button id="saveModelButton" type="submit">保存</button>
+                        </div>
+                    </header>
+                    <div class="settings-form-grid">
+                        <label><span>ID</span><input id="modelId" required pattern="[a-z][a-z0-9_-]{1,63}"></label>
+                        <label><span>名称</span><input id="modelName" required maxlength="120"></label>
+                        <label><span>类型</span><select id="modelKind"></select></label>
+                        <label><span>协议</span><select id="modelProtocol"></select></label>
+                        <label class="wide"><span>模型名</span><input id="modelNameValue" placeholder="model-id"></label>
+                        <label class="wide"><span>端点，每行一个</span><textarea id="modelEndpoints" rows="4" placeholder="http://127.0.0.1:18012/api/asr/transcribe"></textarea></label>
+                        <label><span>部署位置</span><select id="modelDeployment">
+                            <option value="">自动判断</option>
+                            <option value="local">本机</option>
+                            <option value="cloud">云端</option>
+                            <option value="remote">远程设备</option>
+                        </select></label>
+                        <label><span>Worker 数</span><input id="modelWorkerCount" type="number" min="1" max="64" placeholder="5"></label>
+                        <label><span>并发数</span><input id="modelConcurrency" type="number" min="1" max="256" placeholder="5"></label>
+                        <label><span>API Key 环境变量</span><input id="modelApiKeyEnv" placeholder="DEEPSEEK_API_KEY"></label>
+                        <label><span>健康检查 URL</span><input id="modelHealthUrl" type="url" placeholder="http://127.0.0.1:18012/api/health"></label>
+                        <label class="wide"><span>高级参数 JSON</span><textarea id="modelOptions" rows="9">{}</textarea></label>
+                    </div>
+                    <div id="modelSettingsMessage" class="settings-message"></div>
+                </form>
+            </section>
+
+            <section id="settingsProfilesView" class="settings-layout" hidden>
+                <aside class="settings-list-pane">
+                    <div class="settings-list-head">
+                        <strong>运行方案</strong>
+                        <button id="newProfileButton" class="icon-button light" type="button" title="新增运行方案" aria-label="新增运行方案">+</button>
+                    </div>
+                    <div id="settingsProfileList" class="settings-item-list"></div>
+                </aside>
+                <form id="profileSettingsForm" class="settings-editor">
+                    <header>
+                        <div>
+                            <h3 id="profileEditorTitle">新增运行方案</h3>
+                            <span id="profileEditorMeta">组合各阶段模型</span>
+                        </div>
+                        <div class="settings-actions">
+                            <button id="duplicateProfileButton" class="secondary" type="button" disabled>复制</button>
+                            <button id="activateProfileButton" class="secondary" type="button" disabled>设为默认</button>
+                            <button id="deleteProfileButton" class="secondary danger" type="button" disabled>删除</button>
+                            <button id="saveProfileButton" type="submit">保存</button>
+                        </div>
+                    </header>
+                    <div class="settings-form-grid profile-model-grid">
+                        <label><span>ID</span><input id="profileId" required pattern="[A-Za-z0-9][A-Za-z0-9_.-]{0,63}"></label>
+                        <label><span>显示名称</span><input id="profileLabel" required maxlength="120"></label>
+                        <label><span>工作流</span><select id="profileWorkflow" required></select></label>
+                        <label class="wide"><span>说明</span><input id="profileDescription" maxlength="500"></label>
+                        <section class="profile-flow-section wide" aria-labelledby="profileFlowTitle">
+                            <div class="profile-flow-head">
+                                <div>
+                                    <h4 id="profileFlowTitle">分析流程</h4>
+                                    <span>从左到右配置每个阶段使用的模型，点击节点查看详细参数。</span>
+                                </div>
+                                <div class="profile-flow-head-actions">
+                                    <div id="profileFlowLegend" class="profile-flow-legend" aria-label="流程分支图例"></div>
+                                    <div class="profile-test-controls">
+                                        <select id="profileTestMode" aria-label="通路测试模式">
+                                            <option value="quick">快速检查</option>
+                                            <option value="inference">最小推理</option>
+                                            <option value="pathway">全链路冒烟</option>
+                                        </select>
+                                        <button id="testProfileButton" class="secondary" type="button" disabled>测试通路</button>
+                                    </div>
+                                    <span id="profileTestAvailability" class="profile-test-availability">正在检查后台任务...</span>
+                                </div>
+                            </div>
+                            <div id="profileFlowViewport" class="profile-flow-viewport" tabindex="0" aria-label="运行方案流程图">
+                                <div id="profileFlowCanvas" class="profile-flow-canvas">
+                                    <svg id="profileFlowEdges" class="profile-flow-edges" aria-hidden="true"></svg>
+                                    <div id="profileFlowNodes" class="profile-flow-nodes"></div>
+                                </div>
+                            </div>
+                            <section id="profileFlowInspector" class="profile-flow-inspector" aria-live="polite">
+                                <div>
+                                    <span class="profile-flow-inspector-kicker">节点详情</span>
+                                    <h4 id="profileFlowInspectorTitle">选择一个流程节点</h4>
+                                    <p id="profileFlowInspectorMeta">可查看模型来源、协议、端点和节点参数。</p>
+                                </div>
+                                <div id="profileFlowInspectorBody" class="profile-flow-inspector-body"></div>
+                                <div id="profileFlowInspectorActions" class="profile-flow-inspector-actions"></div>
+                            </section>
+                            <section id="profileTestSummary" class="profile-test-summary" hidden aria-live="polite"></section>
+                        </section>
+                        <div class="profile-model-selects" hidden>
+                            <select id="profileAsrModel"></select>
+                            <select id="profileDiarizationModel"></select>
+                            <select id="profileOcrModel"></select>
+                            <select id="profileVisionModel"></select>
+                            <select id="profileTextModel"></select>
+                            <select id="profileReviewModel"></select>
+                            <select id="profileStudyModel"></select>
+                            <select id="profileTriageModel"></select>
+                            <select id="profileImageModel"></select>
+                        </div>
+                        <label><span>流水线深度</span>
+                            <select id="profilePipelineMode">
+                                <option value="fast">fast</option>
+                                <option value="balanced">balanced</option>
+                                <option value="deep">deep</option>
+                            </select>
+                        </label>
+                        <label><span>VL 并发</span><input id="profileVlConcurrency" type="number" min="1" max="32"></label>
+                        <label><span>OCR 并发</span><input id="profileOcrConcurrency" type="text" placeholder="auto"></label>
+                        <label><span>文本超时秒数</span><input id="profileTextTimeout" type="number" min="1"></label>
+                        <label class="wide"><span>其他运行参数 JSON</span><textarea id="profileSettingsJson" rows="10">{}</textarea></label>
+                    </div>
+                    <div id="profileSettingsMessage" class="settings-message"></div>
+                </form>
+            </section>
+        </section>
+
         <section id="vscodeView" class="vscode-view view-panel" hidden>
-            <section class="panel vscode-toolbar">
+            <section id="resourceToolbar" class="panel vscode-toolbar">
                 <div>
                     <h2>学习与资源</h2>
                     <p id="vscodeSummary">选择一个已生成资源包的任务</p>
                 </div>
-                <div class="vscode-actions">
+                <div class="resource-view-tabs" role="tablist" aria-label="学习与资源页面">
+                    <button id="resourceDocsTab" class="resource-view-tab active" type="button" data-resource-view="docs">文档与学习</button>
+                    <button id="resourceSkillsTab" class="resource-view-tab" type="button" data-resource-view="skills">Skills 工作台</button>
+                </div>
+                <div id="docsToolbarActions" class="vscode-actions">
                     <label class="view-switch">
                         <input id="toggleDocListPanel" type="checkbox" checked>
                         <span>文档预览</span>
@@ -321,56 +535,270 @@
                     <button id="stopVscodeButton" class="secondary" type="button" disabled>停止</button>
                 </div>
             </section>
-            <section class="vscode-docs">
-                <aside class="doc-list-panel">
-                    <div class="doc-list-header">
-                        <h3>文档预览</h3>
-                        <span id="docPreviewSummary">-</span>
+            <div id="resourceDocsView">
+                <section class="vscode-docs">
+                    <aside class="doc-list-panel">
+                        <div class="doc-list-header">
+                            <h3>文档预览</h3>
+                            <span id="docPreviewSummary">-</span>
+                        </div>
+                        <div id="docList" class="doc-list"></div>
+                    </aside>
+                    <div class="pane-resizer doc-list-resizer" data-resize-pane="doc-list" role="separator" aria-orientation="vertical" aria-label="调整文档预览宽度" tabindex="0"></div>
+                    <section id="studyPanel" class="study-panel">
+                        <div class="study-header">
+                            <div>
+                                <h3>学习视图</h3>
+                                <span id="studySummary">等待 study guide</span>
+                            </div>
+                            <span id="studyDecision" class="study-decision">-</span>
+                        </div>
+                        <div id="studyBody" class="study-body">暂无结构化学习数据</div>
+                    </section>
+                    <div class="pane-resizer" data-resize-pane="study" role="separator" aria-orientation="vertical" aria-label="调整学习视图宽度" tabindex="0"></div>
+                    <section id="sourcePlayerPanel" class="source-player-panel">
+                        <div class="source-player-header">
+                            <div>
+                                <h3>在线视频</h3>
+                                <span id="sourcePlayerSummary">选择时间戳后播放</span>
+                            </div>
+                            <div class="source-player-actions">
+                                <button id="sourcePlayerStopButton" class="secondary tiny" type="button" hidden>暂停</button>
+                                <a id="sourcePlayerOpenLink" class="secondary-link" href="#" target="_blank" rel="noreferrer" hidden>原站打开</a>
+                            </div>
+                        </div>
+                        <div id="sourcePlayerBody" class="source-player-body">
+                            <div class="source-player-empty">暂无可嵌入播放器</div>
+                        </div>
+                    </section>
+                    <div class="pane-resizer source-player-resizer" data-resize-pane="source-player" role="separator" aria-orientation="vertical" aria-label="调整在线视频宽度" tabindex="0"></div>
+                    <section class="doc-preview-panel" hidden>
+                        <div class="doc-preview-header">
+                            <strong id="docPreviewTitle">选择文档</strong>
+                            <div class="doc-preview-actions">
+                                <a id="docOpenLink" class="secondary-link" href="#" target="_blank" rel="noreferrer" hidden>新窗口打开</a>
+                                <button id="docPreviewClose" class="icon-button light" type="button" title="关闭预览" aria-label="关闭预览">×</button>
+                            </div>
+                        </div>
+                        <div id="docPreviewBody" class="doc-preview-body">暂无可预览文档</div>
+                    </section>
+                </section>
+                <section id="vscodeShell" class="vscode-shell" hidden>
+                    <div id="vscodePlaceholder" class="vscode-placeholder">暂无 VS Code 资源包预览</div>
+                    <iframe id="vscodeFrame" title="VS Code 资源包预览" hidden></iframe>
+                </section>
+            </div>
+
+            <section id="resourceSkillsView" class="skills-workspace" hidden>
+                <header class="skills-workspace-toolbar">
+                    <div class="skills-workspace-navigation">
+                        <div class="resource-view-tabs" role="tablist" aria-label="学习与资源页面">
+                            <button id="skillsResourceDocsTab" class="resource-view-tab" type="button">文档与学习</button>
+                            <button id="skillsResourceSkillsTab" class="resource-view-tab active" type="button">Skills 工作台</button>
+                        </div>
+                        <div class="skills-scope-tabs" role="tablist" aria-label="Skills 范围">
+                            <button class="skills-scope-tab active" type="button" data-skills-scope="current">当前任务</button>
+                            <button class="skills-scope-tab" type="button" data-skills-scope="projects">Skill 项目</button>
+                            <button class="skills-scope-tab" type="button" data-skills-scope="enabled">已启用</button>
+                            <button class="skills-scope-tab" type="button" data-skills-scope="disabled">已禁用</button>
+                            <button class="skills-scope-tab" type="button" data-skills-scope="trash">回收站</button>
+                        </div>
                     </div>
-                    <div id="docList" class="doc-list"></div>
-                </aside>
-                <div class="pane-resizer doc-list-resizer" data-resize-pane="doc-list" role="separator" aria-orientation="vertical" aria-label="调整文档预览宽度" tabindex="0"></div>
-                <section id="studyPanel" class="study-panel">
-                    <div class="study-header">
+                    <div class="skills-workspace-actions">
+                        <label id="skillLibrarySearchLabel" class="skill-library-search" hidden>
+                            <span>搜索</span>
+                            <input id="skillLibrarySearch" type="search" placeholder="名称、标题或描述">
+                        </label>
+                        <button id="toggleSkillsFocusButton" class="icon-button light skills-focus-button" type="button" aria-pressed="false" aria-label="进入 Skills 专注模式" title="进入 Skills 专注模式">
+                            <span aria-hidden="true">⛶</span>
+                        </button>
+                    </div>
+                </header>
+
+                <section id="currentSkillsWorkspace" class="current-skills-workspace">
+                    <div class="skill-run-header">
                         <div>
-                            <h3>学习视图</h3>
-                            <span id="studySummary">等待 study guide</span>
+                            <div class="skill-panel-head">
+                                <h2>当前任务蒸馏</h2>
+                                <select id="skillProfile" aria-label="蒸馏模型"></select>
+                            </div>
+                            <div id="skillSummary" class="skill-summary">等待启动</div>
                         </div>
-                        <span id="studyDecision" class="study-decision">-</span>
+                        <div class="skill-actions">
+                            <button id="createTargetedSkillProjectButton" class="secondary" type="button" disabled>指定目标</button>
+                            <button id="generateSkillButton" class="secondary" type="button" disabled>开始蒸馏</button>
+                            <button id="resumeSkillButton" class="secondary" type="button" hidden>继续</button>
+                            <button id="cancelSkillButton" class="secondary" type="button" hidden>取消</button>
+                            <button id="enableSkillButton" type="button" disabled>启用 Skills</button>
+                        </div>
                     </div>
-                    <div id="studyBody" class="study-body">暂无结构化学习数据</div>
+                    <div id="skillProgress" class="skill-progress" aria-hidden="true">
+                        <span id="skillProgressBar"></span>
+                    </div>
+                    <div id="skillLiveActivity" class="skill-live-activity" hidden></div>
+                    <div id="skillStageRail" class="skill-stage-rail" aria-label="Skills 蒸馏阶段" hidden></div>
+                    <div id="skillWarnings" class="skill-warnings"></div>
+                    <section id="skillOverviewReview" class="skill-review" hidden>
+                        <div id="skillOverviewPreview" class="skill-review-preview"></div>
+                        <textarea id="skillOverviewFeedback" rows="3" placeholder="修订意见"></textarea>
+                        <div class="skill-actions">
+                            <button id="regenerateSkillOverviewButton" class="secondary" type="button">按意见重生成</button>
+                            <button id="confirmSkillOverviewButton" type="button">确认骨架</button>
+                        </div>
+                    </section>
+                    <section id="skillCandidateReview" class="skill-review" hidden>
+                        <div id="skillCandidateList" class="skill-candidate-list"></div>
+                        <button id="confirmSkillCandidatesButton" type="button">确认候选</button>
+                    </section>
+                    <div class="skills-current-grid">
+                        <aside class="skills-item-pane">
+                            <div class="skills-pane-heading">
+                                <h3>候选与成品</h3>
+                                <span id="skillsCurrentCount">0 项</span>
+                            </div>
+                            <div id="skillsCurrentList" class="skills-item-list"></div>
+                        </aside>
+                        <div class="pane-resizer skills-pane-resizer" data-resize-pane="skills-current-left" role="separator" aria-orientation="vertical" aria-label="调整当前任务列表宽度" tabindex="0"></div>
+                        <section class="skills-preview-pane">
+                            <div class="skills-pane-heading">
+                                <div>
+                                    <h3 id="skillsDetailTitle">选择一个候选或 Skill</h3>
+                                    <span id="skillsDetailMeta">证据、审计和测试结果会显示在这里</span>
+                                </div>
+                            </div>
+                            <div id="skillsDetailPreview" class="skills-markdown-preview">暂无预览</div>
+                        </section>
+                        <div class="pane-resizer skills-pane-resizer" data-resize-pane="skills-current-right" role="separator" aria-orientation="vertical" aria-label="调整当前任务详情宽度" tabindex="0"></div>
+                        <aside class="skills-inspector-pane">
+                            <div class="skills-detail-tabs" role="tablist" aria-label="Skill 详情">
+                                <button class="skills-detail-tab active" type="button" data-skill-detail-tab="evidence">证据</button>
+                                <button class="skills-detail-tab" type="button" data-skill-detail-tab="audit">多模态审计</button>
+                                <button class="skills-detail-tab" type="button" data-skill-detail-tab="tests">测试</button>
+                                <button class="skills-detail-tab" type="button" data-skill-detail-tab="raw">原始数据</button>
+                            </div>
+                            <div id="skillsInspectorBody" class="skills-inspector-body">选择左侧项目查看详情</div>
+                        </aside>
+                    </div>
+                    <div class="pane-resizer row-resizer skills-height-resizer" data-resize-pane="skills-current-height" role="separator" aria-orientation="horizontal" aria-label="调整当前任务内容高度" tabindex="0"></div>
                 </section>
-                <div class="pane-resizer" data-resize-pane="study" role="separator" aria-orientation="vertical" aria-label="调整学习视图宽度" tabindex="0"></div>
-                <section id="sourcePlayerPanel" class="source-player-panel">
-                    <div class="source-player-header">
-                        <div>
-                            <h3>在线视频</h3>
-                            <span id="sourcePlayerSummary">选择时间戳后播放</span>
-                        </div>
-                        <div class="source-player-actions">
-                            <button id="sourcePlayerStopButton" class="secondary tiny" type="button" hidden>暂停</button>
-                            <a id="sourcePlayerOpenLink" class="secondary-link" href="#" target="_blank" rel="noreferrer" hidden>原站打开</a>
-                        </div>
-                    </div>
-                    <div id="sourcePlayerBody" class="source-player-body">
-                        <div class="source-player-empty">暂无可嵌入播放器</div>
+
+                <section id="skillProjectsWorkspace" class="skill-projects-workspace" hidden>
+                    <div class="skill-projects-grid">
+                        <aside class="skills-item-pane">
+                            <div class="skills-pane-heading">
+                                <h3>Skill 项目</h3>
+                                <span id="skillProjectsCount">0 项</span>
+                            </div>
+                            <div id="skillProjectsList" class="skills-item-list"></div>
+                        </aside>
+                        <section class="skill-project-main">
+                            <form id="skillProjectForm" class="skill-project-form">
+                                <input id="skillProjectTitle" type="text" maxlength="160" placeholder="项目名称">
+                                <textarea id="skillProjectGoal" rows="4" placeholder="要沉淀成 Skill 的目标"></textarea>
+                                <div class="skill-actions">
+                                    <button id="createSkillProjectButton" type="submit">新建项目</button>
+                                </div>
+                            </form>
+                            <section class="skill-project-flow-panel" aria-label="目标蒸馏流程">
+                                <div class="skill-project-flow-heading">
+                                    <div>
+                                        <h3>目标蒸馏流程</h3>
+                                        <p id="skillProjectFlowSummary">选择一个项目查看从资料包到启用的流程。</p>
+                                    </div>
+                                    <span id="skillProjectFlowStatus" class="skill-project-flow-status">未选择</span>
+                                </div>
+                                <div id="skillProjectFlow" class="skill-project-flow" aria-live="polite">
+                                    <div class="skills-empty">创建或选择一个 Skill 项目</div>
+                                </div>
+                            </section>
+                        </section>
+                        <aside class="skills-inspector-pane">
+                            <section>
+                                <div class="skill-project-inspector-heading">
+                                    <div>
+                                        <h3 id="skillProjectInspectorTitle">流程详情</h3>
+                                        <p id="skillProjectInspectorMeta">选择流程节点查看当前状态</p>
+                                    </div>
+                                </div>
+                                <div id="skillProjectDetail" class="skill-project-detail">
+                                    <div class="skills-empty">创建或选择一个 Skill 项目</div>
+                                </div>
+                            </section>
+                            <section class="skill-project-package-panel">
+                                <h3>导入 Video Analyzer 资料包</h3>
+                                <div class="skill-project-package-controls">
+                                    <input id="skillProjectPackageId" type="text" maxlength="160" placeholder="资料包 ID，例如 BV18Zu46DE3p">
+                                    <button id="previewSkillProjectPackageButton" class="secondary" type="button" disabled>检查</button>
+                                </div>
+                                <div id="skillProjectPackageStatus" class="skill-project-package-status" aria-live="polite"></div>
+                                <div id="skillProjectPackagePreview" class="skill-project-package-preview">输入资料包 ID 后检查。</div>
+                                <button id="importSkillProjectPackageButton" type="button" disabled>导入此资料包</button>
+                            </section>
+                            <section>
+                                <h3>资料来源</h3>
+                                <div id="skillProjectSources" class="skill-project-sources">暂无资料</div>
+                            </section>
+                        </aside>
+                        <section class="skill-project-log-console">
+                            <div class="skill-project-log-head">
+                                <div>
+                                    <h3>实时运行记录</h3>
+                                    <p id="skillProjectLogSummary">选择项目后显示当前阶段记录。</p>
+                                </div>
+                                <button id="copySkillProjectLogButton" class="secondary tiny" type="button" disabled>复制完整日志</button>
+                            </div>
+                            <div id="skillProjectLogTabs" class="skill-project-log-tabs" role="tablist"></div>
+                            <pre id="skillProjectLogText" class="skill-project-log-text">暂无运行记录</pre>
+                        </section>
                     </div>
                 </section>
-                <div class="pane-resizer source-player-resizer" data-resize-pane="source-player" role="separator" aria-orientation="vertical" aria-label="调整在线视频宽度" tabindex="0"></div>
-                <section class="doc-preview-panel" hidden>
-                    <div class="doc-preview-header">
-                        <strong id="docPreviewTitle">选择文档</strong>
-                        <div class="doc-preview-actions">
-                            <a id="docOpenLink" class="secondary-link" href="#" target="_blank" rel="noreferrer" hidden>新窗口打开</a>
-                            <button id="docPreviewClose" class="icon-button light" type="button" title="关闭预览" aria-label="关闭预览">×</button>
-                        </div>
+
+                <section id="skillLibraryWorkspace" class="skill-library-workspace" hidden>
+                    <div id="skillLibraryGrid" class="skill-library-grid">
+                        <aside class="skills-item-pane">
+                            <div class="skills-pane-heading">
+                                <h3 id="skillLibraryTitle">项目 Skills</h3>
+                                <span id="skillLibraryCount">0 项</span>
+                            </div>
+                            <div id="skillLibraryList" class="skills-item-list"></div>
+                        </aside>
+                        <div class="pane-resizer skills-pane-resizer" data-resize-pane="skills-library-left" role="separator" aria-orientation="vertical" aria-label="调整项目 Skill 列表宽度" tabindex="0"></div>
+                        <section class="skill-editor-pane">
+                            <div class="skills-pane-heading">
+                                <div>
+                                    <h3 id="skillEditorTitle">选择一个 Skill</h3>
+                                    <span id="skillEditorMeta">仅 SKILL.md 可编辑</span>
+                                </div>
+                                <div class="skill-actions">
+                                    <button id="saveSkillButton" type="button" disabled>保存</button>
+                                    <button id="disableSkillButton" class="secondary" type="button" hidden>禁用</button>
+                                    <button id="restoreSkillButton" class="secondary" type="button" hidden>恢复</button>
+                                    <button id="deleteSkillButton" class="secondary danger" type="button" hidden>移入回收站</button>
+                                    <button id="permanentDeleteSkillButton" class="secondary danger" type="button" hidden>永久删除</button>
+                                </div>
+                            </div>
+                            <div class="skill-editor-tabs" role="tablist" aria-label="Skill 编辑视图">
+                                <button class="skill-editor-tab active" type="button" data-skill-editor-tab="edit">Markdown</button>
+                                <button class="skill-editor-tab" type="button" data-skill-editor-tab="preview">预览</button>
+                            </div>
+                            <textarea id="skillEditor" class="skill-editor" spellcheck="false" disabled></textarea>
+                            <div id="skillRenderedPreview" class="skills-markdown-preview" hidden>暂无预览</div>
+                            <div id="skillEditorMessage" class="muted"></div>
+                        </section>
+                        <div class="pane-resizer skills-pane-resizer" data-resize-pane="skills-library-right" role="separator" aria-orientation="vertical" aria-label="调整项目 Skill 详情宽度" tabindex="0"></div>
+                        <aside class="skills-inspector-pane">
+                            <section>
+                                <h3>辅助文件</h3>
+                                <div id="skillAuxiliaryFiles" class="skill-auxiliary-files">暂无文件</div>
+                            </section>
+                            <section>
+                                <h3>版本历史</h3>
+                                <div id="skillVersionList" class="skill-version-list">暂无版本</div>
+                            </section>
+                        </aside>
                     </div>
-                    <div id="docPreviewBody" class="doc-preview-body">暂无可预览文档</div>
+                    <div class="pane-resizer row-resizer skills-height-resizer" data-resize-pane="skills-library-height" role="separator" aria-orientation="horizontal" aria-label="调整项目 Skills 内容高度" tabindex="0"></div>
                 </section>
-            </section>
-            <section id="vscodeShell" class="vscode-shell" hidden>
-                <div id="vscodePlaceholder" class="vscode-placeholder">暂无 VS Code 资源包预览</div>
-                <iframe id="vscodeFrame" title="VS Code 资源包预览" hidden></iframe>
             </section>
         </section>
     </main>
@@ -378,6 +806,8 @@
     <script src="{{ url_for('static', filename='vendor/dompurify/purify.min.js') }}?v={{ static_version }}"></script>
     <script src="{{ url_for('static', filename='vendor/katex/katex.min.js') }}?v={{ static_version }}"></script>
     <script src="{{ url_for('static', filename='vendor/katex/contrib/auto-render.min.js') }}?v={{ static_version }}"></script>
+    <script src="{{ url_for('static', filename='vendor/mermaid/mermaid.min.js') }}?v={{ static_version }}"></script>
     <script src="{{ url_for('static', filename='js/main.js') }}?v={{ static_version }}"></script>
+    <script type="module" src="{{ url_for('web_debug_console.static', filename='debug-console.js') }}?v={{ static_version }}"></script>
 </body>
 </html>

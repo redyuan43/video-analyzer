@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import fcntl
+import hashlib
 import html
 import json
 import mimetypes
@@ -11,12 +14,16 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import threading
 import time
-from urllib.parse import quote, urlencode
+import tempfile
+from email import policy
+from email.parser import BytesParser
+from urllib.parse import quote, unquote, urlencode
 import uuid
 from datetime import datetime
 from http import HTTPStatus
@@ -24,15 +31,48 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+from urllib.request import urlopen
 
 from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient
-from video_analyzer.config import Config, build_openai_extra_body, resolve_api_key, resolve_temperature
+from video_analyzer.config import (
+    Config,
+    build_openai_extra_body,
+    deep_merge,
+    resolve_endpoint_config,
+    resolve_api_key,
+    resolve_temperature,
+)
 from video_analyzer.doc_chat import ask_video_docs_result
+from video_analyzer.failures import FAILURE_FILE_ENV, read_failure_envelope
+from video_analyzer.model_settings import (
+    AUDIO_WORKFLOW_ID,
+    AUDIO_PROFILE_FLOW,
+    RuntimeSettingsStore,
+    SettingsValidationError,
+    VIDEO_WORKFLOW_ID,
+    VIDEO_PROFILE_FLOW,
+    apply_disabled_runtime_profiles,
+    build_settings_document,
+    expand_runtime_profile,
+)
 from video_analyzer.qa_index import ANSWER_INDEX_NAME, CHUNKS_NAME, QA_DIR_NAME
-from video_analyzer.skill_candidate import (
-    build_tool_skill_candidate,
-    candidate_summary,
-    enable_tool_skill_candidate,
+from video_analyzer.skill_distillation import (
+    DEFAULT_DISTILLATION_PROFILE,
+    DistillationError,
+    SkillDistillationPipeline,
+    distillation_summary,
+    enable_distilled_skills,
+    initialize_distillation,
+    load_evidence_records,
+    load_state as load_distillation_state,
+    save_state as save_distillation_state,
+)
+from video_analyzer.skill_projects import (
+    SkillProjectError,
+    SkillProjectStore,
+    assess_project,
+    build_source_bundle,
+    capability_inventory,
 )
 from video_analyzer.resource_locks import DEFAULT_LOCK_DIR
 from video_analyzer.url_context import (
@@ -49,17 +89,48 @@ from video_analyzer.url_context import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_JOBS_DIR = REPO_ROOT / "tmp" / "video-link-status" / "jobs"
+AUDIO_TEMPLATE_CATALOG = (
+    REPO_ROOT
+    / "video-analyzer-ui"
+    / "video_analyzer_ui"
+    / "static"
+    / "data"
+    / "audio_prompt_templates.json"
+)
+AUDIO_JOB_RETENTION_DAYS = max(
+    1,
+    int(os.environ.get("VIDEO_ANALYZER_AUDIO_RETENTION_DAYS", "7")),
+)
+AUDIO_PIPELINE_PROFILE_NX1 = "audio_nx1"
+AUDIO_PIPELINE_KIND_TRANSCRIPTION = "transcription"
+AUDIO_PIPELINE_PROFILE_ALIASES = {
+    "": AUDIO_PIPELINE_PROFILE_NX1,
+    "analysis": AUDIO_PIPELINE_PROFILE_NX1,
+    AUDIO_PIPELINE_PROFILE_NX1: AUDIO_PIPELINE_PROFILE_NX1,
+    AUDIO_PIPELINE_KIND_TRANSCRIPTION: AUDIO_PIPELINE_KIND_TRANSCRIPTION,
+}
 BAOYU_PROMPT_SCRIPT = REPO_ROOT / "tools" / "prepare_baoyu_image_prompts.py"
 ALLOWED_ANALYSIS_MODES = ("auto", "fast", "balanced", "deep", "operation-fast", "long-talk-fast")
 ALLOWED_ANALYSIS_DEPTHS = ("light", "full")
 ALLOWED_COOKIE_BROWSERS = ("", "chrome", "none", "edge", "firefox", "chromium", "brave")
 ALLOWED_DOWNLOAD_DEVICES = ("local", "mi")
 DEFAULT_COOKIE_BROWSER = ""
-DEFAULT_PROFILE = "deepseek_v4_pro"
-DEFAULT_FRAME_EXTRACTOR = "jetson"
+DEFAULT_PROFILE = "deepseek_v4_flash"
+DEFAULT_FRAME_EXTRACTOR = "local_gpu"
+DEFAULT_LOCAL_FRAME_GPUS = "auto"
 DEFAULT_JETSON_FRAME_HOSTS = "agx,agx"
 DEFAULT_JETSON_FRAME_BACKEND = "ray"
 DEFAULT_JETSON_SAMPLE_FPS = "0.5"
+SKILL_LIBRARY_DIRS = {
+    "enabled": "skills",
+    "disabled": "skills-disabled",
+    "trash": "skills-trash",
+}
+SKILL_HISTORY_DIR = "skills-history"
+SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+SKILL_TRASH_ID_PATTERN = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[a-z0-9][a-z0-9-]{0,63}$")
+MAX_SKILL_MARKDOWN_BYTES = 1_000_000
+BAOYU_IMAGE_GENERATION_ENABLED = os.environ.get("VIDEO_LINK_ENABLE_BAOYU_IMAGES", "").strip().lower() in {"1", "true", "yes", "on"}
 CORE_ANALYSIS_ERROR_PATTERNS = (
     "Error analyzing frame",
     "model-resource-busy",
@@ -81,7 +152,7 @@ CORE_DIAGNOSTIC_NOT_READY_PATTERNS = (
 )
 CORE_DIAGNOSTIC_STALE_SECONDS = 600
 CORE_DIAGNOSTIC_QUEUE_WARN_SECONDS = 300
-CORE_DIAGNOSTIC_EXPECTED_MINICPM_CONCURRENCY = 6
+CORE_DIAGNOSTIC_EXPECTED_MINICPM_CONCURRENCY = 5
 CORE_DIAGNOSTIC_GPU_TTL_SECONDS = 120
 CORE_DIAGNOSTIC_GPU_TIMEOUT_SECONDS = 0.8
 AUTO_MODE_LONG_SECONDS = 2700
@@ -262,6 +333,8 @@ STAGE_RESOURCES = {
 RESOURCE_LIMITS = {
     "prepare": 2,
     "core": 1,
+    "audio-analysis": 1,
+    "audio-cloud-analysis": 4,
     "asr": 1,
     "ocr": 1,
     "vl": 1,
@@ -279,7 +352,74 @@ EXPECTED_FINAL_EXPORTS = (
     "deep_report_v2.pdf",
     "manual_evidence.pdf",
 )
-SOFT_FAILURE_STAGES = {"multidoc", "deep-v2", "web-evidence", "qa-index", "image-prompts", "final-publish"}
+EXPECTED_FINAL_DOCUMENTS = (
+    "operation_manual.md",
+    "docs_analysis_chapters/knowledge_notes_v2.md",
+    "docs_analysis_chapters/deep_report_v2.md",
+    "manual_evidence.md",
+)
+EXECUTION_NODE_ARTIFACTS = {
+    "prepare": ("input_page_context.md",),
+    "audio_extract": ("audio.wav",),
+    "asr": ("orin/asr.json",),
+    "diarization": ("qa/speaker_diarization_report.json",),
+    "transcript_merge": ("transcript.md", "orin/transcript.json"),
+    "frame_extract": ("frame_manifest.json", "frames_manifest.json"),
+    "frame_audit": ("frame_dedup_audit.json",),
+    "ocr": ("orin/ocr_events.json",),
+    "vision": ("orin/frame_analyses.json",),
+    "visual_evidence": ("manual_evidence.md", "visual_review.html"),
+    "text": ("operation_manual.md", "operation_manual.quality_failed.md"),
+    "core_verify": ("analysis.json", "manual_evidence.md"),
+    "study": ("study_guide.json", "study_cards.md"),
+    "triage": ("evidence_triage.json", "evidence_gaps.json"),
+    "documents": ("docs_analysis/analysis.json", "docs_analysis/knowledge_notes.md"),
+    "deep_report": ("docs_analysis_chapters/deep_report_v2.md",),
+    "deep_review": ("docs_analysis_chapters/deep_report_v2.review.json",),
+    "evidence_review": ("evidence_review.json", "publish_decision.json"),
+    "web_evidence": ("web_evidence.json", "web_evidence.md"),
+    "qa_index": ("qa/answer_index.json", "qa/source_chunks.jsonl"),
+    "image_prompts": ("baoyu_images/prompts",),
+    "image": ("baoyu_images/final",),
+    "final_publish": ("final_publish_summary.json",),
+}
+DOCUMENT_PREVIEW_PRIMARY = (
+    ("operation_manual.md", "操作手册", "优先阅读：核心结论、流程步骤和关键截图。"),
+    ("docs_analysis_chapters/knowledge_notes_v2.md", "逐章知识笔记", "第二阅读：按章节整理概念、背景和要点。"),
+    ("docs_analysis_chapters/deep_report_v2.md", "深度报告", "第三阅读：综合分析、风险点和深入判断。"),
+)
+DOCUMENT_PREVIEW_EVIDENCE = (
+    ("manual_evidence.md", "证据审计表", "核查 OCR/VL/帧证据时使用，内容较重。"),
+    ("evidence_index.md", "证据索引", "按结论和证据位置整理的索引。"),
+    ("visual_review.html", "视觉复核页", "快速检查抽帧、截图和视觉证据覆盖。"),
+    ("evidence_review.json", "证据复核结果", "发布门禁和证据质量复核数据。"),
+    ("publish_decision.json", "发布决策", "是否可发布及阻断原因。"),
+    ("web_evidence.md", "联网补证据摘要", "需要外部资料时的补证据结果。"),
+    ("web_evidence.json", "联网补证据数据", "联网补证据的结构化原始数据。"),
+)
+DOCUMENT_PREVIEW_PROCESS = (
+    ("transcript.md", "转写文本", "ASR 生成的全文转写。"),
+    ("analysis.json", "核心分析 JSON", "核心分析的结构化总产物。"),
+    ("study_guide.json", "学习证据账本", "学习卡片和证据分诊的结构化输入。"),
+    ("study_overview.md", "学习概览", "轻量脑图/概要式学习入口。"),
+    ("study_cards.md", "学习卡片", "拆分后的学习卡片。"),
+    ("evidence_gaps.json", "证据缺口", "模型发现的证据不足点。"),
+    ("evidence_triage.json", "证据分诊", "证据缺口的处理路由。"),
+    ("docs_analysis/knowledge_notes.md", "知识笔记草稿", "旧版多文档分析中间产物。"),
+    ("docs_analysis/deep_report.md", "深度报告草稿", "旧版深度报告中间产物。"),
+    ("docs_analysis/operation_manual_review.md", "操作手册复核", "多文档分析对操作手册的复核。"),
+    ("docs_analysis_chapters/deep_report_v2.review.md", "深度报告复核", "新版深度报告质量复核。"),
+    ("docs_analysis_chapters/deep_report_v2.review.json", "深度报告复核数据", "新版深度报告复核结构化数据。"),
+    ("RUN_MANIFEST.md", "运行清单", "本次运行的关键命令和环境记录。"),
+    ("frame_dedup_audit.json", "抽帧去重审计", "候选帧去重和覆盖情况。"),
+)
+DOCUMENT_PREVIEW_ASSETS = (
+    ("frames", "原始抽帧", "Jetson/Ray 抽出的候选帧目录。"),
+    ("manual_assets", "手册截图", "写入 Markdown 的真实截图资源。"),
+    ("orin", "OCR/VL 原始结果", "ASR、OCR、VL 的结构化中间结果。"),
+    ("visual_review", "视觉复核素材", "视觉复核页面使用的素材目录。"),
+)
+SOFT_FAILURE_STAGES = {"deep-v2", "web-evidence", "qa-index", "image-prompts"}
 VIDEO_PREVIEW_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 VSCODE_PORT_RANGE = tuple(
     int(part)
@@ -292,6 +432,25 @@ ORPHANED_PROCESS_GONE_MESSAGE = (
 ORPHANED_PROCESS_REQUEUE_MESSAGE = (
     "server stopped while this stage was running; process is gone and artifacts are incomplete; queued for retry"
 )
+TRANSIENT_RESOURCE_REQUEUE_MESSAGE = "remote/system resource is temporarily busy; queued for retry"
+TRANSIENT_API_REQUEUE_MESSAGE = "text API is temporarily unavailable; queued for one automatic retry"
+YOUTUBE_FORMAT_REQUEUE_MESSAGE = "YouTube returned no downloadable formats; queued for one automatic retry"
+AUTO_RETRY_REASONS = {
+    ORPHANED_PROCESS_REQUEUE_MESSAGE,
+    TRANSIENT_RESOURCE_REQUEUE_MESSAGE,
+    TRANSIENT_API_REQUEUE_MESSAGE,
+    YOUTUBE_FORMAT_REQUEUE_MESSAGE,
+}
+TRANSIENT_RESOURCE_BUSY_PATTERNS = (
+    "ray.exceptions.OutOfMemoryError",
+    "Task was killed due to the node running low on memory",
+    "exceeds the memory usage threshold",
+    "Ray killed this worker",
+)
+YOUTUBE_FORMAT_UNAVAILABLE_PATTERN = "Requested format is not available"
+MAX_YOUTUBE_FORMAT_RETRIES = 1
+MAX_TRANSIENT_API_RETRIES = 1
+MAX_INTERRUPTED_RETRIES = 1
 RESOURCE_WAIT_SECONDS = 5.0
 AUTO_RETRY_DELAY_SECONDS = float(os.environ.get("VIDEO_LINK_AUTO_RETRY_DELAY_SECONDS", "60"))
 AUTO_RETRY_POLL_SECONDS = float(os.environ.get("VIDEO_LINK_AUTO_RETRY_POLL_SECONDS", "5"))
@@ -305,6 +464,7 @@ CORE_PROGRESS_STEPS = [
     ("asr_done", "ASR 完成", (r"ASR succeeded", r"Using existing transcript file")),
     ("frames", "扫描/候选帧抽取", (r"Extracting frames from video", r"Jetson video cache", r"frame worker")),
     ("frames_done", "候选帧就绪", (r"Extracted \d+ screen keyframes",)),
+    ("ocr_audit", "OCR帧去重审计", (r"OCR frame audit retained",)),
     ("ocr", "OCR关键帧选择/执行", (r"Selected \d+ OCR keyframes", r"Running OCR", r"\[resource-lock\] (waiting|acquired) resource=ocr")),
     ("ocr_ready", "OCR文本事件就绪", (r"DotsMOCR endpoint not ready", r"DotsMOCR endpoint ready", r"OpenAI-compatible vision OCR", r"OCR results ready")),
     ("vl", "VL解释帧选择/分析", (r"Selecting and analyzing VL frames", r"\[resource-lock\] (waiting|acquired) resource=vl")),
@@ -319,7 +479,8 @@ CORE_PROGRESS_WEIGHTS = {
     "asr": 15,
     "asr_done": 5,
     "frames": 10,
-    "frames_done": 5,
+    "frames_done": 3,
+    "ocr_audit": 2,
     "ocr": 5,
     "ocr_ready": 20,
     "vl": 15,
@@ -385,7 +546,7 @@ STAGE_PROGRESS_STEPS = {
         ("images", "生成/复用最终图片", (r"\[images\]", r"augment_video_docs_images")),
         ("docs", "补齐最终文档", (r"\[docs\]", r"multidoc", r"deep-v2")),
         ("augment", "插入配图", (r"augment", r"image-augmented", r"baoyu_images")),
-        ("export", "导出 PDF/长图", (r"\[pdf\]", r"export_video_docs", r"\[long-png\]")),
+        ("export", "导出发布文件", (r"\[pdf\]", r"\[export\]", r"export_video_docs", r"\[long-png\]")),
         ("verify", "校验发布产物", (r"\[verify\]", r"pdf=", r"long_png=")),
         ("summary", "写出发布摘要", (r"\[summary\]", r"final_publish_summary\.json")),
         ("send", "发送/跳过发送", (r"\[send\]", r"skipped")),
@@ -406,6 +567,13 @@ class VideoLinkStatusServer:
         self.repo_root = repo_root
         self.runner_lock = threading.Lock()
         self.active_runners: dict[str, threading.Thread] = {}
+        self.skill_distillation_lock = threading.Lock()
+        self.active_skill_distillations: dict[str, threading.Thread] = {}
+        self.skill_distillation_cancel_events: dict[str, threading.Event] = {}
+        self.skill_project_runner_leases: dict[str, int] = {}
+        self.active_skill_project_processes: dict[str, subprocess.Popen[Any]] = {}
+        self.skill_projects = SkillProjectStore(self.repo_root / "var" / "skill-projects")
+        self.runtime_settings = RuntimeSettingsStore(self.repo_root)
         self.vscode_sessions: dict[str, dict[str, Any]] = {}
         self.vscode_lock = threading.Lock()
         self.auto_retry_stop = threading.Event()
@@ -416,16 +584,46 @@ class VideoLinkStatusServer:
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         if auto_resume:
             self.recover_interrupted_jobs(auto_start=True)
+            self.recover_interrupted_skill_distillations()
+            self.recover_interrupted_skill_projects()
             self.start_auto_retry_loop()
 
+    def runtime_activity(self) -> dict[str, Any]:
+        with self.runner_lock:
+            video_jobs = sorted(
+                job_id
+                for job_id, thread in self.active_runners.items()
+                if thread.is_alive()
+            )
+        with self.skill_distillation_lock:
+            skill_distillations = sorted(
+                job_id
+                for job_id, thread in self.active_skill_distillations.items()
+                if thread.is_alive()
+            )
+            skill_projects = sorted(
+                key
+                for key, process in self.active_skill_project_processes.items()
+                if process.poll() is None
+            )
+        active_count = len(video_jobs) + len(skill_distillations) + len(skill_projects)
+        return {
+            "busy": active_count > 0,
+            "active_count": active_count,
+            "video_jobs": video_jobs,
+            "skill_distillations": skill_distillations,
+            "skill_projects": skill_projects,
+        }
+
     def options(self) -> dict[str, Any]:
-        profiles = runtime_profile_names()
-        default_profile = DEFAULT_PROFILE if DEFAULT_PROFILE in profiles else active_runtime_profile(profiles)
+        profiles = runtime_profile_names(VIDEO_WORKFLOW_ID)
+        default_profile = active_runtime_profile(profiles)
         return {
             "defaults": {
                 "analysis_mode": "auto",
                 "analysis_depth": "full",
                 "profile": default_profile,
+                "skill_distillation_profile": DEFAULT_DISTILLATION_PROFILE,
                 "run_name": DEFAULT_RUN_NAME,
                 "cookies_from_browser": "none",
                 "download_device": "local",
@@ -443,16 +641,121 @@ class VideoLinkStatusServer:
                 "analysis_modes": list(ALLOWED_ANALYSIS_MODES),
                 "analysis_depths": list(ALLOWED_ANALYSIS_DEPTHS),
                 "profiles": profiles,
+                "skill_distillation_profiles": runtime_profile_choices(),
                 "cookie_browsers": [item for item in ALLOWED_COOKIE_BROWSERS if item],
                 "download_devices": list(ALLOWED_DOWNLOAD_DEVICES),
             },
         }
 
+    def settings(self) -> dict[str, Any]:
+        try:
+            return self.runtime_settings.public_settings()
+        except (OSError, json.JSONDecodeError, SettingsValidationError) as exc:
+            raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc)) from exc
+
+    def save_model_setting(self, model_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return self.runtime_settings.save_model(model_id, payload)
+        except SettingsValidationError as exc:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+
+    def delete_model_setting(self, model_id: str) -> dict[str, Any]:
+        try:
+            return self.runtime_settings.delete_model(model_id)
+        except FileNotFoundError as exc:
+            raise BridgeError(HTTPStatus.NOT_FOUND, str(exc)) from exc
+        except SettingsValidationError as exc:
+            raise BridgeError(HTTPStatus.CONFLICT, str(exc)) from exc
+
+    def test_model_setting(self, model_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = payload or {}
+        self.ensure_settings_test_idle()
+        try:
+            return self.runtime_settings.test_model(
+                model_id,
+                str(payload.get("mode") or "quick"),
+                force=bool(payload.get("force")),
+            )
+        except FileNotFoundError as exc:
+            raise BridgeError(HTTPStatus.NOT_FOUND, str(exc)) from exc
+        except SettingsValidationError as exc:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+
+    def test_profile_setting(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.ensure_settings_test_idle()
+        try:
+            return self.runtime_settings.test_profile(payload)
+        except SettingsValidationError as exc:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+
+    def settings_test_blockers(self) -> list[dict[str, str]]:
+        blockers: list[dict[str, str]] = []
+        for job in self.list_jobs(200).get("jobs") or []:
+            runner = job.get("runner") or {}
+            process = job.get("process") or {}
+            status = str(job.get("status") or "")
+            runner_status = str(runner.get("status") or "")
+            if not (
+                status in {"running", "queued"}
+                or runner_status in {"running", "queued"}
+                or process.get("alive")
+            ):
+                continue
+            blockers.append(
+                {
+                    "job_id": str(job.get("job_id") or ""),
+                    "title": str(
+                        job.get("display_title")
+                        or job.get("title")
+                        or job.get("video_url")
+                        or job.get("job_id")
+                        or "后台任务"
+                    ),
+                    "status": runner_status or status or "running",
+                    "stage": str(job.get("current_stage") or runner.get("current_stage") or ""),
+                }
+            )
+        return blockers
+
+    def ensure_settings_test_idle(self) -> None:
+        blockers = self.settings_test_blockers()
+        if not blockers:
+            return
+        first = blockers[0]
+        stage = f"，阶段 {first['stage']}" if first.get("stage") else ""
+        raise BridgeError(
+            HTTPStatus.CONFLICT,
+            f"后台有 {len(blockers)} 个任务正在运行或排队，通路测试暂不可用"
+            f"（{first['title']}{stage}）",
+        )
+
+    def save_profile_setting(self, profile_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return self.runtime_settings.save_profile(profile_name, payload)
+        except SettingsValidationError as exc:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+
+    def delete_profile_setting(self, profile_name: str) -> dict[str, Any]:
+        try:
+            return self.runtime_settings.delete_profile(profile_name)
+        except FileNotFoundError as exc:
+            raise BridgeError(HTTPStatus.NOT_FOUND, str(exc)) from exc
+        except SettingsValidationError as exc:
+            raise BridgeError(HTTPStatus.CONFLICT, str(exc)) from exc
+
+    def activate_profile_setting(self, profile_name: str) -> dict[str, Any]:
+        try:
+            return self.runtime_settings.activate_profile(profile_name)
+        except FileNotFoundError as exc:
+            raise BridgeError(HTTPStatus.NOT_FOUND, str(exc)) from exc
+
     def create_job(self, payload: dict[str, Any]) -> dict[str, Any]:
         video_url = str(payload.get("video_url") or payload.get("videoUrl") or "").strip()
         if not video_url.startswith(("http://", "https://")):
             raise BridgeError(HTTPStatus.BAD_REQUEST, "video_url must be an http(s) URL")
-        return self._create_job(payload, video_url=video_url)
+        create_payload = dict(payload)
+        create_payload["_expected_workflow_id"] = VIDEO_WORKFLOW_ID
+        return self._create_job(create_payload, video_url=video_url)
 
     def create_uploaded_media_job(self, payload: dict[str, Any], media_path: Path, source_filename: str) -> dict[str, Any]:
         source_name = sanitize_upload_filename(source_filename)
@@ -461,6 +764,8 @@ class VideoLinkStatusServer:
             raise BridgeError(HTTPStatus.BAD_REQUEST, f"media file must be one of {sorted(MEDIA_EXTENSIONS)}")
         if not media_path.is_file():
             raise BridgeError(HTTPStatus.BAD_REQUEST, "media file is not available")
+        if media_path.stat().st_size <= 0:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "uploaded media file is empty")
 
         create_payload = dict(payload)
         create_payload["auto_start"] = False
@@ -544,7 +849,16 @@ class VideoLinkStatusServer:
         profiles = runtime_profile_names()
         if profiles and profile not in profiles:
             raise BridgeError(HTTPStatus.BAD_REQUEST, f"profile must be one of {profiles}")
-        skip_images = parse_bool_option(payload, "skip_images", "skipImages", defaults["skip_images"])
+        expected_workflow_id = str(payload.get("_expected_workflow_id") or "").strip()
+        workflow_id = runtime_profile_workflow_id(profile)
+        if expected_workflow_id and workflow_id != expected_workflow_id:
+            raise BridgeError(
+                HTTPStatus.BAD_REQUEST,
+                f"profile {profile} uses workflow {workflow_id}, expected {expected_workflow_id}",
+            )
+        skip_images = True
+        if BAOYU_IMAGE_GENERATION_ENABLED:
+            skip_images = parse_bool_option(payload, "skip_images", "skipImages", defaults["skip_images"])
         auto_start = parse_bool(normalize_optional_template(payload.get("auto_start") if "auto_start" in payload else payload.get("autoStart", False)))
         keep_existing = parse_bool_option(payload, "keep_existing", "keepExisting", defaults["keep_existing"])
         include_subtitles = False if source_type == UPLOAD_SOURCE_TYPE else parse_bool_option(payload, "include_subtitles", "includeSubtitles", defaults["include_subtitles"])
@@ -580,6 +894,7 @@ class VideoLinkStatusServer:
                 "analysis_mode": analysis_mode,
                 "analysis_depth": analysis_depth,
                 "profile": profile,
+                "workflow_id": workflow_id,
                 "run_name": run_name,
                 "cookies_from_browser": cookie_browser,
                 "download_device": download_device,
@@ -605,6 +920,16 @@ class VideoLinkStatusServer:
             "warnings": [],
             "runner": {"status": "idle", "current_stage": None, "error": None},
         }
+        self.write_runtime_snapshot(job, profile)
+        skill_project_id = str(payload.get("skill_project_id") or payload.get("skillProjectId") or "").strip()
+        material_request_id = str(
+            payload.get("material_request_id") or payload.get("materialRequestId") or ""
+        ).strip()
+        if skill_project_id:
+            self.skill_projects.load(skill_project_id)
+            job["skill_project_id"] = skill_project_id
+        if material_request_id:
+            job["material_request_id"] = material_request_id[:96]
         self.save_job(job)
         if auto_start:
             return self.start_run(job_id)
@@ -662,6 +987,7 @@ class VideoLinkStatusServer:
                 jobs.append(self.public_job_summary(self.load_job(path.parent.name)))
             except Exception:
                 continue
+        self.annotate_failure_dispositions(jobs)
         jobs.sort(key=lambda item: item.get("created_at") or "", reverse=True)
         return {
             "jobs": jobs[: max(1, min(limit, 200))],
@@ -671,6 +997,7 @@ class VideoLinkStatusServer:
         }
 
     def list_mobile_audio_jobs(self, limit: int = 50) -> dict[str, Any]:
+        self.cleanup_acknowledged_mobile_audio_jobs()
         jobs = []
         for path in self.jobs_dir.glob("*/job.json"):
             try:
@@ -688,6 +1015,300 @@ class VideoLinkStatusServer:
             raise BridgeError(HTTPStatus.NOT_FOUND, "audio job not found")
         return self.mobile_audio_job(job, include_resources=True)
 
+    def get_mobile_audio_job_by_attempt(self, external_attempt_id: str) -> dict[str, Any]:
+        external_attempt_id = normalize_external_attempt_id(external_attempt_id)
+        job = self.mobile_audio_job_by_attempt(external_attempt_id)
+        if not job:
+            raise BridgeError(HTTPStatus.NOT_FOUND, "audio job not found")
+        return self.mobile_audio_job(job, include_resources=True)
+
+    def create_mobile_audio_job(
+        self,
+        payload: dict[str, Any],
+        media_path: Path,
+        source_filename: str,
+        *,
+        pipeline_kind: str = AUDIO_PIPELINE_PROFILE_NX1,
+    ) -> dict[str, Any]:
+        requested_pipeline = pipeline_kind
+        if pipeline_kind != AUDIO_PIPELINE_KIND_TRANSCRIPTION:
+            requested_pipeline = (
+                payload.get("pipeline_profile")
+                or payload.get("pipelineProfile")
+                or payload.get("pipeline_kind")
+                or payload.get("pipelineKind")
+                or pipeline_kind
+            )
+        pipeline_kind = normalize_audio_pipeline_profile(requested_pipeline)
+        external_attempt_id = normalize_external_attempt_id(
+            payload.get("external_attempt_id")
+            or payload.get("externalAttemptId")
+            or ""
+        )
+        source_sha256 = str(
+            payload.get("source_sha256")
+            or payload.get("sourceSha256")
+            or ""
+        ).strip().lower()
+        actual_sha256 = sha256_file(media_path)
+        if source_sha256 and source_sha256 != actual_sha256:
+            raise BridgeError(
+                HTTPStatus.BAD_REQUEST,
+                "uploaded media sha256 does not match source_sha256",
+            )
+        source_sha256 = actual_sha256
+
+        if external_attempt_id:
+            existing = self.mobile_audio_job_by_attempt(external_attempt_id)
+            if existing:
+                existing_kind = normalize_audio_pipeline_profile(
+                    existing.get("audio_pipeline_kind")
+                    or existing.get("audio_pipeline_profile")
+                )
+                if existing_kind != pipeline_kind:
+                    raise BridgeError(
+                        HTTPStatus.CONFLICT,
+                        "external_attempt_id is already bound to another audio pipeline",
+                    )
+                if str(existing.get("source_sha256") or "") != source_sha256:
+                    raise BridgeError(
+                        HTTPStatus.CONFLICT,
+                        "external_attempt_id is already bound to another audio file",
+                    )
+                return self.mobile_audio_job(existing, include_resources=True)
+
+        create_payload = dict(payload)
+        requested_profile = str(
+            payload.get("profile")
+            or payload.get("analysis_profile")
+            or AUDIO_PIPELINE_PROFILE_NX1
+        ).strip()
+        analysis_profile = (
+            requested_profile
+            if pipeline_kind == AUDIO_PIPELINE_KIND_TRANSCRIPTION
+            else normalize_audio_runtime_profile(requested_profile)
+        )
+        create_payload.update(
+            {
+                "analysis_mode": "auto",
+                "analysis_depth": "light",
+                "run_name": (
+                    "audio-transcription"
+                    if pipeline_kind == AUDIO_PIPELINE_KIND_TRANSCRIPTION
+                    else "audio-summary"
+                ),
+                "skip_images": True,
+                "keep_existing": True,
+                "auto_start": False,
+                "profile": analysis_profile,
+                "_expected_workflow_id": (
+                    ""
+                    if pipeline_kind == AUDIO_PIPELINE_KIND_TRANSCRIPTION
+                    else AUDIO_WORKFLOW_ID
+                ),
+            }
+        )
+        created = self.create_uploaded_media_job(
+            create_payload,
+            media_path,
+            source_filename,
+        )
+        job = self.load_job(created["job_id"])
+        job["external_attempt_id"] = external_attempt_id or uuid.uuid4().hex
+        job["source_sha256"] = source_sha256
+        job["source_device"] = str(payload.get("source_device") or "external-audio")
+        job["source_file_id"] = str(payload.get("source_file_id") or "")
+        job["consumer_acknowledged_at"] = None
+        job["audio_pipeline"] = True
+        job["audio_pipeline_kind"] = pipeline_kind
+        job["audio_pipeline_profile"] = pipeline_kind
+        if requested_profile != analysis_profile:
+            job["legacy_requested_profile"] = requested_profile
+        if pipeline_kind == AUDIO_PIPELINE_KIND_TRANSCRIPTION:
+            job["asr_provider"] = str(
+                payload.get("asr_provider")
+                or payload.get("asrProvider")
+                or "firered_3dspeaker"
+            ).strip()
+        self.save_job(job)
+        self.cleanup_acknowledged_mobile_audio_jobs()
+        return self.start_run(job["job_id"])
+
+    def create_mobile_transcript_job(
+        self,
+        payload: dict[str, Any],
+        transcript_path: Path,
+        source_filename: str,
+    ) -> dict[str, Any]:
+        external_attempt_id = normalize_external_attempt_id(payload.get("external_attempt_id") or "")
+        required = {
+            "source_sha256": str(payload.get("source_sha256") or "").strip().lower(),
+            "source_transcription_id": str(payload.get("source_transcription_id") or "").strip(),
+            "source_transcript_sha256": str(payload.get("source_transcript_sha256") or "").strip().lower(),
+        }
+        if not external_attempt_id or any(not value for value in required.values()):
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "external_attempt_id and transcript source identifiers are required")
+        if not re.fullmatch(r"[a-f0-9]{64}", required["source_sha256"]):
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "source_sha256 must be a lowercase sha256")
+        if not transcript_path.is_file() or transcript_path.stat().st_size <= 0:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "transcript JSON file is required")
+        try:
+            transcript_payload = json.loads(transcript_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, f"transcript file is invalid JSON: {exc}") from exc
+        if not isinstance(transcript_payload, dict):
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "transcript JSON must be an object")
+        actual_transcript_sha256 = sha256_file(transcript_path)
+        if required["source_transcript_sha256"] != actual_transcript_sha256:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "transcript sha256 does not match source_transcript_sha256")
+
+        existing = self.mobile_audio_job_by_attempt(external_attempt_id)
+        if existing:
+            matches = bool(existing.get("provided_transcript")) and all(
+                str(existing.get(key) or "") == value for key, value in required.items()
+            )
+            if not matches:
+                raise BridgeError(HTTPStatus.CONFLICT, "external_attempt_id is already bound to another transcript source")
+            return self.mobile_audio_job(existing, include_resources=True)
+
+        create_payload = dict(payload)
+        requested_profile = str(
+            payload.get("profile") or AUDIO_PIPELINE_PROFILE_NX1
+        ).strip()
+        analysis_profile = normalize_audio_runtime_profile(requested_profile)
+        create_payload.update({
+            "analysis_mode": "auto", "analysis_depth": "light", "run_name": "audio-summary",
+            "skip_images": True, "keep_existing": True, "auto_start": False,
+            "profile": analysis_profile,
+            "_expected_workflow_id": AUDIO_WORKFLOW_ID,
+        })
+        source_name = sanitize_upload_filename(source_filename or "transcript.json")
+        created = self._create_job(
+            create_payload,
+            video_url=f"upload://{source_name}",
+            source_type=UPLOAD_SOURCE_TYPE,
+            source_name=source_name,
+            upload_suffix=".json",
+        )
+        job = self.load_job(created["job_id"])
+        video_dir = self.upload_video_dir(job["job_id"])
+        video_dir.mkdir(parents=True, exist_ok=True)
+        provided_path = video_dir / "provided_transcript.json"
+        shutil.copy2(transcript_path, provided_path)
+        context_path = video_dir / "page_context.md"
+        context_path.write_text(f"# Provided transcript\n\n- source: `{source_name}`\n", encoding="utf-8")
+        job.update({
+            "external_attempt_id": external_attempt_id,
+            **required,
+            "provided_transcript": True,
+            "provided_transcript_path": str(provided_path),
+            "media_path": str(provided_path),
+            "video_path": str(provided_path),
+            "page_context_path": str(context_path),
+            "video_dir": str(video_dir),
+            "run_dir": str(video_dir / job["options"]["run_name"]),
+            "audio_pipeline": True,
+            "audio_pipeline_kind": AUDIO_PIPELINE_PROFILE_NX1,
+            "audio_pipeline_profile": AUDIO_PIPELINE_PROFILE_NX1,
+            "consumer_acknowledged_at": None,
+        })
+        if requested_profile != analysis_profile:
+            job["legacy_requested_profile"] = requested_profile
+        self.save_job(job)
+        return self.start_run(job["job_id"])
+
+    def mobile_audio_job_by_attempt(self, external_attempt_id: str) -> dict[str, Any] | None:
+        for path in self.jobs_dir.glob("*/job.json"):
+            try:
+                job = self.load_job(path.parent.name)
+            except Exception:
+                continue
+            if (
+                self.is_mobile_audio_job(job)
+                and str(job.get("external_attempt_id") or "") == external_attempt_id
+            ):
+                return job
+        return None
+
+    def acknowledge_mobile_audio_job(self, job_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        if not self.is_mobile_audio_job(job):
+            raise BridgeError(HTTPStatus.NOT_FOUND, "audio job not found")
+        if job.get("status") != "succeeded":
+            raise BridgeError(
+                HTTPStatus.CONFLICT,
+                "audio job cannot be acknowledged before it succeeds",
+            )
+        job["consumer_acknowledged_at"] = iso_now()
+        job["updated_at"] = iso_now()
+        self.save_job(job)
+        return {
+            "acknowledged": True,
+            "job_id": job_id,
+            "retention_days": AUDIO_JOB_RETENTION_DAYS,
+            "consumer_acknowledged_at": job["consumer_acknowledged_at"],
+        }
+
+    def cleanup_acknowledged_mobile_audio_jobs(
+        self,
+        now: float | None = None,
+    ) -> list[str]:
+        now = time.time() if now is None else now
+        cutoff = now - AUDIO_JOB_RETENTION_DAYS * 86400
+        deleted: list[str] = []
+        for path in sorted(self.jobs_dir.glob("*/job.json")):
+            try:
+                job = self.load_job(path.parent.name)
+            except Exception:
+                continue
+            if not self.is_mobile_audio_job(job):
+                continue
+            acknowledged = parse_iso_timestamp(job.get("consumer_acknowledged_at"))
+            if acknowledged is None or acknowledged > cutoff:
+                continue
+            try:
+                self.delete_job(job["job_id"])
+            except BridgeError:
+                continue
+            deleted.append(job["job_id"])
+        return deleted
+
+    def mobile_audio_templates(self) -> dict[str, Any]:
+        try:
+            raw = AUDIO_TEMPLATE_CATALOG.read_bytes()
+            templates = json.loads(raw.decode("utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise BridgeError(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                f"audio template catalog is unavailable: {exc}",
+            ) from exc
+        if not isinstance(templates, list):
+            raise BridgeError(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "audio template catalog must be a list",
+            )
+        public_fields = (
+            "id",
+            "title",
+            "title_zh",
+            "first_category",
+            "first_category_zh",
+        )
+        public_templates = []
+        for item in templates:
+            if not isinstance(item, dict):
+                raise BridgeError(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    "audio template catalog entries must be objects",
+                )
+            public_templates.append({key: item.get(key, "") for key in public_fields})
+        return {
+            "pipeline_profile": AUDIO_PIPELINE_PROFILE_NX1,
+            "templates": public_templates,
+            "total": len(public_templates),
+            "version": hashlib.sha256(raw).hexdigest(),
+        }
+
     def is_mobile_audio_job(self, job: dict[str, Any]) -> bool:
         opts = job.get("options") or {}
         source_name = str(job.get("source_name") or "")
@@ -695,6 +1316,7 @@ class VideoLinkStatusServer:
             job.get("source_type") == UPLOAD_SOURCE_TYPE
             and (
                 opts.get("run_name") == "audio-summary"
+                or opts.get("run_name") == "audio-transcription"
                 or re.fullmatch(r"\d{14}\.mp3", source_name)
                 or str(job.get("upload_suffix") or "").lower() in AUDIO_MEDIA_EXTENSIONS
             )
@@ -713,6 +1335,34 @@ class VideoLinkStatusServer:
             "created_at": public.get("created_at"),
             "updated_at": public.get("updated_at"),
             "current_stage": public.get("current_stage"),
+            "progress": public.get("progress"),
+            "queue": self.mobile_audio_queue_info(job),
+            "error": ((public.get("runner") or {}).get("error") or ""),
+            "error_code": ((public.get("error_summary") or {}).get("code") or ""),
+            "external_attempt_id": job.get("external_attempt_id"),
+            "source_sha256": job.get("source_sha256"),
+            "source_device": job.get("source_device"),
+            "source_file_id": job.get("source_file_id"),
+            "provided_transcript": bool(job.get("provided_transcript")),
+            "source_transcription_id": job.get("source_transcription_id"),
+            "source_transcript_sha256": job.get("source_transcript_sha256"),
+            "profile": ((job.get("options") or {}).get("profile")),
+            "workflow_id": (
+                (job.get("runtime_profile_snapshot") or {}).get("workflow_id")
+                or (job.get("options") or {}).get("workflow_id")
+            ),
+            "pipeline_kind": normalize_audio_pipeline_profile(
+                job.get("audio_pipeline_kind")
+                or job.get("audio_pipeline_profile")
+            ),
+            "pipeline_profile": normalize_audio_pipeline_profile(
+                job.get("audio_pipeline_profile")
+                or job.get("audio_pipeline_kind")
+            ),
+            "asr_provider": job.get("asr_provider"),
+            "compute_route": job.get("compute_route") or "local",
+            "compute_route_reason": job.get("compute_route_reason") or "",
+            "consumer_acknowledged_at": job.get("consumer_acknowledged_at"),
             "summary": {"study": (public.get("summary") or {}).get("study") or {}},
             "prompt_template": {
                 "requested": requested,
@@ -721,7 +1371,82 @@ class VideoLinkStatusServer:
         }
         if include_resources:
             item["result_resources"] = public.get("result_resources") or {}
+            item["result"] = self.mobile_audio_result(job)
         return item
+
+    def mobile_audio_result(self, job: dict[str, Any]) -> dict[str, Any]:
+        run_dir_value = job.get("run_dir")
+        if not run_dir_value:
+            return {}
+        run_dir = Path(str(run_dir_value))
+        pipeline_kind = normalize_audio_pipeline_profile(
+            job.get("audio_pipeline_kind")
+            or job.get("audio_pipeline_profile")
+        )
+        result_path = (
+            run_dir / "transcription.json"
+            if pipeline_kind == AUDIO_PIPELINE_KIND_TRANSCRIPTION
+            else run_dir / "analysis.json"
+        )
+        if not result_path.is_file():
+            return {}
+        try:
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if pipeline_kind == AUDIO_PIPELINE_KIND_TRANSCRIPTION:
+            return payload
+        return {
+            "pipeline_profile": str(
+                payload.get("pipeline_profile") or AUDIO_PIPELINE_PROFILE_NX1
+            ),
+            "workflow_id": (
+                (job.get("runtime_profile_snapshot") or {}).get("workflow_id")
+                or AUDIO_WORKFLOW_ID
+            ),
+            "pipeline_version": payload.get("pipeline_version"),
+            "audio_template_analysis": payload.get("audio_template_analysis") or {},
+            "speaker_diarization": payload.get("speaker_diarization") or {},
+            "speaker_count": (
+                (payload.get("speaker_diarization") or {}).get("final_speaker_count")
+                or (payload.get("speaker_diarization") or {}).get("detected_speaker_count")
+                or (payload.get("speaker_diarization") or {}).get("original_speaker_count")
+                or 0
+            ),
+            "asr": payload.get("asr") or {},
+            "providers_run": list((payload.get("asr") or {}).get("providers_run") or []),
+            "transcript": payload.get("transcript") or {},
+            "provided_transcript": bool(job.get("provided_transcript")),
+            "source_transcription_id": job.get("source_transcription_id"),
+            "source_transcript_sha256": job.get("source_transcript_sha256"),
+        }
+
+    def mobile_audio_queue_info(self, job: dict[str, Any]) -> dict[str, Any]:
+        runner = job.get("runner") or {}
+        if runner.get("status") == "running":
+            return {"state": "running", "position": 0}
+        queued: list[dict[str, Any]] = []
+        for path in self.jobs_dir.glob("*/job.json"):
+            try:
+                candidate = self.load_job(path.parent.name)
+            except Exception:
+                continue
+            candidate_runner = candidate.get("runner") or {}
+            if (
+                self.is_mobile_audio_job(candidate)
+                and candidate_runner.get("status") == "queued"
+            ):
+                queued.append(candidate)
+        queued.sort(
+            key=lambda item: (
+                item.get("created_at") or "",
+                item.get("job_id") or "",
+            )
+        )
+        for index, candidate in enumerate(queued, start=1):
+            if candidate.get("job_id") == job.get("job_id"):
+                return {"state": "queued", "position": index}
+        return {"state": str(runner.get("status") or job.get("status") or "idle"), "position": None}
 
     def mobile_prompt_template(self, value: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -750,16 +1475,26 @@ class VideoLinkStatusServer:
 
     def jobs_summary(self, jobs: list[dict[str, Any]]) -> dict[str, Any]:
         counts = {status: 0 for status in ("created", "running", "queued", "succeeded", "failed")}
+        failure_counts: dict[str, int] = {}
+        rerun_required = 0
         progress_values = []
         for job in jobs:
             status = job.get("status") or "created"
             counts[status] = counts.get(status, 0) + 1
+            disposition = job.get("failure_disposition") or {}
+            category = str(disposition.get("category") or "")
+            if status == "failed" and category:
+                failure_counts[category] = failure_counts.get(category, 0) + 1
+                if disposition.get("rerun_recommended"):
+                    rerun_required += 1
             progress = job.get("progress") or {}
             if "percent" in progress:
                 progress_values.append(progress.get("percent") or 0)
         return {
             "total": len(jobs),
             "counts": counts,
+            "failure_counts": failure_counts,
+            "rerun_required": rerun_required,
             "average_progress": int(round(sum(progress_values) / len(progress_values))) if progress_values else 0,
         }
 
@@ -782,7 +1517,7 @@ class VideoLinkStatusServer:
             stage = runner.get("current_stage") or job.get("current_stage")
             if status not in {"running", "queued"} or not stage:
                 continue
-            resource = runner.get("queued_for") or stage_resource(stage)
+            resource = runner.get("queued_for") or job_stage_resource(job, stage)
             entry = {
                 "job_id": job.get("job_id"),
                 "video_url": job.get("video_url"),
@@ -855,7 +1590,7 @@ class VideoLinkStatusServer:
             )
         return users
 
-    def start_run(self, job_id: str) -> dict[str, Any]:
+    def start_run(self, job_id: str, profile: str | None = None) -> dict[str, Any]:
         job = self.load_job(job_id)
         with self.runner_lock:
             active = self.active_runners.get(job_id)
@@ -864,22 +1599,76 @@ class VideoLinkStatusServer:
             self.active_runners.pop(job_id, None)
 
             now = iso_now()
+            if profile:
+                profile = str(profile).strip()
+                snapshot_profile = str((job.get("runtime_profile_snapshot") or {}).get("profile") or "")
+                if snapshot_profile and profile != snapshot_profile:
+                    raise BridgeError(
+                        HTTPStatus.CONFLICT,
+                        f"job runtime is locked to profile snapshot {snapshot_profile}",
+                    )
+            if not job.get("runtime_profile_snapshot"):
+                self.write_runtime_snapshot(job, str((job.get("options") or {}).get("profile") or DEFAULT_PROFILE), legacy=True)
             job["status"] = "running"
             job["updated_at"] = now
             job["runner"] = {
                 "status": "running",
+                "run_id": uuid.uuid4().hex,
                 "started_at": now,
                 "updated_at": now,
                 "finished_at": None,
                 "current_stage": self.next_stage(job),
                 "error": None,
                 "server_pid": os.getpid(),
+                "transition_count": 0,
             }
             self.save_job(job)
             thread = threading.Thread(target=self._run_remaining_stages, args=(job_id,), daemon=True)
             self.active_runners[job_id] = thread
         thread.start()
         return self.public_job(self.load_job(job_id))
+
+    def rerun_from_stage(
+        self,
+        job_id: str,
+        stage: str,
+        *,
+        profile: str | None = None,
+        refresh_runtime_profile: bool = False,
+    ) -> dict[str, Any]:
+        stage = normalize_stage_name(stage)
+        job = self.load_job(job_id)
+        if stage not in self.stage_order_for_job(job):
+            raise BridgeError(HTTPStatus.NOT_FOUND, f"unknown stage: {stage}")
+        if self.current_stage(job):
+            raise BridgeError(HTTPStatus.CONFLICT, "job already has a running stage")
+
+        if refresh_runtime_profile:
+            profile_name = str(
+                profile
+                or (job.get("options") or {}).get("profile")
+                or (job.get("runtime_profile_snapshot") or {}).get("profile")
+                or DEFAULT_PROFILE
+            ).strip()
+            self.write_runtime_snapshot(job, profile_name)
+            job.setdefault("options", {})["profile"] = profile_name
+
+        stage_order = self.stage_order_for_job(job)
+        stage_index = stage_order.index(stage)
+        for invalidated_stage in stage_order[stage_index:]:
+            job.setdefault("stages", {}).pop(invalidated_stage, None)
+            for artifact_name in MODULE_SPECS.get(invalidated_stage, {}).get("produces", []):
+                job.setdefault("artifacts", {}).pop(artifact_name, None)
+        job["warnings"] = [
+            warning
+            for warning in job.get("warnings", [])
+            if warning.get("stage") not in stage_order[stage_index:]
+        ]
+        job["status"] = "queued"
+        job["updated_at"] = iso_now()
+        job["summary"] = self.collect_summary(job)
+        self.save_job(job)
+        return self.start_run(job_id)
 
     def stop_job(self, job_id: str) -> dict[str, Any]:
         job = self.load_job(job_id)
@@ -1005,16 +1794,20 @@ class VideoLinkStatusServer:
         if job.get("status") != "queued" or runner.get("status") != "queued" or not stage:
             return {}
         stage_info = (job.get("stages") or {}).get(stage) or {}
-        if runner.get("error") != ORPHANED_PROCESS_REQUEUE_MESSAGE and stage_info.get("retry_reason") != ORPHANED_PROCESS_REQUEUE_MESSAGE:
+        retry_reason = stage_info.get("retry_reason") or runner.get("error")
+        if retry_reason not in AUTO_RETRY_REASONS:
             return {}
         queued_at = stage_info.get("queued_at") or runner.get("updated_at") or job.get("updated_at")
         queued_at_ts = parse_iso_timestamp(queued_at)
         if queued_at_ts is None:
             queued_at_ts = time.time()
         now = time.time() if now is None else now
+        retry_info = dict(stage_info.get("retry") or {})
+        next_retry_at_ts = parse_iso_timestamp(retry_info.get("next_retry_at"))
         delay = max(0.0, AUTO_RETRY_DELAY_SECONDS)
-        retry_after = max(0.0, queued_at_ts + delay - now)
-        resource = runner.get("queued_for") or stage_info.get("queued_for") or stage_resource(stage)
+        ready_at = next_retry_at_ts if next_retry_at_ts is not None else queued_at_ts + delay
+        retry_after = max(0.0, ready_at - now)
+        resource = runner.get("queued_for") or stage_info.get("queued_for") or job_stage_resource(job, stage)
         return {
             "auto_retry": True,
             "ready": retry_after <= 0,
@@ -1031,6 +1824,10 @@ class VideoLinkStatusServer:
         return int(info.get("running_count") or 0) > 0
 
     def _run_remaining_stages(self, job_id: str) -> None:
+        self._run_remaining_stages_serial(job_id)
+
+    def _run_remaining_stages_serial(self, job_id: str) -> None:
+        transition_count = 0
         try:
             while True:
                 job = self.load_job(job_id)
@@ -1039,8 +1836,28 @@ class VideoLinkStatusServer:
                     job["status"] = "succeeded"
                     self.update_runner(job, "succeeded", current_stage=None, finished=True)
                     return
+                if transition_count > len(self.stage_order_for_job(job)):
+                    raise BridgeError(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        "state_machine_invariant_violation: runner exceeded the maximum stage transitions",
+                    )
                 self.update_runner(job, "running", current_stage=stage)
-                self.run_stage(job_id, stage)
+                result = self.run_stage(job_id, stage, continue_runner=True)
+                result_runner = result.get("runner") or {}
+                if result.get("status") == "queued" or result_runner.get("status") == "queued":
+                    return
+                transition_count += 1
+                next_stage = self.next_stage(result)
+                if next_stage == stage:
+                    raise BridgeError(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        f"state_machine_invariant_violation: stage {stage} did not converge",
+                    )
+                current = self.load_job(job_id)
+                runner = dict(current.get("runner") or {})
+                runner["transition_count"] = transition_count
+                current["runner"] = runner
+                self.save_job(current)
         except BridgeError as exc:
             job = self.load_job(job_id)
             if self.runner_failure_can_finish_with_warning(job):
@@ -1078,6 +1895,7 @@ class VideoLinkStatusServer:
         if "started_at" not in runner:
             runner["started_at"] = runner["updated_at"]
         runner["current_stage"] = current_stage
+        runner.pop("wait_reason", None)
         if error is not None:
             runner["error"] = error
         elif status != "failed":
@@ -1092,7 +1910,7 @@ class VideoLinkStatusServer:
             job["status"] = "failed"
         self.save_job(job)
 
-    def run_stage(self, job_id: str, stage: str) -> dict[str, Any]:
+    def run_stage(self, job_id: str, stage: str, continue_runner: bool = False) -> dict[str, Any]:
         stage = normalize_stage_name(stage)
         job = self.load_job(job_id)
         if stage not in self.stage_order_for_job(job):
@@ -1123,18 +1941,21 @@ class VideoLinkStatusServer:
             return self.public_job(job)
         if stage == "final-publish" and current_status == "skipped" and not self.export_outputs_complete(job):
             current_status = None
+        if current_status == "skipped" and self.skipped_stage_outputs_incomplete(job, stage):
+            current_status = None
         if current_status in {"succeeded", "skipped"}:
             return self.public_job(job)
-        if stage == "image-prompts" and job["options"].get("skip_images"):
-            return self.mark_stage_skipped(job, stage, "skip_images is true")
+        if stage == "image-prompts" and (job["options"].get("skip_images") or not BAOYU_IMAGE_GENERATION_ENABLED):
+            return self.mark_stage_skipped(job, stage, "baoyu image generation is disabled", continue_runner=continue_runner)
 
-        resource = stage_resource(stage)
+        job = self.select_audio_compute_route(job, stage)
+        resource = job_stage_resource(job, stage)
         self.mark_stage_queued(job, stage, resource)
         self.wait_for_resource_slot(resource, job_id)
         lock = self.resource_locks[resource]
         lock.acquire()
         try:
-            return self._run_stage_locked(job_id, stage)
+            return self._run_stage_locked(job_id, stage, continue_runner=continue_runner)
         finally:
             lock.release()
 
@@ -1151,6 +1972,45 @@ class VideoLinkStatusServer:
             self.touch_queued_runner(job_id, resource, len(blockers), limit)
             time.sleep(RESOURCE_WAIT_SECONDS)
 
+    def select_audio_compute_route(
+        self,
+        job: dict[str, Any],
+        stage: str,
+    ) -> dict[str, Any]:
+        raw_pipeline_kind = (
+            job.get("audio_pipeline_kind")
+            or job.get("audio_pipeline_profile")
+        )
+        if (
+            normalize_stage_name(stage) != "analyze-core"
+            or not raw_pipeline_kind
+            or normalize_audio_pipeline_profile(raw_pipeline_kind)
+            != AUDIO_PIPELINE_PROFILE_NX1
+        ):
+            return job
+        if job.get("compute_route") in {"local", "cloud_fallback"}:
+            return job
+        fallback = (job.get("runtime_profile_snapshot") or {}).get(
+            "audio_cloud_fallback"
+        ) or {}
+        local_busy = any(
+            self.live_resource_users(resource, exclude_job_id=job.get("job_id"))
+            for resource in ("core", "audio-analysis", "asr", "ocr", "vl")
+        )
+        job["compute_route"] = (
+            "cloud_fallback"
+            if local_busy and fallback.get("enabled")
+            else "local"
+        )
+        job["compute_route_reason"] = (
+            "local_resource_busy"
+            if job["compute_route"] == "cloud_fallback"
+            else "local_first"
+        )
+        job["updated_at"] = iso_now()
+        self.save_job(job)
+        return job
+
     def live_resource_users(self, resource: str, exclude_job_id: str | None = None) -> list[dict[str, Any]]:
         users = []
         for path in self.jobs_dir.glob("*/job.json"):
@@ -1164,7 +2024,7 @@ class VideoLinkStatusServer:
             if runner.get("status") != "running":
                 continue
             stage = normalize_stage_name(runner.get("current_stage") or self.current_stage(job) or "")
-            if not stage or stage_resource(stage) != resource:
+            if not stage or job_stage_resource(job, stage) != resource:
                 continue
             stage_info = (job.get("stages") or {}).get(stage) or {}
             process_info = stage_info.get("process") or {}
@@ -1173,7 +2033,7 @@ class VideoLinkStatusServer:
                 users.append(job)
         return users
 
-    def _run_stage_locked(self, job_id: str, stage: str) -> dict[str, Any]:
+    def _run_stage_locked(self, job_id: str, stage: str, continue_runner: bool = False) -> dict[str, Any]:
         stage = normalize_stage_name(stage)
         job = self.load_job(job_id)
         previous_stage_info = dict(job.get("stages", {}).get(stage, {}) or {})
@@ -1198,8 +2058,15 @@ class VideoLinkStatusServer:
             "attempt_log_paths": attempt_log_paths,
             "log_path": str(log_path),
             "artifacts": {},
-            "queued_for": stage_resource(stage),
+            "queued_for": job_stage_resource(job, stage),
         }
+        failure_path = self.stage_failure_path(job_id, stage, attempt)
+        if failure_path.exists():
+            failure_path.unlink()
+        stage_info["failure_path"] = str(failure_path)
+        for key in ("auto_retry_attempts", "first_error", "retry"):
+            if previous_stage_info.get(key):
+                stage_info[key] = previous_stage_info[key]
         job["status"] = "running"
         job["updated_at"] = iso_now()
         job["stages"][stage] = stage_info
@@ -1217,7 +2084,7 @@ class VideoLinkStatusServer:
             elif stage == "multidoc":
                 result = self.run_command_stage(job, stage, self.multidoc_command(job), stage_info["log_path"], stage_info)
             elif stage == "deep-v2":
-                result = self.run_command_stage(job, stage, self.deep_v2_command(job), stage_info["log_path"], stage_info)
+                result = self.stage_deep_v2(job, stage_info["log_path"], stage_info)
             elif stage == "study-guide":
                 result = self.run_command_stage(job, stage, self.study_guide_command(job), stage_info["log_path"], stage_info)
             elif stage == "evidence-review":
@@ -1239,48 +2106,156 @@ class VideoLinkStatusServer:
             stage_info["finished_at"] = iso_now()
             job["status"] = "succeeded" if self.next_stage(job) is None else "running"
         except Exception as exc:
-            stage_info["status"] = "failed"
+            failure = self.stage_failure(stage_info, exc)
+            retry_reason = self.retryable_stage_failure_reason(
+                job,
+                stage,
+                exc,
+                stage_info["log_path"],
+                previous_stage_info,
+                failure,
+            )
+            stage_info["status"] = "queued" if retry_reason else "failed"
             stage_info["exit_code"] = getattr(exc, "returncode", 1)
             stage_info["duration_seconds"] = round(time.time() - start, 3)
             stage_info["finished_at"] = iso_now()
-            stage_info["error"] = str(exc)
             stage_info.pop("process", None)
-            if self.stage_can_soft_fail(job, stage):
-                warning = self.add_warning(job, stage, str(exc))
+            stage_info["failure"] = failure
+            if retry_reason:
+                stage_info["queued_at"] = stage_info["finished_at"]
+                stage_info["queued_for"] = job_stage_resource(job, stage)
+                stage_info["retry_reason"] = retry_reason
+                stage_info["last_error"] = self.exception_text(exc) or str(exc)
+                previous_retry = dict(previous_stage_info.get("retry") or {})
+                max_attempts = self.max_auto_retries_for_reason(retry_reason)
+                stage_info["retry"] = {
+                    "auto_attempts": int(previous_retry.get("auto_attempts") or 0) + 1,
+                    "max_auto_attempts": max_attempts,
+                    "next_retry_at": iso_from_timestamp(time.time() + max(0.0, AUTO_RETRY_DELAY_SECONDS)),
+                }
+                stage_info["auto_retry_attempts"] = stage_info["retry"]["auto_attempts"]
+                stage_info["first_error"] = previous_stage_info.get("first_error") or stage_info["last_error"]
+                stage_info.pop("error", None)
+                job["status"] = "queued"
+            elif self.stage_can_soft_fail(job, stage, failure):
+                visible_error = str(failure.get("message") or str(exc))
+                stage_info["error"] = visible_error
+                warning = self.add_warning(job, stage, visible_error)
                 stage_info["status"] = "skipped"
                 stage_info["warning"] = warning["message"]
                 stage_info["soft_failed"] = True
                 job["status"] = "running"
             else:
+                stage_info["error"] = str(failure.get("message") or str(exc))
                 job["status"] = "failed"
         job["updated_at"] = iso_now()
         job["stages"][stage] = stage_info
         job["summary"] = self.collect_summary(job)
-        next_stage = self.next_stage(job)
-        runner = dict(job.get("runner") or {})
-        runner["updated_at"] = job["updated_at"]
-        runner["server_pid"] = os.getpid()
-        runner["error"] = None if job["status"] != "failed" else stage_info.get("error")
-        if job["status"] == "succeeded":
-            runner["status"] = "succeeded"
-            runner["current_stage"] = None
-            runner["queued_for"] = None
-            runner["finished_at"] = job["updated_at"]
-        elif job["status"] == "failed":
-            runner["status"] = "failed"
-            runner["current_stage"] = stage
-            runner["queued_for"] = stage_resource(stage)
-            runner["finished_at"] = job["updated_at"]
-        else:
-            runner["status"] = "running"
-            runner["current_stage"] = next_stage
-            runner["queued_for"] = stage_resource(next_stage) if next_stage else None
-            runner.pop("finished_at", None)
-        job["runner"] = runner
+        self.finalize_stage_runner(job, stage, stage_info, continue_runner=continue_runner)
         self.save_job(job)
         if stage_info["status"] == "failed":
             raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, f"{stage} failed: {stage_info.get('error')}")
         return self.public_job(job)
+
+    def retryable_stage_failure_reason(
+        self,
+        job: dict[str, Any],
+        stage: str,
+        exc: Exception,
+        log_path: str,
+        previous_stage_info: dict[str, Any] | None = None,
+        failure: dict[str, Any] | None = None,
+    ) -> str | None:
+        previous_stage_info = previous_stage_info or {}
+        failure = failure or {}
+        retry = dict(previous_stage_info.get("retry") or {})
+        if failure.get("kind") == "transient_resource":
+            if int(retry.get("auto_attempts") or 0) < MAX_TRANSIENT_API_RETRIES:
+                return TRANSIENT_RESOURCE_REQUEUE_MESSAGE
+            return None
+        if failure.get("retryable"):
+            if int(retry.get("auto_attempts") or 0) < MAX_TRANSIENT_API_RETRIES:
+                return TRANSIENT_API_REQUEUE_MESSAGE
+            return None
+        if normalize_stage_name(stage) != "analyze-core":
+            return None
+        text = self.exception_text(exc)
+        output = getattr(exc, "output", None)
+        if not output:
+            try:
+                text += "\n" + Path(log_path).read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+        retry_reason = self.retryable_stage_failure_text(stage, text)
+        if retry_reason:
+            return retry_reason
+        if not self.youtube_format_retry_allowed(job, previous_stage_info, text):
+            return None
+        return YOUTUBE_FORMAT_REQUEUE_MESSAGE
+
+    def stage_failure(self, stage_info: dict[str, Any], exc: Exception) -> dict[str, Any]:
+        envelope = read_failure_envelope(stage_info.get("failure_path"))
+        if envelope:
+            return {
+                "kind": str(envelope.get("kind") or "unknown"),
+                "retryable": bool(envelope.get("retryable")),
+                "status_code": envelope.get("status_code"),
+                "provider_code": envelope.get("provider_code"),
+                "message": str(envelope.get("message") or str(exc)),
+            }
+        text = self.exception_text(exc)
+        if self.retryable_stage_failure_text("", text):
+            return {
+                "kind": "transient_resource",
+                "retryable": True,
+                "status_code": None,
+                "provider_code": None,
+                "message": str(exc),
+            }
+        return {
+            "kind": "unknown",
+            "retryable": False,
+            "status_code": None,
+            "provider_code": None,
+            "message": str(exc),
+        }
+
+    def max_auto_retries_for_reason(self, reason: str) -> int:
+        if reason == YOUTUBE_FORMAT_REQUEUE_MESSAGE:
+            return MAX_YOUTUBE_FORMAT_RETRIES
+        if reason == ORPHANED_PROCESS_REQUEUE_MESSAGE:
+            return MAX_INTERRUPTED_RETRIES
+        return MAX_TRANSIENT_API_RETRIES
+
+    def retryable_stage_failure_text(self, stage: str, text: str) -> str | None:
+        if "Ray frame driver failed" not in text and "run_frame_worker" not in text and "Jetson" not in text:
+            return None
+        if any(pattern in text for pattern in TRANSIENT_RESOURCE_BUSY_PATTERNS):
+            return TRANSIENT_RESOURCE_REQUEUE_MESSAGE
+        return None
+
+    def youtube_format_retry_allowed(self, job: dict[str, Any], previous_stage_info: dict[str, Any], text: str) -> bool:
+        if not is_youtube_url(str(job.get("video_url") or "")):
+            return False
+        if YOUTUBE_FORMAT_UNAVAILABLE_PATTERN not in text or "[youtube]" not in text.lower():
+            return False
+        if int(previous_stage_info.get("auto_retry_attempts") or 0) >= MAX_YOUTUBE_FORMAT_RETRIES:
+            return False
+        return not self.core_artifacts_exist(job)
+
+    def core_artifacts_exist(self, job: dict[str, Any]) -> bool:
+        run_dir_value = str(job.get("run_dir") or "")
+        if not run_dir_value:
+            return False
+        run_dir = Path(run_dir_value)
+        return any((run_dir / name).is_file() for name in ("analysis.json", "operation_manual.md", "manual_evidence.md"))
+
+    def exception_text(self, exc: Exception) -> str:
+        text = str(exc)
+        output = getattr(exc, "output", None)
+        if output:
+            text += "\n" + str(output)
+        return text
 
     def touch_queued_runner(self, job_id: str, resource: str, blocker_count: int, limit: int) -> None:
         try:
@@ -1320,6 +2295,7 @@ class VideoLinkStatusServer:
         runner["updated_at"] = now
         runner["server_pid"] = os.getpid()
         runner["error"] = None
+        runner.pop("wait_reason", None)
         if "started_at" not in runner:
             runner["started_at"] = now
         job["runner"] = runner
@@ -1350,7 +2326,12 @@ class VideoLinkStatusServer:
         if self.uploaded_media_job(job):
             return self.stage_prepare_uploaded_media(job)
         command = self.prepare_command(job)
-        result = self.run_command(command, log_path, on_start=self.record_stage_process(job, "prepare", stage_info))
+        result = self.run_command(
+            command,
+            log_path,
+            on_start=self.record_stage_process(job, "prepare", stage_info),
+            env_overrides=self.job_runtime_env(job),
+        )
         text = Path(log_path).read_text(encoding="utf-8", errors="replace")
         video_path = parse_prefixed_path(text, "[download] video:")
         page_context = parse_prefixed_path(text, "[download] context:")
@@ -1379,13 +2360,28 @@ class VideoLinkStatusServer:
         if not job.get("resolved_mode"):
             self.stage_probe(job)
         command = self.operation_command(job)
-        result = self.run_command(command, log_path, on_start=self.record_stage_process(job, "analyze-core", stage_info))
+        jetson_ray = self.ensure_jetson_ray_ready(command, log_path)
+        run_kwargs = {"on_start": self.record_stage_process(job, "analyze-core", stage_info)}
+        if jetson_ray:
+            run_kwargs["append_log"] = True
+        runtime_env = self.job_runtime_env(job)
+        runtime_env.update(self.stage_failure_env(stage_info))
+        run_kwargs["env_overrides"] = runtime_env
+        result = self.run_command(command, log_path, **run_kwargs)
         run_dir = str(job.get("run_dir") or "") if self.uploaded_media_job(job) else parse_run_dir(Path(log_path).read_text(encoding="utf-8", errors="replace"))
         if not run_dir:
             raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, "operation stage did not print a run directory")
         job["run_dir"] = str(self.resolve_output_path(run_dir))
         run_dir_path = Path(job["run_dir"])
-        artifacts = {"run_dir": job["run_dir"], "command": command, **self.collect_core_artifacts(run_dir_path)}
+        artifacts = {
+            "run_dir": job["run_dir"],
+            "command": command,
+            **({"jetson_ray": jetson_ray} if jetson_ray else {}),
+            **self.collect_core_artifacts(run_dir_path),
+        }
+        generation_error = self.core_manual_generation_error(run_dir_path)
+        if generation_error:
+            raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, generation_error)
         actual_template = self.audio_prompt_template_actual(run_dir_path)
         if actual_template:
             job["prompt_template_actual"] = actual_template
@@ -1394,8 +2390,49 @@ class VideoLinkStatusServer:
             self.add_warning(job, "analyze-core", warning)
         return {"artifacts": artifacts, "stdout_tail": result["stdout_tail"]}
 
+    def ensure_jetson_ray_ready(self, command: list[str], log_path: str) -> dict[str, Any] | None:
+        if "--frame-extractor" not in command:
+            return None
+        extractor_index = command.index("--frame-extractor") + 1
+        if extractor_index >= len(command) or command[extractor_index] != "jetson":
+            return None
+        if "--jetson-frame-backend" not in command:
+            return None
+        backend_index = command.index("--jetson-frame-backend") + 1
+        if backend_index >= len(command) or command[backend_index] != "ray":
+            return None
+        script = self.repo_root / "tools" / "start_jetson_frame_ray.sh"
+        if not script.is_file():
+            raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, f"missing Jetson Ray startup script: {script}")
+        result = subprocess.run(
+            [str(script)],
+            cwd=str(self.repo_root),
+            capture_output=True,
+            text=True,
+            env=operation_env(),
+        )
+        preflight_log = "\n".join(
+            line
+            for line in (
+                "[jetson-ray] ensuring cluster readiness",
+                result.stdout.strip(),
+                result.stderr.strip(),
+            )
+            if line
+        )
+        Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(log_path).write_text(preflight_log + "\n", encoding="utf-8")
+        if result.returncode != 0:
+            error = subprocess.CalledProcessError(result.returncode, [str(script)])
+            error.output = preflight_log
+            raise error
+        return {"command": [str(script)], "stdout_tail": tail_lines(preflight_log)}
+
     def stage_verify_core(self, job: dict[str, Any]) -> dict[str, Any]:
         run_dir = self.require_run_dir(job)
+        generation_error = self.core_manual_generation_error(run_dir)
+        if generation_error:
+            raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, generation_error)
         missing = self.missing_core_artifacts(run_dir)
         if missing:
             raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, f"missing core artifact(s): {', '.join(missing)}")
@@ -1405,6 +2442,44 @@ class VideoLinkStatusServer:
             warnings.append(self.add_warning(job, "verify-core", warning))
         return {"artifacts": {"required": ["analysis.json", "operation_manual.md|operation_manual.quality_failed.md", "manual_evidence.md"], "missing": [], "warnings": warnings}}
 
+    def stage_deep_v2(self, job: dict[str, Any], log_path: str, stage_info: dict[str, Any]) -> dict[str, Any]:
+        run_dir = self.require_run_dir(job)
+        outputs = (
+            run_dir / "docs_analysis_chapters" / "knowledge_notes_v2.md",
+            run_dir / "docs_analysis_chapters" / "deep_report_v2.md",
+        )
+        if all(path.is_file() and path.stat().st_size > 0 for path in outputs):
+            Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(log_path).write_text("[docs] reusing chapter documents from multidoc\n", encoding="utf-8")
+            return {
+                "artifacts": {
+                    "stage": "deep-v2",
+                    "reused_from": "multidoc",
+                    "knowledge_notes_v2": str(outputs[0]),
+                    "deep_report_v2": str(outputs[1]),
+                },
+                "stdout_tail": ["[docs] reusing chapter documents from multidoc"],
+            }
+        return self.run_command_stage(job, "deep-v2", self.deep_v2_command(job), log_path, stage_info)
+
+    def skipped_stage_outputs_incomplete(self, job: dict[str, Any], stage: str) -> bool:
+        if stage not in {"multidoc", "deep-v2"}:
+            return False
+        run_dir = self.require_run_dir(job)
+        expected = {
+            "multidoc": (
+                run_dir / "docs_analysis" / "analysis.json",
+                run_dir / "docs_analysis" / "knowledge_notes.md",
+                run_dir / "docs_analysis" / "deep_report.md",
+                run_dir / "docs_analysis" / "operation_manual_review.md",
+            ),
+            "deep-v2": (
+                run_dir / "docs_analysis_chapters" / "knowledge_notes_v2.md",
+                run_dir / "docs_analysis_chapters" / "deep_report_v2.md",
+            ),
+        }
+        return any(not path.is_file() or path.stat().st_size == 0 for path in expected[stage])
+
     def run_command_stage(
         self,
         job: dict[str, Any],
@@ -1413,25 +2488,58 @@ class VideoLinkStatusServer:
         log_path: str,
         stage_info: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        result = self.run_command(command, log_path, on_start=self.record_stage_process(job, stage, stage_info))
+        if stage in {"study-guide", "multidoc", "deep-v2", "evidence-review", "web-evidence"}:
+            command = self.local_text_command(job, command)
+        runtime_env = self.job_runtime_env(job)
+        runtime_env.update(self.stage_failure_env(stage_info))
+        result = self.run_command(
+            command,
+            log_path,
+            on_start=self.record_stage_process(job, stage, stage_info),
+            env_overrides=runtime_env,
+        )
+        summary = self.collect_summary(job)
+        artifacts = {
+            "stage": stage,
+            "command": command,
+            **summary,
+        }
+        if stage == "multidoc":
+            multidoc_summary = summary.get("multidoc") or {}
+            if multidoc_summary.get("analysis"):
+                artifacts["docs_analysis"] = multidoc_summary["analysis"]
+            artifacts["generation_metrics"] = multidoc_summary.get("metrics") or {}
         return {
-            "artifacts": {
-                "stage": stage,
-                "command": command,
-                **self.collect_summary(job),
-            },
+            "artifacts": artifacts,
             "stdout_tail": result["stdout_tail"],
         }
+
+    def local_text_command(self, job: dict[str, Any], command: list[str]) -> list[str]:
+        return [
+            sys.executable,
+            "tools/run_local_model_stage.py",
+            "--stage",
+            "text",
+            "--config",
+            "config",
+            "--profile",
+            job["options"].get("profile") or DEFAULT_PROFILE,
+            "--",
+            *command,
+        ]
 
     def run_command(
         self,
         command: list[str],
         log_path: str,
         on_start: Any | None = None,
+        append_log: bool = False,
+        env_overrides: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         env = operation_env()
+        env.update(env_overrides or {})
         Path(log_path).parent.mkdir(parents=True, exist_ok=True)
-        with Path(log_path).open("w", encoding="utf-8") as log_file:
+        with Path(log_path).open("a" if append_log else "w", encoding="utf-8") as log_file:
             process = subprocess.Popen(
                 command,
                 cwd=str(self.repo_root),
@@ -1493,6 +2601,7 @@ class VideoLinkStatusServer:
                 "--run-name",
                 opts["run_name"],
             ]
+            self.append_default_frame_extractor_options(command, job)
         else:
             command = [
                 "tools/run_operation_manual_from_url.sh",
@@ -1504,7 +2613,7 @@ class VideoLinkStatusServer:
                 "--pipeline-mode",
                 pipeline_mode_for(resolved_mode),
             ]
-            self.append_default_frame_extractor_options(command)
+            self.append_default_frame_extractor_options(command, job)
             if resolved_mode == "operation-fast":
                 command.extend(["--vl-frame-policy", "auto", "--min-vl-frames", "8", "--max-vl-frames", "16"])
         command.append("--resume-existing-core")
@@ -1522,6 +2631,25 @@ class VideoLinkStatusServer:
             raise BridgeError(HTTPStatus.BAD_REQUEST, f"uploaded media context does not exist: {context_path}")
         if not run_dir:
             raise BridgeError(HTTPStatus.BAD_REQUEST, "uploaded media job is missing run_dir")
+        if normalize_audio_pipeline_profile(
+            job.get("audio_pipeline_kind")
+            or job.get("audio_pipeline_profile")
+        ) == AUDIO_PIPELINE_KIND_TRANSCRIPTION:
+            return [
+                os.environ.get("PYTHON") or sys.executable,
+                "tools/run_audio_transcription.py",
+                str(media_path),
+                "--output",
+                str(run_dir),
+                "--config",
+                "config",
+                "--profile",
+                opts["profile"],
+                "--source-name",
+                str(job.get("source_name") or media_path.name),
+                "--asr-provider",
+                str(job.get("asr_provider") or "firered_3dspeaker"),
+            ]
         command = [
             os.environ.get("PYTHON") or sys.executable,
             "tools/run_audio_template_analysis.py",
@@ -1539,6 +2667,11 @@ class VideoLinkStatusServer:
             command.extend(["--template-id", opts["template_id"]])
         if opts.get("focus_prompt"):
             command.extend(["--focus-prompt", opts["focus_prompt"]])
+        if job.get("provided_transcript"):
+            command.extend(["--transcript-json", str(job["provided_transcript_path"])])
+        command.extend(
+            ["--compute-route", str(job.get("compute_route") or "local")]
+        )
         return command
 
     def prepare_command(self, job: dict[str, Any]) -> list[str]:
@@ -1563,7 +2696,7 @@ class VideoLinkStatusServer:
         page_context = Path(str(job.get("page_context_path") or ""))
         if not media_path.is_file():
             raise BridgeError(HTTPStatus.BAD_REQUEST, f"uploaded media file does not exist: {media_path}")
-        if media_path.suffix.lower() not in MEDIA_EXTENSIONS:
+        if not job.get("provided_transcript") and media_path.suffix.lower() not in MEDIA_EXTENSIONS:
             raise BridgeError(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "uploaded media file is not supported")
         if not page_context.is_file():
             page_context.write_text(upload_page_context(str(job.get("source_name") or media_path.name), media_path), encoding="utf-8")
@@ -1602,17 +2735,24 @@ class VideoLinkStatusServer:
         if opts.get("focus_prompt"):
             command.extend(["--focus-prompt", opts["focus_prompt"]])
 
-    def append_default_frame_extractor_options(self, command: list[str]) -> None:
+    def append_default_frame_extractor_options(self, command: list[str], job: dict[str, Any] | None = None) -> None:
+        profile_name = str(((job or {}).get("options") or {}).get("profile") or "")
+        profile = (runtime_config().get("runtime_profiles") or {}).get(profile_name) or {}
         command.extend(
             [
                 "--frame-extractor",
-                os.environ.get("VIDEO_LINK_FRAME_EXTRACTOR", DEFAULT_FRAME_EXTRACTOR),
+                str(profile.get("frame_extractor") or os.environ.get("VIDEO_LINK_FRAME_EXTRACTOR", DEFAULT_FRAME_EXTRACTOR)),
+                "--local-frame-gpus",
+                str(profile.get("local_frame_gpus") or os.environ.get("VIDEO_LINK_LOCAL_FRAME_GPUS", DEFAULT_LOCAL_FRAME_GPUS)),
                 "--jetson-frame-hosts",
-                os.environ.get("VIDEO_LINK_JETSON_FRAME_HOSTS", os.environ.get("JETSON_FRAME_HOSTS", DEFAULT_JETSON_FRAME_HOSTS)),
+                str(
+                    profile.get("jetson_frame_hosts")
+                    or os.environ.get("VIDEO_LINK_JETSON_FRAME_HOSTS", os.environ.get("JETSON_FRAME_HOSTS", DEFAULT_JETSON_FRAME_HOSTS))
+                ),
                 "--jetson-frame-backend",
-                os.environ.get("VIDEO_LINK_JETSON_FRAME_BACKEND", DEFAULT_JETSON_FRAME_BACKEND),
+                str(profile.get("jetson_frame_backend") or os.environ.get("VIDEO_LINK_JETSON_FRAME_BACKEND", DEFAULT_JETSON_FRAME_BACKEND)),
                 "--jetson-sample-fps",
-                os.environ.get("VIDEO_LINK_JETSON_SAMPLE_FPS", DEFAULT_JETSON_SAMPLE_FPS),
+                str(profile.get("jetson_sample_fps") or os.environ.get("VIDEO_LINK_JETSON_SAMPLE_FPS", DEFAULT_JETSON_SAMPLE_FPS)),
                 "--jetson-require-hwdec",
             ]
         )
@@ -1677,17 +2817,28 @@ class VideoLinkStatusServer:
 
     def final_publish_command(self, job: dict[str, Any]) -> list[str]:
         self.ensure_publish_not_blocked(job)
+        run_dir = self.require_run_dir(job)
+        manual_path = run_dir / "operation_manual.md"
+        if not manual_path.is_file() or manual_path.stat().st_size <= 0:
+            quality_failed_path = run_dir / "operation_manual.quality_failed.md"
+            if quality_failed_path.is_file() and quality_failed_path.stat().st_size > 0:
+                raise BridgeError(
+                    HTTPStatus.CONFLICT,
+                    f"operation manual failed quality gate; review and regenerate {quality_failed_path}",
+                )
+            raise BridgeError(HTTPStatus.CONFLICT, f"missing final operation manual: {manual_path}")
         command = [
             "tools/run_video_doc_final_publish.sh",
-            str(self.require_run_dir(job)),
+            str(run_dir),
             "--profile",
             job["options"].get("profile") or DEFAULT_PROFILE,
             "--jobs",
             "3",
             "--finalize-only",
+            "--skip-pdf",
             "--skip-send",
         ]
-        if job["options"].get("skip_images"):
+        if job["options"].get("skip_images") or not BAOYU_IMAGE_GENERATION_ENABLED:
             command.append("--skip-images")
         return command
 
@@ -1710,7 +2861,7 @@ class VideoLinkStatusServer:
             reason = decision.get("reason") or "evidence review blocked publishing"
             raise BridgeError(HTTPStatus.CONFLICT, f"publish blocked by evidence gate: {reason}")
 
-    def mark_stage_skipped(self, job: dict[str, Any], stage: str, reason: str) -> dict[str, Any]:
+    def mark_stage_skipped(self, job: dict[str, Any], stage: str, reason: str, continue_runner: bool = False) -> dict[str, Any]:
         stage = normalize_stage_name(stage)
         job["stages"][stage] = {
             "status": "skipped",
@@ -1724,8 +2875,67 @@ class VideoLinkStatusServer:
         job["status"] = "succeeded" if self.next_stage(job) is None else "running"
         job["updated_at"] = iso_now()
         job["summary"] = self.collect_summary(job)
+        self.finalize_stage_runner(job, stage, job["stages"][stage], continue_runner=continue_runner)
         self.save_job(job)
         return self.public_job(job)
+
+    def finalize_stage_runner(
+        self,
+        job: dict[str, Any],
+        stage: str,
+        stage_info: dict[str, Any],
+        continue_runner: bool = False,
+    ) -> None:
+        next_stage = self.next_stage(job)
+        now = job.get("updated_at") or iso_now()
+        runner = dict(job.get("runner") or {})
+        runner["updated_at"] = now
+        runner["server_pid"] = os.getpid()
+        runner.pop("wait_reason", None)
+        if job["status"] == "failed":
+            runner["status"] = "failed"
+            runner["current_stage"] = stage
+            runner["queued_for"] = job_stage_resource(job, stage)
+            runner["error"] = stage_info.get("error")
+            runner["finished_at"] = now
+        elif job["status"] == "queued":
+            runner["status"] = "queued"
+            runner["current_stage"] = stage
+            runner["queued_for"] = job_stage_resource(job, stage)
+            runner["error"] = stage_info.get("retry_reason")
+            runner.pop("finished_at", None)
+        elif next_stage is None:
+            job["status"] = "succeeded"
+            runner["status"] = "succeeded"
+            runner["current_stage"] = None
+            runner["queued_for"] = None
+            runner["error"] = None
+            runner["finished_at"] = now
+        elif continue_runner:
+            job["status"] = "running"
+            runner["status"] = "running"
+            runner["current_stage"] = next_stage
+            runner["queued_for"] = job_stage_resource(job, next_stage)
+            runner["error"] = None
+            runner.pop("finished_at", None)
+        else:
+            resource = job_stage_resource(job, next_stage)
+            next_info = dict((job.get("stages") or {}).get(next_stage) or {})
+            next_info.setdefault("log_path", str(self.stage_log_path(job["job_id"], next_stage)))
+            next_info["status"] = "queued"
+            next_info["queued_at"] = now
+            next_info["queued_for"] = resource
+            next_info.pop("finished_at", None)
+            next_info.pop("exit_code", None)
+            next_info.pop("process", None)
+            job.setdefault("stages", {})[next_stage] = next_info
+            job["status"] = "queued"
+            runner["status"] = "queued"
+            runner["current_stage"] = next_stage
+            runner["queued_for"] = resource
+            runner["error"] = None
+            runner.pop("finished_at", None)
+        job["runner"] = runner
 
     def update_job_artifacts(self, job: dict[str, Any], stage: str, artifacts: dict[str, Any]) -> None:
         artifact_store = dict(job.get("artifacts") or {})
@@ -1744,6 +2954,30 @@ class VideoLinkStatusServer:
                 "module": stage,
                 "updated_at": iso_now(),
             }
+        if stage == "final-publish":
+            run_dir_value = str(job.get("run_dir") or "")
+            manual_path = Path(run_dir_value) / "operation_manual.md" if run_dir_value else None
+            if manual_path and manual_path.is_file() and manual_path.stat().st_size > 0:
+                artifact_store["operation_manual"] = {
+                    "value": str(manual_path),
+                    "module": stage,
+                    "updated_at": iso_now(),
+                }
+                quality_warning = "operation manual failed quality gate"
+                job["warnings"] = [
+                    warning
+                    for warning in job.get("warnings", [])
+                    if quality_warning not in str(warning.get("message") or "")
+                ]
+                for warning_stage in ("analyze-core", "verify-core"):
+                    stage_info = (job.get("stages") or {}).get(warning_stage)
+                    stage_artifacts = stage_info.get("artifacts") if isinstance(stage_info, dict) else None
+                    if isinstance(stage_artifacts, dict) and isinstance(stage_artifacts.get("warnings"), list):
+                        stage_artifacts["warnings"] = [
+                            warning
+                            for warning in stage_artifacts["warnings"]
+                            if quality_warning not in str(warning.get("message") or "")
+                        ]
         job["artifacts"] = artifact_store
 
     def collect_core_artifacts(self, run_dir: Path) -> dict[str, Any]:
@@ -1760,6 +2994,9 @@ class VideoLinkStatusServer:
             "ocr_events": [orin_dir / "ocr_events.json"],
             "frame_analyses": [orin_dir / "frame_analyses.json"],
             "frames": [run_dir / "frames"],
+            "frame_dedup_audit": [run_dir / "frame_dedup_audit.json"],
+            "visual_review": [run_dir / "visual_review.html"],
+            "run_manifest": [run_dir / "RUN_MANIFEST.md"],
         }
         for name, paths in candidate_paths.items():
             path = next((candidate for candidate in paths if candidate.exists()), None)
@@ -1791,6 +3028,9 @@ class VideoLinkStatusServer:
                     "ocr_text_events": ocr_keyframes.get("ocr_text_events_count"),
                     "ocr_events": len(payload.get("ocr_events") or []),
                     "frame_analyses": len(payload.get("frame_analyses") or []),
+                    "frame_dedup_audit": (metadata.get("frame_dedup_audit") or {}).get("summary", {}),
+                    "visual_review": metadata.get("visual_review") or {},
+                    "run_manifest": metadata.get("run_manifest") or {},
                     "timings": metadata.get("timings") or {},
                 }
             except Exception:
@@ -1831,6 +3071,19 @@ class VideoLinkStatusServer:
             return f"core analysis contains VL/resource failure(s): {sample}"
         return None
 
+    def core_manual_generation_error(self, run_dir: Path) -> str | None:
+        quality_failed_path = run_dir / "operation_manual.quality_failed.md"
+        if not quality_failed_path.is_file() or (run_dir / "operation_manual.md").is_file():
+            return None
+        try:
+            text = quality_failed_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        match = re.search(r"^Error generating operation manual:\s*(.+)$", text, flags=re.MULTILINE)
+        if not match:
+            return None
+        return f"operation manual generation failed: {match.group(1).strip()}"
+
     def core_analysis_errors(self, run_dir: Path) -> list[str]:
         candidates = [
             run_dir / "analysis.json",
@@ -1858,7 +3111,14 @@ class VideoLinkStatusServer:
         run_dir = self.discover_run_dir(job)
         return bool(run_dir and self.core_manual_path(run_dir))
 
-    def stage_can_soft_fail(self, job: dict[str, Any], stage: str) -> bool:
+    def stage_can_soft_fail(
+        self,
+        job: dict[str, Any],
+        stage: str,
+        failure: dict[str, Any] | None = None,
+    ) -> bool:
+        if str((failure or {}).get("kind") or "").startswith("permanent_"):
+            return False
         return normalize_stage_name(stage) in SOFT_FAILURE_STAGES and self.core_markdown_available_for_job(job)
 
     def runner_failure_can_finish_with_warning(self, job: dict[str, Any]) -> bool:
@@ -1959,7 +3219,7 @@ class VideoLinkStatusServer:
         job["updated_at"] = now
         next_stage = self.next_stage(job)
         if next_stage:
-            self.mark_stage_queued(job, next_stage, stage_resource(next_stage))
+            self.mark_stage_queued(job, next_stage, job_stage_resource(job, next_stage))
             job["summary"] = self.collect_summary(job)
             self.save_job(job)
             return job
@@ -2174,9 +3434,11 @@ class VideoLinkStatusServer:
             "run_dir": str(run_dir),
             "core_counts": core_counts,
             "study": self.study_summary(run_dir),
+            "multidoc": self.multidoc_summary(run_dir),
             "qa": qa_summary,
             "qa_index": qa_summary.get("answer_index"),
             "skill_candidate": self.skill_candidate_summary(run_dir),
+            "skill_distillation": self.skill_candidate_summary(run_dir),
             "markdown_files": sorted(str(path.relative_to(run_dir)) for path in run_dir.glob("**/*.md") if path.is_file()),
             "export_files": sorted(str(path.relative_to(run_dir)) for path in (run_dir / "exports").glob("*") if path.is_file())
             if (run_dir / "exports").is_dir()
@@ -2187,6 +3449,36 @@ class VideoLinkStatusServer:
             "final_images": sorted(str(path.relative_to(run_dir)) for path in (run_dir / "baoyu_images" / "final").glob("*") if path.is_file())
             if (run_dir / "baoyu_images" / "final").is_dir()
             else [],
+        }
+
+    def multidoc_summary(self, run_dir: Path) -> dict[str, Any]:
+        analysis_path = run_dir / "docs_analysis" / "analysis.json"
+        if not analysis_path.is_file():
+            return {"available": False, "analysis": None, "metrics": {}}
+        try:
+            payload = json.loads(analysis_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {
+                "available": False,
+                "analysis": str(analysis_path.relative_to(run_dir)),
+                "metrics": {},
+                "error": "docs_analysis/analysis.json is invalid",
+            }
+        generation = payload.get("generation") or {}
+        checkpoint_value = generation.get("chapter_checkpoints")
+        checkpoint_path = str(checkpoint_value or "")
+        if checkpoint_path:
+            try:
+                checkpoint_path = str(Path(checkpoint_path).resolve().relative_to(run_dir.resolve()))
+            except (OSError, ValueError):
+                pass
+        return {
+            "available": True,
+            "analysis": str(analysis_path.relative_to(run_dir)),
+            "chapter_count": generation.get("chapter_count"),
+            "resumable": bool(generation.get("resumable")),
+            "chapter_checkpoints": checkpoint_path or None,
+            "metrics": generation.get("metrics") or {},
         }
 
     def qa_summary(self, run_dir: Path) -> dict[str, Any]:
@@ -2211,7 +3503,7 @@ class VideoLinkStatusServer:
 
     def skill_candidate_summary(self, run_dir: Path) -> dict[str, Any]:
         try:
-            return candidate_summary(run_dir)
+            return distillation_summary(run_dir)
         except Exception as exc:
             return {"available": False, "error": str(exc), "warnings": []}
 
@@ -2497,31 +3789,1542 @@ class VideoLinkStatusServer:
         run_dir = self.require_run_dir(job)
         return self.skill_candidate_summary(run_dir)
 
-    def generate_skill_candidate(self, job_id: str) -> dict[str, Any]:
+    def skill_distillation_workspace(self, job_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        summary = self.skill_candidate_summary(run_dir)
+        state = load_distillation_state(run_dir) or {}
+        pack_root = run_dir / "skills" / "cangjie_pack"
+        verified = self._read_json_file(pack_root / "verified.json", default={})
+        candidates = []
+        for group in ("accepted", "single_case", "rejected", "glossary"):
+            for item in verified.get(group) or []:
+                if not isinstance(item, dict):
+                    continue
+                candidate_id = str(item.get("id") or "").strip()
+                if not candidate_id:
+                    continue
+                candidates.append(
+                    {
+                        "item_id": f"candidate:{candidate_id}",
+                        "kind": "candidate",
+                        "group": group,
+                        "id": candidate_id,
+                        "title": item.get("title") or candidate_id,
+                        "summary": item.get("summary") or "",
+                        "reason": item.get("reason") or "",
+                        "source_count": len(item.get("source_ids") or []),
+                        "evidence_level": item.get("evidence_level") or group,
+                        "selected": candidate_id in set((state.get("candidates") or {}).get("selected_ids") or []),
+                    }
+                )
+        generated = []
+        for item in (state.get("skills") or {}).get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not SKILL_NAME_PATTERN.fullmatch(name):
+                continue
+            skill_dir = pack_root / "distilled_skills" / name
+            skill_md = skill_dir / "SKILL.md"
+            if not skill_md.is_file():
+                continue
+            generated.append(
+                {
+                    "item_id": f"skill:{name}",
+                    "kind": "skill",
+                    "name": name,
+                    "title": item.get("title") or name,
+                    "candidate_id": item.get("candidate_id"),
+                    "status": item.get("status"),
+                    "pass_rate": item.get("pass_rate"),
+                    "path": str(skill_md.relative_to(run_dir)),
+                }
+            )
+        artifacts = []
+        for key, value in (state.get("artifacts") or {}).items():
+            if not value:
+                continue
+            path = run_dir / str(value)
+            artifacts.append(
+                {
+                    "name": key,
+                    "path": str(value),
+                    "available": path.exists(),
+                    "url": self._job_resource_url(job_id, str(value)) if path.is_file() else None,
+                }
+            )
+        return {
+            "job_id": job_id,
+            "run_dir": str(run_dir),
+            "summary": summary,
+            "candidates": candidates,
+            "generated_skills": generated,
+            "artifacts": artifacts,
+        }
+
+    def skill_distillation_item(self, job_id: str, item_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        pack_root = run_dir / "skills" / "cangjie_pack"
+        if item_id.startswith("candidate:"):
+            candidate_id = item_id.split(":", 1)[1]
+            verified = self._read_json_file(pack_root / "verified.json", default={})
+            candidate = None
+            group = ""
+            for candidate_group in ("accepted", "single_case", "rejected", "glossary"):
+                for item in verified.get(candidate_group) or []:
+                    if isinstance(item, dict) and str(item.get("id") or "") == candidate_id:
+                        candidate = item
+                        group = candidate_group
+                        break
+                if candidate:
+                    break
+            if not candidate:
+                raise BridgeError(HTTPStatus.NOT_FOUND, "Skill candidate is not available")
+            source_ids = set(str(value) for value in candidate.get("source_ids") or [])
+            evidence = []
+            records_path = pack_root / "evidence_records.jsonl"
+            if records_path.is_file():
+                for line in records_path.read_text(encoding="utf-8").splitlines():
+                    if not line.strip():
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if str(record.get("id") or "") in source_ids:
+                        evidence.append(record)
+            audit = candidate.get("multimodal_audit") or {}
+            frames = []
+            for path in audit.get("image_paths") or []:
+                value = str(path)
+                try:
+                    frame_path = (run_dir / value).resolve()
+                    frame_path.relative_to(run_dir)
+                except (OSError, ValueError):
+                    continue
+                if frame_path.is_file():
+                    frames.append({"path": value, "url": self._job_resource_url(job_id, value)})
+            return {
+                "item_id": item_id,
+                "kind": "candidate",
+                "group": group,
+                "candidate": candidate,
+                "evidence": evidence,
+                "multimodal_audit": audit,
+                "frames": frames,
+            }
+        if item_id.startswith("skill:"):
+            name = item_id.split(":", 1)[1]
+            self._validate_skill_name(name)
+            state = load_distillation_state(run_dir) or {}
+            state_item = next(
+                (
+                    item
+                    for item in (state.get("skills") or {}).get("items") or []
+                    if isinstance(item, dict) and item.get("name") == name
+                ),
+                None,
+            )
+            if not state_item:
+                raise BridgeError(HTTPStatus.NOT_FOUND, "Generated Skill is not in the active task state")
+            skill_dir = pack_root / "distilled_skills" / name
+            skill_md = skill_dir / "SKILL.md"
+            if not skill_md.is_file():
+                raise BridgeError(HTTPStatus.NOT_FOUND, "Generated SKILL.md is not available")
+            files = {}
+            for filename in ("skill.json", "test-prompts.json", "test-results.json", "test-results.md"):
+                path = skill_dir / filename
+                if not path.is_file():
+                    continue
+                if path.suffix == ".json":
+                    files[filename] = self._read_json_file(path, default={})
+                else:
+                    files[filename] = path.read_text(encoding="utf-8")
+            return {
+                "item_id": item_id,
+                "kind": "skill",
+                "skill": state_item,
+                "name": name,
+                "markdown": skill_md.read_text(encoding="utf-8"),
+                "revision": self._skill_revision(skill_md.read_bytes()),
+                "files": files,
+            }
+        raise BridgeError(HTTPStatus.BAD_REQUEST, "item_id must start with candidate: or skill:")
+
+    def list_skills(self, state: str = "enabled", query: str = "") -> dict[str, Any]:
+        root = self._skill_library_root(state)
+        query_value = str(query or "").strip().lower()
+        items = []
+        if root.is_dir():
+            for path in sorted(root.iterdir(), key=lambda item: item.name):
+                if not path.is_dir() or path.is_symlink():
+                    continue
+                try:
+                    detail = self._skill_library_detail(state, path.name, include_content=False)
+                except BridgeError:
+                    continue
+                haystack = " ".join(
+                    str(detail.get(key) or "") for key in ("id", "name", "title", "description")
+                ).lower()
+                if query_value and query_value not in haystack:
+                    continue
+                items.append(detail)
+        return {"state": state, "query": query_value, "count": len(items), "items": items}
+
+    def get_skill(self, state: str, skill_id: str) -> dict[str, Any]:
+        return self._skill_library_detail(state, skill_id, include_content=True)
+
+    def update_skill(self, state: str, skill_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if state not in {"enabled", "disabled"}:
+            raise BridgeError(HTTPStatus.CONFLICT, "Only enabled or disabled Skills can be edited")
+        detail = self._skill_library_detail(state, skill_id, include_content=True)
+        markdown = payload.get("markdown")
+        if not isinstance(markdown, str):
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "markdown must be a string")
+        encoded = markdown.encode("utf-8")
+        if len(encoded) > MAX_SKILL_MARKDOWN_BYTES:
+            raise BridgeError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "SKILL.md is too large")
+        expected_revision = str(payload.get("revision") or "")
+        if not expected_revision:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "revision is required")
+        if expected_revision != detail["revision"]:
+            raise BridgeError(HTTPStatus.CONFLICT, "SKILL.md changed since it was loaded")
+        metadata = self._parse_skill_frontmatter(markdown)
+        if metadata.get("name") != detail["name"]:
+            raise BridgeError(HTTPStatus.CONFLICT, "frontmatter name is immutable")
+        skill_path = Path(detail["path"]) / "SKILL.md"
+        self._snapshot_skill(detail["name"], skill_path)
+        self._atomic_write_bytes(skill_path, encoded)
+        return self._skill_library_detail(state, skill_id, include_content=True)
+
+    def disable_skill(self, name: str) -> dict[str, Any]:
+        self._validate_skill_name(name)
+        source = self._skill_library_path("enabled", name)
+        target = self._skill_library_path("disabled", name, require_existing=False)
+        self._move_skill_directory(source, target)
+        return self._skill_library_detail("disabled", name, include_content=True)
+
+    def restore_disabled_skill(self, name: str) -> dict[str, Any]:
+        self._validate_skill_name(name)
+        source = self._skill_library_path("disabled", name)
+        target = self._skill_library_path("enabled", name, require_existing=False)
+        self._move_skill_directory(source, target)
+        return self._skill_library_detail("enabled", name, include_content=True)
+
+    def delete_skill(self, state: str, skill_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if state == "trash":
+            detail = self._skill_library_detail("trash", skill_id, include_content=False)
+            confirmation = str(payload.get("confirmation") or "")
+            if confirmation != detail["name"]:
+                raise BridgeError(HTTPStatus.CONFLICT, "Permanent deletion requires the exact Skill name")
+            path = self._skill_library_path("trash", skill_id)
+            shutil.rmtree(path)
+            return {"status": "deleted", "state": "trash", "id": skill_id, "name": detail["name"]}
+        if state not in {"enabled", "disabled"}:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "state must be enabled, disabled, or trash")
+        detail = self._skill_library_detail(state, skill_id, include_content=False)
+        source = self._skill_library_path(state, skill_id)
+        timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        trash_id = f"{timestamp}-{detail['name']}"
+        target = self._skill_library_path("trash", trash_id, require_existing=False)
+        self._move_skill_directory(source, target)
+        self._atomic_write_bytes(
+            target / ".skill-trash.json",
+            json.dumps(
+                {
+                    "name": detail["name"],
+                    "previous_state": state,
+                    "deleted_at": iso_now(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ).encode("utf-8"),
+        )
+        return self._skill_library_detail("trash", trash_id, include_content=True)
+
+    def restore_trash_skill(self, skill_id: str) -> dict[str, Any]:
+        detail = self._skill_library_detail("trash", skill_id, include_content=False)
+        metadata = self._read_json_file(Path(detail["path"]) / ".skill-trash.json", default={})
+        target_state = str(metadata.get("previous_state") or "disabled")
+        if target_state not in {"enabled", "disabled"}:
+            target_state = "disabled"
+        source = self._skill_library_path("trash", skill_id)
+        target = self._skill_library_path(target_state, detail["name"], require_existing=False)
+        self._move_skill_directory(source, target)
+        metadata_path = target / ".skill-trash.json"
+        if metadata_path.is_file():
+            metadata_path.unlink()
+        return self._skill_library_detail(target_state, detail["name"], include_content=True)
+
+    def skill_versions(self, state: str, skill_id: str) -> dict[str, Any]:
+        detail = self._skill_library_detail(state, skill_id, include_content=False)
+        versions = self._skill_version_items(detail["name"])
+        return {"state": state, "id": skill_id, "name": detail["name"], "versions": versions}
+
+    def restore_skill_version(
+        self,
+        state: str,
+        skill_id: str,
+        version_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        if state not in {"enabled", "disabled"}:
+            raise BridgeError(HTTPStatus.CONFLICT, "Only enabled or disabled Skills can restore versions")
+        detail = self._skill_library_detail(state, skill_id, include_content=True)
+        expected_revision = str(payload.get("revision") or "")
+        if expected_revision != detail["revision"]:
+            raise BridgeError(HTTPStatus.CONFLICT, "SKILL.md changed since it was loaded")
+        if not re.fullmatch(r"[0-9]{8}T[0-9]{6}(?:[0-9]{6})?Z", version_id):
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "Invalid version id")
+        version_path = self.repo_root / ".codex" / SKILL_HISTORY_DIR / detail["name"] / version_id / "SKILL.md"
+        if version_path.is_symlink() or not version_path.is_file():
+            raise BridgeError(HTTPStatus.NOT_FOUND, "Skill version is not available")
+        markdown = version_path.read_text(encoding="utf-8")
+        metadata = self._parse_skill_frontmatter(markdown)
+        if metadata.get("name") != detail["name"]:
+            raise BridgeError(HTTPStatus.CONFLICT, "Version frontmatter name does not match")
+        skill_path = Path(detail["path"]) / "SKILL.md"
+        self._snapshot_skill(detail["name"], skill_path)
+        self._atomic_write_bytes(skill_path, markdown.encode("utf-8"))
+        return self._skill_library_detail(state, skill_id, include_content=True)
+
+    def _skill_library_root(self, state: str) -> Path:
+        if state not in SKILL_LIBRARY_DIRS:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "Invalid Skill library state")
+        root = self.repo_root / ".codex" / SKILL_LIBRARY_DIRS[state]
+        root.mkdir(parents=True, exist_ok=True)
+        if root.is_symlink():
+            raise BridgeError(HTTPStatus.FORBIDDEN, "Skill library root cannot be a symlink")
+        return root.resolve()
+
+    def _validate_skill_name(self, name: str) -> str:
+        value = str(name or "").strip()
+        if not SKILL_NAME_PATTERN.fullmatch(value):
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "Invalid Skill name")
+        return value
+
+    def _skill_library_path(self, state: str, skill_id: str, *, require_existing: bool = True) -> Path:
+        root = self._skill_library_root(state)
+        value = str(skill_id or "").strip()
+        pattern = SKILL_TRASH_ID_PATTERN if state == "trash" else SKILL_NAME_PATTERN
+        if not pattern.fullmatch(value):
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "Invalid Skill id")
+        path = root / value
+        if path.is_symlink():
+            raise BridgeError(HTTPStatus.FORBIDDEN, "Skill directories cannot be symlinks")
+        resolved = path.resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError as exc:
+            raise BridgeError(HTTPStatus.FORBIDDEN, "Skill path escapes the library") from exc
+        if require_existing and not resolved.is_dir():
+            raise BridgeError(HTTPStatus.NOT_FOUND, "Skill is not available")
+        return resolved
+
+    def _skill_library_detail(
+        self,
+        state: str,
+        skill_id: str,
+        *,
+        include_content: bool,
+    ) -> dict[str, Any]:
+        path = self._skill_library_path(state, skill_id)
+        skill_path = path / "SKILL.md"
+        if skill_path.is_symlink() or not skill_path.is_file():
+            raise BridgeError(HTTPStatus.NOT_FOUND, "SKILL.md is not available")
+        content = skill_path.read_text(encoding="utf-8")
+        metadata = self._parse_skill_frontmatter(content)
+        name = str(metadata.get("name") or "")
+        self._validate_skill_name(name)
+        if state != "trash" and name != skill_id:
+            raise BridgeError(HTTPStatus.CONFLICT, "Skill directory and frontmatter name do not match")
+        files = []
+        for file_path in sorted(path.rglob("*")):
+            if not file_path.is_file() or file_path.is_symlink():
+                continue
+            relative = file_path.relative_to(path).as_posix()
+            if relative == ".skill-trash.json":
+                continue
+            files.append(
+                {
+                    "path": relative,
+                    "size_bytes": file_path.stat().st_size,
+                    "editable": relative == "SKILL.md" and state in {"enabled", "disabled"},
+                }
+            )
+        title_match = re.search(r"^#\s+(.+?)\s*$", content, flags=re.MULTILINE)
+        result = {
+            "state": state,
+            "id": skill_id,
+            "name": name,
+            "title": title_match.group(1).strip() if title_match else name,
+            "description": str(metadata.get("description") or ""),
+            "path": str(path),
+            "revision": self._skill_revision(content.encode("utf-8")),
+            "updated_at": datetime.fromtimestamp(skill_path.stat().st_mtime).astimezone().isoformat(),
+            "files": files,
+            "versions": self._skill_version_items(name),
+        }
+        if include_content:
+            result["markdown"] = content
+            result["auxiliary_files"] = self._read_auxiliary_skill_files(path)
+        return result
+
+    def _parse_skill_frontmatter(self, content: str) -> dict[str, str]:
+        lines = str(content or "").splitlines()
+        if not lines or lines[0].strip() != "---":
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "SKILL.md must start with frontmatter")
+        try:
+            end = next(index for index in range(1, len(lines)) if lines[index].strip() == "---")
+        except StopIteration as exc:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "SKILL.md frontmatter is not closed") from exc
+        metadata: dict[str, str] = {}
+        for line in lines[1:end]:
+            if not line.strip() or line.lstrip().startswith("#") or ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            key = key.strip()
+            if key not in {"name", "description"}:
+                continue
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+                value = value[1:-1]
+            metadata[key] = value
+        if not metadata.get("name"):
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "SKILL.md frontmatter requires name")
+        return metadata
+
+    def _read_auxiliary_skill_files(self, root: Path) -> list[dict[str, Any]]:
+        items = []
+        for path in sorted(root.rglob("*")):
+            if not path.is_file() or path.is_symlink():
+                continue
+            relative = path.relative_to(root).as_posix()
+            if relative in {"SKILL.md", ".skill-trash.json"}:
+                continue
+            size = path.stat().st_size
+            item = {"path": relative, "size_bytes": size, "content": None}
+            if size <= 200_000:
+                try:
+                    item["content"] = path.read_text(encoding="utf-8")
+                except (UnicodeDecodeError, OSError):
+                    pass
+            items.append(item)
+        return items
+
+    def _skill_version_items(self, name: str) -> list[dict[str, Any]]:
+        root = self.repo_root / ".codex" / SKILL_HISTORY_DIR / name
+        if not root.is_dir() or root.is_symlink():
+            return []
+        versions = []
+        for path in sorted(root.iterdir(), key=lambda item: item.name, reverse=True):
+            skill_path = path / "SKILL.md"
+            if not path.is_dir() or path.is_symlink() or skill_path.is_symlink() or not skill_path.is_file():
+                continue
+            versions.append(
+                {
+                    "id": path.name,
+                    "revision": self._skill_revision(skill_path.read_bytes()),
+                    "created_at": datetime.fromtimestamp(skill_path.stat().st_mtime).astimezone().isoformat(),
+                }
+            )
+        return versions
+
+    def _snapshot_skill(self, name: str, skill_path: Path) -> str:
+        timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
+        target = self.repo_root / ".codex" / SKILL_HISTORY_DIR / name / timestamp / "SKILL.md"
+        target.parent.mkdir(parents=True, exist_ok=False)
+        self._atomic_write_bytes(target, skill_path.read_bytes())
+        return timestamp
+
+    def _move_skill_directory(self, source: Path, target: Path) -> None:
+        if target.exists():
+            raise BridgeError(HTTPStatus.CONFLICT, f"Target Skill already exists: {target.name}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source), str(target))
+
+    def _atomic_write_bytes(self, path: Path, content: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, path)
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
+
+    @staticmethod
+    def _skill_revision(content: bytes) -> str:
+        return hashlib.sha256(content).hexdigest()
+
+    @staticmethod
+    def _read_json_file(path: Path, *, default: Any) -> Any:
+        if not path.is_file():
+            return default
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return default
+
+    @staticmethod
+    def _job_resource_url(job_id: str, relative_path: str) -> str:
+        return f"/api/video-link/jobs/{job_id}/resource?{urlencode({'path': relative_path})}"
+
+    @staticmethod
+    def public_skill_project(project: dict[str, Any], *, include_detail: bool = False) -> dict[str, Any]:
+        brief = dict(project.get("brief") or {})
+        result = {
+            "id": project.get("id"),
+            "origin": project.get("origin"),
+            "origin_job_id": project.get("origin_job_id"),
+            "title": project.get("title"),
+            "goal": brief.get("goal"),
+            "skill_type": brief.get("skill_type"),
+            "status": project.get("status"),
+            "revision": project.get("revision"),
+            "created_at": project.get("created_at"),
+            "updated_at": project.get("updated_at"),
+            "source_count": len(project.get("sources") or []),
+            "assessment": {
+                key: (project.get("assessment") or {}).get(key)
+                for key in ("verdict", "summary", "assessed_at", "project_revision")
+                if (project.get("assessment") or {}).get(key) is not None
+            },
+        }
+        if include_detail:
+            result.update(
+                {
+                    "brief": brief,
+                    "sources": list(project.get("sources") or []),
+                    "assessment": dict(project.get("assessment") or {}),
+                    "capability_checks": list(project.get("capability_checks") or []),
+                    "distillation": dict(project.get("distillation") or {}),
+                }
+            )
+        return result
+
+    def list_skill_projects(self) -> dict[str, Any]:
+        items = [self.public_skill_project(project) for project in self.skill_projects.list()]
+        return {"count": len(items), "items": items}
+
+    def create_skill_project(self, payload: dict[str, Any]) -> dict[str, Any]:
+        job_id = str(payload.get("job_id") or "").strip()
+        if job_id:
+            raise BridgeError(
+                HTTPStatus.BAD_REQUEST,
+                "New Skill projects accept Video Analyzer material packages only",
+            )
+        try:
+            project = self.skill_projects.create(payload)
+        except SkillProjectError as exc:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+        return self.public_skill_project(project, include_detail=True)
+
+    def get_skill_project(self, project_id: str) -> dict[str, Any]:
+        try:
+            return self.public_skill_project(
+                self.skill_projects.load(project_id),
+                include_detail=True,
+            )
+        except FileNotFoundError as exc:
+            raise BridgeError(HTTPStatus.NOT_FOUND, str(exc)) from exc
+        except SkillProjectError as exc:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+
+    def update_skill_project(self, project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            project = self.skill_projects.update(project_id, payload)
+        except FileNotFoundError as exc:
+            raise BridgeError(HTTPStatus.NOT_FOUND, str(exc)) from exc
+        except SkillProjectError as exc:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+        return self.public_skill_project(project, include_detail=True)
+
+    def add_skill_project_source(self, project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if str(payload.get("kind") or "").strip().lower() != "video_analyzer_package":
+            raise BridgeError(
+                HTTPStatus.BAD_REQUEST,
+                "Skill projects accept Video Analyzer material packages only",
+            )
+        try:
+            project, _, _ = self.skill_projects.import_video_analyzer_package(
+                project_id,
+                str(payload.get("package_id") or ""),
+            )
+        except FileNotFoundError as exc:
+            raise BridgeError(HTTPStatus.NOT_FOUND, str(exc)) from exc
+        except SkillProjectError as exc:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+        return self.public_skill_project(project, include_detail=True)
+
+    def preview_skill_project_package(self, project_id: str, package_id: str) -> dict[str, Any]:
+        try:
+            return self.skill_projects.preview_video_analyzer_package(project_id, package_id)
+        except FileNotFoundError as exc:
+            raise BridgeError(HTTPStatus.NOT_FOUND, str(exc)) from exc
+        except SkillProjectError as exc:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+
+    def import_skill_project_package(self, project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            _, source, created = self.skill_projects.import_video_analyzer_package(
+                project_id,
+                str(payload.get("package_id") or ""),
+            )
+        except FileNotFoundError as exc:
+            raise BridgeError(HTTPStatus.NOT_FOUND, str(exc)) from exc
+        except SkillProjectError as exc:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+        assessment = self.assess_skill_project(project_id, {})
+        return {
+            "created": created,
+            "source": source,
+            "assessment": assessment.get("assessment") or {},
+            "workbench": self.skill_project_workbench(project_id),
+        }
+
+    def remove_skill_project_source(self, project_id: str, source_id: str) -> dict[str, Any]:
+        try:
+            project = self.skill_projects.remove_source(project_id, source_id)
+        except FileNotFoundError as exc:
+            raise BridgeError(HTTPStatus.NOT_FOUND, str(exc)) from exc
+        except SkillProjectError as exc:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+        return self.public_skill_project(project, include_detail=True)
+
+    def _skill_project_job_records(
+        self,
+        job_id: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        job = self.load_job(job_id)
+        return load_evidence_records(self.require_run_dir(job))
+
+    def _skill_project_package_records(
+        self,
+        relative_run_dir: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        packages_root = (self.repo_root / "downloads" / "url-videos").resolve()
+        run_dir = (self.repo_root / str(relative_run_dir or "")).resolve()
+        try:
+            run_dir.relative_to(packages_root)
+        except ValueError as exc:
+            raise SkillProjectError("Video Analyzer material package path escapes downloads") from exc
+        if not run_dir.is_dir():
+            raise FileNotFoundError("Video Analyzer material package is not available")
+        return load_evidence_records(run_dir)
+
+    def _skill_project_qa_records(self, job_id: str) -> list[dict[str, Any]]:
+        return list(self.qa_history(job_id, limit=0).get("messages") or [])
+
+    def skill_project_flow(
+        self,
+        project: dict[str, Any],
+        workspace: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Project the durable state into the compact workbench flow."""
+
+        brief = project.get("brief") or {}
+        sources = list(project.get("sources") or [])
+        packages = [item for item in sources if item.get("kind") == "video_analyzer_package"]
+        legacy_sources = [item for item in sources if item.get("kind") != "video_analyzer_package"]
+        assessment = project.get("assessment") or {}
+        summary = workspace.get("summary") or {}
+        progress = summary.get("progress") or {}
+        stages = progress.get("stages") or {}
+        distillation_status = str(summary.get("status") or "not_started")
+        current_stage = str(summary.get("current_stage") or "")
+        candidates = list(workspace.get("candidates") or [])
+        generated_skills = list(workspace.get("generated_skills") or [])
+        coverage = assessment.get("source_coverage") or {}
+        candidate_groups = {
+            group: sum(1 for item in candidates if item.get("group") == group)
+            for group in ("accepted", "single_case", "rejected", "glossary")
+        }
+        flow_status = {
+            "running": "running",
+            "waiting_overview_review": "waiting",
+            "waiting_candidate_review": "waiting",
+            "succeeded": "succeeded",
+            "completed_no_skills": "succeeded",
+            "failed": "failed",
+            "interrupted": "interrupted",
+            "cancelled": "cancelled",
+            "cancelling": "running",
+            "waiting_resource_decision": "needs_action",
+        }
+        terminal = {"succeeded", "completed_no_skills"}
+        readiness = str(assessment.get("verdict") or "")
+        readiness_status = (
+            "succeeded"
+            if readiness == "ready"
+            else "limited"
+            if readiness == "ready_limited"
+            else "needs_action"
+            if packages
+            else "pending"
+        )
+        startable = (
+            readiness in {"ready", "ready_limited"}
+            and distillation_status == "not_started"
+        )
+        overview_status = "pending"
+        if distillation_status in {"waiting_overview_review"}:
+            overview_status = "waiting"
+        elif current_stage not in {"", "source", "overview"} or distillation_status in terminal:
+            overview_status = "succeeded"
+        elif distillation_status in flow_status:
+            overview_status = flow_status[distillation_status]
+        candidate_status = "pending"
+        if distillation_status == "waiting_candidate_review":
+            candidate_status = "waiting"
+        elif current_stage in {"build", "link", "test", "deliver"} or distillation_status in terminal:
+            candidate_status = "succeeded"
+        elif current_stage in {"extract", "verify"}:
+            candidate_status = flow_status.get(distillation_status, "running")
+        elif distillation_status in {"failed", "interrupted", "cancelled"} and current_stage in {"extract", "verify"}:
+            candidate_status = flow_status[distillation_status]
+        build_stage = stages.get("test") or stages.get("build") or {}
+        build_status = "pending"
+        if current_stage in {"build", "link", "test", "deliver"}:
+            build_status = flow_status.get(distillation_status, "running")
+        elif distillation_status in terminal:
+            build_status = "succeeded"
+        elif build_stage.get("status"):
+            build_status = str(build_stage.get("status"))
+        enabled = bool((project.get("distillation") or {}).get("enabled_at"))
+        nodes = [
+            {
+                "id": "goal",
+                "step": 1,
+                "title": "目标",
+                "subtitle": str(brief.get("goal") or "需要填写目标"),
+                "status": "succeeded" if str(brief.get("goal") or "").strip() else "needs_action",
+            },
+            {
+                "id": "packages",
+                "step": 2,
+                "title": "导入资料包",
+                "subtitle": f"{len(packages)} 个资料包 · {len(legacy_sources)} 个旧来源",
+                "status": "succeeded" if packages else "needs_action",
+                "action": "package",
+            },
+            {
+                "id": "readiness",
+                "step": 3,
+                "title": "证据就绪",
+                "subtitle": (
+                    f"{coverage.get('high_confidence_records', 0)} 条原始证据 · "
+                    f"{coverage.get('independent_learning_cases', 0)} 个案例"
+                ),
+                "status": readiness_status,
+                "action": "start" if startable else "assess" if packages else "package",
+                "secondary_action": "assess" if startable else None,
+            },
+            {
+                "id": "overview",
+                "step": 4,
+                "title": "方法骨架",
+                "subtitle": "生成后需要人工确认",
+                "status": overview_status,
+                "action": (
+                    "cancel"
+                    if overview_status == "running"
+                    else "review-overview"
+                    if overview_status == "waiting"
+                    else "resume"
+                    if overview_status in {
+                        "failed",
+                        "interrupted",
+                        "cancelled",
+                        "needs_action",
+                    }
+                    else None
+                ),
+            },
+            {
+                "id": "candidates",
+                "step": 5,
+                "title": "候选 Review",
+                "subtitle": (
+                    f"{len(candidates)} 个候选 · "
+                    f"可构建 {candidate_groups['accepted'] + candidate_groups['single_case']} 个"
+                    + (
+                        f" · {stages.get(current_stage, {}).get('message')}"
+                        if current_stage in {"extract", "verify"}
+                        and stages.get(current_stage, {}).get("message")
+                        else ""
+                    )
+                ),
+                "status": candidate_status,
+                "action": (
+                    "cancel"
+                    if candidate_status == "running"
+                    else "review-candidates"
+                    if candidate_status == "waiting"
+                    else "resume"
+                    if candidate_status in {
+                        "failed",
+                        "interrupted",
+                        "cancelled",
+                        "needs_action",
+                    }
+                    else None
+                ),
+            },
+            {
+                "id": "build",
+                "step": 6,
+                "title": "构建与压测",
+                "subtitle": (
+                    f"{len(generated_skills)} 项 Skill · "
+                    f"{(summary.get('skills') or {}).get('test_progress', {}).get('completed', 0)}/"
+                    f"{(summary.get('skills') or {}).get('test_progress', {}).get('total', 0)} 已测"
+                ),
+                "status": build_status,
+                "action": (
+                    "cancel"
+                    if build_status == "running"
+                    else "resume"
+                    if distillation_status in {"failed", "interrupted", "cancelled", "ready"}
+                    else None
+                ),
+            },
+            {
+                "id": "enable",
+                "step": 7,
+                "title": "启用",
+                "subtitle": (
+                    f"已启用 {len((project.get('distillation') or {}).get('enabled_paths') or [])} 项"
+                    if enabled
+                    else "仅通过测试后可启用"
+                ),
+                "status": "succeeded" if enabled else "pending",
+                "action": "enable" if distillation_status == "succeeded" and not enabled else None,
+            },
+        ]
+        return {
+            "nodes": nodes,
+            "active_node": (
+                "enable"
+                if enabled
+                else "overview"
+                if distillation_status == "waiting_overview_review"
+                else "candidates"
+                if distillation_status == "waiting_candidate_review"
+                else "build"
+                if current_stage in {"build", "link", "test", "deliver"}
+                else "candidates"
+                if current_stage in {"extract", "verify"}
+                else "overview"
+                if current_stage in {"source", "overview"} and distillation_status != "not_started"
+                else "readiness"
+                if readiness
+                else "packages"
+            ),
+            "status": distillation_status,
+        }
+
+    def skill_project_workbench(self, preferred_project_id: str = "") -> dict[str, Any]:
+        projects = self.skill_projects.list()
+        items = [self.public_skill_project(project) for project in projects]
+        selected_id = str(preferred_project_id or "").strip()
+        if not any(item.get("id") == selected_id for item in items):
+            selected_id = str(items[0].get("id") or "") if items else ""
+        if not selected_id:
+            return {
+                "items": items,
+                "selected_project_id": "",
+                "project": None,
+                "workspace": None,
+                "flow": {"nodes": [], "active_node": "", "status": "not_started"},
+                "snapshot_version": hashlib.sha256(
+                    json.dumps(items, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                ).hexdigest(),
+            }
+        project = self.get_skill_project(selected_id)
+        workspace = self.skill_project_workspace(selected_id)
+        flow = self.skill_project_flow(project, workspace)
+        version_payload = {
+            "items": [(item.get("id"), item.get("revision"), item.get("status")) for item in items],
+            "project": (project.get("id"), project.get("revision"), project.get("status")),
+            "workspace": (
+                (workspace.get("summary") or {}).get("status"),
+                (workspace.get("summary") or {}).get("current_stage"),
+                ((workspace.get("summary") or {}).get("progress") or {}).get("percent"),
+                (workspace.get("runner") or {}).get("active"),
+            ),
+        }
+        return {
+            "items": items,
+            "selected_project_id": selected_id,
+            "project": project,
+            "workspace": workspace,
+            "flow": flow,
+            "snapshot_version": hashlib.sha256(
+                json.dumps(version_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+        }
+
+    def assess_skill_project(self, project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            project = self.skill_projects.load(project_id)
+            if any(key in payload for key in ("title", "goal", "expected_output", "trigger_examples", "boundaries", "acceptance_criteria", "required_capabilities")):
+                project = self.skill_projects.update(project_id, payload)
+            bundle = build_source_bundle(
+                project,
+                self.skill_projects.project_dir(project_id),
+                job_records=self._skill_project_job_records,
+                qa_history=self._skill_project_qa_records,
+                package_records=self._skill_project_package_records,
+            )
+        except FileNotFoundError as exc:
+            project = self.skill_projects.load(project_id)
+            assessment = {
+                "verdict": "needs_materials",
+                "summary": str(exc),
+                "questions": [],
+                "capabilities": [],
+                "material_requests": [],
+                "evidence_gaps": [str(exc)],
+                "assessed_at": iso_now(),
+                "project_revision": project.get("revision"),
+            }
+            project["assessment"] = assessment
+            project["capability_checks"] = []
+            project["status"] = "needs_materials"
+            self.skill_projects.save(project)
+            return self.public_skill_project(project, include_detail=True)
+        except SkillProjectError as exc:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+
+        assessment = assess_project(
+            project,
+            bundle,
+            capability_inventory(self.repo_root, runtime_profile_names()),
+        )
+        project["assessment"] = assessment
+        project["capability_checks"] = list(assessment.get("capabilities") or [])
+        project.setdefault("brief", {})["normalized_goal"] = assessment.get("normalized_goal") or ""
+        project["brief"]["skill_type"] = assessment.get("skill_type") or project["brief"].get("skill_type")
+        project["status"] = assessment["verdict"]
+        self.skill_projects.save(project)
+        return self.public_skill_project(project, include_detail=True)
+
+    def run_skill_project_capability_check(
+        self,
+        project_id: str,
+        check_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            project = self.skill_projects.load(project_id)
+        except FileNotFoundError as exc:
+            raise BridgeError(HTTPStatus.NOT_FOUND, str(exc)) from exc
+        assessment = dict(project.get("assessment") or {})
+        if not parse_bool(payload.get("confirm", False)):
+            raise BridgeError(HTTPStatus.CONFLICT, "Capability smoke test requires confirm=true")
+        if str(payload.get("assessment_revision") or "") != str(assessment.get("project_revision") or ""):
+            raise BridgeError(HTTPStatus.CONFLICT, "Skill project assessment is stale")
+        checks = list(project.get("capability_checks") or [])
+        check = next((item for item in checks if item.get("id") == check_id), None)
+        if not check:
+            raise BridgeError(HTTPStatus.NOT_FOUND, "Capability check is not available")
+        smoke = dict(check.get("smoke_test") or {})
+        kind = str(smoke.get("kind") or "")
+        target = str(smoke.get("target") or "")
+        allowed_smokes = {
+            (
+                str(item.get("smoke_test", {}).get("kind") or ""),
+                str(item.get("smoke_test", {}).get("target") or ""),
+            )
+            for item in capability_inventory(self.repo_root, runtime_profile_names()).get("capabilities") or []
+        }
+        started_at = iso_now()
+        try:
+            if (kind, target) not in allowed_smokes:
+                raise ValueError("Capability smoke test is not approved")
+            if kind == "command_help":
+                executable = shutil.which(target)
+                if not executable:
+                    raise FileNotFoundError(f"command not found: {target}")
+                result = subprocess.run(
+                    [executable, "--help"],
+                    cwd=self.repo_root,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+                passed = result.returncode in {0, 1}
+                detail = (result.stdout or result.stderr or "")[:2000]
+            elif kind == "http_health":
+                parsed = urlparse(target)
+                allowed_host = parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+                allowed_path = parsed.path in {"/health", "/healthz", "/api/health"}
+                if parsed.scheme != "http" or not allowed_host or not allowed_path:
+                    raise ValueError("Only approved loopback health endpoints are allowed")
+                with urlopen(target, timeout=8) as response:
+                    detail = response.read(2000).decode("utf-8", errors="replace")
+                    passed = 200 <= response.status < 300
+            else:
+                raise ValueError("No approved smoke test is available")
+        except Exception as exc:
+            passed = False
+            detail = str(exc)
+        check["status"] = "verified" if passed else "missing"
+        check["verification"] = "smoke_test"
+        check["verification_result"] = {
+            "passed": passed,
+            "started_at": started_at,
+            "finished_at": iso_now(),
+            "detail": detail,
+        }
+        project["capability_checks"] = checks
+        assessment["capabilities"] = checks
+        if passed and assessment.get("verdict") == "ready_limited":
+            unresolved = [item for item in checks if item.get("status") != "verified"]
+            coverage = assessment.get("source_coverage") or {}
+            if not unresolved and int(coverage.get("independent_learning_cases") or 0) >= 2:
+                assessment["verdict"] = "ready"
+                project["status"] = "ready"
+        project["assessment"] = assessment
+        self.skill_projects.save(project)
+        return self.public_skill_project(project, include_detail=True)
+
+    def start_skill_project_distillation(self, project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            project = self.skill_projects.load(project_id)
+        except FileNotFoundError as exc:
+            raise BridgeError(HTTPStatus.NOT_FOUND, str(exc)) from exc
+        assessment = dict(project.get("assessment") or {})
+        if str(assessment.get("project_revision") or "") != str(project.get("revision") or ""):
+            raise BridgeError(HTTPStatus.CONFLICT, "Skill project assessment is stale")
+        verdict = str(assessment.get("verdict") or "")
+        if verdict not in {"ready", "ready_limited"}:
+            raise BridgeError(HTTPStatus.CONFLICT, f"Skill project is not ready: {verdict or 'not assessed'}")
+        if verdict == "ready_limited" and not parse_bool(payload.get("accept_limitations", False)):
+            raise BridgeError(HTTPStatus.CONFLICT, "ready_limited requires accept_limitations=true")
+        profile = str(payload.get("profile") or DEFAULT_DISTILLATION_PROFILE).strip()
+        if profile not in runtime_profile_names():
+            raise BridgeError(HTTPStatus.BAD_REQUEST, f"profile must be one of {runtime_profile_names()}")
+        root = self.skill_projects.project_dir(project_id)
+        try:
+            bundle = build_source_bundle(
+                project,
+                root,
+                job_records=self._skill_project_job_records,
+                qa_history=self._skill_project_qa_records,
+                package_records=self._skill_project_package_records,
+            )
+            snapshot = self.skill_projects.freeze_sources(project_id, bundle)
+            initialize_distillation(
+                root,
+                profile_name=profile,
+                force=parse_bool(payload.get("force", False)),
+                target_brief=project.get("brief") or {},
+                assessment=assessment,
+                source_records=snapshot["records"],
+                reference_context=snapshot.get("reference_documents") or [],
+            )
+        except FileExistsError as exc:
+            raise BridgeError(HTTPStatus.CONFLICT, str(exc)) from exc
+        except (FileNotFoundError, SkillProjectError, DistillationError, ValueError) as exc:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+        project["status"] = "distilling"
+        project["distillation"] = {
+            "profile": profile,
+            "started_at": iso_now(),
+            "source_fingerprint": snapshot["fingerprint"],
+        }
+        self.skill_projects.save(project)
+        self.start_skill_project_runner(project_id)
+        return self.skill_project_workspace(project_id)
+
+    def review_skill_project_overview(self, project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            SkillDistillationPipeline(self.skill_projects.project_dir(project_id)).review_overview(
+                str(payload.get("action") or "confirm"),
+                str(payload.get("feedback") or ""),
+            )
+        except (DistillationError, ValueError) as exc:
+            raise BridgeError(HTTPStatus.CONFLICT, str(exc)) from exc
+        self.start_skill_project_runner(project_id)
+        return self.skill_project_workspace(project_id)
+
+    def review_skill_project_candidates(self, project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        selected_ids = payload.get("selected_ids")
+        if not isinstance(selected_ids, list):
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "selected_ids must be a list")
+        root = self.skill_projects.project_dir(project_id)
+        verified = self._read_json_file(root / "skills" / "cangjie_pack" / "verified.json", default={})
+        eligible_ids = {
+            str(item.get("id"))
+            for group in ("accepted", "single_case")
+            for item in verified.get(group) or []
+            if isinstance(item, dict) and item.get("id")
+        }
+        selected = list(
+            dict.fromkeys(str(value).strip() for value in selected_ids if str(value).strip())
+        )
+        if not selected:
+            raise BridgeError(HTTPStatus.CONFLICT, "Select at least one buildable candidate")
+        unsupported = [candidate_id for candidate_id in selected if candidate_id not in eligible_ids]
+        if unsupported:
+            raise BridgeError(
+                HTTPStatus.BAD_REQUEST,
+                f"Only accepted or single-case candidates can be selected: {unsupported}",
+            )
+        try:
+            SkillDistillationPipeline(root).review_candidates(selected)
+        except (DistillationError, ValueError) as exc:
+            raise BridgeError(HTTPStatus.CONFLICT, str(exc)) from exc
+        self.start_skill_project_runner(project_id)
+        return self.skill_project_workspace(project_id)
+
+    def resume_skill_project_distillation(self, project_id: str) -> dict[str, Any]:
+        root = self.skill_projects.project_dir(project_id)
+        state = load_distillation_state(root)
+        if not state:
+            raise BridgeError(HTTPStatus.NOT_FOUND, "Skill project distillation is not initialized")
+        if state.get("status") in {"waiting_overview_review", "waiting_candidate_review"}:
+            raise BridgeError(HTTPStatus.CONFLICT, "Skill project is waiting for review")
+        if state.get("status") not in {"succeeded", "completed_no_skills"}:
+            project = self.skill_projects.load(project_id)
+            project["status"] = "distilling"
+            self.skill_projects.save(project)
+            self.start_skill_project_runner(project_id)
+        return self.skill_project_workspace(project_id)
+
+    def cancel_skill_project_distillation(self, project_id: str) -> dict[str, Any]:
+        key = f"project:{project_id}"
+        root = self.skill_projects.project_dir(project_id)
+        with self.skill_distillation_lock:
+            process = self.active_skill_project_processes.get(key)
+            worker_active = bool(process and process.poll() is None)
+            if worker_active:
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                except ProcessLookupError:
+                    worker_active = False
+        state = load_distillation_state(root)
+        if state and not worker_active:
+            state.update(
+                {
+                    "status": "cancelled",
+                    "retryable": True,
+                    "error": "distillation cancelled",
+                    "updated_at": iso_now(),
+                }
+            )
+            save_distillation_state(root, state)
+        project = self.skill_projects.load(project_id)
+        runner = project.setdefault("distillation", {}).setdefault("runner", {})
+        if worker_active:
+            project["status"] = "cancelling"
+            runner.update(
+                {
+                    "status": "cancelling",
+                    "cancel_requested_at": iso_now(),
+                    "error": None,
+                }
+            )
+        else:
+            project["status"] = "cancelled"
+            runner.update(
+                {
+                    "status": "cancelled",
+                    "finished_at": iso_now(),
+                    "error": "distillation cancelled",
+                }
+            )
+        self.skill_projects.save(project)
+        return self.skill_project_workspace(project_id)
+
+    def enable_skill_project_distillation(self, project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        root = self.skill_projects.project_dir(project_id)
+        try:
+            summary = enable_distilled_skills(
+                root,
+                self.repo_root,
+                overwrite=parse_bool(payload.get("overwrite", False)),
+            )
+        except FileNotFoundError as exc:
+            raise BridgeError(HTTPStatus.NOT_FOUND, str(exc)) from exc
+        except FileExistsError as exc:
+            raise BridgeError(HTTPStatus.CONFLICT, str(exc)) from exc
+        project = self.skill_projects.load(project_id)
+        project["status"] = "completed"
+        project.setdefault("distillation", {})["enabled_at"] = iso_now()
+        project["distillation"]["enabled_paths"] = (summary.get("installed") or {}).get("paths") or []
+        self.skill_projects.save(project)
+        return self.skill_project_workspace(project_id)
+
+    def skill_project_workspace(self, project_id: str) -> dict[str, Any]:
+        project = self.skill_projects.load(project_id)
+        root = self.skill_projects.project_dir(project_id)
+        state = load_distillation_state(root) or {}
+        summary = distillation_summary(root)
+        key = f"project:{project_id}"
+        with self.skill_distillation_lock:
+            thread = self.active_skill_distillations.get(key)
+            process = self.active_skill_project_processes.get(key)
+            worker_active = bool(
+                (thread and thread.is_alive())
+                or (process and process.poll() is None)
+            )
+        verified = self._read_json_file(root / "skills" / "cangjie_pack" / "verified.json", default={})
+        selected = set((state.get("candidates") or {}).get("selected_ids") or [])
+        candidates = []
+        for group in ("accepted", "single_case", "rejected", "glossary"):
+            for item in verified.get(group) or []:
+                if not isinstance(item, dict) or not item.get("id"):
+                    continue
+                candidates.append(
+                    {
+                        "id": item["id"],
+                        "group": group,
+                        "title": item.get("title") or item["id"],
+                        "summary": item.get("summary") or "",
+                        "reason": item.get("reason") or "",
+                        "source_ids": list(item.get("source_ids") or []),
+                        "source_count": len(item.get("source_ids") or []),
+                        "evidence_level": item.get("evidence_level") or group,
+                        "failed_checks": list(item.get("failed_checks") or []),
+                        "v1": dict(item.get("v1") or {}),
+                        "eligible": group in {"accepted", "single_case"},
+                        "selected": item["id"] in selected,
+                    }
+                )
+        return {
+            "project": self.public_skill_project(project, include_detail=True),
+            "summary": summary,
+            "runner": {
+                "active": worker_active,
+                "checked_at": iso_now(),
+            },
+            "candidates": candidates,
+            "generated_skills": (state.get("skills") or {}).get("items") or [],
+        }
+
+    def skill_project_resource_file(self, project_id: str, relative_path: str) -> tuple[Path, str | None]:
+        root = self.skill_projects.project_dir(project_id).resolve()
+        candidate = Path(str(relative_path or ""))
+        if candidate.is_absolute():
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "Resource path must be relative")
+        path = (root / candidate).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise BridgeError(HTTPStatus.FORBIDDEN, "Resource path escapes project") from exc
+        if not path.is_file():
+            raise BridgeError(HTTPStatus.NOT_FOUND, "Skill project resource is not available")
+        return path, mimetypes.guess_type(str(path))[0]
+
+    def _acquire_skill_project_runner_lease(self, project_id: str) -> int:
+        root = self.skill_projects.project_dir(project_id)
+        root.mkdir(parents=True, exist_ok=True)
+        fd = os.open(root / ".runner.lock", os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(fd)
+            raise BridgeError(
+                HTTPStatus.CONFLICT,
+                "Skill project distillation is already running in another server process",
+            ) from exc
+        return fd
+
+    def _release_skill_project_runner_lease(self, key: str) -> None:
+        fd = self.skill_project_runner_leases.pop(key, None)
+        if fd is None:
+            return
+        try:
+            os.ftruncate(fd, 0)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def start_skill_project_runner(self, project_id: str, *, recovery: bool = False) -> None:
+        key = f"project:{project_id}"
+        with self.skill_distillation_lock:
+            existing = self.active_skill_project_processes.get(key)
+            if existing and existing.poll() is None:
+                raise BridgeError(HTTPStatus.CONFLICT, "Skill project distillation is already running")
+            lease = self._acquire_skill_project_runner_lease(project_id)
+            self.skill_project_runner_leases[key] = lease
+            project = self.skill_projects.load(project_id)
+            distillation = project.setdefault("distillation", {})
+            runner = distillation.setdefault("runner", {})
+            runner.update(
+                {
+                    "run_id": uuid.uuid4().hex,
+                    "attempt": int(runner.get("attempt") or 0) + 1,
+                    "status": "running",
+                    "started_at": iso_now(),
+                    "finished_at": None,
+                    "error": None,
+                }
+            )
+            if recovery:
+                runner["recovered_at"] = iso_now()
+            project["status"] = "distilling"
+            try:
+                self.skill_projects.save(project)
+                command = [
+                    sys.executable,
+                    "tools/run_skill_project_worker.py",
+                    "--repo-root",
+                    str(self.repo_root),
+                    "--project-id",
+                    project_id,
+                    "--run-id",
+                    str(runner["run_id"]),
+                    "--lease-fd",
+                    str(lease),
+                ]
+                process = subprocess.Popen(
+                    command,
+                    cwd=self.repo_root,
+                    env=operation_env(),
+                    start_new_session=True,
+                    pass_fds=(lease,),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                current_project = self.skill_projects.load(project_id)
+                current_runner = (
+                    current_project.setdefault("distillation", {})
+                    .setdefault("runner", {})
+                )
+                if str(current_runner.get("run_id") or "") == str(runner["run_id"]):
+                    current_runner["pid"] = process.pid
+                    self.skill_projects.save(current_project)
+                self.active_skill_project_processes[key] = process
+                threading.Thread(
+                    target=self._watch_skill_project_process,
+                    args=(project_id, str(runner["run_id"]), process),
+                    name=f"skill-project-watch-{project_id[:8]}",
+                    daemon=True,
+                ).start()
+            except Exception:
+                self.active_skill_project_processes.pop(key, None)
+                self._release_skill_project_runner_lease(key)
+                raise
+
+    def _watch_skill_project_process(
+        self,
+        project_id: str,
+        run_id: str,
+        process: subprocess.Popen[Any],
+    ) -> None:
+        key = f"project:{project_id}"
+        try:
+            exit_code = process.wait()
+            if exit_code == 0:
+                return
+            root = self.skill_projects.project_dir(project_id)
+            state = load_distillation_state(root) or {}
+            if state.get("status") == "running":
+                state.update(
+                    {
+                        "status": "failed",
+                        "retryable": True,
+                        "error": f"skill worker exited unexpectedly ({exit_code})",
+                        "updated_at": iso_now(),
+                    }
+                )
+                save_distillation_state(root, state)
+                project = self.skill_projects.load(project_id)
+                runner = project.setdefault("distillation", {}).setdefault("runner", {})
+                if str(runner.get("run_id") or "") == run_id:
+                    project["status"] = "failed"
+                    runner.update(
+                        {
+                            "status": "failed",
+                            "finished_at": iso_now(),
+                            "error": state["error"],
+                        }
+                    )
+                    self.skill_projects.save(project)
+        finally:
+            with self.skill_distillation_lock:
+                active = self.active_skill_project_processes.get(key)
+                if active is process:
+                    self.active_skill_project_processes.pop(key, None)
+                self._release_skill_project_runner_lease(key)
+
+    def start_skill_distillation(self, job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        snapshot = job.get("runtime_profile_snapshot") or {}
+        profile = str(snapshot.get("profile") or (job.get("options") or {}).get("profile") or DEFAULT_DISTILLATION_PROFILE)
+        config_dir = str(snapshot.get("config_dir") or "config")
+        force = parse_bool(payload.get("force", False))
+        try:
+            initialize_distillation(
+                run_dir,
+                profile_name=profile,
+                config_dir=config_dir,
+                force=force,
+            )
+        except FileNotFoundError as exc:
+            raise BridgeError(HTTPStatus.CONFLICT, str(exc)) from exc
+        except FileExistsError as exc:
+            raise BridgeError(HTTPStatus.CONFLICT, str(exc)) from exc
+        except (DistillationError, ValueError) as exc:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+        self.start_skill_distillation_runner(job_id)
+        return self.skill_candidate_summary(run_dir)
+
+    def review_skill_distillation_overview(self, job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         job = self.load_job(job_id)
         run_dir = self.require_run_dir(job)
         try:
-            summary = build_tool_skill_candidate(run_dir)
+            pipeline = SkillDistillationPipeline(run_dir)
+            pipeline.review_overview(
+                str(payload.get("action") or "confirm"),
+                str(payload.get("feedback") or ""),
+            )
+        except (DistillationError, ValueError) as exc:
+            raise BridgeError(HTTPStatus.CONFLICT, str(exc)) from exc
+        self.start_skill_distillation_runner(job_id)
+        return self.skill_candidate_summary(run_dir)
+
+    def review_skill_distillation_candidates(self, job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        selected_ids = payload.get("selected_ids")
+        if not isinstance(selected_ids, list):
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "selected_ids must be a list")
+        try:
+            pipeline = SkillDistillationPipeline(run_dir)
+            pipeline.review_candidates(selected_ids)
+        except ValueError as exc:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+        except DistillationError as exc:
+            raise BridgeError(HTTPStatus.CONFLICT, str(exc)) from exc
+        self.start_skill_distillation_runner(job_id)
+        return self.skill_candidate_summary(run_dir)
+
+    def resume_skill_distillation(self, job_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        state = load_distillation_state(run_dir)
+        if not state:
+            raise BridgeError(HTTPStatus.NOT_FOUND, "Skill distillation is not initialized")
+        if state.get("status") in {"waiting_overview_review", "waiting_candidate_review"}:
+            raise BridgeError(HTTPStatus.CONFLICT, "Skill distillation is waiting for review")
+        if state.get("status") in {"succeeded", "completed_no_skills"}:
+            return self.skill_candidate_summary(run_dir)
+        self.start_skill_distillation_runner(job_id)
+        return self.skill_candidate_summary(run_dir)
+
+    def cancel_skill_distillation(self, job_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        with self.skill_distillation_lock:
+            event = self.skill_distillation_cancel_events.get(job_id)
+            thread = self.active_skill_distillations.get(job_id)
+            if event:
+                event.set()
+        state = load_distillation_state(run_dir)
+        if state and not thread:
+            state["status"] = "cancelled"
+            state["retryable"] = True
+            state["error"] = "distillation cancelled"
+            state["updated_at"] = iso_now()
+            save_distillation_state(run_dir, state)
+        return self.skill_candidate_summary(run_dir)
+
+    def enable_skill_distillation(self, job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        run_dir = self.require_run_dir(job)
+        overwrite = parse_bool(payload.get("overwrite", False))
+        try:
+            summary = enable_distilled_skills(run_dir, self.repo_root, overwrite=overwrite)
         except FileNotFoundError as exc:
+            raise BridgeError(HTTPStatus.NOT_FOUND, str(exc)) from exc
+        except FileExistsError as exc:
+            conflicts = getattr(exc, "conflicts", [])
+            message = str(exc)
+            if conflicts:
+                message = f"{message}: {', '.join(conflicts)}"
+            raise BridgeError(HTTPStatus.CONFLICT, message) from exc
+        except ValueError as exc:
             raise BridgeError(HTTPStatus.CONFLICT, str(exc)) from exc
         job["summary"] = self.collect_summary(job)
         job["updated_at"] = iso_now()
         self.save_job(job)
         return summary
 
-    def enable_skill_candidate(self, job_id: str) -> dict[str, Any]:
-        job = self.load_job(job_id)
-        run_dir = self.require_run_dir(job)
+    def start_skill_distillation_runner(self, job_id: str) -> None:
+        with self.skill_distillation_lock:
+            existing = self.active_skill_distillations.get(job_id)
+            if existing and existing.is_alive():
+                raise BridgeError(HTTPStatus.CONFLICT, "Skill distillation is already running")
+            cancel_event = threading.Event()
+            thread = threading.Thread(
+                target=self._run_skill_distillation,
+                args=(job_id, cancel_event),
+                name=f"skill-distillation-{job_id[:8]}",
+                daemon=True,
+            )
+            self.skill_distillation_cancel_events[job_id] = cancel_event
+            self.active_skill_distillations[job_id] = thread
+            thread.start()
+
+    def _run_skill_distillation(self, job_id: str, cancel_event: threading.Event) -> None:
         try:
-            summary = enable_tool_skill_candidate(run_dir, self.repo_root)
-        except FileNotFoundError as exc:
-            raise BridgeError(HTTPStatus.NOT_FOUND, str(exc)) from exc
-        except (FileExistsError, ValueError) as exc:
-            raise BridgeError(HTTPStatus.CONFLICT, str(exc)) from exc
-        job["summary"] = self.collect_summary(job)
-        job["updated_at"] = iso_now()
-        self.save_job(job)
-        return summary
+            job = self.load_job(job_id)
+            run_dir = self.require_run_dir(job)
+            SkillDistillationPipeline(run_dir).run_until_pause(cancel_event=cancel_event)
+            job = self.load_job(job_id)
+            job["summary"] = self.collect_summary(job)
+            job["updated_at"] = iso_now()
+            self.save_job(job)
+        except Exception:
+            # The pipeline persists its own failure envelope and log.
+            pass
+        finally:
+            with self.skill_distillation_lock:
+                self.active_skill_distillations.pop(job_id, None)
+                self.skill_distillation_cancel_events.pop(job_id, None)
+
+    def recover_interrupted_skill_distillations(self) -> None:
+        for job_path in self.jobs_dir.glob("*/job.json"):
+            try:
+                job = self.load_job(job_path.parent.name)
+                run_dir_value = str(job.get("run_dir") or "")
+                if not run_dir_value:
+                    continue
+                state = load_distillation_state(Path(run_dir_value))
+                if state and state.get("status") == "running":
+                    SkillDistillationPipeline(Path(run_dir_value)).mark_interrupted()
+            except Exception:
+                continue
+
+    def recover_interrupted_skill_projects(self) -> None:
+        for project in self.skill_projects.list():
+            try:
+                project_id = str(project.get("id") or "")
+                root = self.skill_projects.project_dir(project_id)
+                state = load_distillation_state(root)
+                if not state or state.get("status") != "running":
+                    continue
+                self.start_skill_project_runner(project_id, recovery=True)
+            except BridgeError:
+                continue
+
+    def generate_skill_candidate(self, job_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self.start_skill_distillation(job_id, payload or {})
+
+    def enable_skill_candidate(self, job_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self.enable_skill_distillation(job_id, payload or {})
 
     def ask_qa(self, job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         job = self.load_job(job_id)
@@ -2530,7 +5333,8 @@ class VideoLinkStatusServer:
         if not question:
             raise BridgeError(HTTPStatus.BAD_REQUEST, "question is required")
         profile_name = (job.get("options") or {}).get("profile") or DEFAULT_PROFILE
-        config = Config("config")
+        snapshot_config = str((job.get("runtime_profile_snapshot") or {}).get("config_dir") or "config")
+        config = Config(snapshot_config)
         profile = config.get_runtime_profile(profile_name)
         base_url = profile.get("llm_base_url") or (config.get("endpoints") or {}).get("services", {}).get("amd_fast_base_url")
         model = profile.get("text_model")
@@ -2577,6 +5381,7 @@ class VideoLinkStatusServer:
         public["current_stage"] = self.current_stage(job)
         public["next_stage"] = self.next_stage(job)
         public["error_summary"] = self.error_summary(job)
+        public["failure_disposition"] = self.failure_disposition(job)
         public["dashboard_url"] = self.dashboard_url(job["job_id"])
         public["queue"] = self.queue_info(public)
         public["core_progress"] = self.core_progress(public)
@@ -2588,6 +5393,8 @@ class VideoLinkStatusServer:
         public["warnings"] = self.active_warnings(public)
         public["prompt_template"] = self.prompt_template_metadata(public)
         public["result_resources"] = self.result_resources(public)
+        public["document_preview"] = self.document_preview(public)
+        public["execution_flow"] = self.execution_flow(public)
         queued_stage = public["queue"].get("stage")
         if queued_stage and queued_stage in public["stages"]:
             public["stages"][queued_stage] = dict(public["stages"][queued_stage])
@@ -2596,6 +5403,599 @@ class VideoLinkStatusServer:
         current_info = public["stages"].get(current_stage or "", {})
         public["process"] = self.public_process_info(current_info.get("process"))
         return public
+
+    def execution_flow(self, job: dict[str, Any]) -> dict[str, Any]:
+        snapshot = job.get("runtime_profile_snapshot") or {}
+        workflow_id = str(snapshot.get("workflow_id") or VIDEO_WORKFLOW_ID)
+        schema = AUDIO_PROFILE_FLOW if workflow_id == AUDIO_WORKFLOW_ID else VIDEO_PROFILE_FLOW
+        profile = self.execution_profile_payload(job)
+        core_snapshot = self.core_progress_snapshot(job) or {}
+        node_states = core_snapshot.get("node_states") if isinstance(core_snapshot.get("node_states"), dict) else {}
+        core_progress = job.get("core_progress") or {}
+        stage_progress = job.get("stage_progress") or {}
+        summary = job.get("summary") or self.collect_summary(job)
+        run_dir = self.discover_run_dir(job)
+        analysis = read_analysis_payload(run_dir)
+        timings = ((analysis.get("metadata") or {}).get("timings") or {}) if analysis else {}
+        diarization_report = self.execution_json_artifact(run_dir, "qa/speaker_diarization_report.json")
+        snapshot_models = snapshot.get("models") if isinstance(snapshot.get("models"), dict) else {}
+
+        nodes = []
+        for spec in schema.get("nodes") or []:
+            node = dict(spec)
+            model_kind = str(node.get("model_kind") or "")
+            model_role = str(node.get("model_slot") or model_kind)
+            model = (
+                self.execution_model_metadata(profile, model_role, snapshot_models)
+                if model_kind
+                else None
+            )
+            artifacts = self.execution_node_artifacts(
+                run_dir,
+                node,
+                str(job.get("job_id") or ""),
+            )
+            state = self.execution_node_state(
+                job,
+                node,
+                model,
+                artifacts,
+                core_progress,
+                stage_progress,
+                node_states,
+            )
+            node.update(state)
+            node["model"] = model
+            node["artifacts"] = artifacts
+            node["artifact_count"] = len(artifacts)
+            node["duration_seconds"] = self.execution_node_duration(
+                node,
+                state,
+                timings,
+                diarization_report,
+                job,
+            )
+            node["metrics"] = self.execution_node_metrics(
+                node["id"],
+                summary,
+                diarization_report,
+            )
+            nodes.append(node)
+
+        edges = [dict(edge) for edge in schema.get("edges") or []]
+        active_node_ids = [
+            node["id"]
+            for node in nodes
+            if node.get("status") in {"running", "queued"}
+        ]
+        failed_node_ids = [
+            node["id"]
+            for node in nodes
+            if node.get("status") == "failed"
+        ]
+        return {
+            "version": schema.get("version") or 1,
+            "workflow_id": workflow_id,
+            "profile": snapshot.get("profile") or (job.get("options") or {}).get("profile"),
+            "profile_fingerprint": snapshot.get("fingerprint"),
+            "read_only": True,
+            "lanes": copy.deepcopy(schema.get("lanes") or []),
+            "nodes": nodes,
+            "edges": edges,
+            "active_node_ids": active_node_ids,
+            "failed_node_ids": failed_node_ids,
+            "mermaid": self.execution_flow_mermaid(nodes, edges),
+        }
+
+    def execution_profile_payload(self, job: dict[str, Any]) -> dict[str, Any]:
+        snapshot = job.get("runtime_profile_snapshot") or {}
+        config_dir = str(snapshot.get("config_dir") or "")
+        profile_name = str(snapshot.get("profile") or "")
+        if config_dir:
+            path = Path(config_dir) / "config.json"
+            if path.is_file():
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    profile = (payload.get("runtime_profiles") or {}).get(profile_name)
+                    if isinstance(profile, dict):
+                        return profile
+                except Exception:
+                    pass
+        profiles = runtime_config().get("runtime_profiles") or {}
+        profile = profiles.get(profile_name)
+        return dict(profile) if isinstance(profile, dict) else {}
+
+    def execution_model_metadata(
+        self,
+        profile: dict[str, Any],
+        kind: str,
+        snapshot_models: dict[str, Any],
+    ) -> dict[str, Any]:
+        role_labels = {
+            "asr": "ASR",
+            "diarization": "说话人分离",
+            "ocr": "OCR",
+            "vision": "VL",
+            "text": "文本 LLM",
+            "text_fallback": "核心文本兜底",
+            "review": "审核 LLM",
+            "study": "学习模型",
+            "triage": "Triage 模型",
+            "image": "图片模型",
+            "asr_fallback": "云端 ASR 回退",
+            "diarization_fallback": "云端分离回退",
+            "selector": "模板选择模型",
+        }
+        resource_fields = {
+            "asr": "asr_model_id",
+            "diarization": "diarization_model_id",
+            "ocr": "ocr_model_id",
+            "vision": "vision_model_id",
+            "text": "text_model_id",
+            "text_fallback": "text_fallback_model_id",
+            "review": "review_model_id",
+            "study": "study_card_model_id",
+            "triage": "triage_model_id",
+            "image": "image_model_id",
+            "asr_fallback": "asr_fallback_model_id",
+            "diarization_fallback": "diarization_fallback_model_id",
+            "selector": "template_selector_model_id",
+        }
+        endpoint = ""
+        provider = ""
+        model = ""
+        worker_count = None
+        concurrency = None
+        deployment = ""
+        enabled = True
+        inherited_from = None
+
+        if kind == "asr":
+            provider = str(profile.get("asr_provider") or snapshot_models.get("asr") or "")
+            model = str(profile.get("asr_model") or provider)
+            endpoint = str(
+                profile.get(f"{provider}_url")
+                or profile.get("firered_asr2_url")
+                or profile.get("qwen3_asr_url")
+                or profile.get("deep_remote_url")
+                or ""
+            )
+            options = profile.get(f"{provider}_options") or profile.get("asr_options") or {}
+            worker_count = options.get("worker_count") or profile.get("asr_worker_count")
+            concurrency = options.get("concurrency") or profile.get("asr_concurrency")
+            deployment = str(options.get("deployment") or "")
+            enabled = provider not in {"", "none", "disabled"}
+        elif kind == "diarization":
+            config = profile.get("speaker_diarization") or {}
+            provider = str(config.get("backend") or "speaker_diarization")
+            model = str(config.get("model_id") or snapshot_models.get("diarization") or provider)
+            endpoint = str(config.get("base_url") or config.get("url") or "")
+            worker_count = config.get("worker_count")
+            concurrency = config.get("concurrency")
+            deployment = str(config.get("deployment") or "")
+            enabled = bool(config.get("enabled"))
+        elif kind == "ocr":
+            provider = str(profile.get("ocr_provider") or "")
+            model = str(profile.get("ocr_model") or snapshot_models.get("ocr") or provider)
+            endpoints = profile.get("ocr_base_urls") or []
+            endpoint = str(profile.get("ocr_base_url") or (endpoints[0] if endpoints else ""))
+            worker_count = profile.get("ocr_worker_count")
+            concurrency = profile.get("ocr_concurrency")
+            enabled = provider not in {"", "none", "disabled"}
+        elif kind == "vision":
+            runtime = profile.get("vision_runtime") or {}
+            provider = str(runtime.get("engine") or "openai_compatible")
+            model = str(profile.get("vision_model") or snapshot_models.get("vision") or "")
+            endpoint = str(profile.get("vision_base_url") or "")
+            worker_count = runtime.get("worker_count") or profile.get("vision_worker_count")
+            concurrency = runtime.get("concurrency") or profile.get("vl_concurrency")
+            deployment = str(runtime.get("deployment") or "")
+            enabled = bool(model) and provider not in {"none", "disabled"}
+        elif kind == "text":
+            provider = str(profile.get("runtime") or "openai_compatible")
+            model = str(profile.get("text_model") or snapshot_models.get("text") or "")
+            endpoint = str(profile.get("text_base_url") or profile.get("llm_base_url") or "")
+            worker_count = profile.get("worker_count")
+            concurrency = profile.get("concurrency")
+            deployment = str(profile.get("deployment") or "")
+            enabled = bool(model)
+        elif kind == "text_fallback":
+            provider = "openai_compatible"
+            model = str(
+                profile.get("text_fallback_model")
+                or snapshot_models.get("text_fallback")
+                or ""
+            )
+            endpoint = str(profile.get("text_fallback_base_url") or "")
+            worker_count = profile.get("text_fallback_worker_count")
+            concurrency = profile.get("text_fallback_concurrency")
+            deployment = str(
+                profile.get("text_fallback_deployment") or "cloud"
+            )
+            enabled = bool(
+                profile.get("text_fallback_enabled") and model and endpoint
+            )
+        elif kind == "review":
+            model = str(profile.get("review_model") or profile.get("text_model") or snapshot_models.get("review") or "")
+            endpoint = str(profile.get("review_base_url") or profile.get("text_base_url") or profile.get("llm_base_url") or "")
+            provider = str(profile.get("review_runtime") or profile.get("runtime") or "openai_compatible")
+            enabled = bool(profile.get("review_enabled", True) and model)
+            if not profile.get("review_model"):
+                inherited_from = "text"
+        elif kind == "study":
+            model = str(profile.get("study_card_model") or profile.get("text_model") or snapshot_models.get("study") or "")
+            endpoint = str(profile.get("study_card_llm_base_url") or profile.get("text_base_url") or "")
+            provider = "openai_compatible"
+            enabled = bool(profile.get("study_card_enabled", True) and model)
+            if not profile.get("study_card_model"):
+                inherited_from = "text"
+        elif kind == "triage":
+            model = str(profile.get("triage_model") or profile.get("study_card_model") or profile.get("text_model") or "")
+            endpoint = str(
+                profile.get("triage_llm_base_url")
+                or profile.get("study_card_llm_base_url")
+                or profile.get("text_base_url")
+                or ""
+            )
+            provider = "openai_compatible"
+            enabled = bool(profile.get("triage_enabled", True) and model)
+            if not profile.get("triage_model"):
+                inherited_from = "study" if profile.get("study_card_model") else "text"
+        elif kind == "image":
+            provider = str(profile.get("image_provider") or snapshot_models.get("image") or "")
+            model = str(profile.get("image_model") or provider)
+            endpoint = str(profile.get("image_base_url") or "")
+            enabled = bool(profile.get("image_enabled", True) and provider not in {"", "none", "disabled"})
+        elif kind in {"asr_fallback", "diarization_fallback"}:
+            fallback = profile.get("audio_cloud_fallback") or {}
+            config = fallback.get("asr" if kind == "asr_fallback" else "diarization") or {}
+            provider = str(config.get("protocol") or config.get("provider") or "")
+            model = str(
+                config.get("model")
+                or config.get("name")
+                or snapshot_models.get(kind)
+                or ""
+            )
+            endpoints = config.get("endpoints") or []
+            endpoint = str(config.get("endpoint") or (endpoints[0] if endpoints else ""))
+            worker_count = (config.get("options") or {}).get("worker_count")
+            concurrency = (config.get("options") or {}).get("concurrency")
+            deployment = str(config.get("deployment") or "云端")
+            enabled = bool(fallback.get("enabled") and provider not in {"", "none"})
+        elif kind == "selector":
+            provider = "openai_compatible"
+            model = str(
+                profile.get("template_selector_model")
+                or snapshot_models.get("selector")
+                or ""
+            )
+            endpoint = str(
+                profile.get("template_selector_base_url")
+                or profile.get("study_card_llm_base_url")
+                or ""
+            )
+            enabled = bool(profile.get("template_selector_enabled", True) and model)
+
+        deployment = deployment or self.execution_endpoint_deployment(endpoint)
+        label = model or provider or role_labels.get(kind, kind)
+        if kind == "diarization" and provider and model and provider.lower() != model.lower():
+            label = f"{provider} · {model}"
+        return {
+            "role": kind,
+            "role_label": role_labels.get(kind, kind),
+            "resource_id": profile.get(resource_fields.get(kind, "")) if resource_fields.get(kind) else None,
+            "provider": provider or None,
+            "model": model or None,
+            "label": label,
+            "endpoint": endpoint or None,
+            "deployment": deployment,
+            "worker_count": worker_count,
+            "concurrency": concurrency,
+            "enabled": enabled,
+            "inherited_from": inherited_from,
+        }
+
+    @staticmethod
+    def execution_endpoint_deployment(endpoint: str) -> str:
+        if not endpoint:
+            return "未指定"
+        try:
+            hostname = (urlparse(endpoint).hostname or "").lower()
+        except Exception:
+            hostname = ""
+        if hostname in {"127.0.0.1", "localhost", "::1"}:
+            return "本机"
+        if hostname.endswith(".taild500c8.ts.net") or hostname.startswith("100."):
+            return "远程设备"
+        return "云端"
+
+    def execution_node_artifacts(
+        self,
+        run_dir: Path | None,
+        node: dict[str, Any],
+        job_id: str,
+    ) -> list[dict[str, Any]]:
+        if not run_dir:
+            return []
+        candidates = []
+        if node.get("artifact_path"):
+            candidates.append(str(node["artifact_path"]))
+        candidates.extend(EXECUTION_NODE_ARTIFACTS.get(str(node.get("id") or ""), ()))
+        artifacts = []
+        seen = set()
+        for relative in candidates:
+            if relative in seen:
+                continue
+            seen.add(relative)
+            path = run_dir / relative
+            if path.is_file() and path.stat().st_size > 0:
+                artifacts.append(
+                    {
+                        "path": relative,
+                        "type": "file",
+                        "size_bytes": path.stat().st_size,
+                        "url": self.resource_url(job_id, relative) if job_id else None,
+                    }
+                )
+            elif path.is_dir():
+                files = [candidate for candidate in path.rglob("*") if candidate.is_file()]
+                if files:
+                    artifacts.append(
+                        {
+                            "path": relative,
+                            "type": "directory",
+                            "file_count": len(files),
+                            "size_bytes": sum(candidate.stat().st_size for candidate in files),
+                            "url": None,
+                        }
+                    )
+        return artifacts
+
+    def execution_node_state(
+        self,
+        job: dict[str, Any],
+        node: dict[str, Any],
+        model: dict[str, Any] | None,
+        artifacts: list[dict[str, Any]],
+        core_progress: dict[str, Any],
+        stage_progress: dict[str, Any],
+        node_states: dict[str, Any],
+    ) -> dict[str, Any]:
+        node_id = str(node.get("id") or "")
+        stage = str(node.get("stage") or "")
+        stage_info = (job.get("stages") or {}).get(stage) or {}
+        stage_status = str(stage_info.get("status") or "pending")
+        if node.get("node_kind") == "output":
+            if artifacts:
+                return {"status": "succeeded", "message": "最终文档已生成"}
+            if stage_status == "failed":
+                return {"status": "failed", "message": stage_info.get("error") or "最终文档未生成"}
+            if stage not in self.stage_order_for_job(job):
+                return {"status": "skipped", "message": "当前分析深度不生成该文档"}
+            return {"status": "pending", "message": "等待最终发布"}
+
+        exact_state = node_states.get(node_id)
+        if isinstance(exact_state, dict):
+            return {
+                "status": str(exact_state.get("status") or "pending"),
+                "message": exact_state.get("message"),
+                "started_at": exact_state.get("started_at"),
+                "finished_at": exact_state.get("finished_at"),
+                "progress": exact_state.get("progress"),
+            }
+        if model and not model.get("enabled"):
+            return {"status": "skipped", "message": "该模型能力未启用"}
+
+        if stage == "analyze-core":
+            if stage_status in {"succeeded", "skipped", "failed"}:
+                return {"status": stage_status, "message": stage_info.get("error")}
+            progress_step = str(node.get("progress_step") or "")
+            steps = {
+                str(step.get("id")): step
+                for step in core_progress.get("steps") or []
+            }
+            step = steps.get(progress_step)
+            if step:
+                status = str(step.get("status") or "pending")
+                if node_id == "diarization" and status == "pending":
+                    asr_status = str((steps.get("asr") or {}).get("status") or "pending")
+                    if asr_status == "running":
+                        status = "running"
+                return {
+                    "status": status,
+                    "message": step.get("message"),
+                    "progress": (
+                        (core_progress.get("vl") or {}).get("percent")
+                        if progress_step == "vl"
+                        else None
+                    ),
+                }
+            if node_id == "diarization":
+                asr_status = str((steps.get("asr") or {}).get("status") or "pending")
+                if asr_status == "running":
+                    return {"status": "running", "message": "与 ASR 并行执行"}
+            if artifacts:
+                return {"status": "succeeded", "message": "已从现有产物确认完成"}
+            if stage_status == "queued":
+                return {"status": "queued", "message": stage_info.get("queued_for") or "等待核心资源"}
+            return {"status": "pending", "message": "等待核心分析"}
+
+        if stage not in self.stage_order_for_job(job):
+            return {"status": "skipped", "message": "当前分析深度跳过该节点"}
+        if stage_status in {"succeeded", "skipped"}:
+            return {"status": stage_status, "message": "阶段已完成"}
+        if stage_status == "failed":
+            return {"status": "failed", "message": stage_info.get("error") or "阶段失败"}
+        stage_step = str(node.get("stage_step") or "")
+        if stage_step and stage_progress.get("stage") == stage:
+            step = next(
+                (
+                    item
+                    for item in stage_progress.get("steps") or []
+                    if str(item.get("id")) == stage_step
+                ),
+                None,
+            )
+            if step:
+                return {
+                    "status": str(step.get("status") or stage_status),
+                    "message": step.get("message"),
+                    "progress": (stage_progress.get("position") or {}).get("percent"),
+                }
+        if artifacts and stage_status == "pending":
+            return {"status": "succeeded", "message": "已从现有产物确认完成"}
+        return {
+            "status": stage_status,
+            "message": stage_info.get("error")
+            or stage_info.get("warning")
+            or ("正在处理" if stage_status == "running" else "等待前序节点"),
+            "started_at": stage_info.get("started_at") or stage_info.get("queued_at"),
+            "finished_at": stage_info.get("finished_at"),
+            "progress": stage_progress.get("percent") if stage_progress.get("stage") == stage else None,
+        }
+
+    def execution_node_duration(
+        self,
+        node: dict[str, Any],
+        state: dict[str, Any],
+        timings: dict[str, Any],
+        diarization_report: dict[str, Any],
+        job: dict[str, Any],
+    ) -> float | None:
+        started = parse_iso_timestamp(state.get("started_at"))
+        finished = parse_iso_timestamp(state.get("finished_at"))
+        if started:
+            return round(max(0.0, (finished or time.time()) - started), 3)
+        timing_keys = {
+            "asr": "asr_seconds",
+            "frame_extract": "candidate_frame_extraction_seconds",
+            "ocr": "ocr_seconds",
+            "vision": "vl_seconds",
+            "visual_evidence": "vl_seconds",
+            "text": "manual_generation_seconds",
+        }
+        if node.get("id") == "diarization":
+            value = diarization_report.get("elapsed_seconds")
+            if isinstance(value, (int, float)):
+                return round(float(value), 3)
+        timing = timings.get(timing_keys.get(str(node.get("id") or "")))
+        if isinstance(timing, (int, float)):
+            return round(float(timing), 3)
+        stage = str(node.get("stage") or "")
+        stage_duration = ((job.get("stages") or {}).get(stage) or {}).get("duration_seconds")
+        if stage != "analyze-core" and isinstance(stage_duration, (int, float)):
+            return round(float(stage_duration), 3)
+        return None
+
+    @staticmethod
+    def execution_node_metrics(
+        node_id: str,
+        summary: dict[str, Any],
+        diarization_report: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        counts = summary.get("core_counts") or {}
+        metrics = {
+            "frame_extract": [("候选帧", counts.get("frames_extracted"))],
+            "frame_audit": [
+                ("审计前", counts.get("frames_extracted")),
+                (
+                    "审计后",
+                    (counts.get("frame_dedup_audit") or {}).get("treatment_keep_count"),
+                ),
+            ],
+            "ocr": [
+                ("OCR 帧", counts.get("ocr_keyframes")),
+                ("文本事件", counts.get("ocr_text_events")),
+            ],
+            "vision": [("VL 帧", counts.get("vl_frames"))],
+            "diarization": [
+                (
+                    "说话人数",
+                    diarization_report.get("final_speaker_count")
+                    or diarization_report.get("detected_speaker_count"),
+                )
+            ],
+            "documents": [
+                ("章节", (summary.get("multidoc") or {}).get("chapter_count"))
+            ],
+            "qa_index": [
+                ("证据切片", (summary.get("qa") or {}).get("chunk_count"))
+            ],
+            "image": [("最终图片", len(summary.get("final_images") or []))],
+        }.get(node_id, [])
+        return [
+            {"label": label, "value": value}
+            for label, value in metrics
+            if value is not None
+        ]
+
+    @staticmethod
+    def execution_json_artifact(run_dir: Path | None, relative: str) -> dict[str, Any]:
+        if not run_dir:
+            return {}
+        path = run_dir / relative
+        if not path.is_file():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def execution_flow_mermaid(
+        self,
+        nodes: list[dict[str, Any]],
+        edges: list[dict[str, Any]],
+    ) -> str:
+        def safe(value: Any, limit: int = 52) -> str:
+            text = re.sub(r"\s+", " ", str(value or "")).strip()
+            if len(text) > limit:
+                text = text[: limit - 1] + "…"
+            return text.replace('"', "'")
+
+        status_labels = {
+            "pending": "等待",
+            "queued": "排队",
+            "running": "运行中",
+            "succeeded": "完成",
+            "skipped": "跳过",
+            "failed": "失败",
+            "stopped": "停止",
+        }
+        lines = ["flowchart LR"]
+        for node in nodes:
+            model = node.get("model") or {}
+            model_label = safe(model.get("label"), 38) if model else ""
+            status = str(node.get("status") or "pending")
+            footer = status_labels.get(status, status)
+            if node.get("artifact_count"):
+                footer += f" · {node['artifact_count']} 个产物"
+            label_parts = [safe(node.get("title"))]
+            if model_label:
+                label_parts.append(model_label)
+            elif node.get("subtitle"):
+                label_parts.append(safe(node.get("subtitle"), 42))
+            label_parts.append(footer)
+            lines.append(f'  {node["id"]}["{"<br/>".join(label_parts)}"]')
+        for edge in edges:
+            label = safe(edge.get("label"), 28)
+            connector = f" -->|{label}| " if label else " --> "
+            lines.append(f"  {edge['from']}{connector}{edge['to']}")
+        lines.extend(
+            [
+                "  classDef pending fill:#ffffff,stroke:#cbd5e1,color:#344054;",
+                "  classDef queued fill:#fffbeb,stroke:#d97706,color:#92400e;",
+                "  classDef running fill:#eff6ff,stroke:#2563eb,color:#1d4ed8,stroke-width:2px;",
+                "  classDef succeeded fill:#f0fdf4,stroke:#16a34a,color:#166534;",
+                "  classDef skipped fill:#f8fafc,stroke:#94a3b8,color:#64748b,stroke-dasharray:4 3;",
+                "  classDef failed fill:#fff1f2,stroke:#e11d48,color:#9f1239,stroke-width:2px;",
+                "  classDef stopped fill:#fff7ed,stroke:#ea580c,color:#9a3412;",
+            ]
+        )
+        for node in nodes:
+            status = str(node.get("status") or "pending")
+            lines.append(f"  class {node['id']} {status};")
+        return "\n".join(lines)
 
     def audio_prompt_template_actual(self, run_dir: Path) -> dict[str, Any] | None:
         for path in (run_dir / "audio_template_analysis.json", run_dir / "analysis.json"):
@@ -2644,6 +6044,25 @@ class VideoLinkStatusServer:
             return {}
         run_dir = Path(str(run_dir_value)).expanduser().resolve()
         artifacts = job.get("artifacts") or {}
+        if normalize_audio_pipeline_profile(
+            job.get("audio_pipeline_kind")
+            or job.get("audio_pipeline_profile")
+        ) == AUDIO_PIPELINE_KIND_TRANSCRIPTION:
+            file_candidates = {
+                "transcript_markdown": run_dir / "transcript.md",
+                "transcript_json": run_dir / "orin" / "transcript.json",
+                "asr_json": run_dir / "orin" / "asr.json",
+                "transcription_json": run_dir / "transcription.json",
+                "speaker_diarization_report": run_dir / "qa" / "speaker_diarization_report.json",
+                "transcript_raw": run_dir / "transcript_raw.json",
+                "transcript_aligned": run_dir / "transcript_aligned.json",
+                "transcription_manifest": run_dir / "transcription_manifest.json",
+            }
+            return {
+                name: path
+                for name, value in file_candidates.items()
+                if (path := self.resource_relative_path(run_dir, value))
+            }
         artifact_candidates: dict[str, Any] = {
             "summary_markdown": ((artifacts.get("operation_manual") or {}).get("value")),
             "transcript_markdown": ((artifacts.get("transcript") or {}).get("value")),
@@ -2651,6 +6070,9 @@ class VideoLinkStatusServer:
         }
         file_candidates: dict[str, Any] = {
             "transcript_json": run_dir / "orin" / "transcript.json",
+            "asr_json": run_dir / "orin" / "asr.json",
+            "transcription_json": run_dir / "transcription.json",
+            "speaker_diarization_report": run_dir / "qa" / "speaker_diarization_report.json",
             "study_guide": run_dir / "study_guide.json",
             "mindmap_markdown": run_dir / "study_overview.md",
             "study_cards_markdown": run_dir / "study_cards.md",
@@ -2666,6 +6088,125 @@ class VideoLinkStatusServer:
             if path:
                 resources[name] = path
         return resources
+
+    def document_preview(self, job: dict[str, Any]) -> dict[str, Any]:
+        run_dir_value = job.get("run_dir") or (((job.get("artifacts") or {}).get("run_dir") or {}).get("value"))
+        if not run_dir_value:
+            return {
+                "primary": [],
+                "evidence": [],
+                "process": [],
+                "assets": [],
+                "derivation": self.document_derivation([], [], [], []),
+            }
+        run_dir = Path(str(run_dir_value)).expanduser().resolve()
+        job_id = str(job.get("job_id") or "")
+        primary = self.document_preview_files(job_id, run_dir, DOCUMENT_PREVIEW_PRIMARY)
+        evidence = self.document_preview_files(job_id, run_dir, DOCUMENT_PREVIEW_EVIDENCE)
+        process = self.document_preview_files(job_id, run_dir, DOCUMENT_PREVIEW_PROCESS)
+        assets = self.document_preview_dirs(run_dir, DOCUMENT_PREVIEW_ASSETS)
+        return {
+            "primary": primary,
+            "evidence": evidence,
+            "process": process,
+            "assets": assets,
+            "derivation": self.document_derivation(primary, evidence, process, assets),
+        }
+
+    def document_preview_files(self, job_id: str, run_dir: Path, specs: tuple[tuple[str, str, str], ...]) -> list[dict[str, Any]]:
+        items = []
+        for relative, title, description in specs:
+            path = run_dir / relative
+            if not path.is_file():
+                continue
+            items.append(
+                {
+                    "type": "file",
+                    "path": relative,
+                    "title": title,
+                    "description": description,
+                    "size_bytes": path.stat().st_size,
+                    "updated_at": iso_from_timestamp(path.stat().st_mtime),
+                    "mime_type": mimetypes.guess_type(str(path))[0],
+                    "url": self.resource_url(job_id, relative),
+                }
+            )
+        return items
+
+    def document_preview_dirs(self, run_dir: Path, specs: tuple[tuple[str, str, str], ...]) -> list[dict[str, Any]]:
+        items = []
+        for relative, title, description in specs:
+            path = run_dir / relative
+            if not path.is_dir():
+                continue
+            files = [candidate for candidate in path.rglob("*") if candidate.is_file()]
+            items.append(
+                {
+                    "type": "directory",
+                    "path": relative,
+                    "title": title,
+                    "description": description,
+                    "file_count": len(files),
+                    "size_bytes": sum(candidate.stat().st_size for candidate in files),
+                    "updated_at": iso_from_timestamp(max((candidate.stat().st_mtime for candidate in files), default=path.stat().st_mtime)),
+                }
+            )
+        return items
+
+    def resource_url(self, job_id: str, relative_path: str) -> str:
+        return f"/api/video-link/jobs/{job_id}/resources/{quote(relative_path, safe='/')}"
+
+    def document_derivation(
+        self,
+        primary: list[dict[str, Any]],
+        evidence: list[dict[str, Any]],
+        process: list[dict[str, Any]],
+        assets: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        available = {item["path"] for item in [*primary, *evidence, *process, *assets]}
+        specs = (
+            ("input", "输入素材", "视频 / 页面上下文 / 评论", 0, None),
+            ("transcript", "ASR 转写", "transcript.md", 1, "transcript.md"),
+            ("frames", "抽帧与截图", "frames / manual_assets", 1, "manual_assets"),
+            ("visual", "OCR/VL 视觉理解", "orin / manual_evidence.md", 2, "manual_evidence.md"),
+            ("manual", "操作手册", "operation_manual.md", 3, "operation_manual.md"),
+            ("study", "学习账本与证据分诊", "study_guide / evidence_triage", 4, "study_guide.json"),
+            ("notes", "逐章知识笔记", "knowledge_notes_v2.md", 5, "docs_analysis_chapters/knowledge_notes_v2.md"),
+            ("report", "深度报告", "deep_report_v2.md", 5, "docs_analysis_chapters/deep_report_v2.md"),
+            ("audit", "证据审计与发布判断", "evidence_review / publish_decision", 6, "evidence_review.json"),
+        )
+        nodes = [
+            {"id": node_id, "title": title, "description": description, "tier": tier, "available": required is None or required in available}
+            for node_id, title, description, tier, required in specs
+        ]
+        edges = [
+            ("input", "transcript", "音频提取"),
+            ("input", "frames", "视频抽帧"),
+            ("transcript", "manual", "文本上下文"),
+            ("frames", "visual", "视觉证据"),
+            ("visual", "manual", "截图/证据"),
+            ("manual", "study", "核心文档"),
+            ("visual", "study", "证据缺口"),
+            ("study", "notes", "章节整理"),
+            ("study", "report", "深度分析"),
+            ("notes", "audit", "发布材料"),
+            ("report", "audit", "发布材料"),
+            ("visual", "audit", "证据复核"),
+        ]
+        return {
+            "nodes": nodes,
+            "edges": [{"from": left, "to": right, "label": label} for left, right, label in edges],
+            "mermaid": self.document_derivation_mermaid(nodes, edges),
+        }
+
+    def document_derivation_mermaid(self, nodes: list[dict[str, Any]], edges: list[tuple[str, str, str]]) -> str:
+        labels = {node["id"]: f"{node['title']}<br/>{node['description']}" for node in nodes}
+        lines = ["flowchart LR"]
+        for node_id, label in labels.items():
+            lines.append(f"  {node_id}[\"{label}\"]")
+        for left, right, label in edges:
+            lines.append(f"  {left} -->|{label}| {right}")
+        return "\n".join(lines)
 
     def resource_relative_path(self, run_dir: Path, value: Any, allow_missing: bool = False) -> str | None:
         if not value:
@@ -2709,11 +6250,139 @@ class VideoLinkStatusServer:
         public["current_stage"] = self.current_stage(job)
         public["next_stage"] = self.next_stage(job)
         public["error_summary"] = self.error_summary(job)
+        public["failure_disposition"] = self.failure_disposition(job)
         public["dashboard_url"] = self.dashboard_url(job["job_id"])
         public["source_player"] = self.source_player_metadata(public)
         current_info = public["stages"].get(public.get("current_stage") or "", {})
         public["process"] = self.public_process_info(current_info.get("process"))
         return public
+
+    def annotate_failure_dispositions(self, jobs: list[dict[str, Any]]) -> None:
+        for job in jobs:
+            job["failure_disposition"] = self.failure_disposition(job, jobs)
+
+    def failure_disposition(
+        self,
+        job: dict[str, Any],
+        peers: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
+        if job.get("status") != "failed":
+            return None
+
+        peers = peers or []
+        job_id = str(job.get("job_id") or "")
+        run_dir = str(job.get("run_dir") or "")
+        video_url = str(job.get("video_url") or "")
+        created_at = str(job.get("created_at") or "")
+        for peer in peers:
+            if peer.get("job_id") == job_id or peer.get("status") != "succeeded":
+                continue
+            same_run = bool(run_dir and str(peer.get("run_dir") or "") == run_dir)
+            newer_same_source = bool(
+                video_url
+                and str(peer.get("video_url") or "") == video_url
+                and str(peer.get("created_at") or "") > created_at
+            )
+            if same_run or newer_same_source:
+                return {
+                    "category": "superseded",
+                    "label": "已有成功任务",
+                    "rerun_recommended": False,
+                    "reason": "相同资源目录或来源已有成功任务",
+                    "action": "直接查看成功任务或现有产物，不要重复运行",
+                    "superseded_by": peer.get("job_id"),
+                }
+
+        text = self.failure_text(job)
+        lowered = text.lower()
+        if any(
+            pattern in lowered
+            for pattern in (
+                "publish blocked by evidence gate",
+                "quality gate",
+                "content exists risk",
+                "关键证据缺口",
+                "模型复核建议",
+            )
+        ):
+            return {
+                "category": "review_required",
+                "label": "需要人工复核",
+                "rerun_recommended": False,
+                "reason": "失败来自内容安全、质量或证据门禁，盲目重跑不能解决",
+                "action": "查看 operation_manual、manual_evidence 和 publish_decision 后决定是否补证据",
+            }
+
+        if self.final_documents_present(job):
+            return {
+                "category": "artifacts_complete",
+                "label": "产物已完整",
+                "rerun_recommended": False,
+                "reason": "当前要求的四份 Markdown 文档均已存在且非空",
+                "action": "直接验收现有文档；旧发布失败无需重跑",
+            }
+
+        recommended_profile = active_runtime_profile(runtime_profile_names())
+        if "insufficient balance" in lowered or "402" in lowered:
+            return {
+                "category": "external_block",
+                "label": "余额恢复后续跑",
+                "rerun_recommended": True,
+                "reason": "核心素材仍可复用，文本生成被账户余额阻断",
+                "action": f"余额可用后从第一个产物不完整阶段继续，并切换到 {recommended_profile}",
+                "recommended_profile": recommended_profile,
+            }
+
+        run_dir_path = Path(run_dir) if run_dir else None
+        if run_dir_path and run_dir_path.is_dir() and not self.missing_core_artifacts(run_dir_path):
+            return {
+                "category": "resume_required",
+                "label": "可以继续生成",
+                "rerun_recommended": True,
+                "reason": "核心分析产物完整，缺少后续文档或发布产物",
+                "action": f"从第一个产物不完整阶段继续，并使用 {recommended_profile}",
+                "recommended_profile": recommended_profile,
+            }
+
+        created_timestamp = parse_iso_timestamp(job.get("created_at"))
+        if created_timestamp and time.time() - created_timestamp > 30 * 24 * 60 * 60:
+            return {
+                "category": "historical",
+                "label": "历史失败",
+                "rerun_recommended": False,
+                "reason": "任务超过 30 天且没有可直接复用的完整核心产物",
+                "action": "仅在仍有业务价值时新建任务，不建议直接续跑旧状态",
+            }
+
+        return {
+            "category": "rerun_core",
+            "label": "需要重跑核心分析",
+            "rerun_recommended": True,
+            "reason": "核心产物缺失、无效或包含未解决的分析错误",
+            "action": f"从核心分析阶段重新运行，并使用 {recommended_profile}",
+            "recommended_profile": recommended_profile,
+        }
+
+    def failure_text(self, job: dict[str, Any]) -> str:
+        values = [str((job.get("runner") or {}).get("error") or "")]
+        for stage_info in (job.get("stages") or {}).values():
+            failure = stage_info.get("failure") or {}
+            values.extend(
+                [
+                    str(stage_info.get("error") or ""),
+                    str(stage_info.get("warning") or ""),
+                    str(stage_info.get("last_error") or ""),
+                    str(failure.get("message") or ""),
+                ]
+            )
+        return "\n".join(value for value in values if value)
+
+    def final_documents_present(self, job: dict[str, Any]) -> bool:
+        run_dir_value = str(job.get("run_dir") or "")
+        if not run_dir_value:
+            return False
+        run_dir = Path(run_dir_value)
+        return all((run_dir / name).is_file() and (run_dir / name).stat().st_size > 0 for name in EXPECTED_FINAL_DOCUMENTS)
 
     def active_warnings(self, job: dict[str, Any]) -> list[dict[str, Any]]:
         warnings = []
@@ -2810,15 +6479,24 @@ class VideoLinkStatusServer:
         run_dir_value = job.get("run_dir")
         if not run_dir_value:
             return False
-        export_dir = Path(run_dir_value) / "exports"
-        return all((export_dir / name).is_file() and (export_dir / name).stat().st_size > 0 for name in EXPECTED_FINAL_EXPORTS)
+        run_dir = Path(run_dir_value)
+        summary_path = run_dir / "final_publish_summary.json"
+        if not summary_path.is_file() or summary_path.stat().st_size <= 0:
+            return False
+        if not all((run_dir / name).is_file() and (run_dir / name).stat().st_size > 0 for name in EXPECTED_FINAL_DOCUMENTS):
+            return False
+        if job.get("options", {}).get("skip_images") or not BAOYU_IMAGE_GENERATION_ENABLED:
+            return True
+        final_dir = run_dir / "baoyu_images" / "final"
+        expected_images = ("02-infographic-knowledge-notes.png", "03-infographic-deep-report.png")
+        return all((final_dir / name).is_file() and (final_dir / name).stat().st_size > 0 for name in expected_images)
 
     def queue_info(self, job: dict[str, Any]) -> dict[str, Any]:
         runner = job.get("runner") or {}
         stage = runner.get("current_stage") or self.current_stage(job)
         if runner.get("status") != "queued" or not stage:
             return {}
-        resource = runner.get("queued_for") or stage_resource(stage)
+        resource = runner.get("queued_for") or job_stage_resource(job, stage)
         queued = []
         for path in self.jobs_dir.glob("*/job.json"):
             try:
@@ -2826,7 +6504,10 @@ class VideoLinkStatusServer:
             except Exception:
                 continue
             candidate_runner = candidate.get("runner") or {}
-            if candidate_runner.get("status") == "queued" and (candidate_runner.get("queued_for") or stage_resource(candidate_runner.get("current_stage") or "")) == resource:
+            if candidate_runner.get("status") == "queued" and (
+                candidate_runner.get("queued_for")
+                or job_stage_resource(candidate, candidate_runner.get("current_stage") or "")
+            ) == resource:
                 queued.append(candidate)
         queued.sort(key=lambda item: item.get("updated_at") or item.get("created_at") or "")
         position = next((index + 1 for index, item in enumerate(queued) if item.get("job_id") == job.get("job_id")), None)
@@ -2884,6 +6565,19 @@ class VideoLinkStatusServer:
         current_label = next((step.get("label") for step in steps if step.get("id") == current_step), None)
         visible_steps = [step for step in steps if step.get("status") != "pending"]
         last_signal = visible_steps[-1] if visible_steps else None
+        position = progress.get("position")
+        if not position and current_step:
+            current = next((step for step in steps if step.get("id") == current_step), None)
+            position = {
+                "kind": "step",
+                "label": current_label or current_step,
+                "current": None,
+                "total": None,
+                "unit": "step",
+                "percent": progress.get("percent"),
+                "eta_seconds": None,
+                "detail": (current or {}).get("message"),
+            }
         progress.update(
             {
                 "stage": stage,
@@ -2895,6 +6589,7 @@ class VideoLinkStatusServer:
                 "last_signal_label": last_signal.get("label") if last_signal else None,
                 "stale": bool(status == "queued" and visible_steps and not live),
                 "summary": self.stage_progress_summary(job, stage, status, live, current_label),
+                "position": position,
             }
         )
         return progress
@@ -3048,7 +6743,10 @@ class VideoLinkStatusServer:
 
     def next_stage(self, job: dict[str, Any]) -> str | None:
         for stage in self.stage_order_for_job(job):
-            if job.get("stages", {}).get(stage, {}).get("status") not in {"succeeded", "skipped"}:
+            status = job.get("stages", {}).get(stage, {}).get("status")
+            if status == "skipped" and self.skipped_stage_outputs_incomplete(job, stage):
+                return stage
+            if status not in {"succeeded", "skipped"}:
                 return stage
         return None
 
@@ -3099,7 +6797,67 @@ class VideoLinkStatusServer:
         if not path.exists():
             raise BridgeError(HTTPStatus.NOT_FOUND, "job not found")
         job = json.loads(path.read_text(encoding="utf-8"))
-        return self.recover_orphaned_running_job(job)
+        job = self.recover_orphaned_running_job(job)
+        return self.reconcile_incomplete_false_success(job)
+
+    def reconcile_incomplete_false_success(self, job: dict[str, Any]) -> dict[str, Any]:
+        final_stage = dict((job.get("stages") or {}).get("final-publish") or {})
+        run_dir_value = str(job.get("run_dir") or "")
+        core_error = self.core_manual_generation_error(Path(run_dir_value)) if run_dir_value else None
+        if (
+            job.get("status") == "failed"
+            and final_stage.get("status") == "failed"
+            and core_error
+            and str((job.get("runner") or {}).get("error") or "") != core_error
+        ):
+            now = iso_now()
+            final_stage["error"] = core_error
+            final_stage["root_cause_stage"] = "analyze-core"
+            job.setdefault("stages", {})["final-publish"] = final_stage
+            runner = dict(job.get("runner") or {})
+            runner["error"] = core_error
+            runner["updated_at"] = now
+            job["runner"] = runner
+            job["updated_at"] = now
+            self.save_job(job)
+            return job
+        if (
+            job.get("status") != "succeeded"
+            or final_stage.get("status") not in {"failed", "skipped"}
+            or self.export_outputs_complete(job)
+        ):
+            return job
+        now = iso_now()
+        message = str(
+            core_error
+            or final_stage.get("error")
+            or "final publish is incomplete: expected four non-empty final Markdown documents"
+        )
+        if core_error:
+            final_stage["root_cause_stage"] = "analyze-core"
+        final_stage["status"] = "failed"
+        final_stage["error"] = message
+        final_stage["finished_at"] = final_stage.get("finished_at") or now
+        final_stage.pop("soft_failed", None)
+        job.setdefault("stages", {})["final-publish"] = final_stage
+        runner = dict(job.get("runner") or {})
+        runner.update(
+            {
+                "status": "failed",
+                "current_stage": "final-publish",
+                "queued_for": "final-publish",
+                "error": message,
+                "updated_at": now,
+                "finished_at": now,
+                "server_pid": os.getpid(),
+            }
+        )
+        runner.pop("wait_reason", None)
+        job["runner"] = runner
+        job["status"] = "failed"
+        job["updated_at"] = now
+        self.save_job(job)
+        return job
 
     def recover_orphaned_running_job(self, job: dict[str, Any]) -> dict[str, Any]:
         runner = job.get("runner") or {}
@@ -3108,6 +6866,8 @@ class VideoLinkStatusServer:
             if recovered:
                 return recovered
             return self.requeue_interrupted_job(job)
+        if self.should_requeue_legacy_transient_failure(job):
+            return self.requeue_interrupted_job(job, reason=TRANSIENT_RESOURCE_REQUEUE_MESSAGE)
         if runner.get("status") not in {"running", "queued"}:
             return job
         active = self.active_runners.get(job["job_id"])
@@ -3182,11 +6942,36 @@ class VideoLinkStatusServer:
         stage = normalize_stage_name(runner.get("current_stage") or self.next_stage(job) or "")
         return stage in self.stage_order_for_job(job)
 
+    def should_requeue_legacy_transient_failure(self, job: dict[str, Any]) -> bool:
+        runner = job.get("runner") or {}
+        if job.get("status") != "failed" or runner.get("status") != "failed":
+            return False
+        stage = normalize_stage_name(runner.get("current_stage") or self.current_stage(job) or self.next_stage(job) or "")
+        if stage not in self.stage_order_for_job(job):
+            return False
+        stage_info = (job.get("stages") or {}).get(stage) or {}
+        text = "\n".join(
+            str(value or "")
+            for value in (
+                runner.get("error"),
+                stage_info.get("error"),
+                stage_info.get("last_error"),
+            )
+        )
+        log_path = stage_info.get("log_path")
+        if log_path and Path(str(log_path)).is_file():
+            try:
+                text += "\n" + Path(str(log_path)).read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+        return self.retryable_stage_failure_text(stage, text) is not None
+
     def requeue_interrupted_job(
         self,
         job: dict[str, Any],
         stage: str | None = None,
         stage_info: dict[str, Any] | None = None,
+        reason: str = ORPHANED_PROCESS_REQUEUE_MESSAGE,
     ) -> dict[str, Any]:
         now = iso_now()
         raw_stage = stage or (job.get("runner") or {}).get("current_stage") or self.current_stage(job) or self.next_stage(job)
@@ -3198,12 +6983,59 @@ class VideoLinkStatusServer:
             recovered = self.reconcile_completed_core_stage(job, stage_info)
             if recovered:
                 return recovered
-        resource = stage_resource(stage)
+        interrupted_attempts = int(stage_info.get("restart_recovery_attempts") or 0)
+        if reason == ORPHANED_PROCESS_REQUEUE_MESSAGE and interrupted_attempts >= MAX_INTERRUPTED_RETRIES:
+            message = "stage was interrupted repeatedly after service restart; automatic recovery budget exhausted"
+            stage_info.update(
+                {
+                    "status": "failed",
+                    "finished_at": now,
+                    "error": message,
+                    "failure": {
+                        "kind": "interrupted",
+                        "retryable": False,
+                        "status_code": None,
+                        "provider_code": None,
+                        "message": message,
+                    },
+                }
+            )
+            stage_info.pop("process", None)
+            job.setdefault("stages", {})[stage] = stage_info
+            runner = dict(job.get("runner") or {})
+            runner.update(
+                {
+                    "status": "failed",
+                    "current_stage": stage,
+                    "queued_for": job_stage_resource(job, stage),
+                    "error": message,
+                    "updated_at": now,
+                    "finished_at": now,
+                    "server_pid": os.getpid(),
+                }
+            )
+            runner.pop("wait_reason", None)
+            job["runner"] = runner
+            job["status"] = "failed"
+            job["updated_at"] = now
+            self.save_job(job)
+            return job
+        resource = job_stage_resource(job, stage)
         stage_info["status"] = "queued"
         stage_info["queued_at"] = now
         stage_info["queued_for"] = resource
-        stage_info["retry_reason"] = ORPHANED_PROCESS_REQUEUE_MESSAGE
+        stage_info["retry_reason"] = reason
+        if reason == ORPHANED_PROCESS_REQUEUE_MESSAGE:
+            stage_info["restart_recovery_attempts"] = interrupted_attempts + 1
+        stage_info["retry"] = {
+            "auto_attempts": int((stage_info.get("retry") or {}).get("auto_attempts") or 0) + 1,
+            "max_auto_attempts": self.max_auto_retries_for_reason(reason),
+            "next_retry_at": iso_from_timestamp(time.time() + max(0.0, AUTO_RETRY_DELAY_SECONDS)),
+        }
         stage_info["log_path"] = stage_info.get("log_path") or str(self.stage_log_path(job["job_id"], stage))
+        previous_error = stage_info.get("error")
+        if previous_error and not stage_info.get("last_error"):
+            stage_info["last_error"] = previous_error
         stage_info.pop("process", None)
         stage_info.pop("finished_at", None)
         stage_info.pop("exit_code", None)
@@ -3211,11 +7043,12 @@ class VideoLinkStatusServer:
         job.setdefault("stages", {})[stage] = stage_info
         runner = dict(job.get("runner") or {})
         runner["status"] = "queued"
-        runner["error"] = ORPHANED_PROCESS_REQUEUE_MESSAGE
+        runner["error"] = reason
         runner["updated_at"] = now
         runner["current_stage"] = stage
         runner["queued_for"] = resource
         runner["server_pid"] = os.getpid()
+        runner.pop("wait_reason", None)
         runner.pop("finished_at", None)
         job["runner"] = runner
         job["status"] = "queued"
@@ -3229,6 +7062,77 @@ class VideoLinkStatusServer:
         tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         tmp_path.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp_path.replace(path)
+
+    def write_runtime_snapshot(self, job: dict[str, Any], profile_name: str, *, legacy: bool = False) -> dict[str, Any]:
+        config = runtime_config()
+        profiles = config.get("runtime_profiles") or {}
+        raw_profile = profiles.get(profile_name)
+        if not isinstance(raw_profile, dict):
+            raise BridgeError(HTTPStatus.BAD_REQUEST, f"unknown runtime profile: {profile_name}")
+        settings_document = build_settings_document(config)
+        decorated_profile = (settings_document.get("profiles") or {}).get(profile_name) or raw_profile
+        resolved_profile = expand_runtime_profile(config, decorated_profile)
+        snapshot_dir = self.job_dir(job["job_id"]) / "runtime-config"
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_path = snapshot_dir / "config.json"
+        snapshot_payload = {
+            "active_runtime_profile": profile_name,
+            "runtime_profiles": {profile_name: resolved_profile},
+            "endpoints": copy.deepcopy(config.get("endpoints") or {}),
+            "local_model_runtime": copy.deepcopy(
+                config.get("local_model_runtime") or {}
+            ),
+            "resource_limits": copy.deepcopy(config.get("resource_limits") or {}),
+        }
+        encoded = (json.dumps(snapshot_payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        self._atomic_write_bytes(snapshot_path, encoded)
+        fingerprint = hashlib.sha256(encoded).hexdigest()
+        job["runtime_profile_snapshot"] = {
+            "profile": profile_name,
+            "workflow_id": resolved_profile.get("workflow_id") or VIDEO_WORKFLOW_ID,
+            "fingerprint": fingerprint,
+            "config_dir": str(snapshot_dir),
+            "created_at": iso_now(),
+            "legacy": legacy,
+            "models": {
+                "asr": resolved_profile.get("asr_provider"),
+                "diarization": (resolved_profile.get("speaker_diarization") or {}).get("enabled"),
+                "ocr": resolved_profile.get("ocr_model") or resolved_profile.get("ocr_provider"),
+                "vision": resolved_profile.get("vision_model"),
+                "text": resolved_profile.get("text_model"),
+                "text_fallback": resolved_profile.get("text_fallback_model"),
+                "review": resolved_profile.get("review_model") or resolved_profile.get("text_model"),
+                "study": resolved_profile.get("study_card_model") or resolved_profile.get("text_model"),
+                "image": resolved_profile.get("image_provider") or "codex_imagegen",
+                "selector": resolved_profile.get("template_selector_model")
+                or resolved_profile.get("text_model"),
+                "asr_fallback": (
+                    (resolved_profile.get("audio_cloud_fallback") or {})
+                    .get("asr", {})
+                    .get("id")
+                ),
+                "diarization_fallback": (
+                    (resolved_profile.get("audio_cloud_fallback") or {})
+                    .get("diarization", {})
+                    .get("id")
+                ),
+            },
+            "audio_cloud_fallback": resolved_profile.get("audio_cloud_fallback") or {},
+        }
+        return job["runtime_profile_snapshot"]
+
+    def job_runtime_env(self, job: dict[str, Any]) -> dict[str, str]:
+        snapshot = job.get("runtime_profile_snapshot") or {}
+        config_dir = str(snapshot.get("config_dir") or "")
+        if not config_dir:
+            self.write_runtime_snapshot(
+                job,
+                str((job.get("options") or {}).get("profile") or DEFAULT_PROFILE),
+                legacy=True,
+            )
+            self.save_job(job)
+            config_dir = str((job.get("runtime_profile_snapshot") or {}).get("config_dir") or "")
+        return {"VIDEO_ANALYZER_CONFIG_DIR": config_dir} if config_dir else {}
 
     def job_dir(self, job_id: str) -> Path:
         return self.jobs_dir / job_id
@@ -3244,6 +7148,13 @@ class VideoLinkStatusServer:
 
     def stage_log_path(self, job_id: str, stage: str) -> Path:
         return self.job_dir(job_id) / "logs" / f"{stage}.log"
+
+    def stage_failure_path(self, job_id: str, stage: str, attempt: int) -> Path:
+        return self.job_dir(job_id) / "logs" / f"{stage}.attempt-{attempt}.failure.json"
+
+    def stage_failure_env(self, stage_info: dict[str, Any] | None) -> dict[str, str]:
+        path = str((stage_info or {}).get("failure_path") or "")
+        return {FAILURE_FILE_ENV: path} if path else {}
 
     def stage_attempt_log_path(self, job_id: str, stage: str, attempt: int) -> Path:
         return self.job_dir(job_id) / "logs" / f"{stage}.attempt-{attempt}.log"
@@ -3299,6 +7210,11 @@ def clean_display_title(value: Any) -> str:
     return title[:180]
 
 
+def is_youtube_url(url: str) -> bool:
+    hostname = (urlparse(url).hostname or "").lower()
+    return hostname == "youtu.be" or hostname.endswith(".youtube.com")
+
+
 def artifact_value(job: dict[str, Any], name: str) -> str:
     value = ((job.get("artifacts") or {}).get(name) or {}).get("value")
     return str(value or "")
@@ -3328,6 +7244,54 @@ def normalize_stage_name(stage: str) -> str:
 
 def stage_resource(stage: str) -> str:
     return STAGE_RESOURCES.get(normalize_stage_name(stage), "core")
+
+
+def job_stage_resource(job: dict[str, Any], stage: str) -> str:
+    if normalize_stage_name(stage) == "analyze-core":
+        raw_pipeline_kind = (
+            job.get("audio_pipeline_kind")
+            or job.get("audio_pipeline_profile")
+        )
+        if not job.get("audio_pipeline") and not raw_pipeline_kind:
+            return stage_resource(stage)
+        pipeline_kind = normalize_audio_pipeline_profile(
+            raw_pipeline_kind
+        )
+        if pipeline_kind == AUDIO_PIPELINE_KIND_TRANSCRIPTION:
+            return "asr"
+        if pipeline_kind == AUDIO_PIPELINE_PROFILE_NX1:
+            return (
+                "audio-cloud-analysis"
+                if job.get("compute_route") == "cloud_fallback"
+                else "audio-analysis"
+            )
+    return stage_resource(stage)
+
+
+def normalize_audio_pipeline_profile(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    profile = AUDIO_PIPELINE_PROFILE_ALIASES.get(normalized)
+    if profile:
+        return profile
+    allowed = ", ".join(
+        (AUDIO_PIPELINE_PROFILE_NX1, AUDIO_PIPELINE_KIND_TRANSCRIPTION)
+    )
+    raise BridgeError(
+        HTTPStatus.BAD_REQUEST,
+        f"audio pipeline profile must be one of: {allowed}",
+    )
+
+
+def normalize_audio_runtime_profile(value: Any) -> str:
+    profile_name = str(value or AUDIO_PIPELINE_PROFILE_NX1).strip()
+    profiles = runtime_config().get("runtime_profiles") or {}
+    if profile_name not in profiles:
+        return profile_name
+    if runtime_profile_workflow_id(profile_name) == AUDIO_WORKFLOW_ID:
+        return profile_name
+    if AUDIO_PIPELINE_PROFILE_NX1 in profiles:
+        return AUDIO_PIPELINE_PROFILE_NX1
+    return profile_name
 
 
 def process_alive(pid: Any) -> bool:
@@ -3477,6 +7441,8 @@ def merge_core_progress_snapshot(
             merged["details"] = details
         if vl_progress:
             merged["vl"] = vl_progress
+        if isinstance(snapshot.get("node_states"), dict):
+            merged["node_states"] = snapshot["node_states"]
         return merged
 
     snapshot_status = str(snapshot.get("status") or "running")
@@ -3521,6 +7487,38 @@ def merge_core_progress_snapshot(
         )
         completed_weight += CORE_PROGRESS_WEIGHTS.get("vl", 0) * fraction
         merged["percent"] = min(99, max(0, int(round(completed_weight / total_weight * 100))))
+        current_frame = vl_progress.get("current_frame_number")
+        frame_label = f" · 帧 #{current_frame}" if current_frame is not None else ""
+        merged["position"] = {
+            "kind": "frame",
+            "label": f"VL {completed}/{total}{frame_label}",
+            "current": completed,
+            "total": total,
+            "unit": "frame",
+            "percent": round(fraction * 100, 1) if total else None,
+            "eta_seconds": vl_progress.get("eta_seconds"),
+            "detail": (
+                f"当前帧 #{current_frame}"
+                if current_frame is not None
+                else str(snapshot.get("message") or "")
+            )
+            or None,
+        }
+    elif merged.get("current_step"):
+        current = next(
+            (step for step in steps if step.get("id") == merged.get("current_step")),
+            None,
+        )
+        merged["position"] = {
+            "kind": "step",
+            "label": (current or {}).get("label") or merged.get("current_step"),
+            "current": None,
+            "total": None,
+            "unit": "step",
+            "percent": merged.get("percent"),
+            "eta_seconds": None,
+            "detail": str(snapshot.get("message") or (current or {}).get("message") or "") or None,
+        }
     merged["steps"] = steps
     merged["source"] = "progress_json"
     merged["progress_updated_at"] = snapshot.get("updated_at")
@@ -3528,11 +7526,102 @@ def merge_core_progress_snapshot(
         merged["details"] = details
     if vl_progress:
         merged["vl"] = vl_progress
+    if isinstance(snapshot.get("node_states"), dict):
+        merged["node_states"] = snapshot["node_states"]
     return merged
 
 
 def parse_stage_progress(stage: str, text: str, stage_status: str) -> dict[str, Any]:
-    return parse_progress_steps(text, stage_status, STAGE_PROGRESS_STEPS.get(stage, []))
+    progress = parse_progress_steps(text, stage_status, STAGE_PROGRESS_STEPS.get(stage, []))
+    position = extract_stage_progress_position(stage, text, progress)
+    if position:
+        progress["position"] = position
+    return progress
+
+
+def extract_stage_progress_position(
+    stage: str,
+    text: str,
+    progress: dict[str, Any],
+) -> dict[str, Any] | None:
+    if stage == "prepare" and progress.get("current_step") == "download":
+        matches = list(
+            re.finditer(
+                r"^\[download\]\s+(\d+(?:\.\d+)?)%.*?(?:\sat\s+(.+?))?\s+ETA\s+(\d+:\d+(?::\d+)?)\s*$",
+                text,
+                flags=re.MULTILINE,
+            )
+        )
+        if matches:
+            match = matches[-1]
+            percent = max(0.0, min(float(match.group(1)), 100.0))
+            speed = str(match.group(2) or "").strip()
+            eta_text = match.group(3)
+            return {
+                "kind": "download",
+                "label": f"下载 {percent:g}%",
+                "current": percent,
+                "total": 100,
+                "unit": "percent",
+                "percent": percent,
+                "eta_seconds": parse_clock_duration(eta_text),
+                "detail": f"{speed} · ETA {eta_text}" if speed else f"ETA {eta_text}",
+            }
+
+    if stage == "deep-v2" and progress.get("current_step") == "chapters":
+        matches = list(
+            re.finditer(
+                r"\[(?:run|skip)\]\s+chapter\s+(\d+)/(\d+)(?::\s*(.*))?",
+                text,
+            )
+        )
+        if matches:
+            match = matches[-1]
+            current = max(int(match.group(1)), 0)
+            total = max(int(match.group(2)), 0)
+            return {
+                "kind": "chapter",
+                "label": f"章节 {current}/{total}",
+                "current": current,
+                "total": total,
+                "unit": "chapter",
+                "percent": round(min(current / total, 1.0) * 100, 1) if total else None,
+                "eta_seconds": None,
+                "detail": str(match.group(3) or "").strip() or None,
+            }
+
+    current_step = progress.get("current_step")
+    current = next(
+        (step for step in progress.get("steps") or [] if step.get("id") == current_step),
+        None,
+    )
+    if current_step and current:
+        return {
+            "kind": "step",
+            "label": current.get("label") or current_step,
+            "current": None,
+            "total": None,
+            "unit": "step",
+            "percent": progress.get("percent"),
+            "eta_seconds": None,
+            "detail": current.get("message"),
+        }
+    return None
+
+
+def parse_clock_duration(value: str) -> int | None:
+    parts = str(value or "").strip().split(":")
+    if len(parts) not in {2, 3}:
+        return None
+    try:
+        numbers = [int(part) for part in parts]
+    except ValueError:
+        return None
+    if len(numbers) == 2:
+        minutes, seconds = numbers
+        return minutes * 60 + seconds
+    hours, minutes, seconds = numbers
+    return hours * 3600 + minutes * 60 + seconds
 
 
 def stage_progress_text(stage: str, job: dict[str, Any], stage_info: dict[str, Any]) -> str:
@@ -3907,7 +7996,7 @@ def add_core_gpu_issues(gpu: dict[str, Any], command: str, issues: list[dict[str
                 "minicpm-gpu-worker-count-low",
                 "MiniCPM GPU worker 数低于预期",
                 f"当前 nvidia-smi 看到 {len(workers)} 个 llama-server，期望 {CORE_DIAGNOSTIC_EXPECTED_MINICPM_CONCURRENCY} 个。",
-                "检查 MiniCPM 代理健康和 worker 日志，确认 6 个 backend 都已加载到 GPU。",
+                "检查 MiniCPM 代理健康和 worker 日志，确认 5 个 P40 backend 都已加载到 GPU。",
             )
         )
 
@@ -4551,6 +8640,26 @@ def normalize_optional_template(value: Any) -> Any:
     return value
 
 
+def normalize_external_attempt_id(value: Any) -> str:
+    attempt_id = str(normalize_optional_template(value) or "").strip()
+    if not attempt_id:
+        return ""
+    if len(attempt_id) > 128 or not re.fullmatch(r"[A-Za-z0-9._-]+", attempt_id):
+        raise BridgeError(
+            HTTPStatus.BAD_REQUEST,
+            "external_attempt_id must contain only letters, numbers, dot, dash, or underscore",
+        )
+    return attempt_id
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def normalize_cookie_browser(value: Any) -> str:
     browser = str(normalize_optional_template(value) or "").strip().lower()
     if not browser or browser == "auto":
@@ -4569,17 +8678,50 @@ def runtime_config() -> dict[str, Any]:
             data = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             continue
-        if "active_runtime_profile" in data:
-            merged["active_runtime_profile"] = data["active_runtime_profile"]
-        profiles = data.get("runtime_profiles")
-        if isinstance(profiles, dict):
-            merged.setdefault("runtime_profiles", {}).update(profiles)
-    return merged
+        merged = deep_merge(merged, data)
+    try:
+        return resolve_endpoint_config(apply_disabled_runtime_profiles(merged))
+    except ValueError:
+        return merged
 
 
-def runtime_profile_names() -> list[str]:
+def runtime_profile_workflow_id(profile_name: str) -> str:
+    profile = (runtime_config().get("runtime_profiles") or {}).get(profile_name) or {}
+    return str(profile.get("workflow_id") or VIDEO_WORKFLOW_ID)
+
+
+def runtime_profile_names(workflow_id: str | None = None) -> list[str]:
     profiles = runtime_config().get("runtime_profiles") or {}
-    return sorted(profiles)
+    names = sorted(profiles)
+    if workflow_id:
+        names = [
+            name
+            for name in names
+            if str((profiles.get(name) or {}).get("workflow_id") or VIDEO_WORKFLOW_ID)
+            == workflow_id
+        ]
+    return names
+
+
+def runtime_profile_choices() -> list[dict[str, Any]]:
+    profiles = runtime_config().get("runtime_profiles") or {}
+    choices = []
+    for name in sorted(profiles):
+        profile = profiles.get(name) or {}
+        text_model = str(profile.get("text_model") or "")
+        review_model = str(profile.get("review_model") or text_model)
+        label = f"{name} · {text_model}"
+        if review_model and review_model != text_model:
+            label += f" / {review_model}"
+        choices.append(
+            {
+                "value": name,
+                "label": label,
+                "text_model": text_model,
+                "review_model": review_model,
+            }
+        )
+    return choices
 
 
 def active_runtime_profile(profiles: list[str]) -> str:
@@ -4688,6 +8830,10 @@ def iso_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
+def iso_from_timestamp(value: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(value))
+
+
 def format_seconds_label(value: float) -> str:
     seconds = max(0, int(value))
     hours = seconds // 3600
@@ -4764,7 +8910,7 @@ def render_create_page(options: dict[str, Any]) -> str:
           <label for="download_device">下载设备</label>
           <select id="download_device" name="download_device"></select>
         </div>
-        <label class="check"><input id="skip_images" name="skip_images" type="checkbox">跳过配图/提示词</label>
+        <label class="check"><input id="skip_images" name="skip_images" type="checkbox" checked disabled>跳过配图/提示词</label>
       </div>
       <details class="panel">
         <summary>采集选项</summary>
@@ -4888,6 +9034,28 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
     .errorBox {{ display: none; border-color: #f5c2c7; background: #fff5f5; color: #842029; }}
     .errorBox strong {{ display: block; margin-bottom: 8px; }}
     .hint {{ margin-top: 8px; color: #5f6368; font-size: 13px; }}
+    .docSection {{ margin-top: 14px; }}
+    .docSection h3 {{ margin: 0 0 8px; font-size: 15px; }}
+    .docGrid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }}
+    .docCard {{ border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; background: #fff; min-height: 96px; }}
+    .docCard.primary {{ border-color: #b6d4fe; background: #f8fbff; }}
+    .docTitle {{ display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; font-weight: 650; }}
+    .docBadge {{ flex: 0 0 auto; border-radius: 999px; padding: 2px 8px; font-size: 12px; background: #e8f0fe; color: #174ea6; }}
+    .docDescription {{ margin-top: 8px; color: #3c4043; font-size: 13px; line-height: 1.5; }}
+    .docMeta {{ margin-top: 8px; color: #5f6368; font-size: 12px; }}
+    .docList {{ display: grid; gap: 8px; }}
+    .docListItem {{ display: grid; grid-template-columns: minmax(160px, 1fr) minmax(120px, auto); gap: 10px; border-bottom: 1px solid #edf0f2; padding: 8px 0; }}
+    .docListItem:last-child {{ border-bottom: 0; }}
+    .docEmpty {{ color: #5f6368; font-size: 13px; }}
+    .mindmap {{ display: grid; gap: 8px; }}
+    .mindmapTier {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }}
+    .mindmapTier + .mindmapTier::before {{ content: "\\2193"; color: #5f6368; margin-right: 4px; }}
+    .mindNode {{ border: 1px solid #dadce0; border-radius: 8px; padding: 8px 10px; background: #fff; min-width: 150px; }}
+    .mindNode.missing {{ opacity: .58; background: #f8f9fa; }}
+    .mindNode strong {{ display: block; font-size: 13px; }}
+    .mindNode span {{ display: block; color: #5f6368; font-size: 12px; margin-top: 3px; }}
+    details.docDetails {{ margin-top: 12px; border-top: 1px solid #edf0f2; padding-top: 10px; }}
+    details.docDetails summary {{ cursor: pointer; font-weight: 650; }}
 	    .actions {{ margin-top: 14px; display: flex; gap: 10px; align-items: center; }}
 	    button {{ border: 0; border-radius: 6px; padding: 9px 14px; background: #202124; color: #fff; font-size: 14px; cursor: pointer; }}
 	    button.secondary {{ background: #eef2f7; color: #202124; }}
@@ -4950,7 +9118,7 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
       </table>
     </section>
     <section class="panel">
-      <h2>产物</h2>
+      <h2>文档预览</h2>
       <div id="artifacts" class="value">-</div>
     </section>
     <section class="panel">
@@ -5003,6 +9171,88 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
         if (char === '"') return "&quot;";
         return "&#39;";
       }});
+    }}
+    function formatBytes(value) {{
+      const bytes = Number(value);
+      if (!Number.isFinite(bytes) || bytes <= 0) return "-";
+      if (bytes < 1024) return `${{bytes}} B`;
+      if (bytes < 1024 * 1024) return `${{(bytes / 1024).toFixed(1)}} KB`;
+      return `${{(bytes / 1024 / 1024).toFixed(1)}} MB`;
+    }}
+    function docLink(item) {{
+      if (!item?.url) return escapeHtml(item?.path || "");
+      return `<a href="${{escapeHtml(item.url)}}" target="_blank" rel="noopener noreferrer">${{escapeHtml(item.title || item.path)}}</a>`;
+    }}
+    function docMeta(item) {{
+      const parts = [];
+      if (item?.path) parts.push(escapeHtml(item.path));
+      if (item?.type === "directory") parts.push(`${{Number(item.file_count || 0)}} 个文件`);
+      if (item?.size_bytes) parts.push(formatBytes(item.size_bytes));
+      return parts.join(" · ");
+    }}
+    function renderDocCards(items, badge) {{
+      if (!items?.length) return `<div class="docEmpty">暂无可用文档</div>`;
+      return `<div class="docGrid">${{items.map(item => `
+        <article class="docCard primary">
+          <div class="docTitle"><span>${{docLink(item)}}</span><span class="docBadge">${{escapeHtml(badge)}}</span></div>
+          <div class="docDescription">${{escapeHtml(item.description || "")}}</div>
+          <div class="docMeta">${{docMeta(item)}}</div>
+        </article>
+      `).join("")}}</div>`;
+    }}
+    function renderDocList(items) {{
+      if (!items?.length) return `<div class="docEmpty">暂无可用文件</div>`;
+      return `<div class="docList">${{items.map(item => `
+        <div class="docListItem">
+          <div>
+            <div>${{item.type === "file" ? docLink(item) : escapeHtml(item.title || item.path)}}</div>
+            <div class="hint">${{escapeHtml(item.description || "")}}</div>
+          </div>
+          <div class="docMeta">${{docMeta(item)}}</div>
+        </div>
+      `).join("")}}</div>`;
+    }}
+    function renderMindmap(derivation) {{
+      const nodes = derivation?.nodes || [];
+      if (!nodes.length) return `<div class="docEmpty">暂无推导关系</div>`;
+      const tiers = [...new Set(nodes.map(node => node.tier))].sort((a, b) => a - b);
+      const html = tiers.map(tier => `
+        <div class="mindmapTier">
+          ${{nodes.filter(node => node.tier === tier).map(node => `
+            <div class="mindNode ${{node.available ? "" : "missing"}}">
+              <strong>${{escapeHtml(node.title)}}</strong>
+              <span>${{escapeHtml(node.description)}}</span>
+            </div>
+          `).join("")}}
+        </div>
+      `).join("");
+      const source = derivation?.mermaid ? `<details class="docDetails"><summary>Mermaid 源码</summary><pre>${{escapeHtml(derivation.mermaid)}}</pre></details>` : "";
+      return `<div class="mindmap">${{html}}</div>${{source}}`;
+    }}
+    function renderDocumentPreview(preview) {{
+      if (!preview) return `<div class="docEmpty">暂无文档预览</div>`;
+      return `
+        <div class="docSection">
+          <h3>重点阅读</h3>
+          ${{renderDocCards(preview.primary || [], "重点")}}
+        </div>
+        <div class="docSection">
+          <h3>推导脑图</h3>
+          ${{renderMindmap(preview.derivation)}}
+        </div>
+        <div class="docSection">
+          <h3>证据审计</h3>
+          ${{renderDocList(preview.evidence || [])}}
+        </div>
+        <details class="docDetails">
+          <summary>过程文件</summary>
+          ${{renderDocList(preview.process || [])}}
+        </details>
+        <details class="docDetails">
+          <summary>素材与中间目录</summary>
+          ${{renderDocList(preview.assets || [])}}
+        </details>
+      `;
     }}
     function chooseLogStage(job) {{
       if (selectedLogStage) return selectedLogStage;
@@ -5057,13 +9307,7 @@ def render_job_dashboard(job: dict[str, Any]) -> str:
         }});
       }});
       renderCoreProgress(job.core_progress);
-      const summary = job.summary || {{}};
-      document.getElementById("artifacts").innerHTML = [
-        `Markdown: ${{(summary.markdown_files || []).length}}`,
-        `导出文件: ${{(summary.export_files || []).length}}`,
-        `配图提示词: ${{(summary.prompt_files || []).length}}`,
-        `最终图片: ${{(summary.final_images || []).length}}`
-      ].join("<br>");
+      document.getElementById("artifacts").innerHTML = renderDocumentPreview(job.document_preview);
       const stageForLog = chooseLogStage(job);
       await loadLog(job, stageForLog);
     }}
@@ -5200,6 +9444,12 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
                 full = parse_bool(query.get("full", ["false"])[0])
                 self.write_json(self.server_app.stage_log(match.group(1), match.group(2), limit, full))
                 return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/resources/(.+)", path)
+            if match:
+                resource_path = unquote(match.group(2))
+                file_path, content_type = self.server_app.resource_file(match.group(1), resource_path)
+                self.write_file(file_path, content_type)
+                return
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/qa-index", path)
             if match:
                 self.write_json(self.server_app.qa_index(match.group(1)))
@@ -5216,6 +9466,79 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/skill-candidate", path)
             if match:
                 self.write_json(self.server_app.skill_candidate(match.group(1)))
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/skill-distillation", path)
+            if match:
+                self.write_json(self.server_app.skill_candidate(match.group(1)))
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/skill-distillation/workspace", path)
+            if match:
+                self.write_json(self.server_app.skill_distillation_workspace(match.group(1)))
+                return
+            match = re.fullmatch(
+                r"/api/video-link/jobs/([a-f0-9]{32})/skill-distillation/items/(.+)",
+                path,
+            )
+            if match:
+                self.write_json(
+                    self.server_app.skill_distillation_item(match.group(1), unquote(match.group(2)))
+                )
+                return
+            if path == "/api/skill-projects":
+                self.write_json(self.server_app.list_skill_projects())
+                return
+            if path == "/api/skill-projects/workbench":
+                query = parse_qs(parsed.query)
+                self.write_json(
+                    self.server_app.skill_project_workbench(
+                        query.get("project_id", [""])[0]
+                    )
+                )
+                return
+            match = re.fullmatch(r"/api/skill-projects/([a-f0-9]{32})/packages/preview", path)
+            if match:
+                package_id = parse_qs(parsed.query).get("package_id", [""])[0]
+                self.write_json(
+                    self.server_app.preview_skill_project_package(match.group(1), package_id)
+                )
+                return
+            match = re.fullmatch(r"/api/skill-projects/([a-f0-9]{32})", path)
+            if match:
+                self.write_json(self.server_app.get_skill_project(match.group(1)))
+                return
+            match = re.fullmatch(r"/api/skill-projects/([a-f0-9]{32})/workspace", path)
+            if match:
+                self.write_json(self.server_app.skill_project_workspace(match.group(1)))
+                return
+            match = re.fullmatch(r"/api/skill-projects/([a-f0-9]{32})/resource", path)
+            if match:
+                resource_path = parse_qs(parsed.query).get("path", [""])[0]
+                file_path, content_type = self.server_app.skill_project_resource_file(
+                    match.group(1),
+                    resource_path,
+                )
+                self.write_file(file_path, content_type)
+                return
+            if path == "/api/skills":
+                query = parse_qs(parsed.query)
+                self.write_json(
+                    self.server_app.list_skills(
+                        query.get("state", ["enabled"])[0],
+                        query.get("query", [""])[0],
+                    )
+                )
+                return
+            match = re.fullmatch(r"/api/skills/(enabled|disabled|trash)/([^/]+)/versions", path)
+            if match:
+                self.write_json(
+                    self.server_app.skill_versions(match.group(1), unquote(match.group(2)))
+                )
+                return
+            match = re.fullmatch(r"/api/skills/(enabled|disabled|trash)/([^/]+)", path)
+            if match:
+                self.write_json(
+                    self.server_app.get_skill(match.group(1), unquote(match.group(2)))
+                )
                 return
             match = re.fullmatch(r"/video-link/jobs/([a-f0-9]{32})", path)
             if match:
@@ -5238,13 +9561,32 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         try:
             path = urlparse(self.path).path
+            if path == "/api/mobile/audio-jobs/from-transcript":
+                payload, upload_path, filename = self.read_transcript_multipart()
+                try:
+                    self.write_json(
+                        self.server_app.create_mobile_transcript_job(payload, upload_path, filename),
+                        HTTPStatus.CREATED,
+                    )
+                finally:
+                    upload_path.unlink(missing_ok=True)
+                return
             payload = self.read_json_body()
             if path == "/api/video-link/jobs":
                 self.write_json(self.server_app.create_job(payload), HTTPStatus.CREATED)
                 return
+            if path == "/api/skill-projects":
+                self.write_json(
+                    self.server_app.create_skill_project(payload),
+                    HTTPStatus.CREATED,
+                )
+                return
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/run", path)
             if match:
-                self.write_json(self.server_app.start_run(match.group(1)), HTTPStatus.ACCEPTED)
+                self.write_json(
+                    self.server_app.start_run(match.group(1), profile=payload.get("profile")),
+                    HTTPStatus.ACCEPTED,
+                )
                 return
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/stop", path)
             if match:
@@ -5266,15 +9608,159 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
                 return
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/skill-candidate/generate", path)
             if match:
-                self.write_json(self.server_app.generate_skill_candidate(match.group(1)))
+                self.write_json(
+                    self.server_app.generate_skill_candidate(match.group(1), payload),
+                    HTTPStatus.ACCEPTED,
+                )
                 return
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/skill-candidate/enable", path)
             if match:
-                self.write_json(self.server_app.enable_skill_candidate(match.group(1)))
+                self.write_json(self.server_app.enable_skill_candidate(match.group(1), payload))
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/skill-distillation/start", path)
+            if match:
+                self.write_json(
+                    self.server_app.start_skill_distillation(match.group(1), payload),
+                    HTTPStatus.ACCEPTED,
+                )
+                return
+            match = re.fullmatch(
+                r"/api/video-link/jobs/([a-f0-9]{32})/skill-distillation/review-overview",
+                path,
+            )
+            if match:
+                self.write_json(
+                    self.server_app.review_skill_distillation_overview(match.group(1), payload),
+                    HTTPStatus.ACCEPTED,
+                )
+                return
+            match = re.fullmatch(
+                r"/api/video-link/jobs/([a-f0-9]{32})/skill-distillation/review-candidates",
+                path,
+            )
+            if match:
+                self.write_json(
+                    self.server_app.review_skill_distillation_candidates(match.group(1), payload),
+                    HTTPStatus.ACCEPTED,
+                )
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/skill-distillation/resume", path)
+            if match:
+                self.write_json(
+                    self.server_app.resume_skill_distillation(match.group(1)),
+                    HTTPStatus.ACCEPTED,
+                )
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/skill-distillation/cancel", path)
+            if match:
+                self.write_json(
+                    self.server_app.cancel_skill_distillation(match.group(1)),
+                    HTTPStatus.ACCEPTED,
+                )
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/skill-distillation/enable", path)
+            if match:
+                self.write_json(self.server_app.enable_skill_distillation(match.group(1), payload))
+                return
+            match = re.fullmatch(r"/api/skill-projects/([a-f0-9]{32})/sources", path)
+            if match:
+                self.write_json(
+                    self.server_app.add_skill_project_source(match.group(1), payload)
+                )
+                return
+            match = re.fullmatch(r"/api/skill-projects/([a-f0-9]{32})/packages", path)
+            if match:
+                self.write_json(
+                    self.server_app.import_skill_project_package(match.group(1), payload)
+                )
+                return
+            match = re.fullmatch(r"/api/skill-projects/([a-f0-9]{32})/assess", path)
+            if match:
+                self.write_json(
+                    self.server_app.assess_skill_project(match.group(1), payload)
+                )
+                return
+            match = re.fullmatch(
+                r"/api/skill-projects/([a-f0-9]{32})/capability-checks/([^/]+)/run",
+                path,
+            )
+            if match:
+                self.write_json(
+                    self.server_app.run_skill_project_capability_check(
+                        match.group(1),
+                        unquote(match.group(2)),
+                        payload,
+                    )
+                )
+                return
+            match = re.fullmatch(
+                r"/api/skill-projects/([a-f0-9]{32})/distillation/(start|review-overview|review-candidates|resume|cancel|enable)",
+                path,
+            )
+            if match:
+                project_id, action = match.groups()
+                if action == "start":
+                    result = self.server_app.start_skill_project_distillation(project_id, payload)
+                elif action == "review-overview":
+                    result = self.server_app.review_skill_project_overview(project_id, payload)
+                elif action == "review-candidates":
+                    result = self.server_app.review_skill_project_candidates(project_id, payload)
+                elif action == "resume":
+                    result = self.server_app.resume_skill_project_distillation(project_id)
+                elif action == "cancel":
+                    result = self.server_app.cancel_skill_project_distillation(project_id)
+                else:
+                    result = self.server_app.enable_skill_project_distillation(project_id, payload)
+                status = (
+                    HTTPStatus.ACCEPTED
+                    if action in {"start", "review-overview", "review-candidates", "resume", "cancel"}
+                    else HTTPStatus.OK
+                )
+                self.write_json(result, status)
+                return
+            match = re.fullmatch(r"/api/skills/enabled/([^/]+)/disable", path)
+            if match:
+                self.write_json(self.server_app.disable_skill(unquote(match.group(1))))
+                return
+            match = re.fullmatch(r"/api/skills/disabled/([^/]+)/restore", path)
+            if match:
+                self.write_json(self.server_app.restore_disabled_skill(unquote(match.group(1))))
+                return
+            match = re.fullmatch(r"/api/skills/trash/([^/]+)/restore", path)
+            if match:
+                self.write_json(self.server_app.restore_trash_skill(unquote(match.group(1))))
+                return
+            match = re.fullmatch(
+                r"/api/skills/(enabled|disabled)/([^/]+)/versions/([^/]+)/restore",
+                path,
+            )
+            if match:
+                self.write_json(
+                    self.server_app.restore_skill_version(
+                        match.group(1),
+                        unquote(match.group(2)),
+                        unquote(match.group(3)),
+                        payload,
+                    )
+                )
                 return
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/stages/([a-z0-9-]+)", path)
             if match:
                 self.write_json(self.server_app.run_stage(match.group(1), match.group(2)))
+                return
+            match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/stages/([a-z0-9-]+)/rerun", path)
+            if match:
+                self.write_json(
+                    self.server_app.rerun_from_stage(
+                        match.group(1),
+                        match.group(2),
+                        profile=payload.get("profile"),
+                        refresh_runtime_profile=parse_bool(
+                            payload.get("refresh_runtime_profile", False)
+                        ),
+                    ),
+                    HTTPStatus.ACCEPTED,
+                )
                 return
             raise BridgeError(HTTPStatus.NOT_FOUND, "not found")
         except BridgeError as exc:
@@ -5283,6 +9769,7 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:
         try:
             path = urlparse(self.path).path
+            payload = self.read_json_body()
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})", path)
             if match:
                 self.write_json(self.server_app.delete_job(match.group(1)))
@@ -5290,6 +9777,57 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/vscode-session", path)
             if match:
                 self.write_json(self.server_app.stop_vscode_session(match.group(1)))
+                return
+            match = re.fullmatch(r"/api/skill-projects/([a-f0-9]{32})/sources/([^/]+)", path)
+            if match:
+                self.write_json(
+                    self.server_app.remove_skill_project_source(
+                        match.group(1),
+                        unquote(match.group(2)),
+                    )
+                )
+                return
+            match = re.fullmatch(r"/api/skills/(enabled|disabled|trash)/([^/]+)", path)
+            if match:
+                self.write_json(
+                    self.server_app.delete_skill(
+                        match.group(1),
+                        unquote(match.group(2)),
+                        payload,
+                    )
+                )
+                return
+            raise BridgeError(HTTPStatus.NOT_FOUND, "not found")
+        except BridgeError as exc:
+            self.write_json({"error": exc.message}, exc.status)
+
+    def do_PATCH(self) -> None:
+        try:
+            path = urlparse(self.path).path
+            payload = self.read_json_body()
+            match = re.fullmatch(r"/api/skill-projects/([a-f0-9]{32})", path)
+            if match:
+                self.write_json(
+                    self.server_app.update_skill_project(match.group(1), payload)
+                )
+                return
+            raise BridgeError(HTTPStatus.NOT_FOUND, "not found")
+        except BridgeError as exc:
+            self.write_json({"error": exc.message}, exc.status)
+
+    def do_PUT(self) -> None:
+        try:
+            path = urlparse(self.path).path
+            payload = self.read_json_body()
+            match = re.fullmatch(r"/api/skills/(enabled|disabled)/([^/]+)", path)
+            if match:
+                self.write_json(
+                    self.server_app.update_skill(
+                        match.group(1),
+                        unquote(match.group(2)),
+                        payload,
+                    )
+                )
                 return
             raise BridgeError(HTTPStatus.NOT_FOUND, "not found")
         except BridgeError as exc:
@@ -5308,6 +9846,34 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             raise BridgeError(HTTPStatus.BAD_REQUEST, "request body must be a JSON object")
         return payload
 
+    def read_transcript_multipart(self) -> tuple[dict[str, Any], Path, str]:
+        content_type = self.headers.get("Content-Type", "")
+        if "multipart/form-data" not in content_type.lower():
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "expected multipart/form-data")
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "multipart body is empty")
+        message = BytesParser(policy=policy.default).parsebytes(
+            f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode() + self.rfile.read(length)
+        )
+        payload: dict[str, Any] = {}
+        transcript_part = None
+        for part in message.iter_parts():
+            name = part.get_param("name", header="content-disposition")
+            if name in {"transcript", "transcript_json"}:
+                transcript_part = part
+            elif name:
+                payload[name] = part.get_content().strip()
+        if transcript_part is None:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "transcript JSON file is required")
+        filename = transcript_part.get_filename() or "transcript.json"
+        fd, temporary_name = tempfile.mkstemp(prefix="provided-transcript-", suffix=".json")
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(transcript_part.get_payload(decode=True) or b"")
+            handle.flush()
+            os.fsync(handle.fileno())
+        return payload, Path(temporary_name), filename
+
     def write_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
         body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
         self.send_response(int(status))
@@ -5321,6 +9887,15 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
         self.send_response(int(status))
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def write_file(self, path: Path, content_type: str | None = None) -> None:
+        body = path.read_bytes()
+        self.send_response(int(HTTPStatus.OK))
+        self.send_header("Content-Type", content_type or "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Disposition", f"inline; filename={quote(path.name)}")
         self.end_headers()
         self.wfile.write(body)
 

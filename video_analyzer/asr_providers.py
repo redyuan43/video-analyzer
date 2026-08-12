@@ -1,4 +1,5 @@
 import logging
+import os
 import subprocess
 import tempfile
 import time
@@ -21,6 +22,7 @@ from .config import Config, normalize_string_list
 logger = logging.getLogger(__name__)
 
 FALLBACK_CAPSWRITER_URL = "http://spark-31d6.taild500c8.ts.net:8001/api/asr/transcribe"
+FALLBACK_FIRERED_3DSPEAKER_URL = "http://127.0.0.1:8013/api/firered-3dspeaker/transcribe"
 FALLBACK_REMOTE_VIBEVOICE_URLS = [
     "http://edge.taild500c8.ts.net:8012/api/asr/transcribe",
     "http://spark-31d6.taild500c8.ts.net:8012/api/asr/transcribe",
@@ -43,6 +45,16 @@ def default_capswriter_url(config: Optional[Dict[str, object]] = None) -> str:
 
 def default_vibevoice_urls(config: Optional[Dict[str, object]] = None) -> list[str]:
     return normalize_string_list(default_endpoint_service("vibevoice_urls", FALLBACK_REMOTE_VIBEVOICE_URLS, config))
+
+
+def default_firered_3dspeaker_url(config: Optional[Dict[str, object]] = None) -> str:
+    return str(
+        default_endpoint_service(
+            "firered_3dspeaker_url",
+            FALLBACK_FIRERED_3DSPEAKER_URL,
+            config,
+        )
+    )
 
 
 CAPSWRITER_URL = default_capswriter_url()
@@ -197,6 +209,76 @@ def transcribe_with_http_asr(
 
 def transcribe_with_capswriter(audio_path: Path, hotword: str = "", url: Optional[str] = None) -> Optional[AudioTranscript]:
     return transcribe_with_http_asr(audio_path, url or default_capswriter_url(), hotword=hotword)
+
+
+def transcribe_with_firered_3dspeaker(
+    audio_path: Path,
+    url: Optional[str] = None,
+) -> Optional[AudioTranscript]:
+    return transcribe_with_http_asr(
+        audio_path,
+        url or default_firered_3dspeaker_url(),
+        timeout=_http_timeout_for_audio(_wav_duration(audio_path)),
+    )
+
+
+def transcribe_with_qwen3_asr(
+    audio_path: Path,
+    url: str,
+    model: str = "",
+    options: Optional[Dict[str, object]] = None,
+) -> Optional[AudioTranscript]:
+    request_options = dict(options or {})
+    if model:
+        request_options["model"] = model
+    return transcribe_with_http_asr(
+        audio_path,
+        url,
+        extra_data=request_options,
+        timeout=_http_timeout_for_audio(_wav_duration(audio_path)),
+    )
+
+
+def transcribe_with_firered_asr2(
+    audio_path: Path,
+    url: str,
+) -> Optional[AudioTranscript]:
+    return transcribe_with_http_asr(
+        audio_path,
+        url,
+        timeout=_http_timeout_for_audio(_wav_duration(audio_path)),
+    )
+
+
+def transcribe_with_openai_audio(
+    audio_path: Path,
+    url: str,
+    model: str,
+    api_key_env: str = "",
+) -> Optional[AudioTranscript]:
+    headers = {}
+    if api_key_env and os.environ.get(api_key_env):
+        headers["Authorization"] = f"Bearer {os.environ[api_key_env]}"
+    try:
+        with audio_path.open("rb") as audio_file:
+            response = requests.post(
+                url,
+                headers=headers,
+                files={"file": (audio_path.name, audio_file, "audio/wav")},
+                data={"model": model, "response_format": "verbose_json"},
+                timeout=_http_timeout_for_audio(_wav_duration(audio_path)),
+            )
+        response.raise_for_status()
+        payload = response.json()
+        return AudioTranscript(
+            text=str(payload.get("text") or ""),
+            segments=payload.get("segments") or [],
+            language=payload.get("language") or "unknown",
+            metadata={"provider": "openai_audio", "provider_payload": payload},
+        )
+    except Exception as exc:
+        logger.warning("OpenAI-compatible audio transcription failed from %s: %s", url, exc)
+        return None
 
 
 def transcribe_with_remote_http(audio_path: Path, urls: Optional[list[str]] = None) -> Optional[AudioTranscript]:
@@ -375,6 +457,46 @@ def transcribe_with_provider_result(
                 result,
                 candidate,
                 lambda: transcribe_with_capswriter(audio_path, url=str(vibevoice_config.get("capswriter_url") or "")),
+            )
+        elif candidate == "firered_3dspeaker":
+            transcript = _timed_transcribe(
+                result,
+                candidate,
+                lambda: transcribe_with_firered_3dspeaker(
+                    audio_path,
+                    url=str(vibevoice_config.get("firered_3dspeaker_url") or ""),
+                ),
+            )
+        elif candidate == "firered_asr2":
+            transcript = _timed_transcribe(
+                result,
+                candidate,
+                lambda: transcribe_with_firered_asr2(
+                    audio_path,
+                    url=str(vibevoice_config.get("firered_asr2_url") or ""),
+                ),
+            )
+        elif candidate == "qwen3_asr":
+            transcript = _timed_transcribe(
+                result,
+                candidate,
+                lambda: transcribe_with_qwen3_asr(
+                    audio_path,
+                    url=str(vibevoice_config.get("qwen3_asr_url") or ""),
+                    model=str(vibevoice_config.get("qwen3_asr_model") or ""),
+                    options=dict(vibevoice_config.get("qwen3_asr_options") or {}),
+                ),
+            )
+        elif candidate == "openai_audio":
+            transcript = _timed_transcribe(
+                result,
+                candidate,
+                lambda: transcribe_with_openai_audio(
+                    audio_path,
+                    str(vibevoice_config.get("openai_audio_url") or ""),
+                    str(vibevoice_config.get("openai_audio_model") or ""),
+                    str(vibevoice_config.get("asr_api_key_env") or ""),
+                ),
             )
         elif candidate == "vibevoice":
             transcript = _timed_transcribe(result, candidate, lambda: transcribe_with_vibevoice(audio_path, vibevoice_config))

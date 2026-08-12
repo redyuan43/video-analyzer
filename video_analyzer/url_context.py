@@ -72,13 +72,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vl-context-max-gap")
     parser.add_argument("--duration", type=float, help="Optional duration in seconds to process")
     parser.add_argument("--manual-language")
-    parser.add_argument("--asr-provider", choices=["none", "vibevoice"], help="Analyzer ASR provider when no subtitle transcript is used")
+    parser.add_argument(
+        "--asr-provider",
+        choices=[
+            "none",
+            "remote_http",
+            "capswriter_http",
+            "firered_3dspeaker",
+            "openai_audio",
+            "vibevoice",
+            "faster_whisper",
+        ],
+        help="Analyzer ASR provider when no subtitle transcript is used",
+    )
     parser.add_argument("--vibevoice-url", action="append", help="Remote GPU VibeVoice ASR endpoint; can be provided multiple times")
+    parser.add_argument("--remote-asr-url", action="append", help="Generic multipart ASR endpoint; can be provided multiple times")
+    parser.add_argument(
+        "--ocr-provider",
+        choices=["auto", "unlimited_ocr", "dots_ocr", "dots_mocr_vllm", "openai_vision", "none"],
+        help="OCR provider used by the analyzer",
+    )
     parser.add_argument("--ocr-base-url", action="append", help="DotsMOCR OpenAI-compatible base URL; can be provided multiple times")
     parser.add_argument("--ocr-concurrency", help="OCR concurrency per endpoint, or auto")
     parser.add_argument("--ocr-cache", choices=["on", "off", "refresh"], help="OCR cache mode")
     parser.add_argument("--ocr-cache-dir", help="OCR cache directory")
     parser.add_argument("--ocr-timeout-seconds", type=float, help="Per-frame OCR request timeout")
+    parser.add_argument("--ocr-max-tokens", type=int, help="OCR generation length limit")
+    parser.add_argument("--ocr-max-image-long-side", type=int, help="OCR upload image longest side")
+    parser.add_argument("--ocr-image-mode", choices=["gundam", "base"], help="Unlimited-OCR image mode")
     parser.add_argument("--ocr-keyframe-strategy", choices=["auto", "scan-text", "legacy"])
     parser.add_argument("--ocr-keyframe-budget", help="auto or explicit OCR keyframe count")
     parser.add_argument("--ocr-scan-sample-fps", help="auto or low-cost preview scan FPS for OCR keyframe discovery")
@@ -115,7 +136,8 @@ def parse_args() -> argparse.Namespace:
         help="Use downloaded author/automatic subtitles as transcript and skip audio ASR when available",
     )
     parser.add_argument("--transcript-file", help="Existing transcript markdown file passed through to the analyzer")
-    parser.add_argument("--frame-extractor", choices=["local", "jetson", "auto"])
+    parser.add_argument("--frame-extractor", choices=["local", "local_gpu", "jetson", "auto"])
+    parser.add_argument("--local-frame-gpus")
     parser.add_argument("--jetson-frame-hosts")
     parser.add_argument("--jetson-frame-backend", choices=["auto", "ssh", "ray"])
     parser.add_argument("--jetson-sample-fps")
@@ -169,11 +191,16 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
         "manual_language": profile.get("manual_language", "zh-CN"),
         "asr_provider": profile.get("asr_provider", "vibevoice"),
         "vibevoice_url": profile.get("vibevoice_urls") or profile.get("vibevoice_url"),
+        "remote_asr_url": profile.get("remote_asr_urls") or profile.get("remote_asr_url"),
+        "ocr_provider": profile.get("ocr_provider", "auto"),
         "ocr_base_url": profile.get("ocr_base_urls") or profile.get("ocr_base_url"),
         "ocr_concurrency": profile.get("ocr_concurrency", "auto"),
         "ocr_cache": profile.get("ocr_cache", "on"),
         "ocr_cache_dir": profile.get("ocr_cache_dir", ".cache/video-analyzer/ocr"),
         "ocr_timeout_seconds": profile.get("ocr_timeout_seconds"),
+        "ocr_max_tokens": profile.get("ocr_max_tokens"),
+        "ocr_max_image_long_side": profile.get("ocr_max_image_long_side"),
+        "ocr_image_mode": profile.get("ocr_image_mode"),
         "ocr_keyframe_strategy": profile.get("ocr_keyframe_strategy", "scan-text"),
         "ocr_keyframe_budget": profile.get("ocr_keyframe_budget", "auto"),
         "ocr_scan_sample_fps": profile.get("ocr_scan_sample_fps", "auto"),
@@ -202,8 +229,10 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
     for key, value in defaults.items():
         if getattr(args, key, None) is None and value is not None:
             setattr(args, key, value)
-    if not args.vibevoice_url:
+    if args.asr_provider == "vibevoice" and not args.vibevoice_url:
         raise ValueError("Runtime profile must provide vibevoice_url, or pass --vibevoice-url")
+    if args.asr_provider == "remote_http" and not args.remote_asr_url:
+        raise ValueError("Runtime profile must provide remote_asr_url, or pass --remote-asr-url")
     if not args.ocr_base_url:
         raise ValueError("Runtime profile must provide ocr_base_url, or pass --ocr-base-url")
     return args
@@ -1123,7 +1152,7 @@ def build_analyzer_command(args: argparse.Namespace, video_path: Path, context_p
         "--context-file",
         str(context_path),
         "--ocr-provider",
-        "auto",
+        getattr(args, "ocr_provider", "auto"),
         "--llm-base-url",
         args.llm_base_url,
         "--vision-base-url",
@@ -1167,10 +1196,15 @@ def build_analyzer_command(args: argparse.Namespace, video_path: Path, context_p
         if asr_provider == "vibevoice":
             for vibevoice_url in _as_list(args.vibevoice_url):
                 command.extend(["--vibevoice-url", vibevoice_url])
+        elif asr_provider == "remote_http":
+            for remote_asr_url in _as_list(args.remote_asr_url):
+                command.extend(["--remote-asr-url", remote_asr_url])
     command.extend(
         [
             "--frame-extractor",
             getattr(args, "frame_extractor", "local"),
+            "--local-frame-gpus",
+            getattr(args, "local_frame_gpus", "auto"),
             "--jetson-frame-hosts",
             getattr(args, "jetson_frame_hosts", "nx2,nx3"),
             "--jetson-frame-backend",
@@ -1197,8 +1231,22 @@ def build_analyzer_command(args: argparse.Namespace, video_path: Path, context_p
             getattr(args, "ocr_cache", "on"),
             "--ocr-cache-dir",
             getattr(args, "ocr_cache_dir", ".cache/video-analyzer/ocr"),
-            "--ocr-timeout-seconds",
-            str(getattr(args, "ocr_timeout_seconds", 120)),
+        ]
+    )
+    ocr_timeout_seconds = getattr(args, "ocr_timeout_seconds", None)
+    if ocr_timeout_seconds is not None:
+        command.extend(["--ocr-timeout-seconds", str(ocr_timeout_seconds)])
+    ocr_max_tokens = getattr(args, "ocr_max_tokens", None)
+    if ocr_max_tokens is not None:
+        command.extend(["--ocr-max-tokens", str(ocr_max_tokens)])
+    ocr_max_image_long_side = getattr(args, "ocr_max_image_long_side", None)
+    if ocr_max_image_long_side is not None:
+        command.extend(["--ocr-max-image-long-side", str(ocr_max_image_long_side)])
+    ocr_image_mode = getattr(args, "ocr_image_mode", None)
+    if ocr_image_mode is not None:
+        command.extend(["--ocr-image-mode", str(ocr_image_mode)])
+    command.extend(
+        [
             "--ocr-keyframe-strategy",
             getattr(args, "ocr_keyframe_strategy", "auto"),
             "--ocr-keyframe-budget",

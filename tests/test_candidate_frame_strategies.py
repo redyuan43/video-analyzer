@@ -173,6 +173,89 @@ class CandidateFrameStrategyTests(TestCase):
 
         self.assertEqual(result.metadata["selected_candidate_strategy"], "operation")
 
+    def test_transcript_cue_anchor_treatment_improves_anchor_coverage(self):
+        rows = [
+            candidate(0, 0.0, 40.0, 0.01),
+            candidate(1, 10.0, 39.0, 0.01),
+            candidate(2, 50.0, 5.0, 0.45),
+            candidate(3, 90.0, 38.0, 0.01),
+            candidate(4, 100.0, 37.0, 0.01),
+        ]
+
+        result = select_candidate_frames_with_strategy(
+            rows,
+            candidate_budget=2,
+            video_duration_seconds=120.0,
+            pipeline_mode="balanced",
+            strategy="generic",
+            transcript_segments=[{"start": 48.0, "end": 52.0}],
+        )
+
+        trace = result.metadata["strategy_observations"]["paper_algorithm_trace"]["cue_anchors"]
+        self.assertTrue(trace["enabled"])
+        self.assertGreaterEqual(trace["treatment_anchor_coverage"], trace["baseline_anchor_coverage"])
+        self.assertTrue(any(abs(item[2] - 50.0) <= 0.1 for item in result.selected))
+
+    def test_transcript_cue_anchor_accepts_historical_capitalized_segment_keys(self):
+        rows = [
+            candidate(0, 0.0, 40.0, 0.9),
+            candidate(1, 10.0, 39.0, 0.8),
+            candidate(2, 50.0, 5.0, 0.45),
+            candidate(3, 90.0, 38.0, 0.01),
+        ]
+
+        result = select_candidate_frames_with_strategy(
+            rows,
+            candidate_budget=2,
+            video_duration_seconds=120.0,
+            pipeline_mode="balanced",
+            strategy="generic",
+            transcript_segments=[{"Start": 48.0, "End": 52.0}],
+        )
+
+        trace = result.metadata["strategy_observations"]["paper_algorithm_trace"]["cue_anchors"]
+        self.assertTrue(trace["enabled"])
+        self.assertTrue(any(abs(item[2] - 50.0) <= 0.1 for item in result.selected))
+
+    def test_transcript_cue_anchor_guardrail_keeps_baseline_when_coverage_drops(self):
+        real_frame_points = [
+            (0.0, 266.511),
+            (6.0, 68.528),
+            (20.0, 20.184),
+            (22.0, 72.616),
+            (40.0, 64.523),
+            (60.0, 21.213),
+            (66.78, 270.519),
+            (80.78, 56.092),
+            (100.78, 14.288),
+            (110.78, 71.046),
+            (118.78, 71.294),
+            (120.78, 59.132),
+            (126.78, 79.663),
+            (130.78, 84.722),
+        ]
+        rows = [candidate(index, timestamp, score, 0.0) for index, (timestamp, score) in enumerate(real_frame_points)]
+
+        result = select_candidate_frames_with_strategy(
+            rows,
+            candidate_budget=7,
+            video_duration_seconds=137.558,
+            pipeline_mode="balanced",
+            strategy="generic",
+            transcript_segments=[
+                {"Start": 0.0, "End": 39.77},
+                {"Start": 39.77, "End": 78.86},
+                {"Start": 78.86, "End": 118.44},
+                {"Start": 118.44, "End": 131.86},
+                {"Start": 131.86, "End": 137.58},
+            ],
+        )
+
+        trace = result.metadata["strategy_observations"]["paper_algorithm_trace"]["cue_anchors"]
+        self.assertTrue(trace["guardrail_triggered"])
+        self.assertEqual(trace["coverage_delta"], 0.0)
+        self.assertEqual(trace["baseline_anchor_coverage"], trace["treatment_anchor_coverage"])
+
     def test_deep_auto_adds_secondary_strategy(self):
         rows = [candidate(index, index * 10.0, 4.0, 0.45) for index in range(8)]
 

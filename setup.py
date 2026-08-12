@@ -28,6 +28,6 @@ setup(
             "video-analyzer=video_analyzer.cli:main",
         ],
     },
-    python_requires=">=3.8",
+    python_requires=">=3.11",
     include_package_data=True
 )

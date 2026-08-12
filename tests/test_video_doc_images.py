@@ -73,6 +73,93 @@ class VideoDocImageTests(unittest.TestCase):
             text_again = doc.read_text(encoding="utf-8")
             self.assertEqual(text_again.count("02-infographic-knowledge-notes.png"), 1)
 
+    def test_augment_video_docs_images_can_skip_generated_final_images(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            final_dir = run_dir / "baoyu_images" / "final"
+            final_dir.mkdir(parents=True)
+            (final_dir / "03-infographic-deep-report.png").write_bytes(b"png")
+            manual_assets = run_dir / "manual_assets"
+            manual_assets.mkdir()
+            (manual_assets / "frame_000.jpg").write_bytes(b"jpg")
+            doc_dir = run_dir / "docs_analysis_chapters"
+            doc_dir.mkdir()
+            doc = doc_dir / "deep_report_v2.md"
+            doc.write_text(
+                "# 深度报告\n\n"
+                "![逐章深度报告视觉摘要](../baoyu_images/final/03-infographic-deep-report.png)\n\n"
+                "## 逐章分析\n\n正文\n",
+                encoding="utf-8",
+            )
+
+            import sys
+
+            old_argv = sys.argv
+            try:
+                sys.argv = ["augment_video_docs_images.py", str(run_dir), "--skip-final-images"]
+                augment_main()
+            finally:
+                sys.argv = old_argv
+
+            text = doc.read_text(encoding="utf-8")
+            self.assertNotIn("03-infographic-deep-report.png", text)
+            self.assertIn("../manual_assets/frame_000.jpg", text)
+
+    def test_augment_distributes_chapter_images_instead_of_top_frame_wall(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            doc_dir = run_dir / "docs_analysis_chapters"
+            asset_dir = doc_dir / "chapter_assets"
+            final_dir = run_dir / "baoyu_images" / "final"
+            asset_dir.mkdir(parents=True)
+            final_dir.mkdir(parents=True)
+            assets = []
+            for index in range(1, 4):
+                path = asset_dir / f"chapter_{index:02d}.jpg"
+                path.write_bytes(b"jpg")
+                assets.append({"chapter_index": index, "path": str(path)})
+            (doc_dir / "chapter_assets_manifest.json").write_text(
+                json.dumps({"assets": assets}),
+                encoding="utf-8",
+            )
+            (final_dir / "02-knowledge-notes-chapter-02.png").write_bytes(b"png")
+            doc = doc_dir / "knowledge_notes_v2.md"
+            doc.write_text(
+                "# 知识笔记\n\n"
+                "## 视频代表帧\n\n"
+                "| 图 1 | 图 2 |\n|---|---|\n"
+                "| ![代表帧 01](chapter_assets/chapter_01.jpg) | ![代表帧 02](chapter_assets/chapter_02.jpg) |\n\n"
+                "## 01. 第一章\n\n正文一。\n\n"
+                "## 02. 第二章\n\n正文二。\n\n"
+                "## 03. 第三章\n\n正文三。\n",
+                encoding="utf-8",
+            )
+
+            import sys
+
+            old_argv = sys.argv
+            try:
+                sys.argv = ["augment_video_docs_images.py", str(run_dir)]
+                augment_main()
+                augment_main()
+            finally:
+                sys.argv = old_argv
+
+            text = doc.read_text(encoding="utf-8")
+            self.assertNotIn("## 视频代表帧", text)
+            for index in range(1, 4):
+                heading = f"## {index:02d}."
+                image = f"chapter_assets/chapter_{index:02d}.jpg"
+                self.assertIn(image, text)
+                self.assertLess(text.index(heading), text.index(image))
+            self.assertIn("../baoyu_images/final/02-knowledge-notes-chapter-02.png", text)
+            self.assertLess(
+                text.index("## 02."),
+                text.index("../baoyu_images/final/02-knowledge-notes-chapter-02.png"),
+            )
+            self.assertEqual(text.count("chapter_assets/chapter_01.jpg"), 1)
+            self.assertEqual(text.count("02-knowledge-notes-chapter-02.png"), 1)
+
     def test_operation_manual_reuses_knowledge_notes_image_and_removes_legacy_01(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
@@ -157,6 +244,45 @@ class VideoDocImageTests(unittest.TestCase):
             self.assertFalse((prompt_dir / "04-infographic-manual-evidence.md").exists())
             self.assertTrue((prompt_dir / "02-infographic-knowledge-notes.md").exists())
             self.assertTrue((prompt_dir / "03-infographic-deep-report.md").exists())
+
+    def test_prepare_baoyu_prompts_adds_evenly_spread_chapter_images(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            doc_dir = run_dir / "docs_analysis_chapters"
+            doc_dir.mkdir()
+            chapters = "\n\n".join(
+                f"## {index:02d}. 第 {index} 章\n\n本章内容 {index}。"
+                for index in range(1, 11)
+            )
+            (doc_dir / "knowledge_notes_v2.md").write_text(
+                f"# 知识笔记\n\n{chapters}\n",
+                encoding="utf-8",
+            )
+            (doc_dir / "deep_report_v2.md").write_text(
+                f"# 深度报告\n\n## 总览\n\n总览。\n\n{chapters}\n",
+                encoding="utf-8",
+            )
+
+            import sys
+
+            old_argv = sys.argv
+            try:
+                sys.argv = ["prepare_baoyu_image_prompts.py", str(run_dir)]
+                prepare_prompts_main()
+            finally:
+                sys.argv = old_argv
+
+            prompt_dir = run_dir / "baoyu_images" / "prompts"
+            knowledge_prompts = sorted(prompt_dir.glob("02-knowledge-notes-chapter-*.md"))
+            report_prompts = sorted(prompt_dir.glob("03-deep-report-chapter-*.md"))
+            plan = json.loads((prompt_dir / "image_plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(knowledge_prompts), 4)
+            self.assertEqual(len(report_prompts), 4)
+            self.assertEqual(len(plan["images"]), 10)
+            self.assertEqual(
+                [path.stem.rsplit("-", 1)[-1] for path in knowledge_prompts],
+                ["01", "04", "07", "10"],
+            )
 
     def test_augment_cleans_manual_evidence_generated_image_reference(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -6,9 +6,11 @@ import logging
 import re
 import shutil
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
+from datetime import datetime
 from statistics import median
 from typing import Any
 
@@ -16,6 +18,7 @@ from .artifacts import write_json, write_orin_artifacts, write_transcript_markdo
 from .candidate_frame_strategies import parse_candidate_frame_strategy
 from .config import Config, build_openai_extra_body, get_client, get_model, resolve_api_key, resolve_temperature
 from .frame import VideoProcessor
+from .frame_dedup_audit import select_audited_frames, write_frame_dedup_audit
 from .frame_selection import (
     AUTO,
     FrameDecision,
@@ -29,11 +32,15 @@ from .frame_selection import (
     select_vl_frames,
 )
 from .frame_manifest import MANIFEST_NAME, read_frames_from_manifest, write_frame_manifest
-from .jetson_frames import extract_frames_with_jetson_workers, extract_local_screen_keyframes
+from .jetson_frames import (
+    extract_frames_with_jetson_workers,
+    extract_frames_with_local_gpu_workers,
+    extract_local_screen_keyframes,
+)
 from .prompt import PromptLoader
 from .analyzer import VideoAnalyzer
-from .audio_processor import AudioProcessor, AudioTranscript
-from .asr_providers import ASRStrategyResult, extract_audio_to_wav, transcribe_with_provider_result, transcribe_with_strategy
+from .audio_processor import AudioTranscript
+from .asr_providers import ASRStrategyResult, extract_audio_to_wav
 from .clients.ollama import OllamaClient
 from .clients.generic_openai_api import GenericOpenAIAPIClient
 from .manual import (
@@ -41,6 +48,7 @@ from .manual import (
     generate_operation_manual,
     prepare_frame_assets,
     read_context_file,
+    resolve_manual_prompt_char_budget,
     review_operation_manual_markdown,
     write_frame_evidence_index,
 )
@@ -53,11 +61,16 @@ from .ocr_keyframes import (
 )
 from .local_model_runtime import local_model_runtime_session, local_model_stage
 from .resource_locks import analyzer_resource_lock
+from .review_artifacts import write_run_manifest, write_visual_review
 from .vl_checkpoint import (
     analysis_signature,
     frame_sha256,
     load_vl_checkpoint,
     write_vl_checkpoint,
+)
+from .transcription_pipeline import (
+    speaker_diarization_can_run_parallel,
+    transcribe_and_diarize_configured_audio,
 )
 
 # Initialize logger at module level
@@ -66,6 +79,7 @@ TRANSCRIPT_LINE_RE = re.compile(
     r"^-\s+\[(?P<start>\d\d:\d\d:\d\d)\s+-\s+(?P<end>\d\d:\d\d:\d\d)\]\s+(?P<text>.*)$"
 )
 PROGRESS_FILENAME = "progress.json"
+ANALYSIS_PROGRESS_LOCK = threading.Lock()
 DEFAULT_VL_SECONDS_PER_FRAME = 30.0
 DEFAULT_VL_TARGET_SECONDS = 45 * 60
 
@@ -191,24 +205,64 @@ def write_analysis_progress(
     message: str | None = None,
     artifacts: dict[str, str] | None = None,
     details: dict[str, Any] | None = None,
+    node_updates: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     """Best-effort durable progress for status UIs; never fail analysis work."""
     try:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "version": 2,
-            "stage": "analyze-core",
-            "current_step": current_step,
-            "status": status,
-            "message": message,
-            "artifacts": artifacts or {},
-            "details": details or {},
-            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
-        }
-        progress_path = output_dir / PROGRESS_FILENAME
-        tmp_path = output_dir / f".{PROGRESS_FILENAME}.tmp"
-        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp_path.replace(progress_path)
+        with ANALYSIS_PROGRESS_LOCK:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            progress_path = output_dir / PROGRESS_FILENAME
+            existing = {}
+            if progress_path.is_file():
+                try:
+                    loaded = json.loads(progress_path.read_text(encoding="utf-8"))
+                    existing = loaded if isinstance(loaded, dict) else {}
+                except Exception:
+                    existing = {}
+            now = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
+            node_states = dict(existing.get("node_states") or {})
+            for node_id, raw_update in (node_updates or {}).items():
+                update = dict(raw_update or {})
+                previous = dict(node_states.get(node_id) or {})
+                node_status = str(update.get("status") or previous.get("status") or "pending")
+                if node_status == "running" and not update.get("started_at"):
+                    update["started_at"] = previous.get("started_at") or now
+                    update.pop("finished_at", None)
+                    update.pop("duration_seconds", None)
+                elif node_status in {"succeeded", "failed", "skipped", "stopped"}:
+                    started_at = update.get("started_at") or previous.get("started_at")
+                    update["started_at"] = started_at
+                    update["finished_at"] = update.get("finished_at") or now
+                    if started_at and update.get("duration_seconds") is None:
+                        try:
+                            started = datetime.fromisoformat(str(started_at))
+                            finished = datetime.fromisoformat(str(update["finished_at"]))
+                            update["duration_seconds"] = round(
+                                max(0.0, (finished - started).total_seconds()),
+                                3,
+                            )
+                        except Exception:
+                            pass
+                node_states[node_id] = {
+                    **previous,
+                    **update,
+                    "status": node_status,
+                    "updated_at": now,
+                }
+            payload = {
+                "version": 3,
+                "stage": "analyze-core",
+                "current_step": current_step,
+                "status": status,
+                "message": message,
+                "artifacts": artifacts or {},
+                "details": details or {},
+                "node_states": node_states,
+                "updated_at": now,
+            }
+            tmp_path = output_dir / f".{PROGRESS_FILENAME}.tmp"
+            tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp_path.replace(progress_path)
     except Exception:
         logger.debug("Could not write analysis progress", exc_info=True)
 
@@ -576,6 +630,8 @@ def frame_manifest_matches_request(metadata: dict, frame_extractor: str) -> bool
         return manifest_source == "jetson"
     if requested == "local":
         return manifest_source in {"local", "local_keyframes", "audio_only"}
+    if requested == "local_gpu":
+        return manifest_source == "local_gpu"
     return bool(manifest_source)
 
 
@@ -637,9 +693,43 @@ def create_operation_manual_text_client(config: Config, fallback_client):
             text_base_url,
         ),
         text_base_url,
-        timeout_seconds=int(openai_config.get("timeout_seconds", 600)),
+        timeout_seconds=int(manual_config.get("text_timeout_seconds") or openai_config.get("timeout_seconds", 600)),
         extra_body=build_openai_extra_body(manual_config, text_base_url),
     )
+
+
+def create_operation_manual_fallback_client(
+    config: Config,
+) -> tuple[GenericOpenAIAPIClient | None, str, float | None]:
+    manual_config = config.get("operation_manual", {})
+    if not manual_config.get("text_fallback_enabled"):
+        return None, "", None
+    base_url = str(manual_config.get("text_fallback_base_url") or "").strip()
+    model = str(manual_config.get("text_fallback_model") or "").strip()
+    if not base_url or not model:
+        return None, "", None
+    fallback_settings = {
+        "deepseek_thinking": manual_config.get(
+            "text_fallback_deepseek_thinking"
+        ),
+        "reasoning_effort": manual_config.get(
+            "text_fallback_reasoning_effort"
+        ),
+    }
+    client = GenericOpenAIAPIClient(
+        resolve_api_key(
+            None,
+            manual_config.get("text_fallback_api_key_env"),
+            base_url,
+        ),
+        base_url,
+        timeout_seconds=int(
+            manual_config.get("text_fallback_text_timeout_seconds") or 900
+        ),
+        extra_body=build_openai_extra_body(fallback_settings, base_url),
+    )
+    temperature = manual_config.get("text_fallback_text_temperature")
+    return client, model, float(temperature) if temperature is not None else None
 
 
 def read_page_context_metadata(context_file: str, page_context: str) -> dict:
@@ -694,7 +784,11 @@ def main():
     parser.add_argument("--text-base-url", type=str, help="OpenAI-compatible base URL for final manual generation")
     parser.add_argument("--vision-model", type=str, help="Vision model used for frame analysis")
     parser.add_argument("--text-model", type=str, help="Text model used for manual generation")
-    parser.add_argument("--ocr-provider", choices=["auto", "dots_mocr_vllm", "openai_vision", "none"], help="OCR provider")
+    parser.add_argument(
+        "--ocr-provider",
+        choices=["auto", "unlimited_ocr", "dots_ocr", "dots_mocr_vllm", "openai_vision", "none"],
+        help="OCR provider",
+    )
     parser.add_argument("--ocr-base-url", action="append", help="OCR OpenAI-compatible base URL; can be provided multiple times")
     parser.add_argument("--ocr-concurrency", default=None, help="OCR concurrency per endpoint, or auto")
     parser.add_argument("--ocr-cache", choices=["on", "off", "refresh"], default=None, help="OCR cache mode")
@@ -717,12 +811,33 @@ def main():
         help="Resize OCR images to this longest side before upload; <=0 disables resizing",
     )
     parser.add_argument(
+        "--ocr-image-mode",
+        choices=["gundam", "base"],
+        default=None,
+        help="Unlimited-OCR image preprocessing mode",
+    )
+    parser.add_argument(
         "--ocr-retry-endpoints",
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Retry the same OCR frame on another healthy endpoint after failure",
     )
-    parser.add_argument("--asr-provider", choices=["auto", "remote_http", "capswriter_http", "vibevoice", "faster_whisper", "none"], help="ASR provider")
+    parser.add_argument(
+        "--asr-provider",
+        choices=[
+            "auto",
+            "remote_http",
+            "capswriter_http",
+            "qwen3_asr",
+            "firered_asr2",
+            "firered_3dspeaker",
+            "openai_audio",
+            "vibevoice",
+            "faster_whisper",
+            "none",
+        ],
+        help="ASR provider",
+    )
     parser.add_argument("--asr-strategy", choices=["fast", "balanced", "deep"], help="Dual-ASR strategy for operation manuals")
     parser.add_argument("--remote-asr-url", action="append", help="Remote fast ASR endpoint; can be provided multiple times")
     parser.add_argument("--vibevoice-url", action="append", help="Remote GPU VibeVoice ASR endpoint; can be provided multiple times")
@@ -736,7 +851,17 @@ def main():
         default="auto",
         help="Internal candidate frame strategy: auto, legacy, generic, lecture, or operation",
     )
-    parser.add_argument("--frame-extractor", choices=["local", "jetson", "auto"], default="local", help="Candidate frame extraction backend")
+    parser.add_argument(
+        "--frame-extractor",
+        choices=["local", "local_gpu", "jetson", "auto"],
+        default="local",
+        help="Candidate frame extraction backend",
+    )
+    parser.add_argument(
+        "--local-frame-gpus",
+        default="auto",
+        help="Comma-separated local P40 GPU indices for local_gpu extraction, or auto",
+    )
     parser.add_argument("--jetson-frame-hosts", default="nx2,nx3", help="Comma-separated Jetson SSH hosts for frame extraction")
     parser.add_argument("--jetson-frame-backend", choices=["auto", "ssh", "ray"], default="auto", help="Jetson frame worker transport")
     parser.add_argument("--jetson-sample-fps", default="auto", help="auto or preview sample fps used by Jetson frame workers")
@@ -815,9 +940,16 @@ def main():
         page_context = ""
         page_context_metadata = {"context_file": "", "text_length": 0}
         transcript_markdown_path = None
+        speaker_diarization_report = None
         timings = {}
         frame_selection_metadata = {}
         frame_extraction_metadata = {}
+        frame_dedup_audit_metadata = {}
+        frame_dedup_audit_path = None
+        visual_review_metadata = {}
+        visual_review_path = None
+        run_manifest_metadata = {}
+        run_manifest_path = None
         ocr_keyframe_metadata = {}
         ocr_text_events = []
         ocr_metadata = {}
@@ -826,6 +958,23 @@ def main():
         total_started = time.perf_counter()
         current_progress_step = "audio"
         write_analysis_progress(output_dir, current_progress_step, message="analysis started")
+
+        def report_transcription_progress(
+            node_id: str,
+            node_status: str,
+            node_message: str | None,
+        ) -> None:
+            write_analysis_progress(
+                output_dir,
+                current_progress_step,
+                message=node_message,
+                node_updates={
+                    node_id: {
+                        "status": node_status,
+                        "message": node_message,
+                    }
+                },
+            )
         
         # Stage 1: Frame and Audio Processing
         if args.start_stage <= 2:
@@ -835,7 +984,15 @@ def main():
             stage_started = time.perf_counter()
             if args.transcript_file:
                 current_progress_step = "asr"
-                write_analysis_progress(output_dir, current_progress_step, message="using existing transcript file")
+                write_analysis_progress(
+                    output_dir,
+                    current_progress_step,
+                    message="using existing transcript file",
+                    node_updates={
+                        "asr": {"status": "running", "message": "using existing transcript file"},
+                        "diarization": {"status": "skipped", "message": "provided transcript"},
+                    },
+                )
                 transcript_path = Path(args.transcript_file)
                 logger.info("Using existing transcript file: %s", transcript_path)
                 transcript = read_transcript_markdown(transcript_path)
@@ -852,10 +1009,21 @@ def main():
                     current_progress_step,
                     message="transcript ready",
                     artifacts={"transcript": str(transcript_markdown_path)} if transcript_markdown_path else {},
+                    node_updates={
+                        "asr": {"status": "succeeded", "message": "existing transcript loaded"},
+                        "transcript_merge": {"status": "succeeded", "message": "transcript ready"},
+                    },
                 )
             else:
                 current_progress_step = "audio"
-                write_analysis_progress(output_dir, current_progress_step, message="extracting audio")
+                write_analysis_progress(
+                    output_dir,
+                    current_progress_step,
+                    message="extracting audio",
+                    node_updates={
+                        "audio_extract": {"status": "running", "message": "extracting audio"},
+                    },
+                )
                 logger.info("Extracting audio from video...")
                 try:
                     audio_path = extract_audio_to_wav(video_path, output_dir)
@@ -866,54 +1034,64 @@ def main():
                 if audio_path is None:
                     logger.debug("No audio found in video - skipping transcription")
                     transcript = None
+                    write_analysis_progress(
+                        output_dir,
+                        current_progress_step,
+                        message="no audio stream found",
+                        node_updates={
+                            "audio_extract": {"status": "skipped", "message": "no audio stream"},
+                            "asr": {"status": "skipped", "message": "no audio stream"},
+                            "diarization": {"status": "skipped", "message": "no audio stream"},
+                            "transcript_merge": {"status": "skipped", "message": "no transcript"},
+                        },
+                    )
                 else:
+                    write_analysis_progress(
+                        output_dir,
+                        current_progress_step,
+                        message="audio track ready",
+                        artifacts={"audio": str(audio_path)},
+                        node_updates={
+                            "audio_extract": {"status": "succeeded", "message": "audio track ready"},
+                        },
+                    )
                     current_progress_step = "asr"
-                    write_analysis_progress(output_dir, current_progress_step, message="transcribing audio")
-                    logger.info("Transcribing audio...")
+                    parallel_diarization = speaker_diarization_can_run_parallel(config)
+                    progress_message = (
+                        "transcribing audio and diarizing speakers in parallel"
+                        if parallel_diarization
+                        else "transcribing audio"
+                    )
+                    write_analysis_progress(
+                        output_dir,
+                        current_progress_step,
+                        message=progress_message,
+                        node_updates={
+                            "asr": {"status": "running", "message": "transcribing audio"},
+                            "diarization": {
+                                "status": "running" if parallel_diarization else "pending",
+                                "message": (
+                                    "running in parallel with ASR"
+                                    if parallel_diarization
+                                    else "waiting for ASR"
+                                ),
+                            },
+                        },
+                    )
+                    logger.info("%s...", progress_message.capitalize())
                     asr_config = config.get("asr", {})
                     provider = asr_config.get("provider", "faster_whisper")
                     use_asr_strategy = task == "operation_manual" and args.asr_provider is None and provider == "auto"
-                    asr_lock = (
-                        contextlib.nullcontext()
-                        if provider == "none"
-                        else analyzer_resource_lock(config.config, "asr", str(output_dir), logger)
-                    )
-                    with asr_lock:
-                        with local_model_stage("asr", config.config, logger, str(output_dir)):
-                            if use_asr_strategy:
-                                asr_result = transcribe_with_strategy(
-                                    strategy=asr_config.get("strategy", "balanced"),
-                                    audio_path=audio_path,
-                                    language=config.get("audio", {}).get("language", ""),
-                                    whisper_model=config.get("audio", {}).get("whisper_model", "medium"),
-                                    device=config.get("audio", {}).get("device", "cpu"),
-                                    vibevoice_config=asr_config.get("vibevoice", {}),
-                                )
-                                transcript = asr_result.transcript
-                            elif provider == "faster_whisper":
-                                audio_processor = AudioProcessor(
-                                    language=config.get("audio", {}).get("language", ""),
-                                    model_size_or_path=config.get("audio", {}).get("whisper_model", "medium"),
-                                    device=config.get("audio", {}).get("device", "cpu"),
-                                )
-                                transcript = audio_processor.transcribe(audio_path)
-                            else:
-                                asr_result = transcribe_with_provider_result(
-                                    provider=provider,
-                                    audio_path=audio_path,
-                                    language=config.get("audio", {}).get("language", ""),
-                                    whisper_model=config.get("audio", {}).get("whisper_model", "medium"),
-                                    device=config.get("audio", {}).get("device", "cpu"),
-                                    vibevoice_config=asr_config.get("vibevoice", {}),
-                                )
-                                transcript = asr_result.transcript
-                    if asr_result is None:
-                        asr_result = ASRStrategyResult(
-                            strategy=f"provider:{provider}",
-                            transcript=transcript,
-                            fast_transcript=transcript,
-                            providers_run=[] if provider == "none" else [provider],
+                    transcript, asr_result, speaker_diarization_report = (
+                        transcribe_and_diarize_configured_audio(
+                            audio_path,
+                            output_dir,
+                            config,
+                            use_asr_strategy=use_asr_strategy,
+                            logger=logger,
+                            progress_callback=report_transcription_progress,
                         )
+                    )
                     if transcript is None:
                         require_transcript = bool(asr_config.get("require_transcript", task == "operation_manual"))
                         if require_transcript and provider != "none":
@@ -931,11 +1109,40 @@ def main():
                             current_progress_step,
                             message="transcript ready",
                             artifacts={"transcript": str(transcript_markdown_path)} if transcript_markdown_path else {},
+                            node_updates={
+                                "asr": {"status": "succeeded", "message": "transcript ready"},
+                                "diarization": {
+                                    "status": (
+                                        "failed"
+                                        if (speaker_diarization_report or {}).get("error")
+                                        else "succeeded"
+                                        if speaker_diarization_report
+                                        else "skipped"
+                                    ),
+                                    "message": (
+                                        (speaker_diarization_report or {}).get("error")
+                                        or "speaker turns aligned"
+                                        if speaker_diarization_report
+                                        else "speaker diarization not enabled"
+                                    ),
+                                },
+                                "transcript_merge": {
+                                    "status": "succeeded",
+                                    "message": "transcript and speaker turns ready",
+                                },
+                            },
                         )
             timings["asr_seconds"] = round(time.perf_counter() - stage_started, 3)
             
             current_progress_step = "frames"
-            write_analysis_progress(output_dir, current_progress_step, message="extracting candidate frames")
+            write_analysis_progress(
+                output_dir,
+                current_progress_step,
+                message="extracting candidate frames",
+                node_updates={
+                    "frame_extract": {"status": "running", "message": "extracting candidate frames"},
+                },
+            )
             logger.info(f"Extracting frames from video using model {model}...")
             stage_started = time.perf_counter()
             processor = VideoProcessor(
@@ -979,6 +1186,9 @@ def main():
                     current_progress_step,
                     message="candidate frames reused",
                     artifacts={"frame_manifest": str(frame_manifest_path)},
+                    node_updates={
+                        "frame_extract": {"status": "succeeded", "message": "candidate frames reused"},
+                    },
                 )
                 frame_selection_metadata = {
                     "pipeline_mode": args.pipeline_mode,
@@ -1010,6 +1220,12 @@ def main():
                     current_progress_step,
                     message="audio-only input; skipped frame extraction",
                     artifacts={"frame_manifest": str(frame_manifest_path)},
+                    node_updates={
+                        "frame_extract": {"status": "skipped", "message": "audio-only input"},
+                        "ocr": {"status": "skipped", "message": "audio-only input"},
+                        "vision": {"status": "skipped", "message": "audio-only input"},
+                        "visual_evidence": {"status": "skipped", "message": "audio-only input"},
+                    },
                 )
             elif task == "operation_manual":
                 ocr_scan_sample_fps = resolve_ocr_scan_sample_fps(
@@ -1023,7 +1239,22 @@ def main():
                     candidate_frames=args.candidate_frames,
                     explicit_max_frames=args.max_frames,
                 )
-                if args.frame_extractor in {"jetson", "auto"}:
+                if args.frame_extractor == "local_gpu":
+                    extraction = extract_frames_with_local_gpu_workers(
+                        video_path=video_path,
+                        output_dir=output_dir / "frames",
+                        video_duration_seconds=video_duration,
+                        pipeline_mode=args.pipeline_mode,
+                        candidate_budget=candidate_budget,
+                        candidate_strategy=args.candidate_frame_strategy,
+                        transcript=transcript,
+                        sample_fps=args.jetson_sample_fps,
+                        overlap_seconds=args.jetson_chunk_overlap_seconds,
+                        gpu_indices=args.local_frame_gpus,
+                    )
+                    frames = extraction.frames
+                    frame_extraction_metadata = extraction.metadata
+                elif args.frame_extractor in {"jetson", "auto"}:
                     hosts = [host.strip() for host in args.jetson_frame_hosts.split(",") if host.strip()]
                     jetson_sample_fps = args.jetson_sample_fps
                     if str(jetson_sample_fps).strip().lower() == OCR_AUTO and str(args.ocr_scan_sample_fps).strip().lower() != OCR_AUTO:
@@ -1054,6 +1285,7 @@ def main():
                             frames_per_minute=max(1, int(round(ocr_scan_sample_fps * 60))),
                             duration=config.get("duration"),
                             max_frames=candidate_budget,
+                            transcript=transcript,
                         )
                     frames = extraction.frames
                     frame_extraction_metadata = extraction.metadata
@@ -1063,6 +1295,7 @@ def main():
                         frames_per_minute=max(1, int(round(ocr_scan_sample_fps * 60))),
                         duration=config.get("duration"),
                         max_frames=candidate_budget,
+                        transcript=transcript,
                     )
                     frames = extraction.frames
                     frame_extraction_metadata = extraction.metadata
@@ -1079,6 +1312,9 @@ def main():
                     current_progress_step,
                     message="candidate frames ready",
                     artifacts={"frame_manifest": str(frame_manifest_path)},
+                    node_updates={
+                        "frame_extract": {"status": "succeeded", "message": "candidate frames ready"},
+                    },
                 )
                 frame_selection_metadata = {
                     "pipeline_mode": args.pipeline_mode,
@@ -1101,18 +1337,57 @@ def main():
                     current_progress_step,
                     message="candidate frames ready",
                     artifacts={"frame_manifest": str(frame_manifest_path)},
+                    node_updates={
+                        "frame_extract": {"status": "succeeded", "message": "candidate frames ready"},
+                    },
                 )
             timings["candidate_frame_extraction_seconds"] = round(time.perf_counter() - stage_started, 3)
+            audit_started = time.perf_counter()
+            frame_dedup_audit_path, frame_dedup_audit = write_frame_dedup_audit(frames, output_dir)
+            audited_ocr_frames = select_audited_frames(frames, frame_dedup_audit)
+            audit_summary = frame_dedup_audit.get("summary") or {}
+            timings["ocr_frame_audit_seconds"] = round(time.perf_counter() - audit_started, 3)
+            frame_dedup_audit_metadata = {
+                key: value
+                for key, value in frame_dedup_audit.items()
+                if key != "records"
+            }
 
             if task == "operation_manual":
+                audit_message = (
+                    f"OCR frame audit retained {len(audited_ocr_frames)} of {len(frames)} "
+                    f"candidate frames; max gap "
+                    f"{float(audit_summary.get('max_kept_gap_seconds') or 0):.1f}s"
+                )
+                logger.info(audit_message)
+                write_analysis_progress(
+                    output_dir,
+                    "ocr_audit",
+                    message=audit_message,
+                    artifacts={"frame_dedup_audit": str(frame_dedup_audit_path)},
+                    node_updates={
+                        "frame_audit": {
+                            "status": "succeeded",
+                            "message": audit_message,
+                            "duration_seconds": timings["ocr_frame_audit_seconds"],
+                        },
+                    },
+                )
                 current_progress_step = "ocr"
-                write_analysis_progress(output_dir, current_progress_step, message="running OCR")
+                write_analysis_progress(
+                    output_dir,
+                    current_progress_step,
+                    message="running OCR",
+                    node_updates={
+                        "ocr": {"status": "running", "message": "running OCR"},
+                    },
+                )
                 logger.info("Running OCR on extracted frames...")
                 stage_started = time.perf_counter()
                 ocr_config = config.get("ocr", {})
                 ocr_base_urls = ocr_config.get("base_urls")
                 selected_ocr_frames, ocr_keyframe_decisions, ocr_keyframe_metadata = select_ocr_keyframes(
-                    frames=frames,
+                    frames=audited_ocr_frames,
                     transcript=transcript,
                     video_duration_seconds=frame_selection_metadata.get("video_duration_seconds", config.get("duration") or 0.0),
                     pipeline_mode=args.pipeline_mode,
@@ -1120,9 +1395,14 @@ def main():
                     budget=args.ocr_keyframe_budget,
                     scan_frames_count=scan_frames_count_from_metadata(frame_extraction_metadata),
                 )
+                ocr_keyframe_metadata["source_candidate_frames_count"] = len(frames)
+                ocr_keyframe_metadata["audited_candidate_frames_count"] = len(audited_ocr_frames)
+                ocr_keyframe_metadata["audit_max_gap_seconds"] = audit_summary.get("max_kept_gap_seconds")
                 logger.info(
-                    "Selected %s OCR keyframes from %s candidate frames after scanning %s preview frames",
+                    "Selected %s OCR keyframes from %s audited frames (%s original) "
+                    "after scanning %s preview frames",
                     len(selected_ocr_frames),
+                    len(audited_ocr_frames),
                     len(frames),
                     ocr_keyframe_metadata.get("scan_frames_count"),
                 )
@@ -1189,6 +1469,7 @@ def main():
                                 warmup_retry_interval_seconds=ocr_config.get("warmup_retry_interval_seconds", 5),
                                 cache_mode=ocr_config.get("cache", "on"),
                                 cache_dir=ocr_config.get("cache_dir", ".cache/video-analyzer/ocr"),
+                                image_mode=ocr_config.get("image_mode", "gundam"),
                                 progress_callback=save_ocr_event,
                             )
                 else:
@@ -1227,12 +1508,30 @@ def main():
                 }
                 timings["ocr_seconds"] = round(time.perf_counter() - stage_started, 3)
                 current_progress_step = "ocr_ready"
-                write_analysis_progress(output_dir, current_progress_step, message="OCR results ready")
+                write_analysis_progress(
+                    output_dir,
+                    current_progress_step,
+                    message="OCR results ready",
+                    node_updates={
+                        "ocr": {
+                            "status": "succeeded",
+                            "message": f"{len(ocr_events)} OCR frame results ready",
+                        },
+                    },
+                )
             
         # Stage 2: Frame Analysis
         if args.start_stage <= 2:
             current_progress_step = "vl"
-            write_analysis_progress(output_dir, current_progress_step, message="selecting and analyzing VL frames")
+            write_analysis_progress(
+                output_dir,
+                current_progress_step,
+                message="selecting and analyzing VL frames",
+                node_updates={
+                    "vision": {"status": "running", "message": "selecting and analyzing VL frames"},
+                    "visual_evidence": {"status": "pending", "message": "waiting for VL results"},
+                },
+            )
             logger.info("Selecting and analyzing VL frames...")
             stage_started = time.perf_counter()
             analyzer = VideoAnalyzer(
@@ -1354,6 +1653,13 @@ def main():
                         "vl",
                         message=f"VL frames {completed_count}/{total}",
                         details={"vl": vl_progress},
+                        node_updates={
+                            "vision": {
+                                "status": "running",
+                                "message": f"VL frames {completed_count}/{total}",
+                                "progress": vl_progress.get("percent"),
+                            }
+                        },
                     )
                 if frames:
                     with analyzer_resource_lock(config.config, "vl", str(output_dir), logger):
@@ -1386,6 +1692,22 @@ def main():
                     analysis = analyzer.analyze_frame(frame, ocr_text=ocr_text)
                     frame_analyses.append(analysis)
                 timings["vl_seconds"] = round(time.perf_counter() - stage_started, 3)
+            write_analysis_progress(
+                output_dir,
+                current_progress_step,
+                message="visual evidence ready",
+                node_updates={
+                    "vision": {
+                        "status": "succeeded",
+                        "message": f"{len(frame_analyses)} frame analyses ready",
+                        "progress": 100,
+                    },
+                    "visual_evidence": {
+                        "status": "succeeded",
+                        "message": "OCR and VL evidence ready",
+                    },
+                },
+            )
 
         release_local_runtime()
                 
@@ -1393,33 +1715,89 @@ def main():
         if args.start_stage <= 3:
             if task == "operation_manual":
                 current_progress_step = "manual"
-                write_analysis_progress(output_dir, current_progress_step, message="generating operation manual")
+                write_analysis_progress(
+                    output_dir,
+                    current_progress_step,
+                    message="generating operation manual",
+                    node_updates={
+                        "evidence_merge": {
+                            "status": "succeeded",
+                            "message": "audio, visual and page evidence merged",
+                        },
+                        "text": {"status": "running", "message": "generating operation manual"},
+                    },
+                )
                 logger.info("Generating operation manual...")
                 stage_started = time.perf_counter()
                 manual_config = config.get("operation_manual", {})
+                runtime_profile = config.get_runtime_profile(
+                    getattr(args, "profile", None)
+                )
                 text_client = create_operation_manual_text_client(config, client)
+                (
+                    fallback_text_client,
+                    fallback_text_model,
+                    fallback_text_temperature,
+                ) = create_operation_manual_fallback_client(config)
+                fallback_configured = bool(
+                    fallback_text_client and fallback_text_model
+                )
                 page_context = read_context_file(config.get("context_file", ""))
                 page_context_metadata = read_page_context_metadata(config.get("context_file", ""), page_context)
                 text_model = manual_config.get("text_model") or model
                 frame_assets = prepare_frame_assets(frames, output_dir)
-                operation_manual = generate_operation_manual(
-                    client=text_client,
-                    text_model=text_model,
-                    frame_analyses=frame_analyses,
-                    frames=frames,
-                    transcript=transcript,
-                    asr_metadata=asr_result.to_metadata() if asr_result else {},
-                    ocr_events=ocr_events,
-                    page_context=page_context,
-                    language=config.get("manual_language", "zh-CN"),
-                    temperature=resolve_temperature(manual_config, config.get("clients", {}).get("temperature", 0.2)),
-                    frame_assets=frame_assets,
-                    no_think=bool(manual_config.get("manual_no_think", manual_config.get("frame_no_think", False))),
-                )
+
+                def report_text_fallback(status: str, message: str) -> None:
+                    write_analysis_progress(
+                        output_dir,
+                        current_progress_step,
+                        message=message,
+                        node_updates={
+                            "text": {
+                                "status": "failed",
+                                "message": message,
+                            },
+                            "text_fallback": {
+                                "status": status,
+                                "message": message,
+                            },
+                        },
+                    )
+
+                with local_model_stage("text", config.config, logger, str(output_dir)):
+                    operation_manual = generate_operation_manual(
+                        client=text_client,
+                        text_model=text_model,
+                        frame_analyses=frame_analyses,
+                        frames=frames,
+                        transcript=transcript,
+                        asr_metadata=asr_result.to_metadata() if asr_result else {},
+                        ocr_events=ocr_events,
+                        page_context=page_context,
+                        language=config.get("manual_language", "zh-CN"),
+                        temperature=resolve_temperature(manual_config, config.get("clients", {}).get("temperature", 0.2)),
+                        frame_assets=frame_assets,
+                        no_think=bool(manual_config.get("manual_no_think", manual_config.get("frame_no_think", False))),
+                        max_prompt_chars=resolve_manual_prompt_char_budget(
+                            manual_config.get("context_length")
+                            or runtime_profile.get("context_length"),
+                            manual_config.get("max_prompt_chars"),
+                        ),
+                        fallback_client=fallback_text_client,
+                        fallback_model=fallback_text_model,
+                        fallback_temperature=fallback_text_temperature,
+                        fallback_status_callback=(
+                            report_text_fallback
+                            if fallback_configured
+                            else None
+                        ),
+                    )
                 operation_manual["response"] = embed_step_images(
                     operation_manual.get("response", ""),
                     frames,
                     frame_assets,
+                    frame_analyses=frame_analyses,
+                    ocr_events=ocr_events,
                 )
                 operation_manual["response"] = append_evidence_boundary_section(
                     operation_manual.get("response", ""),
@@ -1447,6 +1825,53 @@ def main():
                 )
                 operation_manual["evidence_path"] = str(evidence_path)
                 timings["manual_generation_seconds"] = round(time.perf_counter() - stage_started, 3)
+                fallback_used = bool(operation_manual.get("fallback_used"))
+                quality_passed = bool(operation_manual["quality_gate_passed"])
+                if fallback_used:
+                    text_node = {
+                        "status": "failed",
+                        "message": operation_manual.get("primary_error")
+                        or "primary text model failed",
+                    }
+                    fallback_node = {
+                        "status": "succeeded" if quality_passed else "failed",
+                        "message": (
+                            f"{fallback_text_model} completed"
+                            if quality_passed
+                            else operation_manual.get("fallback_error")
+                            or "fallback output failed quality gate"
+                        ),
+                    }
+                else:
+                    text_node = {
+                        "status": "succeeded" if quality_passed else "failed",
+                        "message": (
+                            "operation manual draft ready"
+                            if quality_passed
+                            else "operation manual generation failed quality gate"
+                        ),
+                    }
+                    fallback_node = {
+                        "status": "skipped",
+                        "message": (
+                            "primary model succeeded"
+                            if fallback_configured
+                            else "text fallback disabled"
+                        ),
+                    }
+                write_analysis_progress(
+                    output_dir,
+                    current_progress_step,
+                    message=(
+                        "operation manual draft ready"
+                        if quality_passed
+                        else "operation manual draft failed quality gate"
+                    ),
+                    node_updates={
+                        "text": text_node,
+                        "text_fallback": fallback_node,
+                    },
+                )
             else:
                 logger.info("Reconstructing video description...")
                 video_description = analyzer.reconstruct_video(
@@ -1455,7 +1880,21 @@ def main():
         
         output_dir.mkdir(parents=True, exist_ok=True)
         current_progress_step = "write"
-        write_analysis_progress(output_dir, current_progress_step, message="writing analysis outputs")
+        write_analysis_progress(
+            output_dir,
+            current_progress_step,
+            message="writing analysis outputs",
+            node_updates=(
+                None
+                if operation_manual
+                else {
+                    "text": {
+                        "status": "succeeded",
+                        "message": "writing analysis outputs",
+                    }
+                }
+            ),
+        )
         timings["total_seconds"] = round(time.perf_counter() - total_started, 3)
         results = {
             "metadata": {
@@ -1487,6 +1926,9 @@ def main():
                 "vl_frames_processed": len(selected_frame_numbers) if task == "operation_manual" else len(frame_analyses),
                 "frame_selection": frame_selection_metadata,
                 "frame_extraction": frame_extraction_metadata,
+                "frame_dedup_audit": frame_dedup_audit_metadata,
+                "visual_review": visual_review_metadata,
+                "run_manifest": run_manifest_metadata,
                 "vl_context": {
                     "before": max(args.vl_context_before, 0),
                     "after": max(args.vl_context_after, 0),
@@ -1516,6 +1958,24 @@ def main():
             "video_description": video_description,
             "operation_manual": operation_manual
         }
+
+        visual_review_path, visual_review_metadata = write_visual_review(
+            output_dir=output_dir,
+            video_path=video_path if has_video_stream else None,
+            frames=frames,
+            transcript=transcript,
+            ocr_events=ocr_events,
+            frame_analyses=frame_analyses,
+            metadata=results["metadata"],
+        )
+        results["metadata"]["visual_review"] = visual_review_metadata
+        run_manifest_path, run_manifest_metadata = write_run_manifest(
+            output_dir=output_dir,
+            results=results,
+            visual_review_path=visual_review_path,
+            dedup_audit_path=frame_dedup_audit_path,
+        )
+        results["metadata"]["run_manifest"] = run_manifest_metadata
         
         with open(output_dir / "analysis.json", "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
@@ -1558,7 +2018,29 @@ def main():
             
     except Exception as e:
         logger.error(f"Error during video analysis: {e}")
-        write_analysis_progress(output_dir, current_progress_step, status="failed", message=str(e))
+        failure_node = {
+            "audio": "audio_extract",
+            "asr": "asr",
+            "asr_done": "transcript_merge",
+            "frames": "frame_extract",
+            "frames_done": "frame_extract",
+            "ocr": "ocr",
+            "ocr_ready": "ocr",
+            "vl": "vision",
+            "manual": "text",
+            "write": "text",
+        }.get(current_progress_step)
+        write_analysis_progress(
+            output_dir,
+            current_progress_step,
+            status="failed",
+            message=str(e),
+            node_updates={
+                failure_node: {"status": "failed", "message": str(e)}
+            }
+            if failure_node
+            else None,
+        )
         if not config.get("keep_frames"):
             cleanup_files(output_dir)
         raise
