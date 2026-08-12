@@ -77,7 +77,7 @@ VIDEO_WORKFLOW_ID = "video_operation_manual"
 AUDIO_WORKFLOW_ID = "audio_nx1"
 
 VIDEO_PROFILE_FLOW = {
-    "version": 3,
+    "version": 4,
     "lanes": [
         {"id": "audio", "label": "音频"},
         {"id": "visual", "label": "视觉"},
@@ -95,28 +95,29 @@ VIDEO_PROFILE_FLOW = {
         {"id": "diarization", "step": 4, "column": 4, "row": 2, "mobile_order": 5, "lane": "audio", "title": "说话人分离", "subtitle": "与语音识别并行生成声纹轨", "model_kind": "diarization", "required": False, "stage": "analyze-core"},
         {"id": "transcript_merge", "step": 5, "column": 5, "row": 1, "mobile_order": 6, "lane": "audio", "title": "转写与说话人合并", "subtitle": "对齐文字、时间戳与说话人", "stage": "analyze-core", "progress_step": "asr_done"},
         {"id": "frame_extract", "step": 3, "column": 3, "row": 3, "mobile_order": 7, "lane": "visual", "title": "候选帧提取", "subtitle": "采样并筛选可分析画面", "stage": "analyze-core", "progress_step": "frames"},
-        {"id": "ocr", "step": 4, "column": 4, "row": 3, "mobile_order": 8, "lane": "visual", "title": "画面 OCR", "subtitle": "提取画面文字证据", "model_kind": "ocr", "required": False, "stage": "analyze-core", "progress_step": "ocr"},
-        {"id": "vision", "step": 5, "column": 5, "row": 3, "mobile_order": 9, "lane": "visual", "title": "视觉理解", "subtitle": "在 OCR 之后理解动作、界面和场景", "model_kind": "vision", "required": False, "stage": "analyze-core", "progress_step": "vl"},
-        {"id": "visual_evidence", "step": 6, "column": 6, "row": 3, "mobile_order": 10, "lane": "visual", "title": "视觉证据", "subtitle": "整理 OCR、VL 与帧引用", "stage": "analyze-core", "progress_step": "vl"},
-        {"id": "evidence_merge", "step": 7, "column": 7, "row": 2, "mobile_order": 11, "lane": "main", "title": "证据汇合", "subtitle": "合并转写、视觉与页面上下文", "stage": "analyze-core", "progress_step": "manual"},
-        {"id": "text", "step": 8, "column": 8, "row": 2, "mobile_order": 12, "lane": "main", "title": "核心分析", "subtitle": "结构化理解并生成手册草稿", "model_kind": "text", "required": True, "stage": "analyze-core", "progress_step": "manual"},
-        {"id": "text_fallback", "step": 9, "column": 9, "row": 4, "mobile_order": 13, "lane": "fallback", "title": "核心文本兜底", "subtitle": "主文本模型失败时调用，可禁用", "model_slot": "text_fallback", "model_kind": "text", "required": False, "stage": "analyze-core", "progress_step": "manual"},
-        {"id": "core_verify", "step": 10, "column": 10, "row": 2, "mobile_order": 14, "lane": "quality", "title": "核心校验", "subtitle": "检查核心产物与证据引用", "stage": "verify-core"},
-        {"id": "study", "step": 11, "column": 11, "row": 3, "mobile_order": 15, "lane": "learning", "title": "学习账本", "subtitle": "提炼章节与学习卡片", "model_kind": "study", "required": False, "stage": "study-guide"},
-        {"id": "triage", "step": 12, "column": 12, "row": 3, "mobile_order": 16, "lane": "learning", "title": "证据 Triage", "subtitle": "判断证据缺口与处理路由", "model_kind": "triage", "required": False, "stage": "study-guide"},
-        {"id": "documents", "step": 13, "column": 12, "row": 2, "mobile_order": 17, "lane": "main", "title": "多文档章节分析", "subtitle": "生成知识笔记与初版报告", "model_kind": "text", "model_slot": "text", "required": True, "stage": "multidoc"},
-        {"id": "deep_report", "step": 14, "column": 13, "row": 2, "mobile_order": 18, "lane": "main", "title": "章节深度报告", "subtitle": "逐章分析与最终综合", "model_kind": "text", "model_slot": "text", "required": True, "stage": "deep-v2", "stage_step": "chapters"},
-        {"id": "deep_review", "step": 15, "column": 14, "row": 2, "mobile_order": 19, "lane": "quality", "title": "深度报告复核", "subtitle": "语义审核与格式校验", "model_kind": "review", "required": False, "stage": "deep-v2", "stage_step": "review"},
-        {"id": "evidence_review", "step": 16, "column": 15, "row": 1, "mobile_order": 20, "lane": "quality", "title": "证据复核与发布门禁", "subtitle": "复核缺口对最终发布的影响", "model_kind": "text", "model_slot": "text", "required": True, "stage": "evidence-review"},
-        {"id": "web_evidence", "step": 17, "column": 16, "row": 1, "mobile_order": 21, "lane": "quality", "title": "联网补证据", "subtitle": "仅补充可由外部来源验证的缺口", "model_kind": "text", "model_slot": "text", "required": True, "stage": "web-evidence"},
-        {"id": "qa_index", "step": 18, "column": 17, "row": 2, "mobile_order": 22, "lane": "delivery", "title": "问答证据索引", "subtitle": "规则切片并建立可追溯索引", "stage": "qa-index"},
-        {"id": "image_prompts", "step": 19, "column": 17, "row": 3, "mobile_order": 23, "lane": "delivery", "title": "配图提示词", "subtitle": "整理最终文档的配图需求", "stage": "image-prompts"},
-        {"id": "image", "step": 20, "column": 18, "row": 3, "mobile_order": 24, "lane": "delivery", "title": "文档配图", "subtitle": "生成或复用最终文档插图", "model_kind": "image", "required": False, "stage": "final-publish", "stage_step": "images"},
-        {"id": "final_publish", "step": 21, "column": 19, "row": 2, "mobile_order": 25, "lane": "delivery", "title": "最终定稿与发布", "subtitle": "补齐、插图并校验交付文档", "stage": "final-publish"},
-        {"id": "operation_manual_doc", "step": 22, "column": 20, "row": 1, "mobile_order": 26, "lane": "delivery", "title": "操作手册", "subtitle": "operation_manual.md", "stage": "final-publish", "artifact_path": "operation_manual.md", "node_kind": "output"},
-        {"id": "knowledge_notes_doc", "step": 22, "column": 20, "row": 2, "mobile_order": 27, "lane": "delivery", "title": "逐章知识笔记", "subtitle": "knowledge_notes_v2.md", "stage": "final-publish", "artifact_path": "docs_analysis_chapters/knowledge_notes_v2.md", "node_kind": "output"},
-        {"id": "deep_report_doc", "step": 22, "column": 20, "row": 3, "mobile_order": 28, "lane": "delivery", "title": "深度报告", "subtitle": "deep_report_v2.md", "stage": "final-publish", "artifact_path": "docs_analysis_chapters/deep_report_v2.md", "node_kind": "output"},
-        {"id": "manual_evidence_doc", "step": 22, "column": 20, "row": 4, "mobile_order": 29, "lane": "delivery", "title": "证据审计表", "subtitle": "manual_evidence.md", "stage": "final-publish", "artifact_path": "manual_evidence.md", "node_kind": "output"},
+        {"id": "frame_audit", "step": 4, "column": 4, "row": 3, "mobile_order": 8, "lane": "visual", "title": "帧去重审计", "subtitle": "去重并补齐时间轴覆盖", "stage": "analyze-core", "progress_step": "ocr_audit"},
+        {"id": "ocr", "step": 5, "column": 5, "row": 3, "mobile_order": 9, "lane": "visual", "title": "画面 OCR", "subtitle": "提取画面文字证据", "model_kind": "ocr", "required": False, "stage": "analyze-core", "progress_step": "ocr"},
+        {"id": "vision", "step": 6, "column": 6, "row": 3, "mobile_order": 10, "lane": "visual", "title": "视觉理解", "subtitle": "在 OCR 之后理解动作、界面和场景", "model_kind": "vision", "required": False, "stage": "analyze-core", "progress_step": "vl"},
+        {"id": "visual_evidence", "step": 7, "column": 7, "row": 3, "mobile_order": 11, "lane": "visual", "title": "视觉证据", "subtitle": "整理 OCR、VL 与帧引用", "stage": "analyze-core", "progress_step": "vl"},
+        {"id": "evidence_merge", "step": 7, "column": 7, "row": 2, "mobile_order": 12, "lane": "main", "title": "证据汇合", "subtitle": "合并转写、视觉与页面上下文", "stage": "analyze-core", "progress_step": "manual"},
+        {"id": "text", "step": 8, "column": 8, "row": 2, "mobile_order": 13, "lane": "main", "title": "核心分析", "subtitle": "结构化理解并生成手册草稿", "model_kind": "text", "required": True, "stage": "analyze-core", "progress_step": "manual"},
+        {"id": "text_fallback", "step": 9, "column": 9, "row": 4, "mobile_order": 14, "lane": "fallback", "title": "核心文本兜底", "subtitle": "主文本模型失败时调用，可禁用", "model_slot": "text_fallback", "model_kind": "text", "required": False, "stage": "analyze-core", "progress_step": "manual"},
+        {"id": "core_verify", "step": 10, "column": 10, "row": 2, "mobile_order": 15, "lane": "quality", "title": "核心校验", "subtitle": "检查核心产物与证据引用", "stage": "verify-core"},
+        {"id": "study", "step": 11, "column": 11, "row": 3, "mobile_order": 16, "lane": "learning", "title": "学习账本", "subtitle": "提炼章节与学习卡片", "model_kind": "study", "required": False, "stage": "study-guide"},
+        {"id": "triage", "step": 12, "column": 12, "row": 3, "mobile_order": 17, "lane": "learning", "title": "证据 Triage", "subtitle": "判断证据缺口与处理路由", "model_kind": "triage", "required": False, "stage": "study-guide"},
+        {"id": "documents", "step": 13, "column": 12, "row": 2, "mobile_order": 18, "lane": "main", "title": "多文档章节分析", "subtitle": "生成知识笔记与初版报告", "model_kind": "text", "model_slot": "text", "required": True, "stage": "multidoc"},
+        {"id": "deep_report", "step": 14, "column": 13, "row": 2, "mobile_order": 19, "lane": "main", "title": "章节深度报告", "subtitle": "逐章分析与最终综合", "model_kind": "text", "model_slot": "text", "required": True, "stage": "deep-v2", "stage_step": "chapters"},
+        {"id": "deep_review", "step": 15, "column": 14, "row": 2, "mobile_order": 20, "lane": "quality", "title": "深度报告复核", "subtitle": "语义审核与格式校验", "model_kind": "review", "required": False, "stage": "deep-v2", "stage_step": "review"},
+        {"id": "evidence_review", "step": 16, "column": 15, "row": 1, "mobile_order": 21, "lane": "quality", "title": "证据复核与发布门禁", "subtitle": "复核缺口对最终发布的影响", "model_kind": "text", "model_slot": "text", "required": True, "stage": "evidence-review"},
+        {"id": "web_evidence", "step": 17, "column": 16, "row": 1, "mobile_order": 22, "lane": "quality", "title": "联网补证据", "subtitle": "仅补充可由外部来源验证的缺口", "model_kind": "text", "model_slot": "text", "required": True, "stage": "web-evidence"},
+        {"id": "qa_index", "step": 18, "column": 17, "row": 2, "mobile_order": 23, "lane": "delivery", "title": "问答证据索引", "subtitle": "规则切片并建立可追溯索引", "stage": "qa-index"},
+        {"id": "image_prompts", "step": 19, "column": 17, "row": 3, "mobile_order": 24, "lane": "delivery", "title": "配图提示词", "subtitle": "整理最终文档的配图需求", "stage": "image-prompts"},
+        {"id": "image", "step": 20, "column": 18, "row": 3, "mobile_order": 25, "lane": "delivery", "title": "文档配图", "subtitle": "生成或复用最终文档插图", "model_kind": "image", "required": False, "stage": "final-publish", "stage_step": "images"},
+        {"id": "final_publish", "step": 21, "column": 19, "row": 2, "mobile_order": 26, "lane": "delivery", "title": "最终定稿与发布", "subtitle": "补齐、插图并校验交付文档", "stage": "final-publish"},
+        {"id": "operation_manual_doc", "step": 22, "column": 20, "row": 1, "mobile_order": 27, "lane": "delivery", "title": "操作手册", "subtitle": "operation_manual.md", "stage": "final-publish", "artifact_path": "operation_manual.md", "node_kind": "output"},
+        {"id": "knowledge_notes_doc", "step": 22, "column": 20, "row": 2, "mobile_order": 28, "lane": "delivery", "title": "逐章知识笔记", "subtitle": "knowledge_notes_v2.md", "stage": "final-publish", "artifact_path": "docs_analysis_chapters/knowledge_notes_v2.md", "node_kind": "output"},
+        {"id": "deep_report_doc", "step": 22, "column": 20, "row": 3, "mobile_order": 29, "lane": "delivery", "title": "深度报告", "subtitle": "deep_report_v2.md", "stage": "final-publish", "artifact_path": "docs_analysis_chapters/deep_report_v2.md", "node_kind": "output"},
+        {"id": "manual_evidence_doc", "step": 22, "column": 20, "row": 4, "mobile_order": 30, "lane": "delivery", "title": "证据审计表", "subtitle": "manual_evidence.md", "stage": "final-publish", "artifact_path": "manual_evidence.md", "node_kind": "output"},
     ],
     "edges": [
         {"from": "input", "to": "prepare", "lane": "main", "label": "探测与下载"},
@@ -128,7 +129,8 @@ VIDEO_PROFILE_FLOW = {
         {"from": "asr", "to": "transcript_merge", "lane": "audio", "label": "转写文本"},
         {"from": "diarization", "to": "transcript_merge", "lane": "audio", "label": "说话人片段"},
         {"from": "transcript_merge", "to": "evidence_merge", "lane": "audio", "label": "带说话人文字稿"},
-        {"from": "frame_extract", "to": "ocr", "lane": "visual", "label": "候选帧"},
+        {"from": "frame_extract", "to": "frame_audit", "lane": "visual", "label": "候选帧"},
+        {"from": "frame_audit", "to": "ocr", "lane": "visual", "label": "审计保留帧"},
         {"from": "ocr", "to": "vision", "lane": "visual", "label": "OCR 文本"},
         {"from": "vision", "to": "visual_evidence", "lane": "visual", "label": "画面解释"},
         {"from": "visual_evidence", "to": "evidence_merge", "lane": "visual", "label": "帧证据"},
@@ -541,7 +543,11 @@ def _add_builtin_model_resources(
                 "engine": "unlimited",
                 "worker_count": 5,
                 "concurrency": 5,
+                "gpu_ids": [0, 1, 2, 4, 5],
                 "cache": "on",
+                "max_tokens": 8192,
+                "max_image_long_side": 0,
+                "image_mode": "gundam",
                 "skip_model_inventory_check": True,
             },
         },
@@ -560,6 +566,8 @@ def _add_builtin_model_resources(
                 "worker_count": 5,
                 "concurrency": 5,
                 "cache": "on",
+                "max_tokens": 1024,
+                "max_image_long_side": 1280,
                 "skip_model_inventory_check": True,
             },
         },
@@ -1063,6 +1071,12 @@ def expand_runtime_profile(config: dict[str, Any], profile: dict[str, Any]) -> d
             expanded["ocr_cache"] = options["cache"]
         if options.get("timeout_seconds") is not None:
             expanded["ocr_timeout_seconds"] = options["timeout_seconds"]
+        if options.get("max_tokens") is not None:
+            expanded["ocr_max_tokens"] = options["max_tokens"]
+        if options.get("max_image_long_side") is not None:
+            expanded["ocr_max_image_long_side"] = options["max_image_long_side"]
+        if options.get("image_mode") is not None:
+            expanded["ocr_image_mode"] = options["image_mode"]
         expanded["ocr_engine"] = options.get("engine")
         expanded["ocr_worker_count"] = options.get("worker_count")
 
@@ -1355,6 +1369,16 @@ class RuntimeSettingsStore:
         ocr["base_urls"] = copy.deepcopy(expanded.get("ocr_base_urls") or [])
         ocr["engine"] = expanded.get("ocr_engine")
         ocr["worker_count"] = expanded.get("ocr_worker_count")
+        for expanded_key, runtime_key in (
+            ("ocr_concurrency", "concurrency"),
+            ("ocr_cache", "cache"),
+            ("ocr_timeout_seconds", "timeout_seconds"),
+            ("ocr_max_tokens", "max_tokens"),
+            ("ocr_max_image_long_side", "max_image_long_side"),
+            ("ocr_image_mode", "image_mode"),
+        ):
+            if expanded.get(expanded_key) is not None:
+                ocr[runtime_key] = copy.deepcopy(expanded[expanded_key])
 
         manual = runtime_config.setdefault("operation_manual", {})
         manual["vision_base_url"] = expanded.get("vision_base_url")
@@ -1405,6 +1429,16 @@ class RuntimeSettingsStore:
             ocr["base_urls"] = endpoints
             ocr["engine"] = options.get("engine")
             ocr["worker_count"] = options.get("worker_count")
+            for key in (
+                "concurrency",
+                "cache",
+                "timeout_seconds",
+                "max_tokens",
+                "max_image_long_side",
+                "image_mode",
+            ):
+                if options.get(key) is not None:
+                    ocr[key] = copy.deepcopy(options[key])
         elif kind == "vision":
             manual = runtime_config.setdefault("operation_manual", {})
             manual["vision_base_url"] = endpoints[0] if endpoints else ""

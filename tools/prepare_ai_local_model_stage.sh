@@ -99,7 +99,7 @@ start_ocr() {
   case "${engine}" in
     unlimited|unlimited-ocr)
       local workers="${UNLIMITED_OCR_WORKER_COUNT:-5}"
-      local model="${UNLIMITED_OCR_MODEL:-/home/ai/.cache/huggingface/hub/models--baidu--Unlimited-OCR/snapshots/f799a9cb8404eda2deeefee81ac79a46f6a6f447}"
+      local model="${UNLIMITED_OCR_MODEL:-/home/ai/ocr-deploy/models/unlimited-ocr-f799-p40-runtime}"
       UNLIMITED_OCR_MODEL="${model}" \
       UNLIMITED_OCR_GPU_IDS="${UNLIMITED_OCR_GPU_IDS:-0,1,2,4,5}" \
       UNLIMITED_OCR_PROXY_PORT="${UNLIMITED_OCR_PROXY_PORT:-18088}" \

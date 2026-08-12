@@ -365,6 +365,7 @@ EXECUTION_NODE_ARTIFACTS = {
     "diarization": ("qa/speaker_diarization_report.json",),
     "transcript_merge": ("transcript.md", "orin/transcript.json"),
     "frame_extract": ("frame_manifest.json", "frames_manifest.json"),
+    "frame_audit": ("frame_dedup_audit.json",),
     "ocr": ("orin/ocr_events.json",),
     "vision": ("orin/frame_analyses.json",),
     "visual_evidence": ("manual_evidence.md", "visual_review.html"),
@@ -463,6 +464,7 @@ CORE_PROGRESS_STEPS = [
     ("asr_done", "ASR 完成", (r"ASR succeeded", r"Using existing transcript file")),
     ("frames", "扫描/候选帧抽取", (r"Extracting frames from video", r"Jetson video cache", r"frame worker")),
     ("frames_done", "候选帧就绪", (r"Extracted \d+ screen keyframes",)),
+    ("ocr_audit", "OCR帧去重审计", (r"OCR frame audit retained",)),
     ("ocr", "OCR关键帧选择/执行", (r"Selected \d+ OCR keyframes", r"Running OCR", r"\[resource-lock\] (waiting|acquired) resource=ocr")),
     ("ocr_ready", "OCR文本事件就绪", (r"DotsMOCR endpoint not ready", r"DotsMOCR endpoint ready", r"OpenAI-compatible vision OCR", r"OCR results ready")),
     ("vl", "VL解释帧选择/分析", (r"Selecting and analyzing VL frames", r"\[resource-lock\] (waiting|acquired) resource=vl")),
@@ -477,7 +479,8 @@ CORE_PROGRESS_WEIGHTS = {
     "asr": 15,
     "asr_done": 5,
     "frames": 10,
-    "frames_done": 5,
+    "frames_done": 3,
+    "ocr_audit": 2,
     "ocr": 5,
     "ocr_ready": 20,
     "vl": 15,
@@ -5893,6 +5896,13 @@ class VideoLinkStatusServer:
         counts = summary.get("core_counts") or {}
         metrics = {
             "frame_extract": [("候选帧", counts.get("frames_extracted"))],
+            "frame_audit": [
+                ("审计前", counts.get("frames_extracted")),
+                (
+                    "审计后",
+                    (counts.get("frame_dedup_audit") or {}).get("treatment_keep_count"),
+                ),
+            ],
             "ocr": [
                 ("OCR 帧", counts.get("ocr_keyframes")),
                 ("文本事件", counts.get("ocr_text_events")),

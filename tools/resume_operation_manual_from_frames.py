@@ -425,6 +425,7 @@ def main() -> int:
                 retry_endpoints=bool(ocr_config.get("retry_endpoints", True)),
                 cache_mode=ocr_config.get("cache", "on"),
                 cache_dir=ocr_config.get("cache_dir", ".cache/video-analyzer/ocr"),
+                image_mode=ocr_config.get("image_mode", "gundam"),
             )
         timings["ocr_seconds"] = round(time.perf_counter() - stage_started, 3)
 

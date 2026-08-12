@@ -137,6 +137,8 @@ class Config:
                     self.config.setdefault("ocr", {})["max_tokens"] = value
                 elif key == "ocr_max_image_long_side":
                     self.config.setdefault("ocr", {})["max_image_long_side"] = value
+                elif key == "ocr_image_mode":
+                    self.config.setdefault("ocr", {})["image_mode"] = value
                 elif key == "ocr_retry_endpoints":
                     self.config.setdefault("ocr", {})["retry_endpoints"] = value
                 elif key == "asr_provider":

@@ -89,7 +89,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--remote-asr-url", action="append", help="Generic multipart ASR endpoint; can be provided multiple times")
     parser.add_argument(
         "--ocr-provider",
-        choices=["auto", "dots_mocr_vllm", "openai_vision", "none"],
+        choices=["auto", "unlimited_ocr", "dots_ocr", "dots_mocr_vllm", "openai_vision", "none"],
         help="OCR provider used by the analyzer",
     )
     parser.add_argument("--ocr-base-url", action="append", help="DotsMOCR OpenAI-compatible base URL; can be provided multiple times")
@@ -97,6 +97,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ocr-cache", choices=["on", "off", "refresh"], help="OCR cache mode")
     parser.add_argument("--ocr-cache-dir", help="OCR cache directory")
     parser.add_argument("--ocr-timeout-seconds", type=float, help="Per-frame OCR request timeout")
+    parser.add_argument("--ocr-max-tokens", type=int, help="OCR generation length limit")
+    parser.add_argument("--ocr-max-image-long-side", type=int, help="OCR upload image longest side")
+    parser.add_argument("--ocr-image-mode", choices=["gundam", "base"], help="Unlimited-OCR image mode")
     parser.add_argument("--ocr-keyframe-strategy", choices=["auto", "scan-text", "legacy"])
     parser.add_argument("--ocr-keyframe-budget", help="auto or explicit OCR keyframe count")
     parser.add_argument("--ocr-scan-sample-fps", help="auto or low-cost preview scan FPS for OCR keyframe discovery")
@@ -195,6 +198,9 @@ def apply_runtime_profile(args: argparse.Namespace) -> argparse.Namespace:
         "ocr_cache": profile.get("ocr_cache", "on"),
         "ocr_cache_dir": profile.get("ocr_cache_dir", ".cache/video-analyzer/ocr"),
         "ocr_timeout_seconds": profile.get("ocr_timeout_seconds"),
+        "ocr_max_tokens": profile.get("ocr_max_tokens"),
+        "ocr_max_image_long_side": profile.get("ocr_max_image_long_side"),
+        "ocr_image_mode": profile.get("ocr_image_mode"),
         "ocr_keyframe_strategy": profile.get("ocr_keyframe_strategy", "scan-text"),
         "ocr_keyframe_budget": profile.get("ocr_keyframe_budget", "auto"),
         "ocr_scan_sample_fps": profile.get("ocr_scan_sample_fps", "auto"),
@@ -1230,6 +1236,15 @@ def build_analyzer_command(args: argparse.Namespace, video_path: Path, context_p
     ocr_timeout_seconds = getattr(args, "ocr_timeout_seconds", None)
     if ocr_timeout_seconds is not None:
         command.extend(["--ocr-timeout-seconds", str(ocr_timeout_seconds)])
+    ocr_max_tokens = getattr(args, "ocr_max_tokens", None)
+    if ocr_max_tokens is not None:
+        command.extend(["--ocr-max-tokens", str(ocr_max_tokens)])
+    ocr_max_image_long_side = getattr(args, "ocr_max_image_long_side", None)
+    if ocr_max_image_long_side is not None:
+        command.extend(["--ocr-max-image-long-side", str(ocr_max_image_long_side)])
+    ocr_image_mode = getattr(args, "ocr_image_mode", None)
+    if ocr_image_mode is not None:
+        command.extend(["--ocr-image-mode", str(ocr_image_mode)])
     command.extend(
         [
             "--ocr-keyframe-strategy",

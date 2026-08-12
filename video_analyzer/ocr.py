@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import html
 import ipaddress
 import io
 import json
@@ -59,6 +60,23 @@ PROMPTS = {
     ),
 }
 
+UNLIMITED_OCR_PROMPT = "<image>\nFree OCR."
+UNLIMITED_OCR_NORMALIZATION_VERSION = 2
+UNLIMITED_OCR_NGRAM_SIZES = [3, 35]
+UNLIMITED_OCR_NGRAM_WINDOW = 128
+UNLIMITED_OCR_REPETITION_PENALTY = 1.1
+UNLIMITED_OCR_MAX_CROP_BLOCKS = 8
+UNLIMITED_OCR_REPEAT_STOP_MIN_TOKENS = 256
+UNLIMITED_OCR_REPEAT_BLOCK_TOKENS = 32
+UNLIMITED_OCR_REPEAT_COUNT = 3
+UNLIMITED_OCR_QUALITY_GATE_MODE = "observe"
+_UNLIMITED_DETECTION_RE = re.compile(
+    r"<\|det\|>\s*([^\[\n<]+?)\s*\[([^\]<]+)\]\s*<\|/det\|>",
+    re.IGNORECASE,
+)
+_MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_NON_TEXT_CATEGORIES = {"image", "figure", "picture", "non-text"}
+
 
 @dataclass
 class OCREvent:
@@ -70,6 +88,9 @@ class OCREvent:
     items: List[Dict[str, Any]]
     error: Optional[str] = None
     cache_status: Optional[str] = None
+    raw_text: Optional[str] = None
+    quality_status: Optional[str] = None
+    generation_metadata: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -81,6 +102,9 @@ class OCREvent:
             "items": self.items,
             "error": self.error,
             "cache_status": self.cache_status,
+            "raw_text": self.raw_text,
+            "quality_status": self.quality_status,
+            "generation_metadata": self.generation_metadata,
         }
 
     @classmethod
@@ -94,6 +118,9 @@ class OCREvent:
             items=list(payload.get("items") or []),
             error=payload.get("error"),
             cache_status=payload.get("cache_status"),
+            raw_text=payload.get("raw_text"),
+            quality_status=payload.get("quality_status"),
+            generation_metadata=dict(payload.get("generation_metadata") or {}) or None,
         )
 
 
@@ -140,12 +167,13 @@ def _ocr_cache_key(
     endpoint_family: str,
     max_tokens: int,
     max_image_long_side: int,
+    image_mode: Optional[str] = None,
 ) -> Optional[str]:
     image_path = _frame_image_path(frame)
     if not image_path or not image_path.exists():
         return None
     payload = {
-        "version": 2,
+        "version": 3,
         "image_sha256": _hash_file(image_path),
         "provider": provider,
         "model": model,
@@ -154,6 +182,10 @@ def _ocr_cache_key(
         "endpoint_family": endpoint_family,
         "max_tokens": int(max_tokens),
         "max_image_long_side": int(max_image_long_side),
+        "image_mode": image_mode if provider == "unlimited_ocr" else None,
+        "normalization_version": (
+            UNLIMITED_OCR_NORMALIZATION_VERSION if provider == "unlimited_ocr" else 0
+        ),
     }
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -210,6 +242,132 @@ def _extract_json_array(text: str) -> Optional[List[Dict[str, Any]]]:
     return None
 
 
+def _parse_unlimited_bbox(value: str) -> Optional[List[int]]:
+    parts = [item.strip() for item in value.split(",")]
+    if len(parts) != 4:
+        return None
+    try:
+        return [int(round(float(item))) for item in parts]
+    except ValueError:
+        return None
+
+
+def _clean_unlimited_text(value: str) -> str:
+    cleaned = _MARKDOWN_IMAGE_RE.sub("", value)
+    cleaned = cleaned.replace("<|endoftext|>", "").replace("<｜end▁of▁sentence｜>", "")
+    cleaned = re.sub(r"<\|det\|>\s*[A-Za-z_][\w-]*\s*\[?", "", cleaned)
+    cleaned = cleaned.replace("<|/det|>", "")
+    cleaned = re.sub(r"</(?:td|th)>", "\t", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"</tr>", "\n", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"<[^>]+>", "", cleaned)
+    cleaned = html.unescape(cleaned)
+    lines = [line.strip() for line in cleaned.splitlines()]
+    ignored_lines = {"[non-text]", "[no text]", "(no text to output)"}
+    retained: List[str] = []
+    for line in lines:
+        normalized = line.lower().rstrip(".")
+        if not line or normalized in ignored_lines:
+            continue
+        if normalized.startswith("the image contains no text"):
+            continue
+        if normalized.startswith("the image is too blurry to recognize any text"):
+            continue
+        retained.append(line)
+    return "\n".join(retained)
+
+
+def _trim_incomplete_unlimited_detection(raw_text: str) -> str:
+    last_open = raw_text.rfind("<|det|>")
+    last_close = raw_text.rfind("<|/det|>")
+    if last_open > last_close:
+        return raw_text[:last_open].rstrip()
+    return raw_text
+
+
+def _unlimited_quality_failures(text: str, items: List[Dict[str, Any]], raw_text: str) -> List[str]:
+    failures: List[str] = []
+    image_marker_count = len(_MARKDOWN_IMAGE_RE.findall(raw_text))
+    if image_marker_count and not text:
+        failures.append("image_only_output")
+    if raw_text.count("<|det|>") != raw_text.count("<|/det|>"):
+        failures.append("unbalanced_detection_markers")
+
+    lines: List[str] = []
+    for item in items:
+        item_text = str(item.get("text") or "")
+        lines.extend(line.strip() for line in item_text.splitlines() if len(line.strip()) >= 4)
+    if not lines:
+        lines = [line.strip() for line in text.splitlines() if len(line.strip()) >= 4]
+
+    counts: Dict[str, int] = {}
+    for line in lines:
+        counts[line] = counts.get(line, 0) + 1
+    if counts:
+        max_count = max(counts.values())
+        repeated_count = sum(count - 1 for count in counts.values() if count > 1)
+        if max_count >= 8 or (len(lines) >= 12 and repeated_count / len(lines) >= 0.35):
+            failures.append("repetitive_output")
+
+    formula_lines = [
+        line
+        for line in lines
+        if "\\frac" in line or "\\therefore" in line or "\\overrightarrow" in line
+    ]
+    if len(formula_lines) >= 5 and len(set(formula_lines)) <= max(2, len(formula_lines) // 4):
+        failures.append("repetitive_formula_output")
+
+    compact_text = re.sub(r"\s+", "", text)
+    if len(compact_text) >= 200 and len(set(compact_text)) / len(compact_text) < 0.08:
+        failures.append("low_character_diversity")
+    alphanumeric_text = re.sub(r"[^\w\u3400-\u9fff]+", "", text, flags=re.UNICODE).replace("_", "").lower()
+    if re.search(r"_{3,}", text) and alphanumeric_text in {"text", "recognizedtext", "ocrtext"}:
+        failures.append("placeholder_output")
+
+    if len(raw_text) >= 8000:
+        failures.append("abnormally_long_output")
+    if not text and len(_clean_unlimited_text(raw_text)) >= 80:
+        failures.append("unparsed_nonempty_output")
+    meaningful_chars = len(re.findall(r"[\w\u3400-\u9fff]", text))
+    if len(raw_text) >= 200 and meaningful_chars < 20:
+        failures.append("low_information_output")
+    return failures
+
+
+def normalize_unlimited_ocr_output(
+    raw_text: str,
+) -> tuple[str, List[Dict[str, Any]], str, List[str]]:
+    parse_text = _trim_incomplete_unlimited_detection(raw_text)
+    matches = list(_UNLIMITED_DETECTION_RE.finditer(parse_text))
+    items: List[Dict[str, Any]] = []
+    text_parts: List[str] = []
+
+    for index, match in enumerate(matches):
+        next_start = matches[index + 1].start() if index + 1 < len(matches) else len(parse_text)
+        category = match.group(1).strip().lower()
+        item_text = _clean_unlimited_text(parse_text[match.end():next_start])
+        bbox = _parse_unlimited_bbox(match.group(2))
+        item: Dict[str, Any] = {"category": category, "text": item_text}
+        if bbox is not None:
+            item["bbox"] = bbox
+        items.append(item)
+        if item_text and category not in _NON_TEXT_CATEGORIES:
+            text_parts.append(item_text)
+
+    if matches:
+        normalized_text = "\n".join(text_parts).strip()
+    else:
+        normalized_text = _clean_unlimited_text(parse_text)
+
+    failures = _unlimited_quality_failures(normalized_text, items, parse_text)
+    if failures:
+        quality_status = "quality_failed"
+    elif normalized_text:
+        quality_status = "passed"
+    else:
+        quality_status = "empty"
+    return normalized_text, items, quality_status, failures
+
+
 class DotsMOCRVLLMProvider:
     def __init__(
         self,
@@ -222,6 +380,8 @@ class DotsMOCRVLLMProvider:
         probe_timeout_seconds: float = 5,
         warmup_timeout_seconds: float = 180,
         warmup_retry_interval_seconds: float = 5,
+        provider_name: str = "dots_mocr_vllm",
+        image_mode: str = "gundam",
     ):
         self.base_url = base_url
         self.model = model
@@ -232,6 +392,8 @@ class DotsMOCRVLLMProvider:
         self.probe_timeout_seconds = probe_timeout_seconds
         self.warmup_timeout_seconds = warmup_timeout_seconds
         self.warmup_retry_interval_seconds = warmup_retry_interval_seconds
+        self.provider_name = provider_name
+        self.image_mode = image_mode if image_mode in {"gundam", "base"} else "gundam"
         self.selected_base_url: Optional[str] = None
         self.diagnostics: List[Dict[str, str]] = []
         self.session = _make_session(self.base_url)
@@ -270,20 +432,26 @@ class DotsMOCRVLLMProvider:
             time.sleep(sleep_seconds)
         return None
 
-    def analyze_frame(self, frame: Frame) -> OCREvent:
+    def _request_frame(self, frame: Frame, image_mode: Optional[str] = None) -> OCREvent:
         base_url = self.selected_base_url or self.probe()
         if not base_url:
             return OCREvent(
                 frame_number=frame.number,
                 timestamp=frame.timestamp,
-                provider="dots_mocr_vllm",
+                provider=self.provider_name,
                 status="unavailable",
                 text="",
                 items=[],
                 error=f"No DotsMOCR vLLM endpoint is reachable: {self.diagnostics}",
             )
 
-        prompt = PROMPTS.get(self.prompt_mode, PROMPTS["prompt_scene_spotting"])
+        is_unlimited = self.provider_name == "unlimited_ocr"
+        prompt = (
+            UNLIMITED_OCR_PROMPT
+            if is_unlimited
+            else PROMPTS.get(self.prompt_mode, PROMPTS["prompt_scene_spotting"])
+        )
+        mode = image_mode or self.image_mode
         payload = {
             "model": self.model,
             "messages": [
@@ -296,7 +464,14 @@ class DotsMOCRVLLMProvider:
                                 "url": f"data:image/jpeg;base64,{_encode_image(frame.path, self.max_image_long_side)}"
                             },
                         },
-                        {"type": "text", "text": f"<|img|><|imgpad|><|endofimg|>{prompt}"},
+                        {
+                            "type": "text",
+                            "text": (
+                                prompt
+                                if is_unlimited
+                                else f"<|img|><|imgpad|><|endofimg|>{prompt}"
+                            ),
+                        },
                     ],
                 }
             ],
@@ -304,8 +479,22 @@ class DotsMOCRVLLMProvider:
             "top_p": 0.9,
             "max_tokens": self.max_tokens,
         }
+        if is_unlimited:
+            payload["images_config"] = {
+                "image_mode": mode,
+                "max_crop_blocks": UNLIMITED_OCR_MAX_CROP_BLOCKS,
+            }
+            payload["custom_params"] = {
+                "ngram_sizes": UNLIMITED_OCR_NGRAM_SIZES,
+                "window_size": UNLIMITED_OCR_NGRAM_WINDOW,
+                "repetition_penalty": UNLIMITED_OCR_REPETITION_PENALTY,
+                "repeat_stop_min_tokens": UNLIMITED_OCR_REPEAT_STOP_MIN_TOKENS,
+                "repeat_block_tokens": UNLIMITED_OCR_REPEAT_BLOCK_TOKENS,
+                "repeat_count": UNLIMITED_OCR_REPEAT_COUNT,
+            }
 
         try:
+            started = time.monotonic()
             response = self.session.post(
                 f"{base_url}/chat/completions",
                 headers={"Authorization": "Bearer 0", "Content-Type": "application/json"},
@@ -315,29 +504,53 @@ class DotsMOCRVLLMProvider:
             response.raise_for_status()
             data = response.json()
             content = data["choices"][0]["message"]["content"]
-            items = _extract_json_array(content) or []
-            text = "\n".join(str(item.get("text", "")).strip() for item in items if item.get("text"))
-            if not text:
-                text = content.strip()
+            generation_metadata = dict(data.get("ocr_metadata") or {})
+            generation_metadata.setdefault("elapsed_seconds", round(time.monotonic() - started, 3))
+            generation_metadata.setdefault("image_mode", mode if is_unlimited else None)
+            quality_status = None
+            raw_text = None
+            failures: List[str] = []
+            if is_unlimited:
+                raw_text = content
+                text, items, quality_status, failures = normalize_unlimited_ocr_output(content)
+                generation_metadata["quality_gate_mode"] = UNLIMITED_OCR_QUALITY_GATE_MODE
+                generation_metadata["quality_warnings"] = failures
+            else:
+                items = _extract_json_array(content) or []
+                text = "\n".join(str(item.get("text", "")).strip() for item in items if item.get("text"))
+                if not text:
+                    text = content.strip()
+            observe_quality = (
+                is_unlimited
+                and UNLIMITED_OCR_QUALITY_GATE_MODE == "observe"
+                and bool(text)
+            )
             return OCREvent(
                 frame_number=frame.number,
                 timestamp=frame.timestamp,
-                provider=f"dots_mocr_vllm:{base_url}",
-                status="ok",
-                text=text,
+                provider=f"{self.provider_name}:{base_url}",
+                status="ok" if observe_quality or not failures else "quality_failed",
+                text=text if observe_quality or not failures else "",
                 items=items,
+                error=None if observe_quality else ", ".join(failures) if failures else None,
+                raw_text=raw_text,
+                quality_status=quality_status,
+                generation_metadata=generation_metadata,
             )
         except Exception as exc:
             logger.warning("OCR failed for frame %s: %s", frame.number, exc)
             return OCREvent(
                 frame_number=frame.number,
                 timestamp=frame.timestamp,
-                provider=f"dots_mocr_vllm:{base_url}",
+                provider=f"{self.provider_name}:{base_url}",
                 status="error",
                 text="",
                 items=[],
                 error=str(exc),
             )
+
+    def analyze_frame(self, frame: Frame) -> OCREvent:
+        return self._request_frame(frame)
 
 
 class OpenAICompatibleVisionOCRProvider:
@@ -429,13 +642,16 @@ class OpenAICompatibleVisionOCRProvider:
                 error=str(exc),
             )
 
-
-def _unavailable_events(frames: List[Frame], error: str) -> List[OCREvent]:
+def _unavailable_events(
+    frames: List[Frame],
+    error: str,
+    provider_name: str = "dots_mocr_vllm",
+) -> List[OCREvent]:
     return [
         OCREvent(
             frame_number=frame.number,
             timestamp=frame.timestamp,
-            provider="dots_mocr_vllm",
+            provider=provider_name,
             status="unavailable",
             text="",
             items=[],
@@ -552,6 +768,8 @@ def _probe_dots_providers(
     probe_timeout_seconds: float,
     warmup_timeout_seconds: float,
     warmup_retry_interval_seconds: float,
+    provider_name: str,
+    image_mode: str,
 ) -> List[DotsMOCRVLLMProvider]:
     providers = [
         DotsMOCRVLLMProvider(
@@ -564,6 +782,8 @@ def _probe_dots_providers(
             probe_timeout_seconds=probe_timeout_seconds,
             warmup_timeout_seconds=warmup_timeout_seconds,
             warmup_retry_interval_seconds=warmup_retry_interval_seconds,
+            provider_name=provider_name,
+            image_mode=image_mode,
         )
         for endpoint in endpoints
     ]
@@ -603,6 +823,7 @@ def run_ocr(
     warmup_retry_interval_seconds: float = 5,
     cache_mode: str = "on",
     cache_dir: Optional[str] = ".cache/video-analyzer/ocr",
+    image_mode: str = "gundam",
     progress_callback=None,
 ) -> List[OCREvent]:
     if provider == "none":
@@ -631,6 +852,7 @@ def run_ocr(
             endpoint_family,
             max_tokens,
             max_image_long_side,
+            image_mode,
         )
         if key is None:
             event = analyze(frame)
@@ -658,6 +880,7 @@ def run_ocr(
                 endpoint_family,
                 max_tokens,
                 max_image_long_side,
+                image_mode,
             )
             if key is None:
                 return None
@@ -685,7 +908,11 @@ def run_ocr(
                     progress_callback(event)
             return cached_events
         if not fallback.probe():
-            events = _unavailable_events(frames, f"OpenAI-compatible OCR endpoint is not reachable: {fallback_base_url}")
+            events = _unavailable_events(
+                frames,
+                f"OpenAI-compatible OCR endpoint is not reachable: {fallback_base_url}",
+                "openai_vision",
+            )
             if progress_callback:
                 for event in events:
                     progress_callback(event)
@@ -706,7 +933,8 @@ def run_ocr(
 
     dots_endpoints = _resolve_dots_endpoints(base_url, base_urls)
     dots_endpoint_family = ",".join(dots_endpoints) if dots_endpoints else base_url
-    cached_events = read_all_cached("dots_mocr_vllm", dots_endpoint_family)
+    provider_name = requested_provider if requested_provider in {"unlimited_ocr", "dots_ocr"} else "dots_mocr_vllm"
+    cached_events = read_all_cached(provider_name, dots_endpoint_family)
     if cached_events is not None:
         if progress_callback:
             for event in cached_events:
@@ -723,6 +951,8 @@ def run_ocr(
         probe_timeout_seconds=probe_timeout_seconds,
         warmup_timeout_seconds=warmup_timeout_seconds,
         warmup_retry_interval_seconds=warmup_retry_interval_seconds,
+        provider_name=provider_name,
+        image_mode=image_mode,
     )
     if not dots_providers:
         error = f"DotsMOCR vLLM endpoint was not ready after {warmup_timeout_seconds}s"
@@ -751,7 +981,7 @@ def run_ocr(
                     if progress_callback:
                         progress_callback(event)
                 return events
-        events = _unavailable_events(frames, error)
+        events = _unavailable_events(frames, error, provider_name)
         if progress_callback:
             for event in events:
                 progress_callback(event)
@@ -763,12 +993,13 @@ def run_ocr(
         for frame in frames:
             key = _ocr_cache_key(
                 frame,
-                "dots_mocr_vllm",
+                provider_name,
                 model,
                 prompt_mode,
                 dots_endpoint_family,
                 max_tokens,
                 max_image_long_side,
+                image_mode,
             )
             cached = _read_cached_event(cache_path, key, frame) if key else None
             if cached:
@@ -812,7 +1043,7 @@ def run_ocr(
         index, frame = index_frame
         return cached_or_analyze(
             frame,
-            "dots_mocr_vllm",
+            provider_name,
             dots_endpoint_family,
             lambda item: analyze_with_endpoint_retry(index, item),
         )
@@ -828,9 +1059,4 @@ def run_ocr(
             if progress_callback:
                 progress_callback(event)
 
-    ordered = [results[frame.number] for frame in frames]
-    if requested_provider in {"unlimited_ocr", "dots_ocr"}:
-        for event in ordered:
-            if event.provider.startswith("dots_mocr_vllm"):
-                event.provider = requested_provider + event.provider.removeprefix("dots_mocr_vllm")
-    return ordered
+    return [results[frame.number] for frame in frames]
