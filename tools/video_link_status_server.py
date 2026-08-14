@@ -74,6 +74,7 @@ from video_analyzer.skill_projects import (
     build_source_bundle,
     capability_inventory,
 )
+from video_analyzer.tencent_hy_asr import missing_tencent_credentials
 from video_analyzer.resource_locks import DEFAULT_LOCK_DIR
 from video_analyzer.url_context import (
     AUDIO_MEDIA_EXTENSIONS,
@@ -401,7 +402,7 @@ DOCUMENT_PREVIEW_PROCESS = (
     ("transcript.md", "转写文本", "ASR 生成的全文转写。"),
     ("analysis.json", "核心分析 JSON", "核心分析的结构化总产物。"),
     ("study_guide.json", "学习证据账本", "学习卡片和证据分诊的结构化输入。"),
-    ("study_overview.md", "学习概览", "轻量脑图/概要式学习入口。"),
+    ("study_overview.md", "内容脑图与学习概览", "按音频章节展示的内容脑图与概要。"),
     ("study_cards.md", "学习卡片", "拆分后的学习卡片。"),
     ("evidence_gaps.json", "证据缺口", "模型发现的证据不足点。"),
     ("evidence_triage.json", "证据分诊", "证据缺口的处理路由。"),
@@ -2004,23 +2005,39 @@ class VideoLinkStatusServer:
         fallback = (job.get("runtime_profile_snapshot") or {}).get(
             "audio_cloud_fallback"
         ) or {}
+        fallback_credentials_ready = self.audio_cloud_fallback_credentials_ready(
+            fallback
+        )
         local_busy = any(
             self.live_resource_users(resource, exclude_job_id=job.get("job_id"))
             for resource in ("core", "audio-analysis", "asr", "ocr", "vl")
         )
         job["compute_route"] = (
             "cloud_fallback"
-            if local_busy and fallback.get("enabled")
+            if local_busy and fallback.get("enabled") and fallback_credentials_ready
             else "local"
         )
         job["compute_route_reason"] = (
             "local_resource_busy"
             if job["compute_route"] == "cloud_fallback"
-            else "local_first"
+            else (
+                "cloud_fallback_credentials_missing"
+                if local_busy and fallback.get("enabled")
+                else "local_first"
+            )
         )
         job["updated_at"] = iso_now()
         self.save_job(job)
         return job
+
+    @staticmethod
+    def audio_cloud_fallback_credentials_ready(
+        fallback: dict[str, Any],
+    ) -> bool:
+        asr = fallback.get("asr") or {}
+        if str(asr.get("protocol") or "") != "tencent_hy_asr_ws":
+            return True
+        return not missing_tencent_credentials(dict(asr.get("options") or {}))
 
     def live_resource_users(self, resource: str, exclude_job_id: str | None = None) -> list[dict[str, Any]]:
         users = []

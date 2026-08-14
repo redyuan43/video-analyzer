@@ -304,6 +304,11 @@ class Config:
                 vibevoice["openai_audio_url"] = profile["openai_audio_url"]
                 vibevoice["openai_audio_model"] = profile.get("openai_audio_model")
                 vibevoice["asr_api_key_env"] = profile.get("asr_api_key_env")
+            if profile.get("tencent_hy_asr_endpoint"):
+                vibevoice["tencent_hy_asr_endpoint"] = profile["tencent_hy_asr_endpoint"]
+                vibevoice["tencent_hy_asr_model"] = profile.get("tencent_hy_asr_model")
+                vibevoice["tencent_hy_asr_options"] = profile.get("tencent_hy_asr_options") or {}
+                vibevoice["asr_api_key_env"] = profile.get("asr_api_key_env")
             if services.get("capswriter_url"):
                 vibevoice.setdefault("capswriter_url", services["capswriter_url"])
             if isinstance(profile.get("speaker_diarization"), dict):

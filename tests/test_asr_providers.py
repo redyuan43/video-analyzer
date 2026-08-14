@@ -7,6 +7,7 @@ from video_analyzer.asr_providers import (
     merge_asr_transcripts,
     transcribe_with_firered_asr2,
     transcribe_with_http_asr,
+    transcribe_with_provider_result,
 )
 from video_analyzer.audio_processor import AudioTranscript
 
@@ -38,6 +39,27 @@ class ASRProviderTests(unittest.TestCase):
         self.assertEqual(transcript.metadata["mode"], "ray_chunk_reconcile")
         self.assertEqual(transcript.metadata["quality_report"]["global_speaker_count"], 18)
         self.assertIn("audit_chunks", transcript.metadata)
+
+    def test_http_asr_rejects_failed_coverage_acceptance(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "success": True,
+            "text": "不完整",
+            "segments": [],
+            "acceptance": {
+                "status": "failed",
+                "failure_reasons": ["empty_chunk_output"],
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio_path = Path(temp_dir) / "audio.wav"
+            audio_path.write_bytes(b"fake wav")
+            with patch("video_analyzer.asr_providers.requests.post", return_value=response):
+                transcript = transcribe_with_http_asr(audio_path, "http://127.0.0.1:18014/api/asr/transcribe")
+
+        self.assertIsNone(transcript)
 
     def test_merge_asr_transcripts_preserves_source_metadata(self):
         fast = AudioTranscript(text="fast", segments=[{"text": "fast"}], language="zh", metadata={"provider": "fast"})
@@ -91,6 +113,35 @@ class ASRProviderTests(unittest.TestCase):
                 "chunk_overlap_sec": 3,
             },
         )
+
+    def test_tencent_provider_forwards_endpoint_and_options(self):
+        transcript = AudioTranscript(text="腾讯转写", segments=[], language="zh")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio_path = Path(temp_dir) / "audio.wav"
+            audio_path.write_bytes(b"fake wav")
+            with patch(
+                "video_analyzer.asr_providers.transcribe_with_tencent_hy_asr",
+                return_value=transcript,
+            ) as transcribe:
+                result = transcribe_with_provider_result(
+                    provider="tencent_hy_asr",
+                    audio_path=audio_path,
+                    language="zh",
+                    whisper_model="medium",
+                    device="cpu",
+                    vibevoice_config={
+                        "tencent_hy_asr_endpoint": "wss://asr.cloud.tencent.com/asr/v2",
+                        "tencent_hy_asr_options": {"parallel_chunks": 4},
+                    },
+                )
+
+        self.assertIs(result.transcript, transcript)
+        self.assertEqual(result.providers_run, ["tencent_hy_asr"])
+        self.assertEqual(
+            transcribe.call_args.args[1],
+            "wss://asr.cloud.tencent.com/asr/v2",
+        )
+        self.assertEqual(transcribe.call_args.args[2]["parallel_chunks"], 4)
 
 
 if __name__ == "__main__":

@@ -994,6 +994,7 @@ class VideoAnalyzerUITests(unittest.TestCase):
     def test_static_ui_marks_running_and_pending_states_visually(self):
         js = (UI_ROOT / "video_analyzer_ui" / "static" / "js" / "main.js").read_text(encoding="utf-8")
         css = (UI_ROOT / "video_analyzer_ui" / "static" / "css" / "styles.css").read_text(encoding="utf-8")
+        status_source = (REPO_ROOT / "tools" / "video_link_status_server.py").read_text(encoding="utf-8")
 
         self.assertIn("status-spinner", js)
         self.assertIn("pendingUrls", js)
@@ -1087,6 +1088,7 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn("DOCUMENT_DERIVATION_PATH", js)
         self.assertIn("group: 'process',\n        kind: 'mindmap'", js)
         self.assertNotIn("['mindmap', '文档推导'", js)
+        self.assertIn("内容脑图与学习概览", status_source)
         self.assertIn(".doc-preview-body", css)
         self.assertIn(".mindmap-preview", css)
         self.assertIn(".mindmap-mermaid", css)

@@ -33,7 +33,11 @@ from video_analyzer.asr_providers import (  # noqa: E402
 from video_analyzer.audio_processor import AudioProcessor, AudioTranscript  # noqa: E402
 from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient  # noqa: E402
 from video_analyzer.config import Config, build_openai_extra_body, resolve_api_key, resolve_temperature  # noqa: E402
-from video_analyzer.local_model_runtime import local_model_runtime_session, local_model_stage  # noqa: E402
+from video_analyzer.local_model_runtime import (  # noqa: E402
+    local_model_runtime_session,
+    local_model_stage,
+    local_model_stage_needed,
+)
 from video_analyzer.resource_locks import analyzer_resource_lock  # noqa: E402
 from video_analyzer.transcription_pipeline import (  # noqa: E402
     load_provided_transcript,
@@ -59,6 +63,9 @@ TEMPLATE_SELECTOR_SHARD_COUNT = 5
 TEMPLATE_SELECTOR_TOP_K = 3
 TEMPLATE_SELECTOR_MIN_CONFIDENCE = 0.75
 TEMPLATE_SELECTOR_AUDIT_FILE = "template_selection.json"
+TEMPLATE_SELECTOR_PROMPT_CHAR_LIMIT = 6000
+TEMPLATE_SELECTOR_TRANSCRIPT_CHARS = 1200
+TEMPLATE_FINAL_REQUIREMENT_CHARS = 120
 TEMPLATE_CONTENT_FORMS = {
     "interview",
     "meeting",
@@ -80,11 +87,23 @@ TEMPLATE_FORM_FALLBACK_IDS = {
 SUMMARY_SINGLE_PASS_CHARS = 24000
 SUMMARY_MAP_CHUNK_CHARS = 20000
 SUMMARY_REDUCE_BATCH_CHARS = 48000
+SUMMARY_MAP_MAX_TOKENS = 1800
+SUMMARY_FINAL_MAX_TOKENS = 4096
+SUMMARY_DUPLICATE_RATIO_LIMIT = 0.15
+SUMMARY_MAX_STATEMENT_REPEATS = 2
 ASR_PREFLIGHT_MIN_DURATION_SECONDS = 20 * 60
 ASR_PREFLIGHT_SAMPLE_SECONDS = 30
 ASR_PREFLIGHT_SAMPLE_COUNT = 5
 CLIENT_TEMPLATE_BLOCK_RE = re.compile(r"【模板指令开始】[\s\S]*?【模板指令结束】\s*")
 CLIENT_USER_SUPPLEMENT_MARKER = "【用户补充】"
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+SUMMARY_BULLET_RE = re.compile(r"^\s*[-*]\s+(.+?)\s*$")
+SUMMARY_TIME_RANGE_RE = re.compile(
+    r"\[(\d{2}:\d{2}(?::\d{2})?)-(\d{2}:\d{2}(?::\d{2})?)\]"
+)
+SUMMARY_QUESTION_RE = re.compile(
+    r"^(\s*(?:\*\*)?问题)(\d+)([:：].*?(?:\*\*)?)\s*$"
+)
 logger = logging.getLogger("audio_template_analysis")
 
 
@@ -269,7 +288,12 @@ def main() -> int:
         audio_path = extract_audio_to_wav(media_path, output_dir)
         if audio_path is None:
             raise RuntimeError(f"audio extraction produced no audio stream: {media_path}")
-        with local_model_runtime_session(config.config, logger, str(output_dir)):
+        transcription_runtime = (
+            local_model_runtime_session(config.config, logger, str(output_dir))
+            if local_model_stage_needed("asr", config.config)
+            else contextlib.nullcontext()
+        )
+        with transcription_runtime:
             transcript, asr_result, speaker_report = (
                 transcribe_and_diarize_configured_audio(
                     audio_path,
@@ -290,6 +314,9 @@ def main() -> int:
 
     selector_client, selector_model, selector_base_url, _selector_temperature = build_template_selector_client(config)
     content_client, content_model, content_base_url, content_temperature = build_content_analysis_client(config, args.profile)
+    summary_settings = summary_generation_settings(
+        config.get_runtime_profile(args.profile)
+    )
     analysis_transcript = format_transcript_for_analysis(transcript)
     selector_executed = args.template_id == DEFAULT_TEMPLATE_ID
     if selector_executed:
@@ -329,7 +356,9 @@ def main() -> int:
                 language=args.language,
                 temperature=content_temperature,
                 source_name=args.source_name or media_path.name,
+                settings=summary_settings,
             )
+            summary_quality = assess_summary_quality(summary, summary_settings)
             study_guide_path = build_light_study_guide(
                 content_client,
                 content_model,
@@ -366,6 +395,7 @@ def main() -> int:
         elapsed_seconds=round(time.perf_counter() - started, 3),
         timings=node_progress.timings,
         compute_route=args.compute_route,
+        summary_quality=summary_quality,
     )
     node_progress.update("artifact_package", "succeeded", "final audio artifacts written")
     node_progress.finish(
@@ -412,12 +442,10 @@ def apply_cloud_fallback(config: Config, profile_name: str | None) -> None:
         "generic_http": "remote_http",
         "firered_3dspeaker_http": "firered_3dspeaker",
         "openai_audio": "openai_audio",
+        "tencent_hy_asr_ws": "tencent_hy_asr",
     }.get(protocol)
     if not provider or not endpoints:
         raise ValueError(f"unsupported audio cloud fallback ASR protocol: {protocol or '(missing)'}")
-    if str(diarization.get("protocol") or "") != "asr_embedded":
-        raise ValueError("audio cloud fallback requires ASR embedded speaker labels")
-
     asr_config = config.config.setdefault("asr", {})
     asr_config["provider"] = provider
     vibevoice = asr_config.setdefault("vibevoice", {})
@@ -431,11 +459,40 @@ def apply_cloud_fallback(config: Config, profile_name: str | None) -> None:
         vibevoice["openai_audio_url"] = endpoints[0]
         vibevoice["openai_audio_model"] = asr.get("model")
         vibevoice["asr_api_key_env"] = asr.get("api_key_env")
-    config.config["speaker_diarization"] = {
-        "enabled": False,
-        "assignment_enabled": False,
-        "source": "asr_embedded",
-    }
+    elif protocol == "tencent_hy_asr_ws":
+        vibevoice["tencent_hy_asr_endpoint"] = endpoints[0]
+        vibevoice["tencent_hy_asr_model"] = asr.get("model")
+        vibevoice["tencent_hy_asr_options"] = dict(asr.get("options") or {})
+        vibevoice["asr_api_key_env"] = asr.get("api_key_env")
+
+    diarization_protocol = str(diarization.get("protocol") or "")
+    if diarization_protocol == "asr_embedded":
+        config.config["speaker_diarization"] = {
+            "enabled": False,
+            "assignment_enabled": False,
+            "source": "asr_embedded",
+        }
+    else:
+        backend = {
+            "three_d_speaker": "3dspeaker",
+            "pyannote_community": "pyannote_community",
+            "wespeaker_diarization": "wespeaker",
+        }.get(diarization_protocol)
+        if not backend:
+            raise ValueError(
+                f"unsupported audio cloud fallback diarization protocol: "
+                f"{diarization_protocol or '(missing)'}"
+            )
+        speaker_config = dict(diarization.get("options") or {})
+        speaker_config.update(
+            {
+                "enabled": True,
+                "assignment_enabled": True,
+                "parallel_with_asr": True,
+                "backend": backend,
+            }
+        )
+        config.config["speaker_diarization"] = speaker_config
 
 
 def client_focus_supplement(value: str) -> str:
@@ -942,6 +999,7 @@ def choose_template(
         content_form = infer_content_form(transcript_text)
         fallback = fallback_template_for_form(templates, content_form)
         warning = str(exc)
+        public_reason = selector_fallback_public_reason(exc)
         audit["warnings"] = [warning]
         audit["fallback"] = {
             "content_form": content_form,
@@ -953,7 +1011,7 @@ def choose_template(
         return fallback, {
             "method": "content-form-fallback",
             "selection_method": "content-form-fallback",
-            "reason": warning,
+            "reason": public_reason,
             "template_id": fallback.get("id"),
             "scene": content_form_label(content_form),
             "confidence": 0.0,
@@ -962,7 +1020,7 @@ def choose_template(
             "domain": str(fallback.get("first_category") or ""),
             "runner_up_id": "",
             "margin": 0.0,
-            "warnings": [warning],
+            "warnings": [public_reason],
             "audit_path": audit_path,
         }
 
@@ -1000,22 +1058,19 @@ def render_template_shard_prompt(
     shard_count: int,
 ) -> str:
     catalog = "\n\n".join(
-        render_template_candidate(item)
+        render_compact_template_candidate(item)
         for item in templates
     )
     content_form_hint = infer_content_form(transcript_text)
-    return f"""你是音频模板选择初审智能体，正在评审目录分片 {shard_index}/{shard_count}。
+    prompt_template = f"""你是音频模板选择初审智能体，正在评审目录分片 {shard_index}/{shard_count}。
 
 选择原则按以下顺序执行：
 1. 内容形态优先：访谈、会议、演讲/播客独白、电话、教育讲座、个人口述或通用。
 2. 专业领域其次：IT、金融、医疗、法律等不能覆盖内容形态。
 3. 最后比较模板要求与用户关注点、期望输出结构是否匹配。
 
-内容形态必须按对话结构判断：
-- interview：主持人/采访者与嘉宾/受访者持续问答，包括播客访谈、技术访谈和深度对谈。
-- speech：一位主讲人持续陈述，包括主题演讲、独白或没有嘉宾问答的播客独白。
-- 只要存在明确主持人提问、嘉宾回答，就不得因为主题专业或内容较长而判为 speech。
-- 规则提示为 {content_form_hint}，它仅用于提醒你检查证据；若不同意，必须在 reason 中说明具体结构证据。
+内容形态提示为 {content_form_hint}。有主持人提问和嘉宾回答时应判为 interview；
+单人持续陈述才是 speech。若不同意提示，必须给出对话结构证据。
 
 只输出一个 JSON 对象：
 {{"content_form":"interview|meeting|speech|call|education|personal_note|general",
@@ -1031,11 +1086,12 @@ ranked 必须恰好包含本分片中最合适的 {TEMPLATE_SELECTOR_TOP_K} 个�
 {focus_prompt or "无"}
 
 转写文本节选：
-{clip_text(transcript_text, MAX_TRANSCRIPT_CHARS_FOR_CLASSIFY)}
+__TRANSCRIPT_EXCERPT__
 
 模板目录分片：
 {catalog}
 """
+    return fit_selector_prompt(prompt_template, transcript_text)
 
 
 def render_template_candidate(template: dict[str, Any]) -> str:
@@ -1046,6 +1102,72 @@ def render_template_candidate(template: dict[str, Any]) -> str:
         f"{template.get('second_category_zh') or template.get('second_category')}\n"
         f"完整要求：\n{template.get('prompt_original') or ''}"
     )
+
+
+def render_compact_template_candidate(
+    template: dict[str, Any],
+    *,
+    include_requirement: bool = False,
+) -> str:
+    title = clip_text(
+        str(template.get("title_zh") or template.get("title") or ""),
+        18,
+    )
+    category = clip_text(
+        str(
+            template.get("first_category_zh")
+            or template.get("first_category")
+            or ""
+        ),
+        10,
+    )
+    lines = [
+        f"id={template.get('id')}",
+        f"标题={title}",
+        f"分类={category}",
+    ]
+    if include_requirement:
+        requirement = re.sub(
+            r"\s+",
+            " ",
+            str(template.get("prompt_original") or ""),
+        ).strip()
+        lines.append(
+            f"要求摘要={clip_text(requirement, TEMPLATE_FINAL_REQUIREMENT_CHARS)}"
+        )
+    return "\n".join(lines)
+
+
+def fit_selector_prompt(prompt_template: str, transcript_text: str) -> str:
+    marker = "__TRANSCRIPT_EXCERPT__"
+    if marker not in prompt_template:
+        raise ValueError("selector prompt template is missing transcript marker")
+    base_length = len(prompt_template) - len(marker)
+    available = min(
+        TEMPLATE_SELECTOR_TRANSCRIPT_CHARS,
+        TEMPLATE_SELECTOR_PROMPT_CHAR_LIMIT - base_length,
+    )
+    if available < 0:
+        raise ValueError(
+            "template selector catalog exceeds the prompt character budget"
+        )
+    prompt = prompt_template.replace(
+        marker,
+        clip_text(transcript_text, available),
+    )
+    if len(prompt) > TEMPLATE_SELECTOR_PROMPT_CHAR_LIMIT:
+        raise AssertionError("template selector prompt exceeded its hard budget")
+    return prompt
+
+
+def selector_fallback_public_reason(exc: Exception) -> str:
+    diagnostic = ANSI_ESCAPE_RE.sub("", str(exc or ""))
+    lowered = diagnostic.lower()
+    if "exceed" in lowered and "context" in lowered:
+        return "自动模板选择输入超出模型上下文，已按内容形态使用默认模板。"
+    if "timeout" in lowered or "timed out" in lowered:
+        return "自动模板选择暂时超时，已按内容形态使用默认模板。"
+    return "自动模板选择暂不可用，已按内容形态使用默认模板。"
 
 
 def run_parallel_template_shards(
@@ -1073,7 +1195,7 @@ def run_parallel_template_shards(
                     prompt,
                     model=model,
                     temperature=0.0,
-                    num_predict=1400,
+                    num_predict=800,
                     extra_body=selector_request_extra_body(),
                 )["response"],
                 shard,
@@ -1445,11 +1567,11 @@ def run_template_final_adjudication(
             f"分片形态={item.get('shard_content_form')} "
             f"分片领域={item.get('shard_domain')} "
             f"初选评分={json.dumps(item.get('scores'), ensure_ascii=False)}\n"
-            f"{render_template_candidate(item['template'])}"
+            f"{render_compact_template_candidate(item['template'], include_requirement=True)}"
         )
         for item in finalists
     )
-    prompt = f"""你是音频模板选择终审智能体。五路初审对内容形态的多数判断是：
+    prompt_template = f"""你是音频模板选择终审智能体。五路初审对内容形态的多数判断是：
 {majority_form}
 
 必须首先服从内容形态，再比较专业领域和输出要求。不得仅因主题包含 AI、模型、医疗或金融，就选择与访谈/会议等形态不兼容的模板。
@@ -1474,16 +1596,17 @@ confidence 范围 0 到 1，margin 范围 0 到 100。
 {focus_prompt or "无"}
 
 转写文本节选：
-{clip_text(transcript_text, MAX_TRANSCRIPT_CHARS_FOR_CLASSIFY)}
+__TRANSCRIPT_EXCERPT__
 
 决赛模板：
 {finalist_text}
 """
+    prompt = fit_selector_prompt(prompt_template, transcript_text)
     response = client.generate(
         prompt,
         model=model,
         temperature=0.0,
-        num_predict=1200,
+        num_predict=600,
         extra_body=selector_request_extra_body(),
     )["response"]
     payload = parse_json_object(response)
@@ -1633,6 +1756,67 @@ def numeric_template_id(template: dict[str, Any]) -> int:
     return int(str(template.get("id")))
 
 
+def parse_bool_setting(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "no", "off"}
+    return bool(value)
+
+
+def summary_generation_settings(profile: dict[str, Any] | None) -> dict[str, Any]:
+    profile = profile or {}
+    return {
+        "single_pass_chars": max(
+            1000,
+            int(profile.get("summary_single_pass_chars") or SUMMARY_SINGLE_PASS_CHARS),
+        ),
+        "map_chunk_chars": max(
+            1000,
+            int(profile.get("summary_map_chunk_chars") or SUMMARY_MAP_CHUNK_CHARS),
+        ),
+        "reduce_batch_chars": max(
+            2000,
+            int(
+                profile.get("summary_reduce_batch_chars")
+                or SUMMARY_REDUCE_BATCH_CHARS
+            ),
+        ),
+        "map_max_tokens": max(
+            256,
+            int(profile.get("summary_map_max_tokens") or SUMMARY_MAP_MAX_TOKENS),
+        ),
+        "final_max_tokens": max(
+            512,
+            int(
+                profile.get("summary_final_max_tokens")
+                or SUMMARY_FINAL_MAX_TOKENS
+            ),
+        ),
+        "duplicate_ratio_limit": min(
+            1.0,
+            max(
+                0.0,
+                float(
+                    profile.get("summary_duplicate_ratio_limit")
+                    or SUMMARY_DUPLICATE_RATIO_LIMIT
+                ),
+            ),
+        ),
+        "max_statement_repeats": max(
+            1,
+            int(
+                profile.get("summary_max_statement_repeats")
+                or SUMMARY_MAX_STATEMENT_REPEATS
+            ),
+        ),
+        "corrective_retry": parse_bool_setting(
+            profile.get("summary_corrective_retry"),
+            True,
+        ),
+    }
+
+
 def summarize_with_template(
     client: GenericOpenAIAPIClient,
     model: str,
@@ -1642,12 +1826,17 @@ def summarize_with_template(
     language: str,
     temperature: float,
     source_name: str = "",
+    settings: dict[str, Any] | None = None,
 ) -> str:
+    settings = {
+        **summary_generation_settings({}),
+        **dict(settings or {}),
+    }
     template_prompt = str(template.get("prompt_original") or "")
     if not template_prompt.strip():
         raise ValueError(f"Doway template {template.get('id')} has an empty prompt")
     recording_time = recording_time_from_source(source_name)
-    if len(transcript_text) <= SUMMARY_SINGLE_PASS_CHARS:
+    if len(transcript_text) <= settings["single_pass_chars"]:
         prompt = build_final_summary_prompt(
             template_prompt=template_prompt,
             transcript=transcript_text,
@@ -1658,21 +1847,29 @@ def summarize_with_template(
             template_title=str(template.get("title_zh") or template.get("title") or template.get("id")),
             transcript_label="完整转写文本",
         )
-        return generate_required_text(
+        summary = generate_required_text(
             client,
             prompt,
             model=model,
             temperature=temperature,
-            num_predict=4096,
+            num_predict=settings["final_max_tokens"],
+            stage="final summary",
+        )
+        return ensure_summary_quality(
+            client=client,
+            model=model,
+            summary=summary,
+            correction_prompt=prompt,
+            settings=settings,
             stage="final summary",
         )
 
-    chunks = split_transcript_chunks(transcript_text, SUMMARY_MAP_CHUNK_CHARS)
+    chunks = split_transcript_chunks(transcript_text, settings["map_chunk_chars"])
     map_summaries = []
     for index, chunk in enumerate(chunks, 1):
         map_prompt = f"""你正在为长录音总结做第 {index}/{len(chunks)} 个连续分块的事实提炼。
 
-请使用 {language}，完整保留本分块中的说话人、时间线、具体数字、观点、决策、行动项、负责人、截止时间、风险和未决问题。不要套用最终总结模板，不要推断未出现的信息。输出紧凑但信息充分的结构化 Markdown，供后续 reduce 使用。
+请使用 {language}，完整保留本分块中的说话人、时间线、具体数字、观点、决策、行动项、负责人、截止时间、风险和未决问题。不要套用最终总结模板，不要推断未出现的信息。相邻时间段表达同一观点时合并为一条；每条只写一个独立事实，不得复制同一句话覆盖不同时间段。输出紧凑但信息充分的结构化 Markdown，供后续 reduce 使用。
 
 用户补充关注点（仅补充，不得取代原文信息）：
 {focus_prompt or "无"}
@@ -1686,7 +1883,7 @@ def summarize_with_template(
                 map_prompt,
                 model=model,
                 temperature=temperature,
-                num_predict=1800,
+                num_predict=settings["map_max_tokens"],
                 stage=f"map chunk {index}/{len(chunks)}",
             )
         )
@@ -1697,6 +1894,8 @@ def summarize_with_template(
         summaries=map_summaries,
         language=language,
         temperature=temperature,
+        max_chars=settings["reduce_batch_chars"],
+        max_tokens=settings["map_max_tokens"],
     )
     prompt = build_final_summary_prompt(
         template_prompt=template_prompt,
@@ -1708,12 +1907,20 @@ def summarize_with_template(
         template_title=str(template.get("title_zh") or template.get("title") or template.get("id")),
         transcript_label=f"按原始顺序生成的 {len(chunks)} 个分块提炼结果",
     )
-    return generate_required_text(
+    summary = generate_required_text(
         client,
         prompt,
         model=model,
         temperature=temperature,
-        num_predict=4096,
+        num_predict=settings["final_max_tokens"],
+        stage="final reduce summary",
+    )
+    return ensure_summary_quality(
+        client=client,
+        model=model,
+        summary=summary,
+        correction_prompt=prompt,
+        settings=settings,
         stage="final reduce summary",
     )
 
@@ -1753,6 +1960,10 @@ def build_final_summary_prompt(
 - 如果转写只出现“明天”“下周”“下周四”“月底”等相对时间，必须保留原文，并标注“相对时间，未换算”。
 - 严禁把相对时间换算成 YYYY-MM-DD 或“某年某月某日”，即使可以根据录音时间推算。
 - 可以总结相对顺序和依赖关系，但不要把相对时间改写成具体日历日期。
+- 采访过程必须按真实问题组织，不要为每一个转写分段机械生成一条记录。
+- 相邻时间段表达同一观点时应合并；禁止用同一句话覆盖多个不同时间段。
+- 每个问题和回答必须包含该部分独有的信息，禁止重复问题、重复回答或重复时间范围。
+- 如果某个时间范围没有足够信息，宁可省略，也不要复制上一条内容补齐。
 
 用户关注点：
 {focus_prompt or "无"}
@@ -1807,6 +2018,177 @@ def looks_like_reasoning_trace(text: str) -> bool:
     )
 
 
+def normalize_summary_statement(value: str) -> str:
+    text = SUMMARY_TIME_RANGE_RE.sub("", str(value or ""))
+    text = re.sub(r"[*_`#>]", "", text)
+    text = re.sub(r"[\s，。；：、,.!?！？;:\"'“”‘’（）()\[\]【】]+", "", text)
+    return text.lower()
+
+
+def assess_summary_quality(
+    summary: str,
+    settings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    settings = {
+        **summary_generation_settings({}),
+        **dict(settings or {}),
+    }
+    statements = []
+    time_ranges = []
+    for line in str(summary or "").splitlines():
+        match = SUMMARY_BULLET_RE.match(line)
+        if not match:
+            continue
+        statement = normalize_summary_statement(match.group(1))
+        if statement:
+            statements.append(statement)
+        time_match = SUMMARY_TIME_RANGE_RE.search(line)
+        if time_match:
+            time_ranges.append(time_match.group(0))
+
+    counts = Counter(statements)
+    repeated_statement_count = sum(
+        count - 1 for count in counts.values() if count > 1
+    )
+    max_statement_repeat = max(counts.values(), default=0)
+    duplicate_ratio = (
+        repeated_statement_count / len(statements) if statements else 0.0
+    )
+    time_counts = Counter(time_ranges)
+    duplicate_time_range_count = sum(
+        count - 1 for count in time_counts.values() if count > 1
+    )
+    issues = []
+    if (
+        len(statements) >= 6
+        and duplicate_ratio > settings["duplicate_ratio_limit"]
+    ):
+        issues.append(
+            "duplicate statement ratio "
+            f"{duplicate_ratio:.3f} exceeds "
+            f"{settings['duplicate_ratio_limit']:.3f}"
+        )
+    if max_statement_repeat > settings["max_statement_repeats"]:
+        issues.append(
+            "one statement repeats "
+            f"{max_statement_repeat} times; maximum is "
+            f"{settings['max_statement_repeats']}"
+        )
+    if duplicate_time_range_count:
+        issues.append(
+            f"{duplicate_time_range_count} duplicate timestamp ranges detected"
+        )
+    return {
+        "passed": not issues,
+        "statement_count": len(statements),
+        "unique_statement_count": len(counts),
+        "repeated_statement_count": repeated_statement_count,
+        "duplicate_ratio": round(duplicate_ratio, 4),
+        "max_statement_repeat": max_statement_repeat,
+        "timestamp_range_count": len(time_ranges),
+        "duplicate_time_range_count": duplicate_time_range_count,
+        "issues": issues,
+    }
+
+
+def deduplicate_summary_lines(summary: str) -> tuple[str, int]:
+    lines = str(summary or "").splitlines()
+    seen = set()
+    kept = []
+    removed = 0
+    for line in lines:
+        match = SUMMARY_BULLET_RE.match(line)
+        if match:
+            statement = normalize_summary_statement(match.group(1))
+            if statement and statement in seen:
+                removed += 1
+                continue
+            if statement:
+                seen.add(statement)
+        kept.append(line)
+
+    blocks = []
+    current = []
+    for line in kept:
+        if SUMMARY_QUESTION_RE.match(line) and current:
+            blocks.append(current)
+            current = []
+        current.append(line)
+    if current:
+        blocks.append(current)
+
+    filtered = []
+    question_index = 0
+    for block in blocks:
+        heading_match = SUMMARY_QUESTION_RE.match(block[0]) if block else None
+        if heading_match:
+            body = [line for line in block[1:] if line.strip()]
+            if not body:
+                removed += 1
+                continue
+            question_index += 1
+            block[0] = (
+                f"{heading_match.group(1)}{question_index}"
+                f"{heading_match.group(3)}"
+            )
+        filtered.extend(block)
+
+    return "\n".join(filtered).strip(), removed
+
+
+def ensure_summary_quality(
+    *,
+    client: GenericOpenAIAPIClient,
+    model: str,
+    summary: str,
+    correction_prompt: str,
+    settings: dict[str, Any],
+    stage: str,
+) -> str:
+    quality = assess_summary_quality(summary, settings)
+    if quality["passed"]:
+        return summary
+    if not settings["corrective_retry"]:
+        raise RuntimeError(
+            f"summary quality gate failed during {stage}: "
+            + "; ".join(quality["issues"])
+        )
+
+    correction = f"""前一次输出未通过质量检查：
+{chr(10).join(f"- {issue}" for issue in quality["issues"])}
+
+请重新生成完整最终结果。必须保留原始事实覆盖，但要合并相邻重复观点，删除重复句子和重复时间范围。每个问题只保留独有内容，不得通过复制上一条来补齐。直接输出修正后的完整结果。
+
+原始任务：
+{correction_prompt}
+"""
+    corrected = generate_required_text(
+        client,
+        correction,
+        model=model,
+        temperature=0.0,
+        num_predict=settings["final_max_tokens"],
+        stage=f"{stage} corrective retry",
+    )
+    corrected_quality = assess_summary_quality(corrected, settings)
+    if corrected_quality["passed"]:
+        return corrected
+
+    deduplicated, removed = deduplicate_summary_lines(corrected)
+    deduplicated_quality = assess_summary_quality(deduplicated, settings)
+    if removed and deduplicated_quality["passed"]:
+        logger.warning(
+            "Summary corrective retry required deterministic deduplication: "
+            "removed %s repeated lines",
+            removed,
+        )
+        return deduplicated
+    raise RuntimeError(
+        f"summary quality gate failed after corrective retry during {stage}: "
+        + "; ".join(deduplicated_quality["issues"])
+    )
+
+
 def split_transcript_chunks(text: str, max_chars: int = SUMMARY_MAP_CHUNK_CHARS) -> list[str]:
     if max_chars <= 0:
         raise ValueError("max_chars must be positive")
@@ -1839,11 +2221,13 @@ def reduce_map_summaries(
     summaries: list[str],
     language: str,
     temperature: float,
+    max_chars: int = SUMMARY_REDUCE_BATCH_CHARS,
+    max_tokens: int = SUMMARY_MAP_MAX_TOKENS,
 ) -> str:
     current = list(summaries)
     level = 1
-    while len(render_summary_sections(current)) > SUMMARY_REDUCE_BATCH_CHARS:
-        batches = pack_summary_batches(current, SUMMARY_REDUCE_BATCH_CHARS)
+    while len(render_summary_sections(current)) > max_chars:
+        batches = pack_summary_batches(current, max_chars)
         reduced: list[str] = []
         for index, batch in enumerate(batches, 1):
             prompt = f"""请使用 {language} 合并以下连续分块提炼结果，严格保留时间线、说话人、事实、数字、决策、行动项、风险和未决问题。不得补写，不得套用最终模板。输出紧凑的结构化 Markdown。
@@ -1857,7 +2241,7 @@ def reduce_map_summaries(
                     prompt,
                     model=model,
                     temperature=temperature,
-                    num_predict=1800,
+                    num_predict=max_tokens,
                     stage=f"intermediate reduce {level}.{index}",
                 )
             )
@@ -2111,6 +2495,30 @@ def build_mindmap(title: str, chapters: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def mermaid_mindmap_label(value: Any, max_chars: int) -> str:
+    text = re.sub(r"[\r\n\t]+", " ", str(value or ""))
+    text = re.sub(r"[\[\]{}()\"`]+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return clip_text(text, max_chars) or "未命名"
+
+
+def render_mindmap_mermaid(guide: dict[str, Any]) -> str:
+    mindmap = guide.get("mindmap") if isinstance(guide.get("mindmap"), dict) else {}
+    nodes = mindmap.get("nodes") if isinstance(mindmap.get("nodes"), list) else []
+    lines = [
+        "mindmap",
+        f"  root(({mermaid_mindmap_label(mindmap.get('title') or guide.get('title'), 36)}))",
+    ]
+    for node in nodes[:8]:
+        if not isinstance(node, dict):
+            continue
+        lines.append(f"    {mermaid_mindmap_label(node.get('label'), 28)}")
+        children = node.get("children") if isinstance(node.get("children"), list) else []
+        for child in children[:5]:
+            lines.append(f"      {mermaid_mindmap_label(child, 42)}")
+    return "\n".join(lines)
+
+
 def fallback_study_guide(
     segments: list[dict[str, Any]],
     summary: str,
@@ -2187,6 +2595,16 @@ def render_study_overview(guide: dict[str, Any]) -> str:
     lines = [f"# {guide.get('title') or '录音脑图'}", "", str(guide.get("summary") or "").strip(), ""]
     if guide.get("keywords"):
         lines.extend(["## 关键词", "", "、".join(str(item) for item in guide["keywords"]), ""])
+    lines.extend(
+        [
+            "## 内容脑图",
+            "",
+            "```mermaid",
+            render_mindmap_mermaid(guide),
+            "```",
+            "",
+        ]
+    )
     if guide.get("action_items"):
         lines.extend(["## 行动项", ""])
         for item in guide["action_items"]:
@@ -2219,11 +2637,16 @@ def format_seconds(value: Any) -> str:
 
 def write_operation_manual(output_dir: Path, template: dict[str, Any], classification: dict[str, Any], summary: str, focus_prompt: str) -> Path:
     path = output_dir / "operation_manual.md"
+    reason = public_document_reason(
+        classification.get("reason")
+        or classification.get("fallback_reason")
+        or ""
+    )
     text = f"""# 音频总结
 
 - 模板：{template.get('title_zh') or template.get('title')}
 - 场景：{classification.get('scene') or template.get('first_category_zh') or template.get('first_category')}
-- 选择原因：{classification.get('reason') or classification.get('fallback_reason') or classification.get('reason', '')}
+- 选择原因：{reason}
 - 用户关注点：{focus_prompt or '无'}
 
 ## 总结
@@ -2232,6 +2655,24 @@ def write_operation_manual(output_dir: Path, template: dict[str, Any], classific
 """
     path.write_text(text.rstrip() + "\n", encoding="utf-8")
     return path
+
+
+def public_document_reason(value: Any) -> str:
+    text = ANSI_ESCAPE_RE.sub("", str(value or "")).strip()
+    internal_markers = (
+        "traceback",
+        "ray::",
+        "raytaskerror",
+        "original exception",
+        'file "/home/',
+        "openaiapierror",
+        "failed to deserialize exception",
+    )
+    lowered = text.lower()
+    if any(marker in lowered for marker in internal_markers):
+        return "自动模板选择暂不可用，已按内容形态使用默认模板。"
+    text = re.sub(r"\s+", " ", text)
+    return clip_text(text, 180) or "根据内容形态和模板要求选择。"
 
 
 def write_manual_evidence(
@@ -2276,6 +2717,7 @@ def write_analysis_json(
     elapsed_seconds: float,
     timings: dict[str, float] | None = None,
     compute_route: str = "local",
+    summary_quality: dict[str, Any] | None = None,
 ) -> Path:
     orin = output_dir / "orin"
     orin.mkdir(parents=True, exist_ok=True)
@@ -2286,6 +2728,7 @@ def write_analysis_json(
     write_json(orin / "frame_analyses.json", [])
     write_json(orin / "visual_events.json", [])
     write_json(orin / "ocr_events.json", [])
+    quality = dict(summary_quality or assess_summary_quality(summary))
     study_guide = load_study_guide_payload(study_guide_path)
     structured_content = {
         "title": str(study_guide.get("title") or title_from_summary(summary)),
@@ -2312,6 +2755,7 @@ def write_analysis_json(
         "mindmap": structured_content["mindmap"],
         "template_selector_model": selector_model,
         "summary_model": content_model,
+        "quality": quality,
     }
     write_json(output_dir / "audio_template_analysis.json", audio_template_analysis)
     payload = {
@@ -2357,14 +2801,16 @@ def write_analysis_json(
             "response": summary,
             "manual_path": str(manual_path),
             "evidence_path": str(evidence_path),
-            "quality_gate_passed": True,
+            "quality_gate_passed": bool(quality.get("passed")),
+            "quality_review": quality,
         },
         "frame_analyses": [],
         "operation_manual": {
             "response": summary,
             "manual_path": str(manual_path),
             "evidence_path": str(evidence_path),
-            "quality_gate_passed": True,
+            "quality_gate_passed": bool(quality.get("passed")),
+            "quality_review": quality,
         },
     }
     analysis_path = output_dir / "analysis.json"
