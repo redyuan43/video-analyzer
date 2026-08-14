@@ -57,14 +57,13 @@ class AudioTranscriptionTests(unittest.TestCase):
                 patch.object(run_audio_transcription, "extract_audio_to_wav", return_value=media),
                 patch.object(
                     run_audio_transcription,
-                    "transcribe_configured_audio",
-                    return_value=(transcript, result),
+                    "transcribe_and_diarize_configured_audio",
+                    return_value=(
+                        transcript,
+                        result,
+                        {"final_speaker_count": 1},
+                    ),
                 ) as transcribe,
-                patch.object(
-                    run_audio_transcription,
-                    "apply_speaker_diarization",
-                    return_value=(transcript, {"final_speaker_count": 1}),
-                ),
                 patch.object(run_audio_transcription, "local_model_runtime_session") as runtime,
             ):
                 runtime.return_value.__enter__.return_value = None
@@ -116,10 +115,9 @@ class AudioTranscriptionTests(unittest.TestCase):
                 ),
                 patch.object(
                     run_audio_transcription,
-                    "transcribe_configured_audio",
-                    return_value=(transcript, result),
+                    "transcribe_and_diarize_configured_audio",
+                    return_value=(transcript, result, {}),
                 ),
-                patch.object(run_audio_transcription, "apply_speaker_diarization", return_value=(transcript, {})),
                 patch.object(
                     run_audio_transcription,
                     "local_model_runtime_session",
@@ -138,10 +136,42 @@ class AudioTranscriptionTests(unittest.TestCase):
             self.assertEqual(manifest["error"], "acceptance failure")
 
     def test_asr_failure_atomically_marks_manifest_failed(self):
-        self.assert_failed_manifest("transcribe_configured_audio", "asr")
+        self.assert_failed_manifest(
+            "transcribe_and_diarize_configured_audio",
+            "asr",
+        )
 
     def test_diarization_failure_atomically_marks_manifest_failed(self):
-        self.assert_failed_manifest("apply_speaker_diarization", "diarization_alignment")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            media = root / "demo.mp3"
+            media.write_bytes(b"audio")
+            output = root / "output"
+            args = ["run_audio_transcription.py", str(media), "--output", str(output)]
+            with (
+                patch("sys.argv", args),
+                patch.object(run_audio_transcription, "load_long_talk_config") as load_config,
+                patch.object(run_audio_transcription, "extract_audio_to_wav", return_value=media),
+                patch.object(
+                    run_audio_transcription,
+                    "transcribe_and_diarize_configured_audio",
+                    side_effect=run_audio_transcription.ParallelBranchError(
+                        "diarization",
+                        RuntimeError("3D-Speaker unavailable"),
+                    ),
+                ),
+                patch.object(run_audio_transcription, "local_model_runtime_session") as runtime,
+            ):
+                runtime.return_value.__enter__.return_value = None
+                runtime.return_value.__exit__.return_value = None
+                load_config.return_value.config = {}
+                with self.assertRaisesRegex(RuntimeError, "diarization branch failed"):
+                    run_audio_transcription.main()
+
+            manifest = json.loads(
+                (output / "transcription_manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["failed_stage"], "diarization_alignment")
 
     def test_diarization_error_report_atomically_marks_manifest_failed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -160,11 +190,14 @@ class AudioTranscriptionTests(unittest.TestCase):
                 patch("sys.argv", args),
                 patch.object(run_audio_transcription, "load_long_talk_config") as load_config,
                 patch.object(run_audio_transcription, "extract_audio_to_wav", return_value=media),
-                patch.object(run_audio_transcription, "transcribe_configured_audio", return_value=(transcript, result)),
                 patch.object(
                     run_audio_transcription,
-                    "apply_speaker_diarization",
-                    return_value=(transcript, {"error": "3D-Speaker unavailable"}),
+                    "transcribe_and_diarize_configured_audio",
+                    return_value=(
+                        transcript,
+                        result,
+                        {"error": "3D-Speaker unavailable"},
+                    ),
                 ),
                 patch.object(run_audio_transcription, "local_model_runtime_session") as runtime,
             ):

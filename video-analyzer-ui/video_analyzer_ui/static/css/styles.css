@@ -1067,6 +1067,12 @@ th {
     color: #9f1239;
 }
 
+.console-stage-flow .flow-node.status-blocked {
+    border-color: #d97706;
+    background: #fffbeb;
+    color: #92400e;
+}
+
 .console-stage-flow .node.kind-output rect,
 .console-stage-flow .node.kind-output polygon,
 .console-stage-flow .node.kind-output path {
