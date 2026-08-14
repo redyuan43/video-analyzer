@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 import wave
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from video_analyzer.artifacts import write_json, write_transcript_markdown  # noqa: E402
+from video_analyzer.analysis_progress import write_analysis_progress  # noqa: E402
 from video_analyzer.asr_providers import (  # noqa: E402
     ASRStrategyResult,
     extract_audio_to_wav,
@@ -33,14 +35,15 @@ from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient  # 
 from video_analyzer.config import Config, build_openai_extra_body, resolve_api_key, resolve_temperature  # noqa: E402
 from video_analyzer.local_model_runtime import local_model_runtime_session, local_model_stage  # noqa: E402
 from video_analyzer.resource_locks import analyzer_resource_lock  # noqa: E402
-from video_analyzer.speaker_diarization import (  # noqa: E402
-    prepare_speaker_assignment,
-    process_transcript_speakers,
-)
 from video_analyzer.transcription_pipeline import (  # noqa: E402
     load_provided_transcript,
-    speaker_diarization_can_run_parallel,
+    transcribe_and_diarize_configured_audio,
 )
+
+try:  # noqa: E402
+    import ray
+except ImportError:  # pragma: no cover - exercised only in incomplete runtimes
+    ray = None
 
 
 DEFAULT_TEMPLATE_CATALOG = REPO_ROOT / "video-analyzer-ui" / "video_analyzer_ui" / "static" / "data" / "audio_prompt_templates.json"
@@ -52,7 +55,28 @@ DOWAY_SOURCE_PATH = "analysis/doway_prompts/server_prompts_zh.json"
 DOWAY_GENERAL_TEMPLATE_ID = "2"
 MAX_TRANSCRIPT_CHARS_FOR_CLASSIFY = 9000
 MAX_TRANSCRIPT_CHARS_FOR_GUIDE = 18000
-CLASSIFICATION_CANDIDATE_LIMIT = 48
+TEMPLATE_SELECTOR_SHARD_COUNT = 5
+TEMPLATE_SELECTOR_TOP_K = 3
+TEMPLATE_SELECTOR_MIN_CONFIDENCE = 0.75
+TEMPLATE_SELECTOR_AUDIT_FILE = "template_selection.json"
+TEMPLATE_CONTENT_FORMS = {
+    "interview",
+    "meeting",
+    "speech",
+    "call",
+    "education",
+    "personal_note",
+    "general",
+}
+TEMPLATE_FORM_FALLBACK_IDS = {
+    "interview": "400000",
+    "meeting": "100005",
+    "speech": "200008",
+    "call": "2000078",
+    "education": "2000162",
+    "personal_note": "15",
+    "general": DOWAY_GENERAL_TEMPLATE_ID,
+}
 SUMMARY_SINGLE_PASS_CHARS = 24000
 SUMMARY_MAP_CHUNK_CHARS = 20000
 SUMMARY_REDUCE_BATCH_CHARS = 48000
@@ -62,6 +86,109 @@ ASR_PREFLIGHT_SAMPLE_COUNT = 5
 CLIENT_TEMPLATE_BLOCK_RE = re.compile(r"【模板指令开始】[\s\S]*?【模板指令结束】\s*")
 CLIENT_USER_SUPPLEMENT_MARKER = "【用户补充】"
 logger = logging.getLogger("audio_template_analysis")
+
+
+class AudioNodeProgress:
+    TIMING_KEYS = {
+        "asr": "asr_seconds",
+        "diarization": "diarization_seconds",
+        "transcript_merge": "transcript_merge_seconds",
+        "template_selector": "template_selector_seconds",
+        "text": "manual_generation_seconds",
+        "artifact_package": "artifact_package_seconds",
+    }
+    CORE_STEPS = {
+        "asr": "asr",
+        "diarization": "asr",
+        "transcript_merge": "asr_done",
+        "template_selector": "manual",
+        "text": "manual",
+        "artifact_package": "write",
+    }
+
+    def __init__(self, output_dir: Path):
+        self.output_dir = output_dir
+        self.started: dict[str, float] = {}
+        self.timings: dict[str, float] = {}
+
+    def update(
+        self,
+        node_id: str,
+        status: str,
+        message: str | None = None,
+    ) -> None:
+        update: dict[str, Any] = {"status": status, "message": message}
+        if status == "running":
+            self.started.setdefault(node_id, time.perf_counter())
+        elif status in {"succeeded", "failed", "skipped", "stopped"}:
+            started = self.started.get(node_id)
+            if started is not None:
+                duration = round(max(0.0, time.perf_counter() - started), 3)
+                update["duration_seconds"] = duration
+                timing_key = self.TIMING_KEYS.get(node_id)
+                if timing_key:
+                    self.timings[timing_key] = duration
+        write_analysis_progress(
+            self.output_dir,
+            self.CORE_STEPS.get(node_id, "manual"),
+            message=message,
+            node_updates={node_id: update},
+        )
+
+    def finish(
+        self,
+        message: str,
+        artifacts: dict[str, str] | None = None,
+    ) -> None:
+        write_analysis_progress(
+            self.output_dir,
+            "write",
+            status="succeeded",
+            message=message,
+            artifacts=artifacts,
+        )
+
+
+def selector_request_extra_body() -> dict[str, Any]:
+    return {
+        "chat_template_kwargs": {
+            "enable_thinking": False,
+            "preserve_thinking": False,
+        }
+    }
+
+
+def content_request_extra_body(model: str) -> dict[str, Any]:
+    if "bonsai" in str(model or "").lower():
+        return selector_request_extra_body()
+    return {}
+
+
+def selector_client_spec(client: GenericOpenAIAPIClient) -> dict[str, Any]:
+    return {
+        "api_key": client.api_key,
+        "api_url": client.base_url,
+        "max_retries": client.max_retries,
+        "timeout_seconds": client.timeout_seconds,
+        "extra_body": dict(client.extra_body or {}),
+    }
+
+
+if ray is not None:
+    @ray.remote(num_cpus=0.2)
+    class TemplateSelectorShardActor:
+        def __init__(self, client_spec: dict[str, Any], model: str):
+            self.client = GenericOpenAIAPIClient(**client_spec)
+            self.model = model
+
+        def select(self, prompt: str) -> str:
+            return self.client.generate(
+                prompt,
+                model=self.model,
+                temperature=0.0,
+                num_predict=1400,
+                extra_body=selector_request_extra_body(),
+            )["response"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -94,6 +221,7 @@ def main() -> int:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
+    node_progress = AudioNodeProgress(output_dir)
     config = load_operation_config(args)
     templates = load_templates(Path(args.template_catalog))
     focus_prompt = client_focus_supplement(args.focus_prompt)
@@ -107,47 +235,50 @@ def main() -> int:
             "skipped": True,
             "reason": "provided_transcript",
         }
+        node_progress.update(
+            "asr",
+            "succeeded",
+            "reused provided transcript; ASR was not executed",
+        )
+        provided_speakers = {
+            str(
+                segment.get("speaker")
+                or segment.get("speaker_id")
+                or segment.get("Speaker")
+                or ""
+            ).strip()
+            for segment in transcript.segments
+            if isinstance(segment, dict)
+        }
+        provided_speakers.discard("")
+        node_progress.update(
+            "diarization",
+            "succeeded" if provided_speakers else "skipped",
+            (
+                f"reused {len(provided_speakers)} provided speaker labels"
+                if provided_speakers
+                else "provided transcript has no speaker labels"
+            ),
+        )
+        node_progress.update(
+            "transcript_merge",
+            "succeeded",
+            "reused aligned transcript",
+        )
     else:
         audio_path = extract_audio_to_wav(media_path, output_dir)
         if audio_path is None:
             raise RuntimeError(f"audio extraction produced no audio stream: {media_path}")
-        prepared_assignment = None
-        if speaker_diarization_can_run_parallel(config):
-            speaker_config = config.get("speaker_diarization") or {}
-            logger.info(
-                "Starting ASR and speaker diarization in parallel (backend=%s)",
-                speaker_config.get("backend") or "3dspeaker",
-            )
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                diarization_future = executor.submit(
-                    prepare_speaker_assignment,
+        with local_model_runtime_session(config.config, logger, str(output_dir)):
+            transcript, asr_result, speaker_report = (
+                transcribe_and_diarize_configured_audio(
                     audio_path,
-                    speaker_config,
+                    output_dir,
+                    config,
+                    use_asr_strategy=False,
+                    logger=logger,
+                    progress_callback=node_progress.update,
                 )
-                transcript, asr_result = transcribe_audio(audio_path, output_dir, config)
-                try:
-                    prepared_assignment = diarization_future.result()
-                except Exception as exc:
-                    logger.warning("parallel speaker diarization failed: %s", exc)
-                    prepared_assignment = (
-                        [],
-                        {
-                            "enabled": True,
-                            "mode": "assignment",
-                            "backend": speaker_config.get("backend") or "3dspeaker",
-                            "notes": ["parallel speaker diarization failed"],
-                            "error": str(exc),
-                        },
-                    )
-        else:
-            transcript, asr_result = transcribe_audio(audio_path, output_dir, config)
-        if transcript is not None:
-            transcript, speaker_report = refine_audio_speakers(
-                audio_path,
-                transcript,
-                output_dir,
-                config,
-                prepared_assignment=prepared_assignment,
             )
     if transcript is None or not transcript.text.strip():
         raise RuntimeError(
@@ -160,33 +291,58 @@ def main() -> int:
     selector_client, selector_model, selector_base_url, _selector_temperature = build_template_selector_client(config)
     content_client, content_model, content_base_url, content_temperature = build_content_analysis_client(config, args.profile)
     analysis_transcript = format_transcript_for_analysis(transcript)
+    selector_executed = args.template_id == DEFAULT_TEMPLATE_ID
+    if selector_executed:
+        node_progress.update("template_selector", "running", "selecting summary template")
     with local_model_stage("text", config.config, logger, str(output_dir)):
-        selected, classification = choose_template(
-            client=selector_client,
-            model=selector_model,
-            templates=templates,
-            transcript_text=analysis_transcript,
-            focus_prompt=focus_prompt,
-            explicit_template_id=args.template_id,
+        try:
+            selected, classification = choose_template(
+                client=selector_client,
+                model=selector_model,
+                templates=templates,
+                transcript_text=analysis_transcript,
+                focus_prompt=focus_prompt,
+                explicit_template_id=args.template_id,
+                output_dir=output_dir,
+            )
+        except Exception as exc:
+            if selector_executed:
+                node_progress.update("template_selector", "failed", str(exc))
+            raise
+        node_progress.update(
+            "template_selector",
+            "succeeded",
+            (
+                "summary template selected"
+                if selector_executed
+                else "used explicitly selected template"
+            ),
         )
-        summary = summarize_with_template(
-            client=content_client,
-            model=content_model,
-            template=selected,
-            transcript_text=analysis_transcript,
-            focus_prompt=focus_prompt,
-            language=args.language,
-            temperature=content_temperature,
-            source_name=args.source_name or media_path.name,
-        )
-        study_guide_path = build_light_study_guide(
-            content_client,
-            content_model,
-            output_dir,
-            transcript,
-            summary,
-            content_temperature,
-        )
+        node_progress.update("text", "running", "generating summary and mind map")
+        try:
+            summary = summarize_with_template(
+                client=content_client,
+                model=content_model,
+                template=selected,
+                transcript_text=analysis_transcript,
+                focus_prompt=focus_prompt,
+                language=args.language,
+                temperature=content_temperature,
+                source_name=args.source_name or media_path.name,
+            )
+            study_guide_path = build_light_study_guide(
+                content_client,
+                content_model,
+                output_dir,
+                transcript,
+                summary,
+                content_temperature,
+            )
+        except Exception as exc:
+            node_progress.update("text", "failed", str(exc))
+            raise
+        node_progress.update("text", "succeeded", "summary and mind map ready")
+    node_progress.update("artifact_package", "running", "writing final audio artifacts")
     write_audio_only_manifest(output_dir, media_path, audio_path)
 
     manual_path = write_operation_manual(output_dir, selected, classification, summary, focus_prompt)
@@ -208,7 +364,13 @@ def main() -> int:
         evidence_path=evidence_path,
         study_guide_path=study_guide_path,
         elapsed_seconds=round(time.perf_counter() - started, 3),
+        timings=node_progress.timings,
         compute_route=args.compute_route,
+    )
+    node_progress.update("artifact_package", "succeeded", "final audio artifacts written")
+    node_progress.finish(
+        "core artifacts complete",
+        artifacts={"analysis_json": str(analysis_path)},
     )
 
     print(f"[audio-template] transcript: {transcript_path}")
@@ -319,7 +481,13 @@ def load_templates(path: Path) -> list[dict[str, Any]]:
     return templates
 
 
-def transcribe_audio(audio_path: Path, output_dir: Path, config: Config) -> tuple[AudioTranscript | None, ASRStrategyResult | None]:
+def transcribe_audio(
+    audio_path: Path,
+    output_dir: Path,
+    config: Config,
+    *,
+    asr_stage_prepared: bool = False,
+) -> tuple[AudioTranscript | None, ASRStrategyResult | None]:
     asr_config = config.get("asr", {})
     provider = asr_config.get("provider", "faster_whisper")
     asr_result: ASRStrategyResult | None = None
@@ -329,9 +497,19 @@ def transcribe_audio(audio_path: Path, output_dir: Path, config: Config) -> tupl
         if provider == "none"
         else analyzer_resource_lock(config.config, "asr", str(output_dir), logger)
     )
-    with local_model_runtime_session(config.config, logger, str(output_dir)):
+    runtime_context = (
+        contextlib.nullcontext()
+        if asr_stage_prepared
+        else local_model_runtime_session(config.config, logger, str(output_dir))
+    )
+    with runtime_context:
         with asr_lock:
-            with local_model_stage("asr", config.config, logger, str(output_dir)):
+            stage_context = (
+                contextlib.nullcontext()
+                if asr_stage_prepared
+                else local_model_stage("asr", config.config, logger, str(output_dir))
+            )
+            with stage_context:
                 preflight_long_audio(audio_path, output_dir, config)
                 if provider == "auto":
                     strategy = asr_config.get("strategy", "balanced")
@@ -487,6 +665,8 @@ def refine_audio_speakers(
     *,
     prepared_assignment: tuple[list[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> tuple[AudioTranscript, dict[str, Any]]:
+    from video_analyzer.speaker_diarization import process_transcript_speakers
+
     speaker_config = config.get("speaker_diarization") or {}
     try:
         refined, report = process_transcript_speakers(
@@ -597,163 +777,856 @@ def choose_template(
     transcript_text: str,
     focus_prompt: str,
     explicit_template_id: str = DEFAULT_TEMPLATE_ID,
+    output_dir: Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if explicit_template_id and explicit_template_id != DEFAULT_TEMPLATE_ID:
         requested_id = str(explicit_template_id)
         selected = next((item for item in templates if item.get("id") == requested_id), None)
         if selected is None:
             raise ValueError(f"unknown explicit Doway template_id: {requested_id}")
-        return selected, {"method": "explicit", "template_id": requested_id, "confidence": 1.0}
-    candidates = template_candidates(templates, transcript_text, focus_prompt)
-    prompt = render_classification_prompt(candidates, transcript_text, focus_prompt)
+        audit = {
+            "version": 2,
+            "method": "explicit",
+            "catalog_count": len(templates),
+            "catalog_fingerprint": template_catalog_fingerprint(templates),
+            "transcript_sha256": hashlib.sha256(
+                transcript_text.encode("utf-8")
+            ).hexdigest(),
+            "selector_model": model,
+            "selected_template_id": requested_id,
+            "warnings": [],
+        }
+        audit_path = write_template_selection_audit(output_dir, audit)
+        return selected, {
+            "method": "explicit",
+            "selection_method": "explicit",
+            "template_id": requested_id,
+            "confidence": 1.0,
+            "content_form": infer_content_form(transcript_text),
+            "domain": str(selected.get("first_category") or ""),
+            "runner_up_id": "",
+            "margin": 100.0,
+            "warnings": [],
+            "audit_path": audit_path,
+        }
+
+    audit: dict[str, Any] = {
+        "version": 2,
+        "method": "bonsai_parallel_tournament",
+        "catalog_count": len(templates),
+        "catalog_fingerprint": template_catalog_fingerprint(templates),
+        "transcript_sha256": hashlib.sha256(
+            transcript_text.encode("utf-8")
+        ).hexdigest(),
+        "transcript_excerpt_chars": min(
+            len(transcript_text),
+            MAX_TRANSCRIPT_CHARS_FOR_CLASSIFY,
+        ),
+        "selector_model": model,
+        "shard_count": TEMPLATE_SELECTOR_SHARD_COUNT,
+        "content_form_hint": infer_content_form(transcript_text),
+        "warnings": [],
+    }
     try:
-        response = client.generate(prompt, model=model, temperature=0.0, num_predict=900)["response"]
-        payload = parse_json_object(response)
-        template_id = str(payload.get("template_id") or "").strip()
-        selected = next((item for item in candidates if item.get("id") == template_id), None)
-        if selected:
-            payload["method"] = "small-model"
-            payload["candidate_count"] = len(candidates)
-            return selected, payload
-        fallback = keyword_template(templates, transcript_text, focus_prompt)
-        return fallback, {
-            "method": "keyword-fallback",
-            "reason": f"small model returned an id outside local candidates: {template_id or '(empty)'}",
-            "model_template_id": template_id,
-            "template_id": fallback.get("id"),
-            "candidate_count": len(candidates),
-            "confidence": 0.0,
+        shards = build_template_shards(
+            templates,
+            TEMPLATE_SELECTOR_SHARD_COUNT,
+        )
+        shard_results = run_parallel_template_shards(
+            client=client,
+            model=model,
+            shards=shards,
+            transcript_text=transcript_text,
+            focus_prompt=focus_prompt,
+        )
+        audit["shards"] = shard_results
+        form_votes = Counter(
+            str(result.get("content_form") or "")
+            for result in shard_results
+        )
+        audit["form_votes"] = dict(form_votes)
+        majority_form, majority_count = (
+            form_votes.most_common(1)[0] if form_votes else ("", 0)
+        )
+        if majority_form not in TEMPLATE_CONTENT_FORMS or majority_count < 3:
+            raise RuntimeError(
+                "template selector did not reach a three-of-five content-form majority"
+            )
+        content_form_hint = str(audit.get("content_form_hint") or "general")
+        if (
+            content_form_hint != "general"
+            and majority_form != content_form_hint
+        ):
+            raise RuntimeError(
+                "template selector content-form majority "
+                f"{majority_form} conflicts with transcript evidence "
+                f"{content_form_hint}"
+            )
+
+        finalists = template_selection_finalists(templates, shard_results)
+        audit["finalists"] = compact_template_finalists(finalists)
+        if not finalists:
+            raise RuntimeError("template selector produced no valid finalists")
+        adjudication_finalists, excluded_finalists = (
+            filter_finalists_for_output_intent(
+                finalists,
+                focus_prompt,
+                transcript_text,
+            )
+        )
+        audit["excluded_finalists"] = compact_template_finalists(
+            excluded_finalists
+        )
+        if not adjudication_finalists:
+            raise RuntimeError(
+                "template selector produced no finalists compatible with "
+                "the requested output intent"
+            )
+        final_decision = run_template_final_adjudication(
+            client=client,
+            model=model,
+            finalists=adjudication_finalists,
+            transcript_text=transcript_text,
+            focus_prompt=focus_prompt,
+            majority_form=majority_form,
+        )
+        audit["final_decision"] = final_decision
+        template_id = str(final_decision.get("template_id") or "")
+        selected = next(
+            (item for item in templates if item.get("id") == template_id),
+            None,
+        )
+        confidence = float(final_decision.get("confidence") or 0.0)
+        final_form = str(final_decision.get("content_form") or "")
+        if selected is None:
+            raise RuntimeError(
+                f"final template selector returned unknown id: {template_id or '(empty)'}"
+            )
+        if final_form != majority_form:
+            raise RuntimeError(
+                f"final content form {final_form or '(empty)'} disagrees with majority {majority_form}"
+            )
+        selected_form = template_declared_content_form(selected)
+        if selected_form and selected_form != final_form:
+            raise RuntimeError(
+                f"selected template category {selected_form} conflicts with "
+                f"content form {final_form}"
+            )
+        if confidence < TEMPLATE_SELECTOR_MIN_CONFIDENCE:
+            raise RuntimeError(
+                f"final template confidence {confidence:.3f} is below "
+                f"{TEMPLATE_SELECTOR_MIN_CONFIDENCE:.2f}"
+            )
+
+        audit["selected_template_id"] = template_id
+        audit_path = write_template_selection_audit(output_dir, audit)
+        return selected, {
+            "method": "bonsai_parallel_tournament",
+            "selection_method": "bonsai_parallel_tournament",
+            "template_id": template_id,
+            "scene": str(
+                final_decision.get("scene")
+                or content_form_label(final_form)
+            ),
+            "reason": str(final_decision.get("reason") or ""),
+            "confidence": confidence,
+            "candidate_count": len(templates),
+            "content_form": final_form,
+            "domain": str(final_decision.get("domain") or ""),
+            "runner_up_id": str(final_decision.get("runner_up_id") or ""),
+            "margin": float(final_decision.get("margin") or 0.0),
+            "warnings": [],
+            "audit_path": audit_path,
         }
     except Exception as exc:
-        fallback = keyword_template(templates, transcript_text, focus_prompt)
-        return fallback, {
-            "method": "keyword-fallback",
-            "reason": str(exc),
+        content_form = infer_content_form(transcript_text)
+        fallback = fallback_template_for_form(templates, content_form)
+        warning = str(exc)
+        audit["warnings"] = [warning]
+        audit["fallback"] = {
+            "content_form": content_form,
             "template_id": fallback.get("id"),
+            "reason": warning,
+        }
+        audit["selected_template_id"] = fallback.get("id")
+        audit_path = write_template_selection_audit(output_dir, audit)
+        return fallback, {
+            "method": "content-form-fallback",
+            "selection_method": "content-form-fallback",
+            "reason": warning,
+            "template_id": fallback.get("id"),
+            "scene": content_form_label(content_form),
             "confidence": 0.0,
+            "candidate_count": len(templates),
+            "content_form": content_form,
+            "domain": str(fallback.get("first_category") or ""),
+            "runner_up_id": "",
+            "margin": 0.0,
+            "warnings": [warning],
+            "audit_path": audit_path,
         }
 
 
-def render_classification_prompt(templates: list[dict[str, Any]], transcript_text: str, focus_prompt: str) -> str:
-    catalog = "\n".join(
-        f"- id={item.get('id')} | 标题={item.get('title_zh') or item.get('title')} | 分类={item.get('first_category_zh')}/{item.get('second_category_zh')}"
+def build_template_shards(
+    templates: list[dict[str, Any]],
+    shard_count: int = TEMPLATE_SELECTOR_SHARD_COUNT,
+) -> list[list[dict[str, Any]]]:
+    if shard_count <= 0:
+        raise ValueError("template selector shard_count must be positive")
+    shards: list[list[dict[str, Any]]] = [[] for _ in range(shard_count)]
+    ordered = sorted(
+        templates,
+        key=lambda item: (
+            str(item.get("first_category") or ""),
+            numeric_template_id(item),
+        ),
+    )
+    for index, item in enumerate(ordered):
+        shards[index % shard_count].append(item)
+    if {
+        str(item.get("id"))
+        for shard in shards
+        for item in shard
+    } != {str(item.get("id")) for item in templates}:
+        raise AssertionError("template sharding lost or duplicated catalog entries")
+    return shards
+
+
+def render_template_shard_prompt(
+    templates: list[dict[str, Any]],
+    transcript_text: str,
+    focus_prompt: str,
+    shard_index: int,
+    shard_count: int,
+) -> str:
+    catalog = "\n\n".join(
+        render_template_candidate(item)
         for item in templates
     )
-    return f"""你是音频内容场景分类器。请先阅读转写文本和用户关注点，再从模板目录中选择一个最合适的模板。
+    content_form_hint = infer_content_form(transcript_text)
+    return f"""你是音频模板选择初审智能体，正在评审目录分片 {shard_index}/{shard_count}。
 
-只输出 JSON，不要输出解释。JSON 字段：
-- template_id: 必须是模板目录中的 id
-- scene: 你判断的中文场景
-- reason: 选择原因，一句话
-- confidence: 0 到 1
+选择原则按以下顺序执行：
+1. 内容形态优先：访谈、会议、演讲/播客独白、电话、教育讲座、个人口述或通用。
+2. 专业领域其次：IT、金融、医疗、法律等不能覆盖内容形态。
+3. 最后比较模板要求与用户关注点、期望输出结构是否匹配。
+
+内容形态必须按对话结构判断：
+- interview：主持人/采访者与嘉宾/受访者持续问答，包括播客访谈、技术访谈和深度对谈。
+- speech：一位主讲人持续陈述，包括主题演讲、独白或没有嘉宾问答的播客独白。
+- 只要存在明确主持人提问、嘉宾回答，就不得因为主题专业或内容较长而判为 speech。
+- 规则提示为 {content_form_hint}，它仅用于提醒你检查证据；若不同意，必须在 reason 中说明具体结构证据。
+
+只输出一个 JSON 对象：
+{{"content_form":"interview|meeting|speech|call|education|personal_note|general",
+  "domain":"简短领域名称",
+  "ranked":[
+    {{"template_id":"目录中的ID","form_fit":95,"domain_fit":80,"instruction_fit":85,"reason":"不超过60字"}}
+  ]}}
+
+ranked 必须恰好包含本分片中最合适的 {TEMPLATE_SELECTOR_TOP_K} 个不同模板，按综合适配度降序。
+三个评分必须是 0 到 100 的数字；内容形态不兼容的模板 form_fit 不得超过 30。
 
 用户关注点：
 {focus_prompt or "无"}
 
-模板目录：
-{catalog}
-
 转写文本节选：
 {clip_text(transcript_text, MAX_TRANSCRIPT_CHARS_FOR_CLASSIFY)}
+
+模板目录分片：
+{catalog}
 """
 
 
-def template_candidates(templates: list[dict[str, Any]], transcript_text: str, focus_prompt: str) -> list[dict[str, Any]]:
-    haystack = f"{focus_prompt}\n{transcript_text[:9000]}".lower()
-    category_weights = {
-        "genera": ("总结", "摘要", "概述", "通用", "summary", "overview"),
-        "meeting": ("会议", "纪要", "讨论", "决策", "待办", "meeting", "minutes", "agenda"),
-        "call": ("电话", "通话", "喂", "hello", "客户", "call", "client"),
-        "it": ("gpu", "cpu", "diffusion", "模型", "ai", "技术", "部署", "代码", "system", "technical"),
-        "interview": ("访谈", "采访", "interview"),
-        "education": ("讲座", "课程", "课堂", "培训", "lecture", "training"),
-        "speech": ("演讲", "主题演讲", "播客", "podcast", "speech"),
-    }
-    title_weights = (
-        "summary",
-        "minutes",
-        "action items",
-        "documentation",
-        "technical",
-        "500 word",
-        "纪要",
-        "摘要",
-        "总结",
+def render_template_candidate(template: dict[str, Any]) -> str:
+    return (
+        f"id={template.get('id')}\n"
+        f"标题={template.get('title_zh') or template.get('title')}\n"
+        f"目录分类={template.get('first_category_zh') or template.get('first_category')}/"
+        f"{template.get('second_category_zh') or template.get('second_category')}\n"
+        f"完整要求：\n{template.get('prompt_original') or ''}"
     )
 
-    scored: list[tuple[int, int, dict[str, Any]]] = []
-    for item in templates:
-        text = template_search_text(item)
-        score = 0
-        first_category = str(item.get("first_category") or "").lower()
-        for category, words in category_weights.items():
-            hits = sum(1 for word in words if word.lower() in haystack)
-            if hits and first_category == category:
-                score += hits * 10
-        score += sum(4 for word in title_weights if word in text)
-        if score > 0:
-            scored.append((score, -numeric_template_id(item), item))
 
-    scored.sort(reverse=True, key=lambda value: (value[0], value[1]))
-    candidates = [item for _, _, item in scored[:CLASSIFICATION_CANDIDATE_LIMIT]]
-    if not candidates:
-        candidates = [keyword_template(templates, transcript_text, focus_prompt)]
-    fallback = next((item for item in templates if item.get("id") == DOWAY_GENERAL_TEMPLATE_ID), None)
-    if fallback and all(item.get("id") != fallback.get("id") for item in candidates):
-        if len(candidates) >= CLASSIFICATION_CANDIDATE_LIMIT:
-            candidates[-1] = fallback
-        else:
-            candidates.append(fallback)
-    return candidates
-
-
-def keyword_template(templates: list[dict[str, Any]], transcript_text: str, focus_prompt: str) -> dict[str, Any]:
-    haystack = f"{focus_prompt}\n{transcript_text[:6000]}".lower()
-    category = "genera"
-    if any(word in haystack for word in ("讲座", "课程", "课堂", "培训", "lecture", "class", "training")):
-        category = "education"
-    elif any(word in haystack for word in ("访谈", "采访", "interview")):
-        category = "interview"
-    elif any(word in haystack for word in ("电话", "通话", "call")):
-        category = "call"
-    elif any(word in haystack for word in ("销售", "客户", "sales")):
-        category = "sales"
-    elif any(word in haystack for word in ("法律", "案件", "合同", "court", "legal")):
-        category = "law"
-    elif any(word in haystack for word in ("医疗", "患者", "病历", "medical", "patient")):
-        category = "medical"
-    matches = [item for item in templates if item.get("first_category") == category]
-    preference_terms = ("纪要", "摘要", "总结", "概述", "summary", "minutes", "autopilot")
-    ranked = sorted(
-        matches,
-        key=lambda item: (
-            -sum(term in template_search_text(item) for term in preference_terms),
-            numeric_template_id(item),
-        ),
-    )
-    if ranked:
-        return ranked[0]
-    fallback = next((item for item in templates if item.get("id") == DOWAY_GENERAL_TEMPLATE_ID), None)
-    if fallback is None:
-        raise ValueError(f"Doway general fallback template {DOWAY_GENERAL_TEMPLATE_ID} is missing")
-    return fallback
-
-
-def template_search_text(template: dict[str, Any]) -> str:
-    return " ".join(
-        str(template.get(key) or "")
-        for key in (
-            "id",
-            "title",
-            "title_zh",
-            "description",
-            "first_category",
-            "first_category_zh",
-            "second_category",
-            "second_category_zh",
-            "tags",
+def run_parallel_template_shards(
+    *,
+    client: GenericOpenAIAPIClient,
+    model: str,
+    shards: list[list[dict[str, Any]]],
+    transcript_text: str,
+    focus_prompt: str,
+) -> list[dict[str, Any]]:
+    prompts = [
+        render_template_shard_prompt(
+            shard,
+            transcript_text,
+            focus_prompt,
+            index,
+            len(shards),
         )
+        for index, shard in enumerate(shards, 1)
+    ]
+    if not isinstance(client, GenericOpenAIAPIClient):
+        return [
+            parse_template_shard_result(
+                client.generate(
+                    prompt,
+                    model=model,
+                    temperature=0.0,
+                    num_predict=1400,
+                    extra_body=selector_request_extra_body(),
+                )["response"],
+                shard,
+                index,
+            )
+            for index, (prompt, shard) in enumerate(zip(prompts, shards), 1)
+        ]
+    if ray is None:
+        raise RuntimeError("Ray is required for parallel template selection")
+
+    started_here = False
+    actors: list[Any] = []
+    results: list[dict[str, Any] | None] = [None] * len(shards)
+    pending_indexes = list(range(len(shards)))
+    last_errors: dict[int, str] = {}
+    try:
+        if not ray.is_initialized():
+            ray.init(
+                namespace="video-analyzer-template-selector",
+                ignore_reinit_error=True,
+                include_dashboard=False,
+                num_cpus=max(1, len(shards)),
+            )
+            started_here = True
+        client_spec = selector_client_spec(client)
+        for attempt in range(2):
+            if not pending_indexes:
+                break
+            round_actors = [
+                TemplateSelectorShardActor.remote(client_spec, model)
+                for _ in pending_indexes
+            ]
+            actors.extend(round_actors)
+            refs = [
+                actor.select.remote(prompts[index])
+                for actor, index in zip(round_actors, pending_indexes)
+            ]
+            failed: list[int] = []
+            for actor, ref, index in zip(round_actors, refs, pending_indexes):
+                try:
+                    results[index] = parse_template_shard_result(
+                        ray.get(ref),
+                        shards[index],
+                        index + 1,
+                    )
+                except Exception as exc:
+                    last_errors[index] = str(exc)
+                    failed.append(index)
+                finally:
+                    try:
+                        ray.kill(actor, no_restart=True)
+                    except Exception:
+                        pass
+            pending_indexes = failed
+        if pending_indexes:
+            details = "; ".join(
+                f"shard {index + 1}: {last_errors.get(index, 'unknown error')}"
+                for index in pending_indexes
+            )
+            raise RuntimeError(f"template selector shard failed after retry: {details}")
+        return [result for result in results if result is not None]
+    finally:
+        for actor in actors:
+            try:
+                ray.kill(actor, no_restart=True)
+            except Exception:
+                pass
+        if started_here:
+            ray.shutdown()
+
+
+def parse_template_shard_result(
+    response: str,
+    shard: list[dict[str, Any]],
+    shard_index: int,
+) -> dict[str, Any]:
+    payload = parse_json_object(response)
+    content_form = str(payload.get("content_form") or "")
+    if content_form not in TEMPLATE_CONTENT_FORMS:
+        raise ValueError(
+            f"shard {shard_index} returned unsupported content_form: {content_form}"
+        )
+    allowed_ids = {str(item.get("id")) for item in shard}
+    ranked = payload.get("ranked")
+    if not isinstance(ranked, list):
+        raise ValueError(f"shard {shard_index} did not return ranked templates")
+    normalized = []
+    seen = set()
+    for item in ranked:
+        if not isinstance(item, dict):
+            continue
+        template_id = str(item.get("template_id") or "")
+        if template_id not in allowed_ids or template_id in seen:
+            continue
+        seen.add(template_id)
+        normalized.append(
+            {
+                "template_id": template_id,
+                "form_fit": bounded_score(item.get("form_fit")),
+                "domain_fit": bounded_score(item.get("domain_fit")),
+                "instruction_fit": bounded_score(item.get("instruction_fit")),
+                "reason": str(item.get("reason") or "")[:240],
+            }
+        )
+    expected_count = min(TEMPLATE_SELECTOR_TOP_K, len(shard))
+    if not normalized:
+        raise ValueError(
+            f"shard {shard_index} returned no valid finalists"
+        )
+    warnings = []
+    if len(normalized) < expected_count:
+        missing_count = expected_count - len(normalized)
+        warnings.append(
+            f"model returned {len(normalized)}/{expected_count} valid finalists; "
+            f"completed {missing_count} deterministically"
+        )
+        remaining = [
+            item
+            for item in shard
+            if str(item.get("id")) not in seen
+        ]
+        matching = [
+            item
+            for item in remaining
+            if template_declared_content_form(item) == content_form
+        ]
+        for item in (matching + remaining):
+            template_id = str(item.get("id") or "")
+            if template_id in seen:
+                continue
+            seen.add(template_id)
+            normalized.append(
+                {
+                    "template_id": template_id,
+                    "form_fit": 0.0,
+                    "domain_fit": 0.0,
+                    "instruction_fit": 0.0,
+                    "reason": "模型未返回足够候选，由同分片稳定补位。",
+                }
+            )
+            if len(normalized) == expected_count:
+                break
+    return {
+        "shard": shard_index,
+        "template_count": len(shard),
+        "content_form": content_form,
+        "domain": str(payload.get("domain") or "")[:120],
+        "ranked": normalized,
+        "warnings": warnings,
+    }
+
+
+def bounded_score(value: Any) -> float:
+    try:
+        return max(0.0, min(100.0, float(value)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def template_selection_finalists(
+    templates: list[dict[str, Any]],
+    shard_results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    catalog = {str(item.get("id")): item for item in templates}
+    finalists = []
+    seen = set()
+    for result in shard_results:
+        for rank, score in enumerate(result.get("ranked") or [], 1):
+            template_id = str(score.get("template_id") or "")
+            if template_id in seen or template_id not in catalog:
+                continue
+            seen.add(template_id)
+            finalists.append(
+                {
+                    "shard": result.get("shard"),
+                    "shard_rank": rank,
+                    "shard_content_form": result.get("content_form"),
+                    "shard_domain": result.get("domain"),
+                    "scores": score,
+                    "template": catalog[template_id],
+                }
+            )
+    return finalists
+
+
+def compact_template_finalists(
+    finalists: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "shard": item.get("shard"),
+            "shard_rank": item.get("shard_rank"),
+            "shard_content_form": item.get("shard_content_form"),
+            "shard_domain": item.get("shard_domain"),
+            "scores": item.get("scores"),
+            "template_id": str((item.get("template") or {}).get("id") or ""),
+            "title": (
+                (item.get("template") or {}).get("title_zh")
+                or (item.get("template") or {}).get("title")
+            ),
+            "category": "/".join(
+                str(value)
+                for value in (
+                    (item.get("template") or {}).get("first_category_zh")
+                    or (item.get("template") or {}).get("first_category"),
+                    (item.get("template") or {}).get("second_category_zh")
+                    or (item.get("template") or {}).get("second_category"),
+                )
+                if value
+            ),
+        }
+        for item in finalists
+    ]
+
+
+def filter_finalists_for_output_intent(
+    finalists: list[dict[str, Any]],
+    focus_prompt: str,
+    transcript_text: str = "",
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    allow_transformation = focus_requests_transformation(focus_prompt)
+    interview_scenario = infer_interview_scenario(transcript_text)
+    accepted = []
+    excluded = []
+    for item in finalists:
+        template = item.get("template") or {}
+        if (
+            not allow_transformation
+            and template_output_intent(template) == "transform"
+        ):
+            excluded.append(item)
+            continue
+        template_scenario = template_interview_scenario(template)
+        if (
+            interview_scenario
+            and template_scenario not in {"", interview_scenario}
+        ):
+            excluded.append(item)
+            continue
+        accepted.append(item)
+    if interview_scenario:
+        exact_scenario = [
+            item
+            for item in accepted
+            if template_interview_scenario(item.get("template") or {})
+            == interview_scenario
+        ]
+        if exact_scenario:
+            excluded.extend(
+                item
+                for item in accepted
+                if item not in exact_scenario
+            )
+            accepted = exact_scenario
+    return accepted, excluded
+
+
+def focus_requests_transformation(focus_prompt: str) -> bool:
+    haystack = str(focus_prompt or "").lower()
+    return any(
+        term in haystack
+        for term in (
+            "改写",
+            "重写",
+            "翻译",
+            "营销",
+            "脚本",
+            "生成播客",
+            "创建播客",
+            "生成文章",
+            "生成书",
+            "rewrite",
+            "translate",
+            "marketing",
+            "script",
+        )
+    )
+
+
+def template_output_intent(template: dict[str, Any]) -> str:
+    haystack = " ".join(
+        str(template.get(key) or "")
+        for key in ("title", "title_zh", "prompt_original")
     ).lower()
+    transformative_terms = (
+        "创建播客",
+        "生成播客",
+        "音频播报",
+        "营销内容",
+        "营销脚本",
+        "播客脚本",
+        "内容再利用",
+        "社交媒体帖子",
+        "生成书籍",
+        "改写",
+        "重写",
+        "翻译成",
+        "rewrite",
+        "translate",
+    )
+    return (
+        "transform"
+        if any(term in haystack for term in transformative_terms)
+        else "summarize"
+    )
+
+
+def infer_interview_scenario(transcript_text: str) -> str:
+    haystack = str(transcript_text or "")[:12000].lower()
+    if (
+        ("主持人" in haystack and "嘉宾" in haystack)
+        or "播客" in haystack
+        or "podcast" in haystack
+    ):
+        return "podcast"
+    if any(
+        term in haystack
+        for term in ("求职", "招聘", "候选人", "面试官", "应聘", "职位面试")
+    ):
+        return "job"
+    if any(
+        term in haystack
+        for term in ("用户访谈", "用户调研", "产品调研", "用户需求访谈")
+    ):
+        return "user_research"
+    if any(term in haystack for term in ("教练会议", "教练辅导", "coaching")):
+        return "coaching"
+    if any(term in haystack for term in ("一对一", "1on1", "kpt")):
+        return "one_on_one"
+    return ""
+
+
+def template_interview_scenario(template: dict[str, Any]) -> str:
+    haystack = " ".join(
+        str(template.get(key) or "")
+        for key in ("title", "title_zh")
+    ).lower()
+    if any(term in haystack for term in ("工作面试", "求职", "招聘")):
+        return "job"
+    if "用户访谈" in haystack:
+        return "user_research"
+    if "教练" in haystack:
+        return "coaching"
+    if any(term in haystack for term in ("一对一", "1on1", "kpt")):
+        return "one_on_one"
+    if "播客" in haystack:
+        return "podcast"
+    return ""
+
+
+def run_template_final_adjudication(
+    *,
+    client: GenericOpenAIAPIClient,
+    model: str,
+    finalists: list[dict[str, Any]],
+    transcript_text: str,
+    focus_prompt: str,
+    majority_form: str,
+) -> dict[str, Any]:
+    interview_scenario = infer_interview_scenario(transcript_text)
+    runner_up_instruction = (
+        "runner_up_id 必须留空，因为决赛只有一个合法候选。"
+        if len(finalists) == 1
+        else "runner_up_id 必须填写决赛中的第二名模板ID。"
+    )
+    finalist_text = "\n\n".join(
+        (
+            f"初选分片={item.get('shard')} 排名={item.get('shard_rank')} "
+            f"分片形态={item.get('shard_content_form')} "
+            f"分片领域={item.get('shard_domain')} "
+            f"初选评分={json.dumps(item.get('scores'), ensure_ascii=False)}\n"
+            f"{render_template_candidate(item['template'])}"
+        )
+        for item in finalists
+    )
+    prompt = f"""你是音频模板选择终审智能体。五路初审对内容形态的多数判断是：
+{majority_form}
+
+必须首先服从内容形态，再比较专业领域和输出要求。不得仅因主题包含 AI、模型、医疗或金融，就选择与访谈/会议等形态不兼容的模板。
+访谈包括主持人/采访者与嘉宾/受访者持续问答的播客和深度对谈；演讲仅指一位主讲人持续陈述。最终模板若明确属于另一种内容形态，必须淘汰。
+当前默认输出目标是忠实总结、记录和分析已有录音，不是把内容改写成新播客、营销稿、脚本、书籍或翻译稿。除非用户关注点明确要求再创作，否则优先选择摘要、采访记录、笔记或分析模板。
+当前访谈子场景判断为 {interview_scenario or "通用"}。播客访谈不得选择工作面试、教练会议、用户调研或一对一绩效沟通模板；其他专用访谈场景也必须与转写证据一致。
+
+只输出一个 JSON 对象：
+{{"template_id":"决赛模板ID",
+  "runner_up_id":"第二名模板ID",
+  "content_form":"{majority_form}",
+  "domain":"简短领域名称",
+  "scene":"中文场景",
+  "confidence":0.0,
+  "margin":0,
+  "reason":"不超过100字"}}
+
+confidence 范围 0 到 1，margin 范围 0 到 100。
+{runner_up_instruction}
+
+用户关注点：
+{focus_prompt or "无"}
+
+转写文本节选：
+{clip_text(transcript_text, MAX_TRANSCRIPT_CHARS_FOR_CLASSIFY)}
+
+决赛模板：
+{finalist_text}
+"""
+    response = client.generate(
+        prompt,
+        model=model,
+        temperature=0.0,
+        num_predict=1200,
+        extra_body=selector_request_extra_body(),
+    )["response"]
+    payload = parse_json_object(response)
+    allowed_ids = {
+        str(item["template"].get("id"))
+        for item in finalists
+    }
+    template_id = str(payload.get("template_id") or "")
+    runner_up_id = str(payload.get("runner_up_id") or "")
+    if template_id not in allowed_ids:
+        raise ValueError(
+            f"final adjudicator returned id outside finalists: {template_id or '(empty)'}"
+        )
+    if len(finalists) == 1:
+        runner_up_id = ""
+    elif runner_up_id and runner_up_id not in allowed_ids:
+        raise ValueError(
+            f"final adjudicator returned invalid runner_up_id: {runner_up_id}"
+        )
+    content_form = str(payload.get("content_form") or "")
+    if content_form not in TEMPLATE_CONTENT_FORMS:
+        raise ValueError(
+            f"final adjudicator returned unsupported content_form: {content_form}"
+        )
+    payload["template_id"] = template_id
+    payload["runner_up_id"] = runner_up_id
+    payload["content_form"] = content_form
+    payload["confidence"] = max(
+        0.0,
+        min(1.0, float(payload.get("confidence") or 0.0)),
+    )
+    payload["margin"] = bounded_score(payload.get("margin"))
+    return payload
+
+
+def infer_content_form(transcript_text: str) -> str:
+    haystack = str(transcript_text or "")[:9000].lower()
+    rules = (
+        (
+            "interview",
+            (
+                "主持人",
+                "嘉宾",
+                "受访者",
+                "采访",
+                "访谈",
+                "深度对谈",
+                "podcast",
+                "interview",
+            ),
+        ),
+        ("meeting", ("会议", "参会", "议程", "决策", "行动项", "待办")),
+        ("call", ("电话", "通话", "来电", "call")),
+        ("education", ("课程", "课堂", "讲座", "培训", "教授", "老师")),
+        ("personal_note", ("口述", "日记", "备忘", "提醒自己", "我的想法")),
+        ("speech", ("演讲", "主题演讲", "podcast", "播客")),
+    )
+    for content_form, terms in rules:
+        if any(term in haystack for term in terms):
+            return content_form
+    return "general"
+
+
+def template_declared_content_form(
+    template: dict[str, Any],
+) -> str:
+    category = str(template.get("first_category") or "").strip().lower()
+    return {
+        "interview": "interview",
+        "meeting": "meeting",
+        "speech": "speech",
+        "call": "call",
+        "education": "education",
+    }.get(category, "")
+
+
+def fallback_template_for_form(
+    templates: list[dict[str, Any]],
+    content_form: str,
+) -> dict[str, Any]:
+    template_id = TEMPLATE_FORM_FALLBACK_IDS.get(
+        content_form,
+        DOWAY_GENERAL_TEMPLATE_ID,
+    )
+    selected = next(
+        (item for item in templates if str(item.get("id")) == template_id),
+        None,
+    )
+    if selected is None and template_id != DOWAY_GENERAL_TEMPLATE_ID:
+        selected = next(
+            (
+                item
+                for item in templates
+                if str(item.get("id")) == DOWAY_GENERAL_TEMPLATE_ID
+            ),
+            None,
+        )
+    if selected is None:
+        raise ValueError(
+            f"template catalog is missing fallback template {template_id}"
+        )
+    return selected
+
+
+def content_form_label(content_form: str) -> str:
+    return {
+        "interview": "访谈",
+        "meeting": "会议",
+        "speech": "演讲或播客独白",
+        "call": "电话通话",
+        "education": "教育讲座",
+        "personal_note": "个人口述",
+        "general": "通用音频",
+    }.get(content_form, "通用音频")
+
+
+def template_catalog_fingerprint(templates: list[dict[str, Any]]) -> str:
+    payload = [
+        {
+            "id": str(item.get("id") or ""),
+            "prompt_sha256": (
+                (item.get("server") or {}).get("prompt_sha256")
+                or hashlib.sha256(
+                    str(item.get("prompt_original") or "").encode("utf-8")
+                ).hexdigest()
+            ),
+        }
+        for item in sorted(templates, key=numeric_template_id)
+    ]
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def write_template_selection_audit(
+    output_dir: Path | None,
+    payload: dict[str, Any],
+) -> str:
+    if output_dir is None:
+        return ""
+    path = output_dir / TEMPLATE_SELECTOR_AUDIT_FILE
+    write_json(path, payload)
+    return path.name
 
 
 def numeric_template_id(template: dict[str, Any]) -> int:
@@ -870,6 +1743,7 @@ def build_final_summary_prompt(
 输入形态：{transcript_label}
 
 约束：
+- 直接输出最终结果，不要输出思考过程、分析步骤、草稿说明或英文元叙述。
 - 下方 Doway 模板是主要输出规范，必须完整遵守；用户补充关注点只能补充强调，不能替代、删减或改写模板要求。
 - 模板询问会议日期或会议时间时，优先使用录音文件时间。
 - 如果转写文本明确提到另一个会议日期，以转写文本为准，并说明它来自转写。
@@ -897,11 +1771,40 @@ def generate_required_text(
     num_predict: int,
     stage: str,
 ) -> str:
-    payload = client.generate(prompt, model=model, temperature=temperature, num_predict=num_predict)
+    payload = client.generate(
+        prompt,
+        model=model,
+        temperature=temperature,
+        num_predict=num_predict,
+        extra_body=content_request_extra_body(model),
+    )
     response = payload.get("response") if isinstance(payload, dict) else None
     if not isinstance(response, str) or not response.strip():
         raise RuntimeError(f"content model returned an empty response during {stage}")
+    if payload.get("response_source") == "reasoning_content":
+        raise RuntimeError(
+            f"content model returned reasoning_content instead of final output during {stage}"
+        )
+    if looks_like_reasoning_trace(response):
+        raise RuntimeError(
+            f"content model leaked a reasoning trace during {stage}"
+        )
     return response.strip()
+
+
+def looks_like_reasoning_trace(text: str) -> bool:
+    head = str(text or "").lstrip()[:600].lower()
+    return any(
+        marker in head
+        for marker in (
+            "here's a thinking process",
+            "here is a thinking process",
+            "**analyze user input:**",
+            "analyze user input:",
+            "mental mapping",
+            "draft generation",
+        )
+    )
 
 
 def split_transcript_chunks(text: str, max_chars: int = SUMMARY_MAP_CHUNK_CHARS) -> list[str]:
@@ -1042,12 +1945,29 @@ def format_transcript_for_analysis(transcript: AudioTranscript) -> str:
     for segment in transcript.segments or []:
         if not isinstance(segment, dict):
             continue
-        text = str(segment.get("text") or segment.get("content") or "").strip()
+        text = str(
+            segment.get("text")
+            or segment.get("content")
+            or segment.get("Text")
+            or segment.get("Content")
+            or ""
+        ).strip()
         if not text:
             continue
-        speaker = str(segment.get("speaker") or segment.get("speaker_id") or "说话人未提供").strip()
-        start = format_seconds(segment.get("start") or 0)
-        end = format_seconds(segment.get("end") or segment.get("start") or 0)
+        speaker = str(
+            segment.get("speaker")
+            or segment.get("speaker_id")
+            or segment.get("Speaker")
+            or "说话人未提供"
+        ).strip()
+        start_value = segment.get("start")
+        if start_value is None:
+            start_value = segment.get("Start")
+        end_value = segment.get("end")
+        if end_value is None:
+            end_value = segment.get("End")
+        start = format_seconds(start_value or 0)
+        end = format_seconds(end_value if end_value is not None else start_value or 0)
         lines.append(f"[{start}-{end}] {speaker}: {text}")
     return "\n".join(lines) if lines else transcript.text
 
@@ -1106,7 +2026,14 @@ def build_light_study_guide(
 {clip_text(transcript.text, MAX_TRANSCRIPT_CHARS_FOR_GUIDE)}
 """
     try:
-        response = client.generate(prompt, model=model, temperature=temperature, num_predict=4096)["response"]
+        response = generate_required_text(
+            client,
+            prompt,
+            model=model,
+            temperature=temperature,
+            num_predict=4096,
+            stage="study guide",
+        )
         guide = normalize_study_guide(parse_json_object(response), segments, summary)
     except Exception as exc:
         logger.warning("light study guide generation failed: %s", exc)
@@ -1347,6 +2274,7 @@ def write_analysis_json(
     evidence_path: Path,
     study_guide_path: Path,
     elapsed_seconds: float,
+    timings: dict[str, float] | None = None,
     compute_route: str = "local",
 ) -> Path:
     orin = output_dir / "orin"
@@ -1394,7 +2322,6 @@ def write_analysis_json(
             "task": "audio_template_summary",
             "pipeline_profile": AUDIO_PIPELINE_PROFILE,
             "pipeline_version": AUDIO_PIPELINE_VERSION,
-            "compute_route": compute_route,
             "source_type": "audio_upload",
             "media_path": str(media_path),
             "text_base_url": content_base_url,
@@ -1409,7 +2336,10 @@ def write_analysis_json(
             "speaker_diarization": speaker_report,
             "frames_extracted": 0,
             "frames_processed": 0,
-            "timings": {"total_seconds": elapsed_seconds},
+            "timings": {
+                **dict(timings or {}),
+                "total_seconds": elapsed_seconds,
+            },
         },
         "transcript": {
             "text": transcript.text,

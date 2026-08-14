@@ -2,8 +2,6 @@ import hashlib
 import json
 import logging
 import tempfile
-import threading
-import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -12,6 +10,34 @@ from video_analyzer import transcription_pipeline
 
 
 class TranscriptionPipelineTests(unittest.TestCase):
+    def test_local_asr_and_gpu_diarization_can_run_in_parallel(self):
+        class LocalConfig:
+            config = {
+                "asr": {
+                    "provider": "vibevoice",
+                    "vibevoice": {
+                        "deep_remote_urls": [
+                            "http://127.0.0.1:18012/api/asr/transcribe"
+                        ]
+                    },
+                },
+                "speaker_diarization": {
+                    "enabled": True,
+                    "assignment_enabled": True,
+                    "backend": "3dspeaker",
+                    "assignment_device": "cuda",
+                },
+            }
+
+            def get(self, key, default=None):
+                return self.config.get(key, default)
+
+        self.assertTrue(
+            transcription_pipeline.speaker_diarization_can_run_parallel(
+                LocalConfig()
+            )
+        )
+
     def test_provided_transcript_preserves_structure_and_skips_providers(self):
         source = {
             "text": "hello world",
@@ -67,8 +93,7 @@ class TranscriptionPipelineTests(unittest.TestCase):
         provider_mock.assert_not_called()
         diarization_mock.assert_not_called()
 
-    def test_standalone_diarization_runs_in_parallel_with_asr(self):
-        barrier = threading.Barrier(2, timeout=1)
+    def test_standalone_diarization_uses_parallel_ray_dispatch(self):
         progress_events = []
         transcript = transcription_pipeline.AudioTranscript(
             text="hello",
@@ -94,27 +119,16 @@ class TranscriptionPipelineTests(unittest.TestCase):
                     },
                 }.get(key, default)
 
-        def transcribe(*_args, **_kwargs):
-            barrier.wait()
-            time.sleep(0.05)
-            return transcript, result
-
-        def prepare(*_args, **_kwargs):
-            barrier.wait()
-            time.sleep(0.05)
-            return ([{"start": 0, "end": 1, "speaker": "speaker-1"}], {})
-
         with (
             patch.object(
                 transcription_pipeline,
-                "transcribe_configured_audio",
-                side_effect=transcribe,
-            ),
-            patch.object(
-                transcription_pipeline,
-                "prepare_speaker_assignment",
-                side_effect=prepare,
-            ),
+                "run_parallel_transcription_branches",
+                return_value=(
+                    transcript,
+                    result,
+                    ([{"start": 0, "end": 1, "speaker": "speaker-1"}], {}),
+                ),
+            ) as parallel_mock,
             patch.object(
                 transcription_pipeline,
                 "apply_speaker_diarization",
@@ -137,6 +151,7 @@ class TranscriptionPipelineTests(unittest.TestCase):
         self.assertIs(got_transcript, transcript)
         self.assertIs(got_result, result)
         self.assertEqual(report["final_speaker_count"], 1)
+        parallel_mock.assert_called_once()
         self.assertEqual(
             apply_mock.call_args.kwargs["prepared_assignment"][0][0]["speaker"],
             "speaker-1",
@@ -151,8 +166,16 @@ class TranscriptionPipelineTests(unittest.TestCase):
         self.assertTrue(
             any(node_id == "diarization" and status == "succeeded" for node_id, status, _ in progress_events)
         )
+        self.assertIn(
+            ("transcript_merge", "running", "aligning speaker turns"),
+            progress_events,
+        )
+        self.assertIn(
+            ("transcript_merge", "succeeded", "aligned transcript ready"),
+            progress_events,
+        )
 
-    def test_combined_provider_keeps_its_internal_parallel_pipeline(self):
+    def test_asr_embedded_selection_keeps_combined_provider_pipeline(self):
         transcript = transcription_pipeline.AudioTranscript(
             text="hello",
             segments=[{"start": 0, "end": 1, "speaker": "speaker-1", "text": "hello"}],
@@ -170,7 +193,10 @@ class TranscriptionPipelineTests(unittest.TestCase):
             def get(self, key, default=None):
                 return {
                     "asr": {"provider": "firered_3dspeaker"},
-                    "speaker_diarization": {"enabled": True},
+                    "speaker_diarization": {
+                        "enabled": False,
+                        "assignment_enabled": False,
+                    },
                 }.get(key, default)
 
         with (
@@ -198,6 +224,67 @@ class TranscriptionPipelineTests(unittest.TestCase):
             )
 
         prepare_mock.assert_not_called()
+
+    def test_asr_embedded_selection_does_not_start_parallel_diarization(self):
+        class FakeConfig:
+            config = {}
+
+            def get(self, key, default=None):
+                return {
+                    "asr": {"provider": "vibevoice"},
+                    "speaker_diarization": {
+                        "enabled": False,
+                        "assignment_enabled": False,
+                    },
+                }.get(key, default)
+
+        self.assertFalse(
+            transcription_pipeline.speaker_diarization_can_run_parallel(
+                FakeConfig()
+            )
+        )
+
+    def test_external_diarization_error_is_fatal(self):
+        transcript = transcription_pipeline.AudioTranscript(
+            text="hello",
+            segments=[{"start": 0, "end": 1, "text": "hello"}],
+            language="en",
+        )
+
+        class FakeConfig:
+            config = {}
+
+            def get(self, key, default=None):
+                if key == "speaker_diarization":
+                    return {
+                        "enabled": True,
+                        "assignment_enabled": True,
+                        "backend": "3dspeaker",
+                    }
+                return default
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(
+                transcription_pipeline,
+                "process_transcript_speakers",
+                return_value=(
+                    transcript,
+                    {"enabled": True, "error": "model unavailable"},
+                ),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "selected speaker diarization model failed",
+            ):
+                transcription_pipeline.apply_speaker_diarization(
+                    Path("/tmp/audio.wav"),
+                    transcript,
+                    Path(tmp),
+                    FakeConfig(),
+                    logger=logging.getLogger(__name__),
+                )
 
     def test_parallel_marker_is_written_to_diarization_report(self):
         transcript = transcription_pipeline.AudioTranscript(

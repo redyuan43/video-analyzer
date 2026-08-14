@@ -196,24 +196,26 @@ AUDIO_PROFILE_FLOW = {
     ],
     "nodes": [
         {"id": "audio_input", "step": 1, "column": 1, "row": 2, "mobile_order": 1, "lane": "primary", "title": "NX1 音频输入", "subtitle": "原始文件由 NX1 持久管理", "stage": "prepare"},
-        {"id": "asr", "step": 2, "column": 2, "row": 1, "mobile_order": 2, "lane": "primary", "title": "本地语音识别", "subtitle": "与说话人分离并行执行", "model_slot": "asr", "model_kind": "asr", "required": True},
-        {"id": "diarization", "step": 2, "column": 2, "row": 2, "mobile_order": 3, "lane": "primary", "title": "本地说话人分离", "subtitle": "并行生成声纹轨后再对齐", "model_slot": "diarization", "model_kind": "diarization", "required": False},
-        {"id": "asr_fallback", "step": 2, "column": 2, "row": 3, "mobile_order": 4, "lane": "fallback", "title": "云端 ASR 回退", "subtitle": "仅在本地资源繁忙时启用", "model_slot": "asr_fallback", "model_kind": "asr", "required": False},
-        {"id": "diarization_fallback", "step": 2, "column": 2, "row": 4, "mobile_order": 5, "lane": "fallback", "title": "云端分离回退", "subtitle": "与云端 ASR 并行执行", "model_slot": "diarization_fallback", "model_kind": "diarization", "required": False},
-        {"id": "template_selector", "step": 3, "column": 3, "row": 2, "mobile_order": 6, "lane": "analysis", "title": "模板选择", "subtitle": "等待文字稿与声纹轨对齐完成", "model_slot": "selector", "model_kind": "selector", "required": True},
-        {"id": "text", "step": 4, "column": 4, "row": 2, "mobile_order": 7, "lane": "analysis", "title": "总结与脑图", "subtitle": "按所选模板生成最终内容", "model_slot": "text", "model_kind": "text", "required": True},
-        {"id": "artifact_package", "step": 5, "column": 5, "row": 2, "mobile_order": 8, "lane": "delivery", "title": "产物封装", "subtitle": "整理转写、总结和结构化结果", "stage": "analyze-core"},
-        {"id": "nx1_sync", "step": 6, "column": 6, "row": 2, "mobile_order": 9, "lane": "delivery", "title": "回传 NX1", "subtitle": "镜像资源、发布结果并确认", "stage": "final-publish"},
+        {"id": "asr", "step": 2, "column": 2, "row": 1, "mobile_order": 2, "lane": "primary", "title": "本地语音识别", "subtitle": "与说话人分离并行执行", "model_slot": "asr", "model_kind": "asr", "required": True, "stage": "analyze-core", "progress_step": "asr"},
+        {"id": "diarization", "step": 2, "column": 2, "row": 2, "mobile_order": 3, "lane": "primary", "title": "本地说话人分离", "subtitle": "并行生成声纹轨后再对齐", "model_slot": "diarization", "model_kind": "diarization", "required": False, "stage": "analyze-core"},
+        {"id": "asr_fallback", "step": 2, "column": 2, "row": 3, "mobile_order": 4, "lane": "fallback", "title": "云端 ASR 回退", "subtitle": "仅在本地资源繁忙时启用", "model_slot": "asr_fallback", "model_kind": "asr", "required": False, "stage": "analyze-core"},
+        {"id": "diarization_fallback", "step": 2, "column": 2, "row": 4, "mobile_order": 5, "lane": "fallback", "title": "云端分离回退", "subtitle": "与云端 ASR 并行执行", "model_slot": "diarization_fallback", "model_kind": "diarization", "required": False, "stage": "analyze-core"},
+        {"id": "transcript_merge", "step": 3, "column": 3, "row": 1, "mobile_order": 6, "lane": "primary", "title": "转写与说话人合并", "subtitle": "对齐文字、时间戳与所选说话人模型", "stage": "analyze-core"},
+        {"id": "template_selector", "step": 4, "column": 4, "row": 2, "mobile_order": 7, "lane": "analysis", "title": "模板选择", "subtitle": "从已对齐文字稿中选择总结模板", "model_slot": "selector", "model_kind": "selector", "required": True, "stage": "analyze-core"},
+        {"id": "text", "step": 5, "column": 5, "row": 2, "mobile_order": 8, "lane": "analysis", "title": "总结与脑图", "subtitle": "按所选模板生成最终内容", "model_slot": "text", "model_kind": "text", "required": True, "stage": "analyze-core"},
+        {"id": "artifact_package", "step": 6, "column": 6, "row": 2, "mobile_order": 9, "lane": "delivery", "title": "产物封装", "subtitle": "整理转写、总结和结构化结果", "stage": "analyze-core"},
+        {"id": "nx1_sync", "step": 7, "column": 7, "row": 2, "mobile_order": 10, "lane": "delivery", "title": "回传 NX1", "subtitle": "镜像资源、发布结果并确认", "stage": "final-publish"},
     ],
     "edges": [
         {"from": "audio_input", "to": "asr", "lane": "primary"},
         {"from": "audio_input", "to": "diarization", "lane": "primary"},
         {"from": "audio_input", "to": "asr_fallback", "lane": "fallback"},
         {"from": "audio_input", "to": "diarization_fallback", "lane": "fallback"},
-        {"from": "asr", "to": "template_selector", "lane": "primary"},
-        {"from": "diarization", "to": "template_selector", "lane": "primary"},
-        {"from": "asr_fallback", "to": "template_selector", "lane": "fallback"},
-        {"from": "diarization_fallback", "to": "template_selector", "lane": "fallback"},
+        {"from": "asr", "to": "transcript_merge", "lane": "primary"},
+        {"from": "diarization", "to": "transcript_merge", "lane": "primary"},
+        {"from": "asr_fallback", "to": "transcript_merge", "lane": "fallback"},
+        {"from": "diarization_fallback", "to": "transcript_merge", "lane": "fallback"},
+        {"from": "transcript_merge", "to": "template_selector", "lane": "primary"},
         {"from": "template_selector", "to": "text", "lane": "analysis"},
         {"from": "text", "to": "artifact_package", "lane": "analysis"},
         {"from": "artifact_package", "to": "nx1_sync", "lane": "delivery"},
@@ -536,7 +538,13 @@ def _add_builtin_model_resources(
             "kind": "diarization",
             "protocol": "three_d_speaker",
             "model": "speech_campplus_sv_zh-cn_16k-common",
-            "options": {"deployment": "local", "backend": "3dspeaker"},
+            "options": {
+                "deployment": "local",
+                "backend": "3dspeaker",
+                "device": "P40",
+                "gpu_id": 0,
+                "dispatch_mode": "ray_actor",
+            },
         },
         "diarization-pyannote-community1-local": {
             "name": "Pyannote Community-1（本地）",
@@ -1064,7 +1072,10 @@ def expand_runtime_profile(config: dict[str, Any], profile: dict[str, Any]) -> d
     diarization = model_for("diarization")
     if diarization:
         protocol = diarization.get("protocol")
-        options = dict(diarization.get("options") or {})
+        options = deep_merge(
+            dict(diarization.get("options") or {}),
+            dict(expanded.get("speaker_diarization") or {}),
+        )
         backend = {
             "three_d_speaker": "3dspeaker",
             "pyannote_community": "pyannote_community",

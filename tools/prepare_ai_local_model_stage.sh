@@ -62,11 +62,44 @@ stop_minicpm() {
 }
 
 stop_bonsai() {
-  "${ROOT_DIR}/.venv/bin/python" "${ROOT_DIR}/tools/bonsai_local_pool.py" stop >/dev/null 2>&1 || true
+  systemctl --user stop bonsai-local-pool.service >/dev/null
+  for _ in $(seq 1 60); do
+    if ! systemctl --user is-active --quiet bonsai-local-pool.service \
+      && ! fuser -n tcp 18103 >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "BONSAI local pool did not stop within 60 seconds" >&2
+  return 1
 }
 
 start_bonsai() {
-  "${ROOT_DIR}/.venv/bin/python" "${ROOT_DIR}/tools/bonsai_local_pool.py" start
+  local health_payload
+  systemctl --user start bonsai-local-pool.service
+  for _ in $(seq 1 900); do
+    health_payload="$(
+      curl --noproxy "*" -fsS "http://127.0.0.1:${BONSAI_LOCAL_PORT:-18103}/api/health" \
+        2>/dev/null || true
+    )"
+    if [[ -n "${health_payload}" ]] && printf '%s' "${health_payload}" \
+      | "${ROOT_DIR}/.venv/bin/python" -c '
+import json
+import sys
+
+payload = json.load(sys.stdin)
+raise SystemExit(0 if payload.get("ok") else 1)
+'; then
+      return 0
+    fi
+    if ! systemctl --user is-active --quiet bonsai-local-pool.service; then
+      systemctl --user status bonsai-local-pool.service --no-pager >&2 || true
+      return 1
+    fi
+    sleep 1
+  done
+  echo "BONSAI local pool did not become ready within 900 seconds" >&2
+  return 1
 }
 
 start_vibevoice() {

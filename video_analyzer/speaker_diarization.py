@@ -62,16 +62,19 @@ def process_transcript_speakers(
         return transcript, {"enabled": False, "reason": "disabled"}
 
     current_speakers = _speaker_ids(transcript.segments or [])
-    if current_speakers:
+    if prepared_assignment is None and current_speakers:
         return refine_transcript_speakers(audio_path, transcript, config)
 
     turns, report = prepared_assignment or prepare_speaker_assignment(audio_path, config)
     if not turns:
+        report.setdefault("notes", [])
         if "no diarization turns produced" not in report["notes"]:
             report["notes"].append("no diarization turns produced")
         transcript.metadata = _with_hybrid_metadata(transcript.metadata, report)
         return transcript, report
 
+    # An independently prepared assignment is authoritative. In particular,
+    # VibeVoice can emit provisional speaker labels while 3D-Speaker runs.
     assigned, assignment_stats = assign_speakers_by_overlap(transcript, turns)
     report.update(assignment_stats)
     assigned.metadata = _with_hybrid_metadata(assigned.metadata, report)
@@ -305,6 +308,13 @@ def run_3dspeaker_assignment(
         command.extend(["--speaker-num", str(int(speaker_num))])
 
     started = time.perf_counter()
+    env = os.environ.copy()
+    env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    env["CUDA_VISIBLE_DEVICES"] = str(
+        config.get("gpu_id") or env.get("DIARIZATION_GPU_ID") or "0"
+    )
+    env.setdefault("NO_PROXY", "127.0.0.1,localhost")
+    env.setdefault("no_proxy", "127.0.0.1,localhost")
     try:
         completed = subprocess.run(
             command,
@@ -312,6 +322,7 @@ def run_3dspeaker_assignment(
             capture_output=True,
             text=True,
             timeout=float(config.get("assignment_timeout_seconds") or DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS),
+            env=env,
         )
     except subprocess.TimeoutExpired:
         report["error"] = "3D-Speaker assignment timed out"

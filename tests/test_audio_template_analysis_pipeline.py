@@ -1,6 +1,7 @@
 import hashlib
 import importlib.util
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -116,7 +117,7 @@ class AudioTemplateCatalogTests(unittest.TestCase):
             {"reasoning_effort": "none"},
         )
 
-    def test_invalid_small_model_id_uses_legal_keyword_fallback(self):
+    def test_invalid_selector_result_uses_content_form_fallback(self):
         client = FakeClient(
             lambda _prompt, _call: json.dumps(
                 {"template_id": "outside-candidates", "scene": "会议", "confidence": 0.9}
@@ -131,11 +132,299 @@ class AudioTemplateCatalogTests(unittest.TestCase):
         )
         self.assertIn(selected["id"], {item["id"] for item in self.templates})
         self.assertTrue(selected["id"].isdigit())
-        self.assertEqual(classification["method"], "keyword-fallback")
+        self.assertEqual(selected["id"], "100005")
+        self.assertEqual(classification["method"], "content-form-fallback")
+        self.assertEqual(classification["content_form"], "meeting")
         self.assertEqual(classification["template_id"], selected["id"])
+
+    def test_template_shards_cover_catalog_once_and_stay_balanced(self):
+        first = run_audio_template_analysis.build_template_shards(self.templates)
+        second = run_audio_template_analysis.build_template_shards(self.templates)
+
+        self.assertEqual(
+            [[item["id"] for item in shard] for shard in first],
+            [[item["id"] for item in shard] for shard in second],
+        )
+        self.assertEqual(sorted(len(shard) for shard in first), [76, 76, 76, 77, 77])
+        flattened = [item["id"] for shard in first for item in shard]
+        self.assertEqual(len(flattened), 382)
+        self.assertEqual(len(set(flattened)), 382)
+
+    def test_parallel_tournament_prefers_content_form_and_writes_audit(self):
+        selected_id = "400000"
+
+        def respond(prompt, call):
+            ids = re.findall(r"^id=(\d+)$", prompt, flags=re.MULTILINE)
+            if call <= 5:
+                ranked_ids = ids[:3]
+                if selected_id in ids and selected_id not in ranked_ids:
+                    ranked_ids[-1] = selected_id
+                ranked = [
+                    {
+                        "template_id": template_id,
+                        "form_fit": 90 - index,
+                        "domain_fit": 70,
+                        "instruction_fit": 80,
+                        "reason": "访谈形态匹配",
+                    }
+                    for index, template_id in enumerate(ranked_ids)
+                ]
+                return json.dumps(
+                    {
+                        "content_form": "interview",
+                        "domain": "人工智能",
+                        "ranked": ranked,
+                    }
+                )
+            finalists = re.findall(r"^id=(\d+)$", prompt, flags=re.MULTILINE)
+            winner = selected_id if selected_id in finalists else finalists[0]
+            runner_up = next(item for item in finalists if item != winner)
+            return json.dumps(
+                {
+                    "template_id": winner,
+                    "runner_up_id": runner_up,
+                    "content_form": "interview",
+                    "domain": "人工智能",
+                    "scene": "播客访谈",
+                    "confidence": 0.92,
+                    "margin": 18,
+                    "reason": "内容是主持人与嘉宾的连续问答。",
+                }
+            )
+
+        client = FakeClient(respond)
+        with tempfile.TemporaryDirectory() as tmp:
+            selected, classification = run_audio_template_analysis.choose_template(
+                client=client,
+                model="prism-ml/bonsai-27b",
+                templates=self.templates,
+                transcript_text="主持人：欢迎嘉宾。嘉宾：今天讨论模型部署。",
+                focus_prompt="保留关键观点",
+                output_dir=Path(tmp),
+            )
+            audit = json.loads(
+                (Path(tmp) / "template_selection.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(len(client.prompts), 6)
+        self.assertEqual(selected["id"], selected_id)
+        self.assertEqual(classification["method"], "bonsai_parallel_tournament")
+        self.assertEqual(classification["content_form"], "interview")
+        self.assertEqual(classification["audit_path"], "template_selection.json")
+        self.assertEqual(len(audit["shards"]), 5)
+        self.assertLessEqual(len(audit["finalists"]), 15)
+        self.assertTrue(
+            all("template" not in finalist for finalist in audit["finalists"])
+        )
+
+    def test_shard_parser_completes_missing_third_candidate(self):
+        shard = [
+            template
+            for template in self.templates
+            if template.get("first_category") == "interview"
+        ][:5]
+        response = json.dumps(
+            {
+                "content_form": "interview",
+                "domain": "科技",
+                "ranked": [
+                    {
+                        "template_id": shard[0]["id"],
+                        "form_fit": 95,
+                        "domain_fit": 80,
+                        "instruction_fit": 90,
+                        "reason": "问答结构匹配",
+                    },
+                    {
+                        "template_id": shard[1]["id"],
+                        "form_fit": 90,
+                        "domain_fit": 75,
+                        "instruction_fit": 85,
+                        "reason": "播客访谈匹配",
+                    },
+                ],
+            }
+        )
+
+        parsed = run_audio_template_analysis.parse_template_shard_result(
+            response,
+            shard,
+            1,
+        )
+
+        self.assertEqual(len(parsed["ranked"]), 3)
+        self.assertEqual(parsed["ranked"][2]["form_fit"], 0.0)
+        self.assertTrue(parsed["warnings"])
+
+    def test_default_summary_intent_excludes_podcast_creation_template(self):
+        summary = next(
+            item for item in self.templates if item["id"] == "2000088"
+        )
+        marketing = next(
+            item for item in self.templates if item["id"] == "2000093"
+        )
+        repurposing = next(
+            item for item in self.templates if item["id"] == "2000252"
+        )
+        finalists = [
+            {"template": summary},
+            {"template": marketing},
+            {"template": repurposing},
+        ]
+
+        accepted, excluded = (
+            run_audio_template_analysis.filter_finalists_for_output_intent(
+                finalists,
+                "",
+                "主持人欢迎嘉宾参加本期播客。",
+            )
+        )
+        transformed, transformed_excluded = (
+            run_audio_template_analysis.filter_finalists_for_output_intent(
+                finalists,
+                "请改写成营销播客脚本",
+                "主持人欢迎嘉宾参加本期播客。",
+            )
+        )
+
+        self.assertEqual(
+            [item["template"]["id"] for item in accepted],
+            ["2000088"],
+        )
+        self.assertEqual(
+            [item["template"]["id"] for item in excluded],
+            ["2000093", "2000252"],
+        )
+        self.assertEqual(transformed, finalists)
+        self.assertEqual(transformed_excluded, [])
+
+    def test_podcast_interview_excludes_specialized_interview_scenarios(self):
+        template_ids = ("2000088", "2000092", "2000097", "2000098")
+        finalists = [
+            {
+                "template": next(
+                    item for item in self.templates if item["id"] == template_id
+                )
+            }
+            for template_id in template_ids
+        ]
+
+        accepted, excluded = (
+            run_audio_template_analysis.filter_finalists_for_output_intent(
+                finalists,
+                "",
+                "主持人向嘉宾提问，欢迎收听本期播客。",
+            )
+        )
+
+        self.assertEqual(
+            [item["template"]["id"] for item in accepted],
+            ["2000088"],
+        )
+        self.assertEqual(
+            {item["template"]["id"] for item in excluded},
+            {"2000092", "2000097", "2000098"},
+        )
+
+    def test_exact_podcast_scenario_outranks_general_interview_template(self):
+        template_ids = ("2000007", "400002", "2000088")
+        finalists = [
+            {
+                "template": next(
+                    item for item in self.templates if item["id"] == template_id
+                )
+            }
+            for template_id in template_ids
+        ]
+
+        accepted, excluded = (
+            run_audio_template_analysis.filter_finalists_for_output_intent(
+                finalists,
+                "",
+                "主持人与嘉宾在播客中持续问答。",
+            )
+        )
+
+        self.assertEqual(
+            [item["template"]["id"] for item in accepted],
+            ["2000088"],
+        )
+        self.assertEqual(
+            {item["template"]["id"] for item in excluded},
+            {"2000007", "400002"},
+        )
+
+    def test_single_finalist_discards_fabricated_runner_up(self):
+        template = next(
+            item for item in self.templates if item["id"] == "2000088"
+        )
+        client = FakeClient(
+            lambda _prompt, _call: json.dumps(
+                {
+                    "template_id": "2000088",
+                    "runner_up_id": "2000089",
+                    "content_form": "interview",
+                    "domain": "科技",
+                    "scene": "播客访谈",
+                    "confidence": 0.95,
+                    "margin": 100,
+                    "reason": "主持人与嘉宾持续问答。",
+                }
+            )
+        )
+
+        result = run_audio_template_analysis.run_template_final_adjudication(
+            client=client,
+            model="fake",
+            finalists=[
+                {
+                    "shard": 1,
+                    "shard_rank": 1,
+                    "shard_content_form": "interview",
+                    "shard_domain": "科技",
+                    "scores": {},
+                    "template": template,
+                }
+            ],
+            transcript_text="主持人与嘉宾在播客中持续问答。",
+            focus_prompt="",
+            majority_form="interview",
+        )
+
+        self.assertEqual(result["template_id"], "2000088")
+        self.assertEqual(result["runner_up_id"], "")
 
 
 class AudioTemplateLongTextTests(unittest.TestCase):
+    def test_format_transcript_accepts_capitalized_provider_fields(self):
+        transcript = AudioTranscript(
+            text="fallback text",
+            segments=[
+                {
+                    "Start": 1.5,
+                    "End": 3.0,
+                    "Speaker": "host",
+                    "Content": "请嘉宾介绍一下。",
+                },
+                {
+                    "Start": 3.0,
+                    "End": 5.0,
+                    "Speaker": "guest",
+                    "Content": "好的。",
+                },
+            ],
+            language="zh",
+            metadata={},
+        )
+
+        rendered = run_audio_template_analysis.format_transcript_for_analysis(
+            transcript
+        )
+
+        self.assertIn("[00:01-00:03] host: 请嘉宾介绍一下。", rendered)
+        self.assertIn("[00:03-00:05] guest: 好的。", rendered)
+        self.assertNotEqual(rendered, transcript.text)
+
     def test_asr_preflight_recognizes_only_speech_text(self):
         self.assertFalse(run_audio_template_analysis.has_meaningful_speech(""))
         self.assertFalse(run_audio_template_analysis.has_meaningful_speech("[Music]"))
@@ -241,6 +530,49 @@ class AudioTemplateLongTextTests(unittest.TestCase):
                 temperature=0.0,
             )
 
+    def test_bonsai_content_disables_thinking_and_rejects_reasoning_fallback(self):
+        class RecordingClient(FakeClient):
+            def __init__(self, payload):
+                super().__init__(lambda _prompt, _call: "")
+                self.payload = payload
+                self.kwargs = []
+
+            def generate(self, prompt, **kwargs):
+                self.prompts.append(prompt)
+                self.kwargs.append(kwargs)
+                return self.payload
+
+        success = RecordingClient({"response": "最终摘要", "response_source": "content"})
+        result = run_audio_template_analysis.generate_required_text(
+            success,
+            "prompt",
+            model="prism-ml/bonsai-27b",
+            temperature=0.0,
+            num_predict=100,
+            stage="test",
+        )
+        self.assertEqual(result, "最终摘要")
+        self.assertEqual(
+            success.kwargs[0]["extra_body"],
+            run_audio_template_analysis.selector_request_extra_body(),
+        )
+
+        reasoning = RecordingClient(
+            {
+                "response": "Here's a thinking process:",
+                "response_source": "reasoning_content",
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "reasoning_content"):
+            run_audio_template_analysis.generate_required_text(
+                reasoning,
+                "prompt",
+                model="prism-ml/bonsai-27b",
+                temperature=0.0,
+                num_predict=100,
+                stage="test",
+            )
+
 
 class AudioTemplateStructuredOutputTests(unittest.TestCase):
     def test_structured_output_keeps_existing_fields_and_adds_mobile_fields(self):
@@ -299,6 +631,11 @@ class AudioTemplateStructuredOutputTests(unittest.TestCase):
                 evidence_path=output / "manual_evidence.md",
                 study_guide_path=guide_path,
                 elapsed_seconds=1.0,
+                timings={
+                    "asr_seconds": 0.5,
+                    "template_selector_seconds": 0.2,
+                    "manual_generation_seconds": 0.3,
+                },
             )
             analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
             audio_analysis = analysis["audio_template_analysis"]
@@ -312,6 +649,16 @@ class AudioTemplateStructuredOutputTests(unittest.TestCase):
             self.assertIn("study_guide", audio_analysis)
             self.assertIn("mindmap", audio_analysis)
             self.assertEqual(analysis["structured_content"]["summary"], "最终摘要")
+            self.assertEqual(analysis["metadata"]["timings"]["asr_seconds"], 0.5)
+            self.assertEqual(
+                analysis["metadata"]["timings"]["template_selector_seconds"],
+                0.2,
+            )
+            self.assertEqual(
+                analysis["metadata"]["timings"]["manual_generation_seconds"],
+                0.3,
+            )
+            self.assertEqual(analysis["metadata"]["timings"]["total_seconds"], 1.0)
 
 
 if __name__ == "__main__":

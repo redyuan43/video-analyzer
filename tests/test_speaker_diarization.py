@@ -120,6 +120,32 @@ def test_assign_speakers_by_overlap_labels_unlabeled_asr_segments():
     assert report["final_speaker_count"] == 2
 
 
+def test_3dspeaker_assignment_uses_native_helper_inside_branch_actor(tmp_path):
+    from video_analyzer import speaker_diarization
+
+    external_python = tmp_path / "python"
+    external_python.touch()
+    project_root = tmp_path / "3D-Speaker"
+    project_root.mkdir()
+    audio_path = tmp_path / "audio.wav"
+    audio_path.touch()
+
+    with patch.object(speaker_diarization.subprocess, "run") as run:
+        run.return_value.returncode = 0
+        run.return_value.stdout = '__3DSPEAKER_JSON__{"turns":[]}'
+        run.return_value.stderr = ""
+        speaker_diarization.run_3dspeaker_assignment(
+            audio_path,
+            {
+                "external_python": str(external_python),
+                "diarization_project_root": str(project_root),
+            },
+        )
+
+    command = run.call_args.args[0]
+    assert command[1].endswith("run_3dspeaker_turns.py")
+
+
 def test_prepared_assignment_is_reused_after_parallel_asr():
     transcript = AudioTranscript(
         text="hello",
@@ -151,6 +177,36 @@ def test_prepared_assignment_is_reused_after_parallel_asr():
 
     backend.assert_not_called()
     assert assigned.segments[0]["speaker"] == "说话人 1"
+    assert report["final_speaker_count"] == 1
+
+
+def test_prepared_assignment_overrides_existing_vibevoice_speakers():
+    transcript = AudioTranscript(
+        text="hello",
+        language="en",
+        segments=[
+            {
+                "start": 0.0,
+                "end": 1.0,
+                "speaker": "Speaker A",
+                "text": "hello",
+            }
+        ],
+        metadata={},
+    )
+    prepared = (
+        [{"start": 0.0, "end": 1.0, "speaker": "spk_02"}],
+        {"enabled": True, "mode": "assignment", "backend": "3dspeaker", "notes": []},
+    )
+
+    assigned, report = process_transcript_speakers(
+        Path("/tmp/audio.wav"),
+        transcript,
+        {"enabled": True, "backend": "3dspeaker"},
+        prepared_assignment=prepared,
+    )
+
+    assert assigned.segments[0]["speaker"] == "说话人 2"
     assert report["final_speaker_count"] == 1
 
 

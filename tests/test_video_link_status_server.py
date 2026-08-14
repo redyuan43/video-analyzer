@@ -1003,6 +1003,133 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             stored["runtime_profile_snapshot"]["audio_cloud_fallback"]["enabled"]
         )
 
+    def test_failed_audio_diarization_blocks_unreached_flow_nodes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs")
+            log_path = Path(tmp) / "analyze-core.log"
+            log_path.write_text(
+                "subprocess failed\n"
+                "ParallelBranchError: diarization branch failed: unavailable\n",
+                encoding="utf-8",
+            )
+            job = {
+                "status": "failed",
+                "runner": {"error": "analyze-core subprocess exited with status 1"},
+                "runtime_profile_snapshot": {"workflow_id": "audio_nx1"},
+                "stages": {
+                    "analyze-core": {
+                        "status": "failed",
+                        "error": "command returned non-zero exit status 1",
+                        "log_path": str(log_path),
+                    }
+                },
+            }
+            diarization = server.execution_node_state(
+                job,
+                {"id": "diarization", "stage": "analyze-core"},
+                {"enabled": True},
+                [],
+                {},
+                {},
+                {},
+            )
+            downstream = server.execution_node_state(
+                job,
+                {"id": "template_selector", "stage": "analyze-core"},
+                {"enabled": True},
+                [],
+                {},
+                {},
+                {},
+            )
+            nx1_sync = server.execution_node_state(
+                job,
+                {"id": "nx1_sync", "stage": "final-publish"},
+                None,
+                [],
+                {},
+                {},
+                {},
+            )
+            running_nx1_sync = server.execution_node_state(
+                {
+                    "status": "running",
+                    "runtime_profile_snapshot": {"workflow_id": "audio_nx1"},
+                    "stages": {},
+                },
+                {"id": "nx1_sync", "stage": "final-publish"},
+                None,
+                [],
+                {},
+                {},
+                {},
+            )
+
+        self.assertEqual(diarization["status"], "failed")
+        self.assertEqual(downstream["status"], "blocked")
+        self.assertEqual(nx1_sync["status"], "blocked")
+        self.assertEqual(running_nx1_sync["status"], "pending")
+
+    def test_provided_transcript_reuses_speaker_labels_in_execution_flow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript_path = Path(tmp) / "transcript.json"
+            transcript_path.write_text(
+                json.dumps(
+                    {
+                        "segments": [
+                            {"Speaker": "0", "Content": "问题"},
+                            {"speaker": "1", "content": "回答"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs")
+            job = {
+                "provided_transcript": True,
+                "provided_transcript_path": str(transcript_path),
+                "runtime_profile_snapshot": {"workflow_id": "audio_nx1"},
+                "stages": {},
+            }
+            diarization = server.execution_node_state(
+                job,
+                {"id": "diarization", "stage": "analyze-core"},
+                {"enabled": True},
+                [],
+                {},
+                {},
+                {},
+            )
+
+        self.assertEqual(diarization["status"], "succeeded")
+        self.assertIn("2 人", diarization["message"])
+
+    def test_selector_execution_metadata_inherits_text_model(self):
+        server = server_mod.VideoLinkStatusServer(
+            Path(tempfile.mkdtemp()),
+            REPO_ROOT,
+        )
+        metadata = server.execution_model_metadata(
+            {
+                "template_selector_inherit": "text",
+                "template_selector_enabled": True,
+                "template_selector_model_id": "selector-inherit-text",
+                "text_model": "prism-ml/bonsai-27b",
+                "text_base_url": "http://127.0.0.1:18103/v1",
+                "runtime": "llama.cpp",
+                "deployment": "local",
+                "text_worker_count": 5,
+                "text_concurrency": 5,
+            },
+            "selector",
+            {},
+        )
+
+        self.assertEqual(metadata["model"], "prism-ml/bonsai-27b")
+        self.assertEqual(metadata["endpoint"], "http://127.0.0.1:18103/v1")
+        self.assertEqual(metadata["inherited_from"], "text")
+        self.assertEqual(metadata["worker_count"], 5)
+
     def test_audio_cloud_fallback_is_selected_only_while_local_models_are_busy(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs")
@@ -2213,6 +2340,27 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(public["result_resources"]["summary_markdown"], "operation_manual.md")
         self.assertEqual(public["result_resources"]["transcript_markdown"], "transcript.md")
         self.assertEqual(public["prompt_template"]["actual"]["id"], "actual")
+
+    def test_audio_result_resources_expose_template_selection_audit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            (run_dir / "template_selection.json").write_text(
+                json.dumps({"method": "bonsai_parallel_tournament"}),
+                encoding="utf-8",
+            )
+            resources = server.result_resources(
+                {
+                    "run_dir": str(run_dir),
+                    "audio_pipeline_kind": "audio_nx1",
+                }
+            )
+
+        self.assertEqual(
+            resources["template_selection"],
+            "template_selection.json",
+        )
 
     def test_document_preview_groups_primary_evidence_process_and_assets(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4580,6 +4728,39 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(prepare["queued_at"], "2026-08-11T10:00:00+0800")
         self.assertEqual(prepare["started_at"], "2026-08-11T10:00:10+0800")
         self.assertEqual(prepare["finished_at"], "2026-08-11T10:00:40+0800")
+
+    def test_execution_flow_recovers_historical_single_provider_asr_timing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs")
+            analysis = {
+                "asr": {
+                    "providers_run": ["vibevoice"],
+                    "elapsed_seconds": {"vibevoice": 455.141},
+                }
+            }
+            timing = server.execution_node_timing(
+                {"id": "asr", "stage": "analyze-core"},
+                {"status": "succeeded"},
+                {},
+                {},
+                {"stages": {"analyze-core": {"status": "succeeded"}}},
+                analysis,
+            )
+
+        self.assertEqual(timing["duration_seconds"], 455.141)
+        self.assertEqual(timing["duration_scope"], "node")
+
+    def test_historical_asr_timing_does_not_sum_multiple_providers(self):
+        duration = server_mod.VideoLinkStatusServer.historical_asr_duration(
+            {
+                "asr": {
+                    "providers_run": ["fast", "deep"],
+                    "elapsed_seconds": {"fast": 10.0, "deep": 20.0},
+                }
+            }
+        )
+
+        self.assertIsNone(duration)
 
     def test_stage_start_preserves_resource_queue_duration(self):
         with tempfile.TemporaryDirectory() as tmp:

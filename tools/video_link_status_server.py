@@ -1449,11 +1449,22 @@ class VideoLinkStatusServer:
         return {"state": str(runner.get("status") or job.get("status") or "idle"), "position": None}
 
     def mobile_prompt_template(self, value: dict[str, Any]) -> dict[str, Any]:
+        classification = value.get("classification") or {}
         return {
             "id": value.get("id"),
             "title": value.get("title"),
             "title_zh": value.get("title_zh"),
             "category": value.get("category"),
+            "classification": {
+                "method": classification.get("method"),
+                "content_form": classification.get("content_form"),
+                "domain": classification.get("domain"),
+                "confidence": classification.get("confidence"),
+                "runner_up_id": classification.get("runner_up_id"),
+                "margin": classification.get("margin"),
+                "warnings": list(classification.get("warnings") or []),
+                "audit_path": classification.get("audit_path"),
+            },
         }
 
     def delete_job(self, job_id: str) -> dict[str, Any]:
@@ -5472,6 +5483,7 @@ class VideoLinkStatusServer:
                 timings,
                 diarization_report,
                 job,
+                analysis,
             ))
             node["metrics"] = self.execution_node_metrics(
                 node["id"],
@@ -5681,17 +5693,40 @@ class VideoLinkStatusServer:
             deployment = str(config.get("deployment") or "云端")
             enabled = bool(fallback.get("enabled") and provider not in {"", "none"})
         elif kind == "selector":
-            provider = "openai_compatible"
-            model = str(
-                profile.get("template_selector_model")
-                or snapshot_models.get("selector")
-                or ""
-            )
-            endpoint = str(
-                profile.get("template_selector_base_url")
-                or profile.get("study_card_llm_base_url")
-                or ""
-            )
+            if profile.get("template_selector_inherit") == "text":
+                provider = str(profile.get("runtime") or "openai_compatible")
+                model = str(
+                    profile.get("text_model")
+                    or snapshot_models.get("text")
+                    or ""
+                )
+                endpoint = str(
+                    profile.get("text_base_url")
+                    or profile.get("llm_base_url")
+                    or ""
+                )
+                worker_count = (
+                    profile.get("text_worker_count")
+                    or profile.get("worker_count")
+                )
+                concurrency = (
+                    profile.get("text_concurrency")
+                    or profile.get("concurrency")
+                )
+                deployment = str(profile.get("deployment") or "")
+                inherited_from = "text"
+            else:
+                provider = "openai_compatible"
+                model = str(
+                    profile.get("template_selector_model")
+                    or snapshot_models.get("selector")
+                    or ""
+                )
+                endpoint = str(
+                    profile.get("template_selector_base_url")
+                    or profile.get("study_card_llm_base_url")
+                    or ""
+                )
             enabled = bool(profile.get("template_selector_enabled", True) and model)
 
         deployment = deployment or self.execution_endpoint_deployment(endpoint)
@@ -5783,6 +5818,18 @@ class VideoLinkStatusServer:
         stage = str(node.get("stage") or "")
         stage_info = (job.get("stages") or {}).get(stage) or {}
         stage_status = str(stage_info.get("status") or "pending")
+        workflow_id = str(
+            (job.get("runtime_profile_snapshot") or {}).get("workflow_id")
+            or VIDEO_WORKFLOW_ID
+        )
+        if workflow_id == AUDIO_WORKFLOW_ID and node_id == "nx1_sync":
+            if job.get("consumer_acknowledged_at"):
+                return {"status": "succeeded", "message": "NX1 已镜像产物并确认"}
+            if job.get("status") == "failed":
+                return {"status": "blocked", "message": "AI 分析失败，未执行 NX1 回传"}
+            if job.get("status") == "succeeded":
+                return {"status": "pending", "message": "等待 NX1 镜像产物并确认"}
+            return {"status": "pending", "message": "等待 AI 分析完成后回传 NX1"}
         if node.get("node_kind") == "output":
             if artifacts:
                 return {"status": "succeeded", "message": "最终文档已生成"}
@@ -5791,6 +5838,29 @@ class VideoLinkStatusServer:
             if stage not in self.stage_order_for_job(job):
                 return {"status": "skipped", "message": "当前分析深度不生成该文档"}
             return {"status": "pending", "message": "等待最终发布"}
+
+        if workflow_id == AUDIO_WORKFLOW_ID and job.get("provided_transcript"):
+            if node_id == "asr":
+                return {
+                    "status": "succeeded",
+                    "message": "复用已有转写结果，未重新执行 ASR",
+                }
+            if node_id == "diarization":
+                speaker_count = self.provided_transcript_speaker_count(job)
+                if speaker_count > 0:
+                    return {
+                        "status": "succeeded",
+                        "message": f"复用已有说话人标签（{speaker_count} 人）",
+                    }
+                return {
+                    "status": "skipped",
+                    "message": "提供的转写没有说话人标签，未重新执行分离",
+                }
+            if node_id == "transcript_merge":
+                return {
+                    "status": "succeeded",
+                    "message": "复用已对齐的转写与说话人结果",
+                }
 
         exact_state = node_states.get(node_id)
         if isinstance(exact_state, dict):
@@ -5809,6 +5879,43 @@ class VideoLinkStatusServer:
             return {"status": "skipped", "message": "该模型能力未启用"}
 
         if stage == "analyze-core":
+            if workflow_id == AUDIO_WORKFLOW_ID and stage_status == "failed":
+                error = str(
+                    stage_info.get("error")
+                    or (job.get("runner") or {}).get("error")
+                    or "核心分析失败"
+                )
+                failure_evidence = error
+                log_path = Path(str(stage_info.get("log_path") or ""))
+                if log_path.is_file():
+                    try:
+                        with log_path.open("rb") as handle:
+                            handle.seek(0, os.SEEK_END)
+                            handle.seek(max(handle.tell() - 65536, 0))
+                            failure_evidence += "\n" + handle.read().decode(
+                                "utf-8",
+                                errors="replace",
+                            )
+                    except OSError:
+                        pass
+                failed_node = (
+                    "diarization"
+                    if "diarization branch failed" in failure_evidence
+                    else "asr"
+                    if "asr branch failed" in failure_evidence
+                    else ""
+                )
+                if node_id == failed_node:
+                    return {"status": "failed", "message": error}
+                return {
+                    "status": "blocked",
+                    "message": (
+                        f"被{('说话人分离' if failed_node == 'diarization' else '语音识别')}失败阻断"
+                        if failed_node
+                        else "被核心分析失败阻断"
+                    ),
+                }
+
             if stage_status in {"succeeded", "skipped", "failed"}:
                 return {"status": stage_status, "message": stage_info.get("error")}
             progress_step = str(node.get("progress_step") or "")
@@ -5884,6 +5991,28 @@ class VideoLinkStatusServer:
             "progress": stage_progress.get("percent") if stage_progress.get("stage") == stage else None,
         }
 
+    @staticmethod
+    def provided_transcript_speaker_count(job: dict[str, Any]) -> int:
+        path = Path(str(job.get("provided_transcript_path") or ""))
+        if not path.is_file():
+            return 0
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return 0
+        speakers = {
+            str(
+                segment.get("speaker")
+                or segment.get("speaker_id")
+                or segment.get("Speaker")
+                or ""
+            ).strip()
+            for segment in payload.get("segments") or []
+            if isinstance(segment, dict)
+        }
+        speakers.discard("")
+        return len(speakers)
+
     def execution_node_timing(
         self,
         node: dict[str, Any],
@@ -5891,6 +6020,7 @@ class VideoLinkStatusServer:
         timings: dict[str, Any],
         diarization_report: dict[str, Any],
         job: dict[str, Any],
+        analysis: dict[str, Any],
     ) -> dict[str, Any]:
         stage = str(node.get("stage") or "")
         stage_info = ((job.get("stages") or {}).get(stage) or {})
@@ -5924,13 +6054,22 @@ class VideoLinkStatusServer:
 
         timing_keys = {
             "asr": "asr_seconds",
+            "diarization": "diarization_seconds",
+            "transcript_merge": "transcript_merge_seconds",
+            "template_selector": "template_selector_seconds",
             "frame_extract": "candidate_frame_extraction_seconds",
             "frame_audit": "ocr_frame_audit_seconds",
             "ocr": "ocr_seconds",
             "vision": "vl_seconds",
             "visual_evidence": "vl_seconds",
             "text": "manual_generation_seconds",
+            "artifact_package": "artifact_package_seconds",
         }
+        if duration is None and node.get("id") == "asr":
+            value = self.historical_asr_duration(analysis)
+            if value is not None:
+                duration = value
+                scope = "node"
         if duration is None and node.get("id") == "diarization":
             value = diarization_report.get("elapsed_seconds")
             if isinstance(value, (int, float)):
@@ -5993,6 +6132,33 @@ class VideoLinkStatusServer:
             ),
             "duration_scope": scope or "none",
         }
+
+    @staticmethod
+    def historical_asr_duration(analysis: dict[str, Any]) -> float | None:
+        asr = analysis.get("asr") if isinstance(analysis, dict) else None
+        elapsed = asr.get("elapsed_seconds") if isinstance(asr, dict) else None
+        if isinstance(elapsed, (int, float)):
+            return float(elapsed)
+        if not isinstance(elapsed, dict):
+            return None
+        providers = [
+            str(provider)
+            for provider in asr.get("providers_run") or []
+            if str(provider)
+        ]
+        values = [
+            float(elapsed[provider])
+            for provider in providers
+            if isinstance(elapsed.get(provider), (int, float))
+        ]
+        if len(values) == 1:
+            return values[0]
+        all_values = [
+            float(value)
+            for value in elapsed.values()
+            if isinstance(value, (int, float))
+        ]
+        return all_values[0] if len(all_values) == 1 else None
 
     @staticmethod
     def execution_node_metrics(
@@ -6185,6 +6351,7 @@ class VideoLinkStatusServer:
             "mindmap_markdown": run_dir / "study_overview.md",
             "study_cards_markdown": run_dir / "study_cards.md",
             "audio_template_analysis": run_dir / "audio_template_analysis.json",
+            "template_selection": run_dir / "template_selection.json",
         }
         resources: dict[str, str] = {}
         for name, value in artifact_candidates.items():
