@@ -2597,6 +2597,7 @@ function consoleFlowNodeTimingLabel(flowNode) {
     if (status === 'failed' || status === 'stopped') {
         return seconds == null ? '已中断' : `中断于 ${formatClock(seconds)}`;
     }
+    if (status === 'blocked') return '被前序失败阻断';
     if (status === 'succeeded') {
         if (seconds == null) return '无独立计时';
         return `${flowNode.duration_scope === 'stage' ? '阶段耗时' : '耗时'} ${formatClock(seconds)}`;

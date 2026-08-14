@@ -6,9 +6,14 @@ import contextlib
 import hashlib
 import json
 import logging
-from concurrent.futures import ThreadPoolExecutor
+import threading
 from pathlib import Path
 from typing import Any, Callable
+
+try:
+    import ray
+except ImportError:  # pragma: no cover - installation validation covers this.
+    ray = None
 
 from .artifacts import write_json
 from .asr_providers import ASRStrategyResult, transcribe_with_provider_result, transcribe_with_strategy
@@ -18,12 +23,70 @@ from .resource_locks import analyzer_resource_lock
 from .speaker_diarization import prepare_speaker_assignment, process_transcript_speakers
 
 
-ASR_PROVIDERS_WITH_INTERNAL_DIARIZATION = {
-    "auto",
-    "firered_3dspeaker",
-    "vibevoice",
-    "vibevoice_remote",
-}
+RAY_TRANSCRIPTION_LOCK = threading.Lock()
+
+
+class ParallelBranchError(RuntimeError):
+    def __init__(self, branch: str, error: Exception) -> None:
+        super().__init__(f"{branch} branch failed: {error}")
+        self.branch = branch
+        self.original_error = error
+
+
+class RuntimeConfigView:
+    """Minimal serializable Config-compatible view for Ray actors."""
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        self.config = config
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.config.get(key, default)
+
+
+if ray is not None:
+
+    @ray.remote(num_cpus=1)
+    class AsrBranchActor:
+        def transcribe(
+            self,
+            audio_path: str,
+            output_dir: str,
+            config_payload: dict[str, Any],
+            use_asr_strategy: bool,
+        ) -> tuple[AudioTranscript | None, ASRStrategyResult]:
+            actor_logger = logging.getLogger("video_analyzer.ray.asr")
+            transcript, result = transcribe_configured_audio(
+                Path(audio_path),
+                Path(output_dir),
+                RuntimeConfigView(config_payload),
+                use_asr_strategy=use_asr_strategy,
+                logger=actor_logger,
+                asr_stage_prepared=True,
+            )
+            if transcript is not None:
+                transcript.metadata = dict(transcript.metadata or {})
+                transcript.metadata["asr_dispatch"] = "ray_actor"
+            return transcript, result
+
+
+    @ray.remote(num_cpus=1)
+    class DiarizationBranchActor:
+        def diarize(
+            self,
+            audio_path: str,
+            speaker_config: dict[str, Any],
+        ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+            turns, report = prepare_speaker_assignment(
+                Path(audio_path),
+                speaker_config,
+            )
+            report = dict(report or {})
+            report["dispatch_mode"] = "ray_actor"
+            if report.get("error"):
+                raise RuntimeError(str(report["error"]))
+            if not turns:
+                raise RuntimeError("selected speaker diarization model produced no turns")
+            return turns, report
 
 
 def load_provided_transcript(path: Path) -> tuple[AudioTranscript, ASRStrategyResult]:
@@ -70,6 +133,7 @@ def transcribe_configured_audio(
     use_asr_strategy: bool,
     logger: logging.Logger,
     provided_transcript_path: Path | None = None,
+    asr_stage_prepared: bool = False,
 ) -> tuple[AudioTranscript | None, ASRStrategyResult]:
     """Run the configured ASR provider with the same locking used by the CLI."""
     if provided_transcript_path is not None:
@@ -86,7 +150,12 @@ def transcribe_configured_audio(
         else analyzer_resource_lock(config.config, "asr", str(output_dir), logger)
     )
     with asr_lock:
-        with local_model_stage("asr", config.config, logger, str(output_dir)):
+        stage_context = (
+            contextlib.nullcontext()
+            if asr_stage_prepared
+            else local_model_stage("asr", config.config, logger, str(output_dir))
+        )
+        with stage_context:
             if use_asr_strategy:
                 asr_result = transcribe_with_strategy(
                     strategy=asr_config.get("strategy", "balanced"),
@@ -142,7 +211,7 @@ def apply_speaker_diarization(
     transcript_metadata = (
         transcript.metadata if isinstance(transcript.metadata, dict) else {}
     )
-    if transcript_metadata.get("speaker_diarization_applied"):
+    if transcript_metadata.get("speaker_diarization_applied") and prepared_assignment is None:
         report = {
             **existing_report,
             "enabled": True,
@@ -154,6 +223,12 @@ def apply_speaker_diarization(
         write_json(qa_dir / "speaker_diarization_report.json", report)
         return transcript, report
     speaker_config = config.get("speaker_diarization") or {}
+    strict_external = (
+        _truthy(speaker_config.get("enabled"), default=True)
+        and _truthy(speaker_config.get("assignment_enabled"), default=True)
+        and str(speaker_config.get("backend") or "").strip()
+        not in {"", "none", "asr_embedded"}
+    )
     try:
         with local_model_runtime_lock(
             config.config,
@@ -169,8 +244,14 @@ def apply_speaker_diarization(
             )
     except Exception as exc:
         logger.warning("speaker diarization failed: %s", exc)
+        if strict_external:
+            raise RuntimeError(f"selected speaker diarization model failed: {exc}") from exc
         refined = transcript
         report = {"enabled": True, "error": str(exc)}
+    if strict_external and report.get("error"):
+        raise RuntimeError(
+            f"selected speaker diarization model failed: {report['error']}"
+        )
     if prepared_assignment is not None:
         report["parallel_with_asr"] = True
     qa_dir = output_dir / "qa"
@@ -224,7 +305,9 @@ def transcribe_and_diarize_configured_audio(
         report_status = "failed" if report.get("error") else "succeeded"
         progress_message = report.get("error") or "speaker diarization finished"
         report_progress("diarization", report_status, progress_message)
+        report_progress("transcript_merge", "running", "finalizing aligned transcript")
         asr_result.transcript = transcript
+        report_progress("transcript_merge", "succeeded", "aligned transcript ready")
         return transcript, asr_result, report
 
     logger.info(
@@ -235,76 +318,127 @@ def transcribe_and_diarize_configured_audio(
     report_progress("asr", "running", f"running {asr_provider or 'configured'} ASR")
     report_progress("diarization", "running", "running in parallel with ASR")
 
-    def prepare_assignment():
+    with local_model_stage("asr", config.config, logger, str(output_dir)):
         try:
-            prepared = prepare_speaker_assignment(
-                audio_path,
-                speaker_config,
+            transcript, asr_result, prepared_assignment = (
+                run_parallel_transcription_branches(
+                    audio_path,
+                    output_dir,
+                    config.config,
+                    speaker_config,
+                    use_asr_strategy=use_asr_strategy,
+                )
             )
-        except Exception as exc:
-            report_progress("diarization", "failed", str(exc))
-            raise
-        report_progress("diarization", "succeeded", "speaker turns prepared")
-        return prepared
-
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        diarization_future = executor.submit(
-            prepare_assignment,
-        )
-        try:
-            transcript, asr_result = transcribe_configured_audio(
-                audio_path,
-                output_dir,
-                config,
-                use_asr_strategy=use_asr_strategy,
-                logger=logger,
+        except ParallelBranchError as exc:
+            failed_node = "diarization" if exc.branch == "diarization" else "asr"
+            cancelled_node = "asr" if failed_node == "diarization" else "diarization"
+            report_progress(failed_node, "failed", str(exc.original_error))
+            report_progress(
+                cancelled_node,
+                "failed",
+                f"cancelled because {failed_node} failed",
             )
-        except Exception as exc:
-            report_progress("asr", "failed", str(exc))
             raise
         report_progress("asr", "succeeded" if transcript is not None else "failed", "ASR finished")
-        try:
-            prepared_assignment = diarization_future.result()
-        except Exception as exc:
-            logger.warning("parallel speaker diarization failed: %s", exc)
-            prepared_assignment = (
-                [],
-                {
-                    "enabled": True,
-                    "mode": "assignment",
-                    "backend": speaker_config.get("backend") or "3dspeaker",
-                    "notes": ["parallel speaker diarization failed"],
-                    "error": str(exc),
-                },
-            )
+        report_progress("diarization", "succeeded", "speaker turns prepared")
 
     if transcript is None:
         return transcript, asr_result, None
-    transcript, report = apply_speaker_diarization(
-        audio_path,
-        transcript,
-        output_dir,
-        config,
-        logger=logger,
-        prepared_assignment=prepared_assignment,
-    )
+    report_progress("transcript_merge", "running", "aligning speaker turns")
+    try:
+        transcript, report = apply_speaker_diarization(
+            audio_path,
+            transcript,
+            output_dir,
+            config,
+            logger=logger,
+            prepared_assignment=prepared_assignment,
+        )
+    except Exception as exc:
+        report_progress("transcript_merge", "failed", str(exc))
+        raise
     report_progress(
-        "diarization",
+        "transcript_merge",
         "failed" if report.get("error") else "succeeded",
-        report.get("error") or "speaker diarization aligned",
+        report.get("error") or "aligned transcript ready",
     )
     asr_result.transcript = transcript
     return transcript, asr_result, report
 
 
+def run_parallel_transcription_branches(
+    audio_path: Path,
+    output_dir: Path,
+    config_payload: dict[str, Any],
+    speaker_config: dict[str, Any],
+    *,
+    use_asr_strategy: bool,
+) -> tuple[
+    AudioTranscript | None,
+    ASRStrategyResult,
+    tuple[list[dict[str, Any]], dict[str, Any]],
+]:
+    """Run independent ASR and diarization branches as Ray actors."""
+    if ray is None:
+        raise RuntimeError("Ray is required for parallel ASR and speaker diarization")
+
+    with RAY_TRANSCRIPTION_LOCK:
+        started_here = False
+        actors: list[Any] = []
+        try:
+            if not ray.is_initialized():
+                ray.init(
+                    namespace="video-analyzer-transcription",
+                    ignore_reinit_error=True,
+                    include_dashboard=False,
+                    num_cpus=2,
+                    resources={"p40_diarization": 1},
+                )
+                started_here = True
+            asr_actor = AsrBranchActor.remote()
+            diarization_actor = DiarizationBranchActor.options(
+                resources={"p40_diarization": 1},
+            ).remote()
+            actors.extend((asr_actor, diarization_actor))
+            asr_ref = asr_actor.transcribe.remote(
+                str(audio_path),
+                str(output_dir),
+                config_payload,
+                use_asr_strategy,
+            )
+            diarization_ref = diarization_actor.diarize.remote(
+                str(audio_path),
+                speaker_config,
+            )
+            pending = {asr_ref: "asr", diarization_ref: "diarization"}
+            results: dict[str, Any] = {}
+            while pending:
+                ready, _ = ray.wait(list(pending), num_returns=1)
+                ref = ready[0]
+                branch = pending.pop(ref)
+                try:
+                    results[branch] = ray.get(ref)
+                except Exception as exc:
+                    raise ParallelBranchError(branch, exc) from exc
+            transcript, asr_result = results["asr"]
+            prepared_assignment = results["diarization"]
+            return transcript, asr_result, prepared_assignment
+        finally:
+            for actor in actors:
+                try:
+                    ray.kill(actor, no_restart=True)
+                except Exception:
+                    pass
+            if started_here:
+                ray.shutdown()
+
+
 def speaker_diarization_can_run_parallel(config: Any) -> bool:
     speaker_config = config.get("speaker_diarization") or {}
-    asr_provider = str((config.get("asr") or {}).get("provider") or "").strip().lower()
     return (
         _truthy(speaker_config.get("parallel_with_asr"), default=True)
         and _truthy(speaker_config.get("enabled"), default=True)
         and _truthy(speaker_config.get("assignment_enabled"), default=True)
-        and asr_provider not in ASR_PROVIDERS_WITH_INTERNAL_DIARIZATION
     )
 
 

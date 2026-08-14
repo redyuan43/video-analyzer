@@ -23,8 +23,8 @@ from video_analyzer.asr_providers import extract_audio_to_wav  # noqa: E402
 from video_analyzer.config import Config  # noqa: E402
 from video_analyzer.local_model_runtime import local_model_runtime_session  # noqa: E402
 from video_analyzer.transcription_pipeline import (  # noqa: E402
-    apply_speaker_diarization,
-    transcribe_configured_audio,
+    ParallelBranchError,
+    transcribe_and_diarize_configured_audio,
 )
 
 
@@ -223,13 +223,24 @@ def run(args: argparse.Namespace) -> int:
 
     asr_started = time.perf_counter()
     with local_model_runtime_session(config.config, logger, str(output_dir)):
-        transcript, asr_result = transcribe_configured_audio(
-            audio_path,
-            output_dir,
-            config,
-            use_asr_strategy=False,
-            logger=logger,
-        )
+        try:
+            transcript, asr_result, diarization_report = (
+                transcribe_and_diarize_configured_audio(
+                    audio_path,
+                    output_dir,
+                    config,
+                    use_asr_strategy=False,
+                    logger=logger,
+                )
+            )
+        except ParallelBranchError as exc:
+            manifest["active_stage"] = (
+                "diarization_alignment"
+                if exc.branch == "diarization"
+                else "asr"
+            )
+            atomic_write_json(manifest_path, manifest)
+            raise
         if transcript is None or not str(getattr(transcript, "text", "") or "").strip():
             failures = "; ".join(asr_result.failures or asr_result.merge_notes)
             raise RuntimeError(
@@ -257,20 +268,10 @@ def run(args: argparse.Namespace) -> int:
         manifest["active_stage"] = "diarization_alignment"
         atomic_write_json(manifest_path, manifest)
 
-        diarization_started = time.perf_counter()
-        transcript, diarization_report = apply_speaker_diarization(
-            audio_path,
-            transcript,
-            output_dir,
-            config,
-            logger=logger,
-        )
         require_valid_diarization_alignment(transcript, diarization_report)
         manifest["stages"]["diarization_alignment"] = {
             "status": "succeeded",
-            "elapsed_seconds": round(
-                time.perf_counter() - diarization_started, 3
-            ),
+            "elapsed_seconds": float(diarization_report.get("elapsed_seconds") or 0),
             "metadata": diarization_report,
         }
 

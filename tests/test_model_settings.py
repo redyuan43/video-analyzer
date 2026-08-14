@@ -467,8 +467,45 @@ class ModelSettingsTests(unittest.TestCase):
         self.assertIn(("audio_input", "asr"), edges)
         self.assertIn(("audio_input", "diarization"), edges)
         self.assertNotIn(("asr", "diarization"), edges)
-        self.assertIn(("asr", "template_selector"), edges)
-        self.assertIn(("diarization", "template_selector"), edges)
+        self.assertIn(("asr", "transcript_merge"), edges)
+        self.assertIn(("diarization", "transcript_merge"), edges)
+        self.assertIn(("transcript_merge", "template_selector"), edges)
+        self.assertNotIn(("asr", "template_selector"), edges)
+
+    def test_expanded_diarization_options_survive_second_expansion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.json").write_text(
+                json.dumps(
+                    {
+                        "active_runtime_profile": "audio_nx1",
+                        "runtime_profiles": {
+                            "audio_nx1": {
+                                "workflow_id": "audio_nx1",
+                                "diarization_model_id": "diarization-3dspeaker-local",
+                                "speaker_diarization": {
+                                    "backend": "3dspeaker",
+                                    "diarization_project_root": "/srv/3D-Speaker",
+                                    "external_python": "/srv/venv/bin/python",
+                                    "enabled": True,
+                                },
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = Config(str(root))
+            expanded = config.get_runtime_profile("audio_nx1")
+
+        self.assertEqual(
+            expanded["speaker_diarization"]["diarization_project_root"],
+            "/srv/3D-Speaker",
+        )
+        self.assertEqual(
+            expanded["speaker_diarization"]["external_python"],
+            "/srv/venv/bin/python",
+        )
 
     def test_audio_profile_can_be_saved_without_video_models(self):
         with tempfile.TemporaryDirectory() as tmp:
