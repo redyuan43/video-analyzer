@@ -43,7 +43,7 @@ def local_model_stage_needed(stage: str, config: dict) -> bool:
         return False
     if stage == "asr":
         provider = str((config.get("asr") or {}).get("provider") or "").strip().lower()
-        if provider in {"firered_3dspeaker", "capswriter"}:
+        if provider in {"firered_3dspeaker", "capswriter", "tencent_hy_asr"}:
             return False
         vibevoice = (config.get("asr") or {}).get("vibevoice") or {}
         if provider == "qwen3_asr":

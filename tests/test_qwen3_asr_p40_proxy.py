@@ -34,7 +34,7 @@ class Qwen3AsrP40ProxyTests(unittest.TestCase):
         ]
         with (
             patch.object(proxy, "ensure_workers"),
-            patch.object(proxy, "audio_duration", return_value=200.0),
+            patch.object(proxy, "audio_duration", return_value=190.0),
             patch.object(proxy, "parsed_workers", return_value=[(0, 18300), (1, 18301)]),
             patch.object(proxy, "materialize_fixed_chunks", return_value=chunks) as materialize,
             patch.object(proxy, "dispatch_asr_chunks", return_value=results) as dispatch,

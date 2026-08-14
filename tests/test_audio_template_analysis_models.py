@@ -37,6 +37,39 @@ class AudioTemplateAnalysisModelTests(unittest.TestCase):
         self.assertEqual(base_url, 'https://api.deepseek.com')
         self.assertEqual(temperature, 1.0)
 
+    def test_audio_deepseek_flash_profile_uses_audio_workflow(self):
+        config = Config('config')
+        profile = config.get_runtime_profile('audio_nx1_deepseek_flash')
+        _client, model, base_url, temperature = (
+            run_audio_template_analysis.build_content_analysis_client(
+                config,
+                'audio_nx1_deepseek_flash',
+            )
+        )
+
+        self.assertEqual(profile['workflow_id'], 'audio_nx1')
+        self.assertEqual(model, 'deepseek-v4-flash')
+        self.assertEqual(base_url, 'https://api.deepseek.com')
+        self.assertEqual(temperature, 1.0)
+
+    def test_audio_local_quality_profile_uses_tuned_bonsai_settings(self):
+        config = Config('config')
+        profile = config.get_runtime_profile('audio_nx1_local_quality')
+        client, model, base_url, temperature = (
+            run_audio_template_analysis.build_content_analysis_client(
+                config,
+                'audio_nx1_local_quality',
+            )
+        )
+
+        self.assertEqual(profile['workflow_id'], 'audio_nx1')
+        self.assertEqual(model, 'prism-ml/bonsai-27b')
+        self.assertEqual(base_url, 'http://127.0.0.1:18103/v1')
+        self.assertEqual(temperature, 0.2)
+        self.assertEqual(client.extra_body['repeat_penalty'], 1.1)
+        self.assertEqual(profile['summary_single_pass_chars'], 12000)
+        self.assertEqual(profile['summary_map_chunk_chars'], 8000)
+
     def test_recording_time_from_source_filename(self):
         self.assertEqual(
             run_audio_template_analysis.recording_time_from_source('20260709113245.mp3'),

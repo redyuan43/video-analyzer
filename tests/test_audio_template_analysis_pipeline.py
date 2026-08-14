@@ -136,6 +136,8 @@ class AudioTemplateCatalogTests(unittest.TestCase):
         self.assertEqual(classification["method"], "content-form-fallback")
         self.assertEqual(classification["content_form"], "meeting")
         self.assertEqual(classification["template_id"], selected["id"])
+        self.assertNotIn("outside-candidates", classification["reason"])
+        self.assertNotIn("outside-candidates", classification["warnings"][0])
 
     def test_template_shards_cover_catalog_once_and_stay_balanced(self):
         first = run_audio_template_analysis.build_template_shards(self.templates)
@@ -149,6 +151,31 @@ class AudioTemplateCatalogTests(unittest.TestCase):
         flattened = [item["id"] for shard in first for item in shard]
         self.assertEqual(len(flattened), 382)
         self.assertEqual(len(set(flattened)), 382)
+
+    def test_template_shard_prompts_fit_small_model_context_budget(self):
+        prompts = [
+            run_audio_template_analysis.render_template_shard_prompt(
+                shard,
+                "主持人与嘉宾持续讨论自主智能体。" * 2000,
+                "",
+                index,
+                5,
+            )
+            for index, shard in enumerate(
+                run_audio_template_analysis.build_template_shards(self.templates),
+                1,
+            )
+        ]
+
+        self.assertTrue(
+            all(
+                len(prompt)
+                <= run_audio_template_analysis.TEMPLATE_SELECTOR_PROMPT_CHAR_LIMIT
+                for prompt in prompts
+            )
+        )
+        self.assertTrue(all("完整要求：" not in prompt for prompt in prompts))
+        self.assertTrue(all(len(re.findall(r"^id=", prompt, re.MULTILINE)) >= 76 for prompt in prompts))
 
     def test_parallel_tournament_prefers_content_form_and_writes_audit(self):
         selected_id = "400000"
@@ -492,6 +519,120 @@ class AudioTemplateLongTextTests(unittest.TestCase):
         self.assertIn("PROMPT_TAIL", final_prompt)
         self.assertNotIn("[中间内容已截断]", "\n".join(client.prompts))
 
+    def test_profile_summary_settings_force_balanced_map_chunks(self):
+        def respond(prompt, _call):
+            if "连续分块" in prompt:
+                return "- 独立事实\n- 独立结论"
+            return "- 结论一\n- 结论二\n- 结论三"
+
+        transcript = "\n".join(
+            f"[00:{index:02d}-00:{index + 1:02d}] A: " + chr(0x4E00 + index) * 3500
+            for index in range(6)
+        )
+        client = FakeClient(respond)
+        settings = run_audio_template_analysis.summary_generation_settings(
+            {
+                "summary_single_pass_chars": 12000,
+                "summary_map_chunk_chars": 8000,
+                "summary_reduce_batch_chars": 24000,
+                "summary_map_max_tokens": 1200,
+            }
+        )
+
+        run_audio_template_analysis.summarize_with_template(
+            client=client,
+            model="fake-content",
+            template={
+                "id": "400000",
+                "title_zh": "采访笔记",
+                "prompt_original": "总结 {transcript}",
+            },
+            transcript_text=transcript,
+            focus_prompt="",
+            language="zh-CN",
+            temperature=0.2,
+            settings=settings,
+        )
+
+        map_prompts = [prompt for prompt in client.prompts if "连续分块" in prompt]
+        self.assertEqual(len(map_prompts), 3)
+        self.assertIn("第 1/3 个连续分块", map_prompts[0])
+        self.assertIn("第 3/3 个连续分块", map_prompts[-1])
+
+    def test_summary_quality_gate_retries_once_and_rejects_repetition(self):
+        repeated = "\n".join(
+            f"- [00:{index:02d}-00:{index + 1:02d}] 相同观点"
+            for index in range(6)
+        )
+        corrected = "\n".join(
+            f"- [00:{index:02d}-00:{index + 1:02d}] 独立观点{index}"
+            for index in range(6)
+        )
+        client = FakeClient(
+            lambda prompt, call: corrected if call == 2 else repeated
+        )
+
+        summary = run_audio_template_analysis.summarize_with_template(
+            client=client,
+            model="fake-content",
+            template={
+                "id": "400000",
+                "title_zh": "采访笔记",
+                "prompt_original": "总结 {transcript}",
+            },
+            transcript_text="短转写",
+            focus_prompt="",
+            language="zh-CN",
+            temperature=0.2,
+        )
+
+        self.assertEqual(summary, corrected)
+        self.assertEqual(len(client.prompts), 2)
+        self.assertIn("前一次输出未通过质量检查", client.prompts[-1])
+        self.assertTrue(
+            run_audio_template_analysis.assess_summary_quality(summary)["passed"]
+        )
+
+    def test_summary_quality_gate_reports_duplicate_time_ranges(self):
+        summary = "\n".join(
+            (
+                "- [30:20-30:58] 行为规范的来源",
+                "- [30:20-30:58] 行为规范的作用",
+            )
+        )
+
+        quality = run_audio_template_analysis.assess_summary_quality(summary)
+
+        self.assertFalse(quality["passed"])
+        self.assertEqual(quality["duplicate_time_range_count"], 1)
+
+    def test_deterministic_summary_deduplication_removes_empty_questions(self):
+        summary = """问题4：行为规范
+- [30:20-30:58] 独立观点
+
+问题5：行为评估
+- [37:32-37:53] 重复观点
+
+问题6：本体
+- [41:30-41:32] 重复观点
+
+问题7：自我改进
+- [59:58-01:01:09] 另一个独立观点"""
+
+        deduplicated, removed = (
+            run_audio_template_analysis.deduplicate_summary_lines(summary)
+        )
+
+        self.assertEqual(removed, 2)
+        self.assertEqual(deduplicated.count("重复观点"), 1)
+        self.assertNotIn("问题6：本体", deduplicated)
+        self.assertIn("问题3：自我改进", deduplicated)
+        self.assertTrue(
+            run_audio_template_analysis.assess_summary_quality(
+                deduplicated
+            )["passed"]
+        )
+
     def test_doway_placeholders_use_known_values_and_mark_unknowns(self):
         rendered = run_audio_template_analysis.render_template_prompt(
             "{{date}}|{{recordStartTime}}|{{recordEndTime}}|{{duration}}|{{location}}|{unknown}|{transcript}",
@@ -659,6 +800,40 @@ class AudioTemplateStructuredOutputTests(unittest.TestCase):
                 0.3,
             )
             self.assertEqual(analysis["metadata"]["timings"]["total_seconds"], 1.0)
+            self.assertTrue(
+                analysis["operation_manual"]["quality_gate_passed"]
+            )
+            self.assertEqual(
+                analysis["audio_template_analysis"]["quality"]["duplicate_ratio"],
+                0.0,
+            )
+
+            overview = run_audio_template_analysis.render_study_overview(guide)
+            self.assertIn("## 内容脑图", overview)
+            self.assertIn("```mermaid\nmindmap", overview)
+            self.assertIn("问题定位", overview)
+
+    def test_operation_manual_hides_internal_selector_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = run_audio_template_analysis.write_operation_manual(
+                Path(tmp),
+                {"title_zh": "采访笔记"},
+                {
+                    "scene": "访谈",
+                    "reason": (
+                        "\x1b[36mray::TemplateSelectorShardActor.select()\x1b[0m\n"
+                        'Traceback File "/home/ai/private.py" OpenAIAPIError'
+                    ),
+                },
+                "干净总结",
+                "",
+            )
+            text = path.read_text(encoding="utf-8")
+
+        self.assertIn("自动模板选择暂不可用", text)
+        self.assertNotIn("ray::", text)
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn("/home/ai", text)
 
 
 if __name__ == "__main__":

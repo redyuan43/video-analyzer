@@ -80,6 +80,7 @@ def parse_args() -> argparse.Namespace:
             "capswriter_http",
             "firered_3dspeaker",
             "openai_audio",
+            "tencent_hy_asr",
             "vibevoice",
             "faster_whisper",
         ],

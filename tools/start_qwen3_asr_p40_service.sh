@@ -68,6 +68,7 @@ start_service() {
   QWEN3_ASR_WORKERS="${worker_spec}" \
   QWEN3_ASR_LOG_DIR="${LOG_DIR}" \
   QWEN3_ASR_PROXY_PORT="${PROXY_PORT}" \
+  PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}" \
   NO_PROXY="${NO_PROXY:-127.0.0.1,localhost}" \
   no_proxy="${no_proxy:-127.0.0.1,localhost}" \
     setsid "${PROXY_PYTHON}" "${ROOT_DIR}/tools/qwen3_asr_p40_proxy.py" \

@@ -211,6 +211,93 @@ class AsrRayWorkerTests(unittest.TestCase):
         self.assertEqual(payload["segments"][0]["end"], 11.0)
         self.assertEqual(payload["words"][0]["end"], 15.0)
 
+    def test_fixed_chunks_with_synthetic_timestamps_need_review(self):
+        results = [
+            ChunkResult(
+                chunk=AsrChunk(0, Path("/tmp/a.wav"), 0.0, 10.0),
+                payload={"success": True, "text": "第一段"},
+                endpoint="worker-1",
+                elapsed_seconds=1.0,
+                attempt=1,
+            ),
+            ChunkResult(
+                chunk=AsrChunk(1, Path("/tmp/b.wav"), 8.0, 10.0),
+                payload={"success": True, "text": "第二段"},
+                endpoint="worker-2",
+                elapsed_seconds=1.0,
+                attempt=1,
+            ),
+        ]
+
+        payload = asr_ray_workers.merge_asr_results(
+            "test",
+            results,
+            segmentation_mode="fixed",
+            audio_duration_seconds=15.0,
+            worker_count=2,
+        )
+
+        acceptance = payload["acceptance"]
+        self.assertTrue(payload["success"])
+        self.assertEqual(acceptance["status"], "needs_review")
+        self.assertEqual(acceptance["timestamp_source"], "chunk_bounds")
+        self.assertEqual(acceptance["chunk_coverage"]["coverage_ratio"], 1.0)
+
+    def test_fixed_chunks_with_empty_output_fail_acceptance(self):
+        results = [
+            ChunkResult(
+                chunk=AsrChunk(0, Path("/tmp/a.wav"), 0.0, 10.0),
+                payload={"success": True, "text": ""},
+                endpoint="worker-1",
+                elapsed_seconds=1.0,
+                attempt=1,
+            )
+        ]
+
+        payload = asr_ray_workers.merge_asr_results(
+            "test",
+            results,
+            segmentation_mode="fixed",
+            audio_duration_seconds=10.0,
+            worker_count=1,
+        )
+
+        self.assertFalse(payload["success"])
+        self.assertEqual(payload["acceptance"]["status"], "failed")
+        self.assertIn("empty_chunk_output", payload["acceptance"]["failure_reasons"])
+
+    def test_word_timestamps_are_preferred_over_chunk_bounds(self):
+        result = ChunkResult(
+            chunk=AsrChunk(0, Path("/tmp/a.wav"), 0.0, 10.0),
+            payload={
+                "success": True,
+                "text": "完整",
+                "segments": [
+                    {
+                        "start": 0.0,
+                        "end": 10.0,
+                        "text": "完整",
+                        "timestamp_source": "chunk_bounds",
+                    }
+                ],
+                "words": [{"start": 0.1, "end": 9.9, "text": "完整"}],
+            },
+            endpoint="worker-1",
+            elapsed_seconds=1.0,
+            attempt=1,
+        )
+
+        payload = asr_ray_workers.merge_asr_results(
+            "test",
+            [result],
+            segmentation_mode="fixed",
+            audio_duration_seconds=10.0,
+            worker_count=1,
+        )
+
+        self.assertEqual(payload["acceptance"]["timestamp_source"], "words")
+        self.assertEqual(payload["acceptance"]["status"], "passed")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -233,6 +233,22 @@ class ModelSettingsTests(unittest.TestCase):
         self.assertEqual(local_text["options"]["text_concurrency"], 5)
         self.assertIn("五张 P40", local_text["name"])
 
+    def test_settings_expose_tencent_hy_asr_cloud_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.make_repo(Path(tmp)).public_settings()
+
+        models = {item["id"]: item for item in settings["models"]}
+        tencent = models["asr-tencent-hy3-preview-cloud"]
+        self.assertEqual(tencent["protocol"], "tencent_hy_asr_ws")
+        self.assertEqual(
+            tencent["endpoints"],
+            ["wss://asr.cloud.tencent.com/asr/v2"],
+        )
+        self.assertEqual(
+            tencent["options"]["secret_key_env"],
+            "TENCENTCLOUD_SECRET_KEY",
+        )
+
     def test_amd_lmstudio_text_model_expands_to_runtime_profile(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

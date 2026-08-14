@@ -122,6 +122,7 @@ def transcribe():
                     "end": duration,
                     "text": text,
                     "confidence": result.get("confidence"),
+                    "timestamp_source": "chunk_bounds",
                 }
             ] if text else [],
             "words": words,

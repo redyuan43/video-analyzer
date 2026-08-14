@@ -19,6 +19,8 @@ except ImportError:  # pragma: no cover - service startup validates the runtime.
     ray = None
 
 RAY_RUNTIME_LOCK = threading.Lock()
+ASR_REVIEW_GAP_SECONDS = 5.0
+ASR_FAILURE_GAP_SECONDS = 20.0
 
 
 @dataclass(frozen=True)
@@ -476,8 +478,15 @@ def merge_asr_results(
     success = bool(text.strip())
     segments = _clamp_and_sort_timestamps(segments, audio_duration_seconds)
     words = _clamp_and_sort_timestamps(words, audio_duration_seconds)
+    acceptance = build_asr_acceptance(
+        results,
+        segments,
+        words,
+        audio_duration_seconds=audio_duration_seconds,
+        segmentation_mode=segmentation_mode,
+    )
     return {
-        "success": success,
+        "success": success and acceptance["status"] != "failed",
         **({"error": "no_transcript_text"} if not success else {}),
         "provider": provider,
         "text": text,
@@ -491,6 +500,7 @@ def merge_asr_results(
         "worker_count": worker_count,
         "chunk_count": len(results),
         "chunk_results": chunk_results,
+        "acceptance": acceptance,
         **metadata,
     }
 
@@ -527,6 +537,7 @@ def offset_segments(payload: dict[str, Any], start: float, duration: float) -> l
             item["start"] = round(float(item["start"]) + start, 3)
         if item.get("end") is not None:
             item["end"] = round(float(item["end"]) + start, 3)
+        item.setdefault("timestamp_source", "model")
         segments.append(item)
     if not segments and str(payload.get("text") or "").strip():
         segments.append(
@@ -534,9 +545,131 @@ def offset_segments(payload: dict[str, Any], start: float, duration: float) -> l
                 "start": round(start, 3),
                 "end": round(start + duration, 3),
                 "text": str(payload.get("text") or "").strip(),
+                "timestamp_source": "chunk_bounds",
             }
         )
     return segments
+
+
+def build_asr_acceptance(
+    results: list[ChunkResult],
+    segments: list[dict[str, Any]],
+    words: list[dict[str, Any]],
+    *,
+    audio_duration_seconds: float,
+    segmentation_mode: str,
+) -> dict[str, Any]:
+    """Report whether every planned ASR chunk produced usable evidence."""
+    chunk_coverage = interval_coverage(
+        [
+            (result.chunk.start, result.chunk.start + result.chunk.length)
+            for result in results
+        ],
+        audio_duration_seconds,
+    )
+    timestamp_items = words or segments
+    timestamp_coverage = interval_coverage(
+        [
+            (float(item.get("start") or 0), float(item.get("end") or 0))
+            for item in timestamp_items
+        ],
+        audio_duration_seconds,
+    )
+    empty_chunks = [
+        result.chunk.index
+        for result in results
+        if not str(result.payload.get("text") or "").strip()
+    ]
+    synthetic_segment_count = sum(
+        1
+        for item in timestamp_items
+        if str(item.get("timestamp_source") or "") == "chunk_bounds"
+    )
+    failure_reasons: list[str] = []
+    review_reasons: list[str] = []
+    if not results:
+        failure_reasons.append("no_chunks_completed")
+    if empty_chunks:
+        failure_reasons.append("empty_chunk_output")
+    if segmentation_mode == "fixed" and chunk_coverage["gap_count"]:
+        failure_reasons.append("fixed_chunk_coverage_incomplete")
+    if words:
+        timestamp_source = "words"
+    elif synthetic_segment_count:
+        timestamp_source = "chunk_bounds"
+    else:
+        timestamp_source = "model"
+    if timestamp_source == "chunk_bounds":
+        review_reasons.append("timestamps_inferred_from_chunk_bounds")
+    elif segmentation_mode == "fixed" and timestamp_coverage["max_gap_seconds"] > ASR_FAILURE_GAP_SECONDS:
+        failure_reasons.append("transcript_timestamp_gap_exceeds_limit")
+    elif timestamp_coverage["max_gap_seconds"] > ASR_REVIEW_GAP_SECONDS:
+        review_reasons.append("transcript_timestamp_gap_needs_review")
+
+    status = "failed" if failure_reasons else "needs_review" if review_reasons else "passed"
+    return {
+        "status": status,
+        "failure_reasons": failure_reasons,
+        "review_reasons": review_reasons,
+        "empty_chunk_count": len(empty_chunks),
+        "empty_chunk_indexes": empty_chunks,
+        "chunk_coverage": chunk_coverage,
+        "timestamp_coverage": timestamp_coverage,
+        "timestamp_source": timestamp_source,
+        "synthetic_segment_count": synthetic_segment_count,
+        "review_gap_seconds": ASR_REVIEW_GAP_SECONDS,
+        "failure_gap_seconds": ASR_FAILURE_GAP_SECONDS,
+    }
+
+
+def interval_coverage(
+    intervals: list[tuple[float, float]],
+    duration: float,
+) -> dict[str, Any]:
+    bounded: list[tuple[float, float]] = []
+    for start, end in intervals:
+        lower = max(0.0, min(float(start), duration))
+        upper = max(lower, min(float(end), duration))
+        if upper > lower:
+            bounded.append((lower, upper))
+    bounded.sort()
+
+    merged: list[list[float]] = []
+    for start, end in bounded:
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+
+    gaps: list[dict[str, float]] = []
+    cursor = 0.0
+    for start, end in merged:
+        if start > cursor:
+            gaps.append(
+                {
+                    "start": round(cursor, 3),
+                    "end": round(start, 3),
+                    "duration": round(start - cursor, 3),
+                }
+            )
+        cursor = max(cursor, end)
+    if duration > cursor:
+        gaps.append(
+            {
+                "start": round(cursor, 3),
+                "end": round(duration, 3),
+                "duration": round(duration - cursor, 3),
+            }
+        )
+
+    covered = sum(end - start for start, end in merged)
+    return {
+        "coverage_seconds": round(covered, 3),
+        "coverage_ratio": round(covered / duration, 6) if duration > 0 else 0.0,
+        "gap_count": len(gaps),
+        "max_gap_seconds": round(max((item["duration"] for item in gaps), default=0.0), 3),
+        "gaps": gaps,
+    }
 
 
 def offset_words(payload: dict[str, Any], start: float) -> list[dict[str, Any]]:
