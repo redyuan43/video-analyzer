@@ -35,6 +35,7 @@ MODEL_KIND_PROTOCOLS = {
         "firered_asr2_http",
         "firered_3dspeaker_http",
         "openai_audio",
+        "tencent_hy_asr_ws",
         "faster_whisper",
         "none",
     },
@@ -87,6 +88,12 @@ ASR_CHUNK_DEFAULTS = {
         "single_pass_max_duration_sec": 35,
         "chunk_duration_sec": 30,
         "chunk_overlap_sec": 3,
+    },
+    "tencent_hy_asr_ws": {
+        "segmentation_mode": "fixed",
+        "single_pass_max_duration_sec": 59,
+        "chunk_duration_sec": 30,
+        "chunk_overlap_sec": 0,
     },
 }
 
@@ -355,10 +362,16 @@ def stable_resource_id(kind: str, protocol: str, payload: dict[str, Any]) -> str
     return f"{kind}-{slug}-{digest}"[:64]
 
 
-def validate_url(value: str, field: str) -> str:
+def validate_url(
+    value: str,
+    field: str,
+    allowed_schemes: set[str] | None = None,
+) -> str:
     parsed = urlparse(value)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise SettingsValidationError(f"{field} must be an http(s) URL")
+    schemes = allowed_schemes or {"http", "https"}
+    if parsed.scheme not in schemes or not parsed.hostname:
+        expected = "/".join(sorted(schemes))
+        raise SettingsValidationError(f"{field} must be a {expected} URL")
     return value.rstrip("/")
 
 
@@ -383,7 +396,12 @@ def validate_model_resource(model_id: str, payload: dict[str, Any]) -> dict[str,
         cleaned["model"] = model[:240]
     endpoints = normalize_string_list(payload.get("endpoints") or payload.get("endpoint"))
     if endpoints:
-        cleaned["endpoints"] = [validate_url(item, "endpoint") for item in endpoints]
+        endpoint_schemes = (
+            {"wss"} if protocol == "tencent_hy_asr_ws" else {"http", "https"}
+        )
+        cleaned["endpoints"] = [
+            validate_url(item, "endpoint", endpoint_schemes) for item in endpoints
+        ]
     health_url = str(payload.get("health_url") or "").strip()
     if health_url:
         cleaned["health_url"] = validate_url(health_url, "health_url")
@@ -405,6 +423,7 @@ def validate_model_resource(model_id: str, payload: dict[str, Any]) -> dict[str,
         "firered_asr2_http",
         "firered_3dspeaker_http",
         "openai_audio",
+        "tencent_hy_asr_ws",
         "unlimited_ocr_openai",
         "dots_ocr_openai",
         "dots_mocr_openai",
@@ -531,6 +550,26 @@ def _add_builtin_model_resources(
                 "gpu_ids": [0, 1, 2, 4, 5],
                 "dispatch_mode": "ray",
                 **ASR_CHUNK_DEFAULTS["firered_asr2_http"],
+            },
+        },
+        "asr-tencent-hy3-preview-cloud": {
+            "name": "腾讯混元 Hy-ASR 3.0 Preview（云端）",
+            "kind": "asr",
+            "protocol": "tencent_hy_asr_ws",
+            "model": "Hy-ASR-3.0-preview",
+            "endpoints": ["wss://asr.cloud.tencent.com/asr/v2"],
+            "api_key_env": "TENCENTCLOUD_SECRET_KEY",
+            "options": {
+                "deployment": "cloud",
+                "app_id_env": "TENCENTCLOUD_APP_ID",
+                "secret_id_env": "TENCENTCLOUD_SECRET_ID",
+                "secret_key_env": "TENCENTCLOUD_SECRET_KEY",
+                "env_file": "~/.config/video-analyzer/tencentcloud.env",
+                "engine_model_type": "Hy-ASR-3.0-preview",
+                "parallel_chunks": 4,
+                "send_realtime_factor": 1.0,
+                "max_attempts": 2,
+                **ASR_CHUNK_DEFAULTS["tencent_hy_asr_ws"],
             },
         },
         "diarization-3dspeaker-local": {
@@ -791,6 +830,18 @@ def build_settings_document(config: dict[str, Any]) -> dict[str, Any]:
                     f"{profile_name} FireRed2",
                     endpoints=profile.get("firered_3dspeaker_url") or services.get("firered_3dspeaker_url"),
                 )
+            elif provider == "tencent_hy_asr":
+                resource = _resource(
+                    "asr",
+                    "tencent_hy_asr_ws",
+                    f"{profile_name} Tencent Hy-ASR",
+                    model=profile.get("tencent_hy_asr_model") or "Hy-ASR-3.0-preview",
+                    endpoints=profile.get("tencent_hy_asr_endpoint")
+                    or "wss://asr.cloud.tencent.com/asr/v2",
+                    api_key_env=profile.get("asr_api_key_env")
+                    or "TENCENTCLOUD_SECRET_KEY",
+                    options=profile.get("tencent_hy_asr_options") or {},
+                )
             elif provider == "faster_whisper":
                 resource = _resource("asr", "faster_whisper", "Local Faster Whisper")
             elif provider == "none":
@@ -1044,6 +1095,7 @@ def expand_runtime_profile(config: dict[str, Any], profile: dict[str, Any]) -> d
             "firered_asr2_http": "firered_asr2",
             "firered_3dspeaker_http": "firered_3dspeaker",
             "openai_audio": "openai_audio",
+            "tencent_hy_asr_ws": "tencent_hy_asr",
             "faster_whisper": "faster_whisper",
             "none": "none",
         }[protocol]
@@ -1067,6 +1119,11 @@ def expand_runtime_profile(config: dict[str, Any], profile: dict[str, Any]) -> d
         elif protocol == "openai_audio":
             expanded["openai_audio_url"] = endpoints[0] if endpoints else ""
             expanded["openai_audio_model"] = asr.get("model")
+            expanded["asr_api_key_env"] = asr.get("api_key_env")
+        elif protocol == "tencent_hy_asr_ws":
+            expanded["tencent_hy_asr_endpoint"] = endpoints[0] if endpoints else ""
+            expanded["tencent_hy_asr_model"] = asr.get("model")
+            expanded["tencent_hy_asr_options"] = options
             expanded["asr_api_key_env"] = asr.get("api_key_env")
 
     diarization = model_for("diarization")
@@ -1110,7 +1167,12 @@ def expand_runtime_profile(config: dict[str, Any], profile: dict[str, Any]) -> d
         fallback_asr
         and fallback_diarization
         and fallback_asr.get("protocol") != "none"
-        and fallback_diarization.get("protocol") == "asr_embedded"
+        and fallback_diarization.get("protocol") in {
+            "asr_embedded",
+            "three_d_speaker",
+            "pyannote_community",
+            "wespeaker_diarization",
+        }
     )
     expanded["audio_cloud_fallback"] = {
         "enabled": fallback_enabled,
@@ -1318,10 +1380,17 @@ def validate_profile(
         if (
             workflow_id == AUDIO_WORKFLOW_ID
             and slot == "diarization_fallback"
-            and resource.get("protocol") not in {"asr_embedded", "none"}
+            and resource.get("protocol")
+            not in {
+                "asr_embedded",
+                "three_d_speaker",
+                "pyannote_community",
+                "wespeaker_diarization",
+                "none",
+            }
         ):
             raise SettingsValidationError(
-                "diarization_fallback must use ASR embedded speakers or be disabled"
+                "diarization_fallback must use an available speaker model or be disabled"
             )
         if spec.get("required") and resource.get("protocol") == "none":
             raise SettingsValidationError(f"{slot} model cannot be disabled")
@@ -1341,6 +1410,7 @@ def validate_profile(
             "firered_asr2_http": {"fixed", "vad"},
             "qwen3_asr_http": {"fixed"},
             "vibevoice_http": {"native"},
+            "tencent_hy_asr_ws": {"fixed"},
         }.get(protocol)
         if allowed and segmentation not in allowed:
             raise SettingsValidationError(
@@ -1584,6 +1654,7 @@ class RuntimeSettingsStore:
                 "qwen3_asr_http": "qwen3_asr",
                 "firered_asr2_http": "firered_asr2",
                 "generic_http": "remote_http",
+                "tencent_hy_asr_ws": "tencent_hy_asr",
             }.get(protocol, protocol)
             if protocol == "vibevoice_http":
                 vibevoice["deep_remote_urls"] = endpoints
@@ -1596,6 +1667,12 @@ class RuntimeSettingsStore:
                 vibevoice["firered_asr2_options"] = options
             elif protocol == "generic_http":
                 vibevoice["remote_urls"] = endpoints
+            elif protocol == "tencent_hy_asr_ws":
+                vibevoice["tencent_hy_asr_endpoint"] = (
+                    endpoints[0] if endpoints else ""
+                )
+                vibevoice["tencent_hy_asr_model"] = item.get("model")
+                vibevoice["tencent_hy_asr_options"] = options
         elif kind == "ocr":
             ocr = runtime_config.setdefault("ocr", {})
             ocr["provider"] = {
@@ -1845,6 +1922,21 @@ class RuntimeSettingsStore:
             "faster_whisper",
         }:
             return {"ok": True, "status": "configured", "detail": "本地进程内能力，将在真实任务中加载"}
+        if protocol == "tencent_hy_asr_ws":
+            from .tencent_hy_asr import missing_tencent_credentials
+
+            missing = missing_tencent_credentials(dict(item.get("options") or {}))
+            if missing:
+                return {
+                    "ok": False,
+                    "status": "missing_credentials",
+                    "detail": "缺少环境变量 " + "、".join(missing),
+                }
+            return {
+                "ok": True,
+                "status": "configured",
+                "detail": "腾讯云鉴权配置完整，真实测试会产生 ASR 调用",
+            }
         target = _health_url_for(item)
         if not target:
             return {"ok": False, "status": "invalid", "detail": "未配置可探测端点"}
@@ -1918,7 +2010,10 @@ class RuntimeSettingsStore:
         if not endpoints:
             return {"ok": False, "status": "invalid", "detail": "未配置推理端点"}
         endpoint = endpoints[0]
-        if urlparse(endpoint).scheme not in {"http", "https"}:
+        allowed_schemes = (
+            {"wss"} if protocol == "tencent_hy_asr_ws" else {"http", "https"}
+        )
+        if urlparse(endpoint).scheme not in allowed_schemes:
             return {"ok": False, "status": "invalid", "detail": f"端点 URL 无效：{endpoint}"}
         headers, auth_error = _auth_headers(item)
         if auth_error:
@@ -1926,6 +2021,34 @@ class RuntimeSettingsStore:
         timeout = 900 if _is_local_url(endpoint) else 60
         session = _test_session(endpoint)
         try:
+            if protocol == "tencent_hy_asr_ws":
+                from .tencent_hy_asr import (
+                    missing_tencent_credentials,
+                    transcribe_with_tencent_hy_asr,
+                )
+
+                options = dict(item.get("options") or {})
+                missing = missing_tencent_credentials(options)
+                if missing:
+                    return {
+                        "ok": False,
+                        "status": "missing_credentials",
+                        "detail": "缺少环境变量 " + "、".join(missing),
+                    }
+                with tempfile.TemporaryDirectory(prefix="tencent-hy-asr-test-") as temp_dir:
+                    audio_path = Path(temp_dir) / "smoke.wav"
+                    audio_path.write_bytes(_tiny_wav_bytes())
+                    transcript = transcribe_with_tencent_hy_asr(
+                        audio_path,
+                        endpoint,
+                        {**options, "parallel_chunks": 1, "max_attempts": 1},
+                    )
+                return {
+                    "ok": True,
+                    "status": "passed",
+                    "detail": "腾讯 Hy-ASR 微型音频请求成功",
+                    "sample": transcript.text[:160],
+                }
             if protocol in {
                 "vibevoice_http",
                 "qwen3_asr_http",

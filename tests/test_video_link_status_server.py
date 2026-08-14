@@ -999,8 +999,15 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             stored["runtime_profile_snapshot"]["workflow_id"],
             "audio_nx1",
         )
-        self.assertFalse(
-            stored["runtime_profile_snapshot"]["audio_cloud_fallback"]["enabled"]
+        fallback = stored["runtime_profile_snapshot"]["audio_cloud_fallback"]
+        self.assertTrue(fallback["enabled"])
+        self.assertEqual(
+            fallback["asr"]["id"],
+            "asr-tencent-hy3-preview-cloud",
+        )
+        self.assertEqual(
+            fallback["diarization"]["id"],
+            "diarization-3dspeaker-local",
         )
 
     def test_failed_audio_diarization_blocks_unreached_flow_nodes(self):
@@ -1153,6 +1160,43 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(
             server_mod.job_stage_resource(routed, "analyze-core"),
             "audio-cloud-analysis",
+        )
+
+    def test_tencent_audio_fallback_waits_locally_until_credentials_exist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs")
+            job = {
+                "job_id": "b" * 32,
+                "audio_pipeline_kind": "audio_nx1",
+                "runtime_profile_snapshot": {
+                    "audio_cloud_fallback": {
+                        "enabled": True,
+                        "asr": {
+                            "protocol": "tencent_hy_asr_ws",
+                            "options": {},
+                        },
+                    }
+                },
+            }
+            with (
+                patch.object(
+                    server,
+                    "live_resource_users",
+                    return_value=[{"job_id": "busy"}],
+                ),
+                patch.object(server, "save_job"),
+                patch.object(
+                    server_mod,
+                    "missing_tencent_credentials",
+                    return_value=["TENCENTCLOUD_APP_ID"],
+                ),
+            ):
+                routed = server.select_audio_compute_route(job, "analyze-core")
+
+        self.assertEqual(routed["compute_route"], "local")
+        self.assertEqual(
+            routed["compute_route_reason"],
+            "cloud_fallback_credentials_missing",
         )
 
     def test_mobile_audio_legacy_analysis_alias_is_normalized_to_audio_nx1(self):

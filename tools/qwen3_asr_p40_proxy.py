@@ -7,6 +7,7 @@ import argparse
 import atexit
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -14,6 +15,10 @@ from pathlib import Path
 
 from flask import Flask, jsonify, request
 import requests
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from tools.asr_ray_workers import (
     audio_duration,
@@ -24,7 +29,6 @@ from tools.asr_ray_workers import (
 )
 
 app = Flask("qwen3_asr_p40")
-ROOT = Path(__file__).resolve().parents[1]
 CAPSWRITER_ROOT = Path(os.environ.get("QWEN3_ASR_ROOT", "/home/ai/CapsWriter-Offline-Windows-64bit-main"))
 WORKER_PYTHON = os.environ.get("QWEN3_ASR_PYTHON", "/home/ai/vllm-p40-nightly-test/bin/python")
 MODEL_PATH = os.environ.get(

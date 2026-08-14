@@ -18,6 +18,7 @@ except ModuleNotFoundError:
 
 from .audio_processor import AudioProcessor, AudioTranscript
 from .config import Config, normalize_string_list
+from .tencent_hy_asr import transcribe_with_tencent_hy_asr
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +166,14 @@ def transcribe_with_http_asr(
             payload = response.json()
             if not payload.get("success"):
                 logger.warning("HTTP ASR failed from %s: %s", url, payload)
+                return None
+            acceptance = payload.get("acceptance") or {}
+            if acceptance.get("status") == "failed":
+                logger.warning(
+                    "HTTP ASR rejected from %s by coverage acceptance: %s",
+                    url,
+                    acceptance,
+                )
                 return None
             return AudioTranscript(
                 text=payload.get("text", ""),
@@ -499,6 +508,19 @@ def transcribe_with_provider_result(
                     str(vibevoice_config.get("openai_audio_url") or ""),
                     str(vibevoice_config.get("openai_audio_model") or ""),
                     str(vibevoice_config.get("asr_api_key_env") or ""),
+                ),
+            )
+        elif candidate == "tencent_hy_asr":
+            transcript = _timed_transcribe(
+                result,
+                candidate,
+                lambda: transcribe_with_tencent_hy_asr(
+                    audio_path,
+                    str(
+                        vibevoice_config.get("tencent_hy_asr_endpoint")
+                        or "wss://asr.cloud.tencent.com/asr/v2"
+                    ),
+                    dict(vibevoice_config.get("tencent_hy_asr_options") or {}),
                 ),
             )
         elif candidate == "vibevoice":

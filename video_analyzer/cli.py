@@ -761,6 +761,7 @@ def main():
             "firered_asr2",
             "firered_3dspeaker",
             "openai_audio",
+            "tencent_hy_asr",
             "vibevoice",
             "faster_whisper",
             "none",

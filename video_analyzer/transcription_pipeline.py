@@ -74,12 +74,24 @@ if ray is not None:
         def diarize(
             self,
             audio_path: str,
+            config_payload: dict[str, Any],
             speaker_config: dict[str, Any],
         ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-            turns, report = prepare_speaker_assignment(
-                Path(audio_path),
-                speaker_config,
+            lock_context = (
+                contextlib.nullcontext()
+                if local_model_stage_needed("asr", config_payload)
+                else local_model_runtime_lock(
+                    config_payload,
+                    logging.getLogger("video_analyzer.ray.diarization"),
+                    f"speaker-diarization:{audio_path}",
+                    stage="diarization",
+                )
             )
+            with lock_context:
+                turns, report = prepare_speaker_assignment(
+                    Path(audio_path),
+                    speaker_config,
+                )
             report = dict(report or {})
             report["dispatch_mode"] = "ray_actor"
             if report.get("error"):
@@ -408,6 +420,7 @@ def run_parallel_transcription_branches(
             )
             diarization_ref = diarization_actor.diarize.remote(
                 str(audio_path),
+                config_payload,
                 speaker_config,
             )
             pending = {asr_ref: "asr", diarization_ref: "diarization"}
