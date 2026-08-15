@@ -60,6 +60,11 @@ def local_model_stage_needed(stage: str, config: dict) -> bool:
     if stage == "text":
         manual = config.get("operation_manual") or {}
         return is_loopback_endpoint(manual.get("text_base_url") or manual.get("llm_base_url"))
+    if stage == "tts":
+        tts = config.get("tts") or {}
+        return bool(tts.get("enabled", True)) and is_loopback_endpoint(
+            tts.get("base_url") or tts.get("endpoint")
+        )
     return False
 
 
@@ -298,6 +303,12 @@ def prepare_local_model_stage(stage: str, config: dict, logger: logging.Logger) 
         gpu_ids = manual.get("text_gpu_ids")
         if gpu_ids:
             env["BONSAI_LOCAL_GPU_IDS"] = ",".join(str(item) for item in gpu_ids)
+    elif stage == "tts":
+        tts = config.get("tts") or {}
+        endpoint = str(tts.get("base_url") or tts.get("endpoint") or "")
+        parsed = urlparse(endpoint)
+        if parsed.port:
+            env["INDEXTTS_PORT"] = str(parsed.port)
     timeout = int(runtime.get("stage_timeout_seconds") or 900)
     logger.info("Preparing local GPU model stage '%s' with %s", stage, " ".join(command_args))
     subprocess.run(command_args, cwd=REPO_ROOT, env=env, timeout=timeout, check=True)

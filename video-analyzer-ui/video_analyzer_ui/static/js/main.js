@@ -9,7 +9,8 @@ const stageNames = {
     'evidence-review': '证据复核/发布门禁',
     'qa-index': '问答证据索引',
     'image-prompts': '生成配图提示词',
-    'final-publish': '最终定稿/发布'
+    'final-publish': '最终定稿/发布',
+    'tts-narration': '长内容语音'
 };
 
 const consoleFlowTimerPlaceholder = '阶段耗时 00:00:00';
@@ -109,6 +110,15 @@ let profileFlowResizeObserver = null;
 let profileTestReport = null;
 let profileTestRunning = false;
 let modelTestRunning = false;
+let narrationPlayerKey = '';
+let narrationPlayerStarted = false;
+let narrationPanelInView = true;
+let narrationPanelObserver = null;
+let narrationTimeline = [];
+let narrationActiveSegmentIndex = -1;
+let narrationTimelineLoadKey = '';
+let narrationFollowSuspendedUntil = 0;
+const narrationTimelineCache = new Map();
 const skillProjectCandidateDrafts = new Map();
 let selectedSkillProjectLogStage = '';
 let skillProjectLogRequestId = 0;
@@ -217,6 +227,7 @@ const nodes = {
     profilePipelineMode: document.getElementById('profilePipelineMode'),
     profileVlConcurrency: document.getElementById('profileVlConcurrency'),
     profileOcrConcurrency: document.getElementById('profileOcrConcurrency'),
+    profileChapterConcurrency: document.getElementById('profileChapterConcurrency'),
     profileTextTimeout: document.getElementById('profileTextTimeout'),
     profileSettingsJson: document.getElementById('profileSettingsJson'),
     duplicateProfileButton: document.getElementById('duplicateProfileButton'),
@@ -297,6 +308,20 @@ const nodes = {
     consoleSummaryHeadline: document.getElementById('consoleSummaryHeadline'),
     consoleSummaryGrid: document.getElementById('consoleSummaryGrid'),
     consoleResultSummary: document.getElementById('consoleResultSummary'),
+    consoleNarrationPanel: document.getElementById('consoleNarrationPanel'),
+    consoleNarrationTitle: document.getElementById('consoleNarrationTitle'),
+    consoleNarrationSummary: document.getElementById('consoleNarrationSummary'),
+    consoleNarrationAudio: document.getElementById('consoleNarrationAudio'),
+    consoleNarrationDuration: document.getElementById('consoleNarrationDuration'),
+    consoleNarrationOpenLink: document.getElementById('consoleNarrationOpenLink'),
+    consoleNarrationTranscript: document.getElementById('consoleNarrationTranscript'),
+    narrationMiniPlayer: document.getElementById('narrationMiniPlayer'),
+    narrationMiniPlayPause: document.getElementById('narrationMiniPlayPause'),
+    narrationMiniStop: document.getElementById('narrationMiniStop'),
+    narrationMiniTitle: document.getElementById('narrationMiniTitle'),
+    narrationMiniSentence: document.getElementById('narrationMiniSentence'),
+    narrationMiniProgress: document.getElementById('narrationMiniProgress'),
+    narrationMiniTime: document.getElementById('narrationMiniTime'),
     coreDiagnosticsPanel: document.getElementById('coreDiagnosticsPanel'),
     coreDiagnosticsSummary: document.getElementById('coreDiagnosticsSummary'),
     coreDiagnosticsStatus: document.getElementById('coreDiagnosticsStatus'),
@@ -1133,7 +1158,8 @@ function profileAdvancedSettings(profile) {
         'review_base_url', 'review_model', 'review_api_key_env',
         'study_card_llm_base_url', 'study_card_model', 'study_card_api_key_env',
         'triage_llm_base_url', 'triage_model', 'triage_api_key_env',
-        'image_provider', 'image_model'
+        'image_provider', 'image_model',
+        'multidoc_chapter_concurrency'
     ]);
     return Object.fromEntries(Object.entries(profile || {}).filter(([key]) => !omitted.has(key)));
 }
@@ -1498,14 +1524,23 @@ function drawProfileFlowEdges() {
 }
 
 function profileFlowParameter(node) {
+    if (node.id === 'documents' || node.id === 'deep_report') {
+        return {
+            label: '章节并发上限',
+            target: nodes.profileChapterConcurrency,
+            type: 'number',
+            min: '1',
+            max: '10'
+        };
+    }
     if (node.model_kind === 'ocr') {
-        return { label: 'OCR 并发', target: nodes.profileOcrConcurrency, type: 'text', min: '' };
+        return { label: 'OCR 并发', target: nodes.profileOcrConcurrency, type: 'text', min: '', max: '' };
     }
     if (node.model_kind === 'vision') {
-        return { label: 'VL 并发', target: nodes.profileVlConcurrency, type: 'number', min: '1' };
+        return { label: 'VL 并发', target: nodes.profileVlConcurrency, type: 'number', min: '1', max: '32' };
     }
     if (node.model_kind === 'text' && node.model_slot !== 'text_fallback') {
-        return { label: '文本超时秒数', target: nodes.profileTextTimeout, type: 'number', min: '1' };
+        return { label: '文本超时秒数', target: nodes.profileTextTimeout, type: 'number', min: '1', max: '' };
     }
     return null;
 }
@@ -1538,6 +1573,21 @@ function renderProfileFlowInspector(nodeId = selectedProfileFlowNodeId) {
     )
         ? asrChunkEditorMarkup(model)
         : '';
+    const ttsPreviewEditor = (
+        flowNode.model_kind === 'tts'
+        && !profileFlowDisabled(model)
+    ) ? `<section class="tts-preview-panel">
+        <div>
+            <strong>TTS 试听</strong>
+            <span>输入短文本，调用当前 profile 选择的语音模型。</span>
+        </div>
+        <textarea data-tts-preview-text rows="3" maxlength="500">这是视频分析最终总结的语音试听。</textarea>
+        <div class="tts-preview-actions">
+            <button class="secondary" type="button" data-tts-preview-generate>生成试听</button>
+            <span data-tts-preview-status></span>
+        </div>
+        <audio controls preload="metadata" data-tts-preview-audio hidden></audio>
+    </section>` : '';
     nodes.profileFlowInspectorBody.innerHTML = `
         <dl class="profile-flow-details">
             <div><dt>当前模型</dt><dd>${escapeHtml(model?.name || '未选择')}</dd></div>
@@ -1550,9 +1600,10 @@ function renderProfileFlowInspector(nodeId = selectedProfileFlowNodeId) {
         </dl>
         ${parameter ? `<label class="profile-flow-parameter">
             <span>${escapeHtml(parameter.label)}</span>
-            <input data-flow-parameter="${escapeHtml(flowNode.id)}" type="${parameter.type}" min="${parameter.min}" value="${escapeHtml(parameter.target.value)}">
+            <input data-flow-parameter="${escapeHtml(flowNode.id)}" type="${parameter.type}" min="${parameter.min}" max="${parameter.max}" value="${escapeHtml(parameter.target.value)}">
         </label>` : ''}
         ${asrChunkEditor}
+        ${ttsPreviewEditor}
         ${profileFlowDisabled(model) ? '<p class="profile-flow-warning">此节点已禁用，运行时会跳过对应的模型能力。</p>' : ''}
         ${testResult ? `<p class="profile-flow-node-result ${testResult.ok ? 'passed' : 'failed'}">
             ${escapeHtml(profileTestStatusLabel(testResult))}：${escapeHtml(testResult.detail || '')}
@@ -1567,6 +1618,41 @@ function renderProfileFlowInspector(nodeId = selectedProfileFlowNodeId) {
         parameter.target.value = event.target.value;
     });
     bindAsrChunkEditor(model);
+    nodes.profileFlowInspectorBody.querySelector('[data-tts-preview-generate]')?.addEventListener('click', async event => {
+        const button = event.currentTarget;
+        const panel = button.closest('.tts-preview-panel');
+        const textNode = panel.querySelector('[data-tts-preview-text]');
+        const statusNode = panel.querySelector('[data-tts-preview-status]');
+        const audioNode = panel.querySelector('[data-tts-preview-audio]');
+        const text = textNode.value.trim();
+        if (!text) {
+            statusNode.textContent = '请输入试听文本';
+            return;
+        }
+        button.disabled = true;
+        statusNode.textContent = '正在切换模型并生成试听...';
+        audioNode.hidden = true;
+        try {
+            const response = await fetch(`/api/settings/models/${encodeURIComponent(model.id)}/tts-preview`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text })
+            });
+            if (!response.ok) {
+                const payload = await response.json().catch(() => ({}));
+                throw new Error(payload.error || `HTTP ${response.status}`);
+            }
+            if (audioNode.src.startsWith('blob:')) URL.revokeObjectURL(audioNode.src);
+            audioNode.src = URL.createObjectURL(await response.blob());
+            audioNode.hidden = false;
+            audioNode.load();
+            statusNode.textContent = `已生成 ${text.length} 字试听`;
+        } catch (error) {
+            statusNode.textContent = error.message;
+        } finally {
+            button.disabled = false;
+        }
+    });
     nodes.profileFlowInspectorActions.querySelector('[data-flow-edit]')?.addEventListener('click', () => {
         if (!model) return;
         setSettingsSection('models');
@@ -1718,6 +1804,7 @@ function resetProfileEditor(source = null) {
     nodes.profilePipelineMode.value = source?.pipeline_mode || 'balanced';
     nodes.profileVlConcurrency.value = source?.vl_concurrency ?? 5;
     nodes.profileOcrConcurrency.value = source?.ocr_concurrency ?? 'auto';
+    nodes.profileChapterConcurrency.value = source?.multidoc_chapter_concurrency ?? 10;
     nodes.profileTextTimeout.value = source?.text_timeout_seconds ?? 600;
     nodes.profileSettingsJson.value = JSON.stringify(source ? profileAdvancedSettings(source) : {}, null, 2);
     nodes.profileEditorTitle.textContent = source ? '复制运行方案' : '新增运行方案';
@@ -1751,6 +1838,7 @@ function selectSettingsProfile(profileName) {
     nodes.profilePipelineMode.value = profile.pipeline_mode || 'balanced';
     nodes.profileVlConcurrency.value = profile.vl_concurrency ?? 5;
     nodes.profileOcrConcurrency.value = profile.ocr_concurrency ?? 'auto';
+    nodes.profileChapterConcurrency.value = profile.multidoc_chapter_concurrency ?? 10;
     nodes.profileTextTimeout.value = profile.text_timeout_seconds ?? 600;
     nodes.profileSettingsJson.value = JSON.stringify(profileAdvancedSettings(profile), null, 2);
     nodes.profileEditorTitle.textContent = profile.label || profile.name;
@@ -1771,6 +1859,7 @@ async function saveProfileSettings(event) {
     settings.pipeline_mode = nodes.profilePipelineMode.value;
     settings.vl_concurrency = Number(nodes.profileVlConcurrency.value || 1);
     settings.ocr_concurrency = nodes.profileOcrConcurrency.value.trim() || 'auto';
+    settings.multidoc_chapter_concurrency = Number(nodes.profileChapterConcurrency.value || 1);
     settings.text_timeout_seconds = Number(nodes.profileTextTimeout.value || 600);
     settings.asr_chunk_mode = profileAsrChunkSettings.mode;
     settings.asr_segmentation_mode = profileAsrChunkSettings.segmentationMode;
@@ -2272,6 +2361,7 @@ function renderEmpty() {
     nodes.selectedSubtitle.textContent = '创建或选择一个任务后查看进度。';
     nodes.stageDurationSummary.textContent = '原视频长度：- · 阶段总耗时：-';
     renderConsoleEmptyState('选择任务后显示执行流程');
+    renderConsoleNarration(null);
     renderQaPanel(null);
 }
 
@@ -2297,6 +2387,7 @@ function renderServiceOffline(error) {
     nodes.progressText.textContent = '0/0 · 0%';
     nodes.progressBar.style.width = '0%';
     renderConsoleEmptyState('服务恢复连接后显示执行流程');
+    renderConsoleNarration(null);
     renderQaPanel(null);
 }
 
@@ -2418,6 +2509,7 @@ function renderJob(job) {
     renderStages(job, stageProgress);
     renderStageProgress(stageProgress);
     renderConsoleSummary(job);
+    renderConsoleNarration(job);
     renderCoreDiagnostics(job.core_diagnostics);
     renderArtifacts(job.summary || {});
     renderConsoleSkillPanel(job);
@@ -3031,6 +3123,252 @@ function renderConsoleSummary(job) {
     nodes.consoleResultSummary.innerHTML = results.length
         ? results.map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join('')
         : '<div class="console-result-empty">处理量与产物统计将在核心分析写出结果后显示。</div>';
+}
+
+function narrationAudioDocument(job) {
+    return previewableDocs(job).find(doc => (
+        doc.kind === 'audio'
+        && doc.path === 'audio_narration/audio_output/narration_full.wav'
+    )) || previewableDocs(job).find(doc => doc.kind === 'audio') || null;
+}
+
+function narrationTimeLabel(seconds) {
+    return formatTimestampFromSeconds(Number.isFinite(seconds) ? seconds : 0) || '0:00';
+}
+
+function narrationTimelinePath(job) {
+    return job?.result_resources?.narration_timeline
+        || 'audio_narration/narration_timeline.json';
+}
+
+function narrationSegmentAt(segments, seconds) {
+    let low = 0;
+    let high = segments.length - 1;
+    while (low <= high) {
+        const middle = Math.floor((low + high) / 2);
+        const segment = segments[middle];
+        if (seconds < Number(segment.start_seconds)) {
+            high = middle - 1;
+        } else if (seconds >= Number(segment.end_seconds)) {
+            low = middle + 1;
+        } else {
+            return middle;
+        }
+    }
+    return Math.max(0, Math.min(segments.length - 1, high));
+}
+
+function narrationTimelineMarkup(segments) {
+    return segments.map(segment => `<button
+        class="narration-transcript-line"
+        type="button"
+        data-narration-segment="${escapeHtml(String(segment.index))}"
+        data-start-seconds="${escapeHtml(String(segment.start_seconds))}"
+    ><time>${escapeHtml(narrationTimeLabel(Number(segment.start_seconds)))}</time><span>${escapeHtml(segment.text || '')}</span></button>`).join('');
+}
+
+function renderNarrationTimeline(container, segments, audio) {
+    if (!container) return;
+    if (!segments.length) {
+        container.innerHTML = '<div class="narration-transcript-empty">暂无同步文字时间轴</div>';
+        return;
+    }
+    container.innerHTML = narrationTimelineMarkup(segments);
+    container.querySelectorAll('[data-narration-segment]').forEach(line => {
+        line.addEventListener('click', () => {
+            const start = Number(line.dataset.startSeconds || 0);
+            if (Number.isFinite(start)) audio.currentTime = start;
+        });
+    });
+}
+
+function syncNarrationTimeline(container, segments, seconds, autoFollow = true) {
+    if (!container || !segments.length) return -1;
+    const activeIndex = narrationSegmentAt(segments, seconds);
+    container.querySelectorAll('[data-narration-segment]').forEach((line, index) => {
+        const active = index === activeIndex;
+        line.classList.toggle('active', active);
+        line.classList.toggle('spoken', index < activeIndex);
+        if (active) line.setAttribute('aria-current', 'true');
+        else line.removeAttribute('aria-current');
+    });
+    const activeLine = container.querySelector(`[data-narration-segment="${activeIndex}"]`);
+    if (activeLine && autoFollow) {
+        activeLine.scrollIntoView({
+            block: 'center',
+            behavior: window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'
+        });
+    }
+    return activeIndex;
+}
+
+async function loadNarrationTimeline(job, key) {
+    if (!job?.job_id || !nodes.consoleNarrationTranscript) return;
+    const path = narrationTimelinePath(job);
+    const cacheKey = `${job.job_id}|${path}`;
+    narrationTimelineLoadKey = key;
+    try {
+        let payload = narrationTimelineCache.get(cacheKey);
+        if (!payload) {
+            const response = await fetch(resourcePathUrl(job.job_id, path));
+            if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+            payload = await response.json();
+            narrationTimelineCache.set(cacheKey, payload);
+        }
+        if (narrationTimelineLoadKey !== key || narrationPlayerKey !== key) return;
+        narrationTimeline = Array.isArray(payload?.segments) ? payload.segments : [];
+        narrationActiveSegmentIndex = -1;
+        renderNarrationTimeline(
+            nodes.consoleNarrationTranscript,
+            narrationTimeline,
+            nodes.consoleNarrationAudio
+        );
+        updateNarrationMiniPlayer();
+    } catch (_error) {
+        if (narrationTimelineLoadKey !== key) return;
+        narrationTimeline = [];
+        narrationActiveSegmentIndex = -1;
+        renderNarrationTimeline(
+            nodes.consoleNarrationTranscript,
+            narrationTimeline,
+            nodes.consoleNarrationAudio
+        );
+    }
+}
+
+function updateNarrationMiniPlayer() {
+    const audio = nodes.consoleNarrationAudio;
+    if (!audio) return;
+    const duration = Number.isFinite(audio.duration) ? audio.duration : 0;
+    const current = Number.isFinite(audio.currentTime) ? audio.currentTime : 0;
+    nodes.narrationMiniProgress.value = duration > 0 ? String(Math.round((current / duration) * 1000)) : '0';
+    nodes.narrationMiniTime.textContent = `${narrationTimeLabel(current)} / ${narrationTimeLabel(duration)}`;
+    const playPauseButton = nodes.narrationMiniPlayPause;
+    if (playPauseButton) {
+        const action = audio.paused ? '播放' : '暂停';
+        playPauseButton.textContent = audio.paused ? '▶' : '❚❚';
+        playPauseButton.title = action;
+        playPauseButton.setAttribute('aria-label', action);
+    }
+    const activeIndex = narrationTimeline.length
+        ? narrationSegmentAt(narrationTimeline, current)
+        : -1;
+    if (activeIndex !== narrationActiveSegmentIndex) {
+        narrationActiveSegmentIndex = activeIndex;
+        const segment = narrationTimeline[activeIndex];
+        if (nodes.narrationMiniSentence) {
+            nodes.narrationMiniSentence.textContent = segment?.text || '';
+        }
+        syncNarrationTimeline(
+            nodes.consoleNarrationTranscript,
+            narrationTimeline,
+            current,
+            Date.now() >= narrationFollowSuspendedUntil
+        );
+    }
+    nodes.narrationMiniPlayer.hidden = !(
+        narrationPlayerStarted
+        && narrationPlayerKey
+        && !narrationPanelInView
+        && !audio.ended
+    );
+}
+
+function resetNarrationPlayer() {
+    const audio = nodes.consoleNarrationAudio;
+    if (audio) {
+        audio.pause();
+        audio.removeAttribute('src');
+        audio.load();
+    }
+    narrationPlayerKey = '';
+    narrationPlayerStarted = false;
+    narrationTimeline = [];
+    narrationActiveSegmentIndex = -1;
+    narrationTimelineLoadKey = '';
+    if (nodes.consoleNarrationTranscript) nodes.consoleNarrationTranscript.innerHTML = '';
+    if (nodes.narrationMiniSentence) nodes.narrationMiniSentence.textContent = '';
+    nodes.narrationMiniPlayer.hidden = true;
+    nodes.consoleNarrationPanel.hidden = true;
+}
+
+function renderConsoleNarration(job) {
+    if (!nodes.consoleNarrationPanel || !nodes.consoleNarrationAudio) return;
+    const doc = job ? narrationAudioDocument(job) : null;
+    if (!job || !doc) {
+        resetNarrationPlayer();
+        return;
+    }
+    const url = docPreviewUrl(job, doc);
+    const key = `${job.job_id}|${doc.path}|${doc.updated_at || ''}|${doc.size_bytes || ''}`;
+    nodes.consoleNarrationPanel.hidden = false;
+    nodes.consoleNarrationTitle.textContent = doc.title || '播放最终总结';
+    nodes.consoleNarrationSummary.textContent = doc.description || '最终文档的完整语音版本';
+    nodes.consoleNarrationOpenLink.href = url;
+    nodes.narrationMiniTitle.textContent = `${jobDisplayTitle(job)} · 完整语音讲解`;
+    if (narrationPlayerKey === key) {
+        updateNarrationMiniPlayer();
+        return;
+    }
+    nodes.consoleNarrationAudio.pause();
+    nodes.consoleNarrationAudio.src = url;
+    nodes.consoleNarrationAudio.load();
+    nodes.consoleNarrationDuration.textContent = docMetaText(doc) || '正在读取音频时长';
+    narrationPlayerKey = key;
+    narrationPlayerStarted = false;
+    narrationTimeline = [];
+    narrationActiveSegmentIndex = -1;
+    nodes.consoleNarrationTranscript.innerHTML = '<div class="narration-transcript-empty">正在加载同步文字...</div>';
+    nodes.narrationMiniPlayer.hidden = true;
+    loadNarrationTimeline(job, key);
+}
+
+function bindNarrationPlayer() {
+    const audio = nodes.consoleNarrationAudio;
+    if (!audio) return;
+    audio.addEventListener('loadedmetadata', () => {
+        const sizeText = narrationAudioDocument(currentJob);
+        const meta = sizeText ? docMetaText(sizeText) : '';
+        nodes.consoleNarrationDuration.textContent = [
+            `时长 ${narrationTimeLabel(audio.duration)}`,
+            meta
+        ].filter(Boolean).join(' · ');
+        updateNarrationMiniPlayer();
+    });
+    audio.addEventListener('play', () => {
+        narrationPlayerStarted = true;
+        updateNarrationMiniPlayer();
+    });
+    audio.addEventListener('pause', updateNarrationMiniPlayer);
+    audio.addEventListener('timeupdate', updateNarrationMiniPlayer);
+    audio.addEventListener('ended', updateNarrationMiniPlayer);
+    nodes.consoleNarrationTranscript?.addEventListener('wheel', () => {
+        narrationFollowSuspendedUntil = Date.now() + 5000;
+    }, { passive: true });
+    nodes.consoleNarrationTranscript?.addEventListener('touchstart', () => {
+        narrationFollowSuspendedUntil = Date.now() + 5000;
+    }, { passive: true });
+    nodes.narrationMiniPlayPause?.addEventListener('click', () => {
+        if (audio.paused) audio.play().catch(() => {});
+        else audio.pause();
+    });
+    nodes.narrationMiniProgress?.addEventListener('input', event => {
+        if (!Number.isFinite(audio.duration) || audio.duration <= 0) return;
+        audio.currentTime = (Number(event.target.value || 0) / 1000) * audio.duration;
+    });
+    nodes.narrationMiniStop?.addEventListener('click', () => {
+        audio.pause();
+        audio.currentTime = 0;
+        narrationPlayerStarted = false;
+        updateNarrationMiniPlayer();
+    });
+    if (window.IntersectionObserver) {
+        narrationPanelObserver = new IntersectionObserver(entries => {
+            narrationPanelInView = Boolean(entries[0]?.isIntersecting);
+            updateNarrationMiniPlayer();
+        }, { threshold: 0.2 });
+        narrationPanelObserver.observe(nodes.consoleNarrationPanel);
+    }
 }
 
 function renderConsoleEmptyState(message) {
@@ -5559,6 +5897,7 @@ function formatBytes(value) {
 
 function docKindFromPath(path) {
     const value = String(path || '').toLowerCase();
+    if (/\.(wav|mp3|flac|m4a|aac|ogg|opus)$/.test(value)) return 'audio';
     if (value.endsWith('.pdf')) return 'pdf';
     if (value.endsWith('.html') || value.endsWith('.htm')) return 'html';
     if (value.endsWith('.json')) return 'json';
@@ -5655,6 +5994,7 @@ function docGroupDefinitions(docs) {
 }
 
 function docTypeLabel(doc) {
+    if (doc.kind === 'audio') return '音频';
     if (doc.kind === 'mindmap') return '图';
     if (doc.kind === 'directory') return '目录';
     if (doc.kind === 'pdf') return 'PDF';
@@ -6004,6 +6344,38 @@ async function loadDocPreview(job, path) {
     if (path.toLowerCase().endsWith('.html') || path.toLowerCase().endsWith('.htm')) {
         nodes.docPreviewBody.className = 'doc-preview-body pdf';
         nodes.docPreviewBody.innerHTML = `<iframe title="${escapeHtml(path)}" src="${escapeHtml(url)}"></iframe>`;
+        loadedDocPreviewKey = previewKey;
+        return;
+    }
+    if (doc.kind === 'audio') {
+        nodes.docPreviewBody.className = 'doc-preview-body audio';
+        nodes.docPreviewBody.innerHTML = `<section class="narration-player">
+            <div>
+                <strong>${escapeHtml(doc.title || '长内容音频讲解')}</strong>
+                <p>${escapeHtml(doc.description || '最终总结的完整语音版本')}</p>
+            </div>
+            <audio controls preload="metadata" src="${escapeHtml(url)}" data-doc-narration-audio></audio>
+            <div class="narration-transcript compact" data-doc-narration-transcript>
+                <div class="narration-transcript-empty">正在加载同步文字...</div>
+            </div>
+        </section>`;
+        const audio = nodes.docPreviewBody.querySelector('[data-doc-narration-audio]');
+        const transcript = nodes.docPreviewBody.querySelector('[data-doc-narration-transcript]');
+        const timelinePath = narrationTimelinePath(job);
+        fetch(resourcePathUrl(job.job_id, timelinePath))
+            .then(response => {
+                if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+                return response.json();
+            })
+            .then(payload => {
+                if (selectedDocPath !== path) return;
+                const segments = Array.isArray(payload?.segments) ? payload.segments : [];
+                renderNarrationTimeline(transcript, segments, audio);
+                audio.addEventListener('timeupdate', () => {
+                    syncNarrationTimeline(transcript, segments, audio.currentTime, true);
+                });
+            })
+            .catch(() => renderNarrationTimeline(transcript, [], audio));
         loadedDocPreviewKey = previewKey;
         return;
     }
@@ -7277,6 +7649,7 @@ async function runSelectedJob() {
 
 async function boot() {
     ensureSkillActivityNodes();
+    bindNarrationPlayer();
     nodes.consoleTab.addEventListener('click', () => setView('console'));
     nodes.qaTab.addEventListener('click', () => setView('qa'));
     nodes.vscodeTab.addEventListener('click', () => setView('vscode'));

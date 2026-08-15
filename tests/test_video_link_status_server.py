@@ -2142,10 +2142,124 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertIn("--skip-send", command)
         self.assertIn("--skip-pdf", command)
         self.assertIn("--jobs", command)
-        self.assertEqual(command[command.index("--jobs") + 1], "3")
+        self.assertEqual(command[command.index("--jobs") + 1], "10")
         self.assertIn("--profile", command)
         self.assertEqual(command[command.index("--profile") + 1], "deepseek_v4_flash")
         self.assertIn("--skip-images", command)
+
+    def test_chapter_concurrency_is_shared_across_document_commands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
+            loaded["run_dir"] = str(run_dir)
+
+            multidoc = server.multidoc_command(loaded)
+            deep_v2 = server.deep_v2_command(loaded)
+            exported = server.export_command(loaded)
+            published = server.final_publish_command(loaded)
+
+        for command in (multidoc, deep_v2):
+            self.assertEqual(
+                command[command.index("--chapter-concurrency") + 1],
+                "10",
+            )
+        for command in (exported, published):
+            self.assertEqual(command[command.index("--jobs") + 1], "10")
+
+    def test_chapter_concurrency_is_clamped_for_legacy_runtime_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            with patch.object(
+                server_mod,
+                "runtime_config",
+                return_value={
+                    "runtime_profiles": {
+                        "deepseek_v4_flash": {
+                            "multidoc_chapter_concurrency": 99,
+                        }
+                    }
+                },
+            ):
+                concurrency = server.chapter_concurrency(loaded)
+
+        self.assertEqual(concurrency, 10)
+
+    def test_audio_narration_command_uses_runtime_profile_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            loaded["run_dir"] = str(run_dir)
+            loaded["runtime_profile_snapshot"] = {
+                "profile": "local_six_gpu",
+                "config_dir": "/tmp/video-analyzer-config",
+                "models": {"tts": "/home/ai/github/indextts-2.5"},
+            }
+
+            command = server.audio_narration_command(loaded)
+
+        self.assertTrue(server.tts_narration_enabled(loaded))
+        self.assertEqual(command[0], "tools/run_audio_narration_stage.sh")
+        self.assertEqual(command[1], str(run_dir))
+        self.assertEqual(command[command.index("--profile") + 1], "local_six_gpu")
+        self.assertEqual(command[command.index("--config") + 1], "/tmp/video-analyzer-config")
+        wrapper = (REPO_ROOT / "tools" / "run_audio_narration_stage.sh").read_text(encoding="utf-8")
+        self.assertIn("--stage tts", wrapper)
+        self.assertIn("--prepare-only", wrapper)
+
+    def test_tts_narration_stage_records_all_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "run"
+            audio_dir = run_dir / "audio_narration"
+            output_dir = audio_dir / "audio_output"
+            output_dir.mkdir(parents=True)
+            (audio_dir / "narration_script.md").write_text("# Audio narration\n" + "content " * 10, encoding="utf-8")
+            (audio_dir / "narration_script.txt").write_text("content " * 10, encoding="utf-8")
+            (audio_dir / "narration_metadata.json").write_text(
+                json.dumps({"duration_seconds": 1.0, "model": "indextts"}) + " " * 30,
+                encoding="utf-8",
+            )
+            (audio_dir / "narration_timeline.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "segment_count": 1,
+                        "segments": [
+                            {
+                                "index": 0,
+                                "text": "content",
+                                "start_seconds": 0.0,
+                                "end_seconds": 1.0,
+                                "duration_seconds": 1.0,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (output_dir / "narration_full.wav").write_bytes(b"RIFF" + b"\0" * 64)
+            loaded["run_dir"] = str(run_dir)
+
+            with patch.object(server, "run_command_stage", return_value={"artifacts": {}}):
+                result = server.stage_tts_narration(loaded, "/tmp/tts.log", {})
+
+        self.assertEqual(
+            result["artifacts"]["narration_audio"],
+            str(output_dir / "narration_full.wav"),
+        )
+        self.assertEqual(result["artifacts"]["narration_metadata"], str(audio_dir / "narration_metadata.json"))
+        self.assertEqual(result["artifacts"]["narration_timeline"], str(audio_dir / "narration_timeline.json"))
 
     def test_final_publish_stage_reports_quality_failed_manual(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2415,6 +2529,10 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             (run_dir / "docs_analysis_chapters").mkdir(parents=True)
             (run_dir / "manual_assets").mkdir()
             (run_dir / "orin").mkdir()
+            (run_dir / "audio_narration" / "audio_output").mkdir(parents=True)
+            (run_dir / "audio_narration" / "audio_output" / "narration_full.wav").write_bytes(
+                b"RIFF" + b"\0" * 64
+            )
             (run_dir / "operation_manual.md").write_text("# Manual\n", encoding="utf-8")
             (run_dir / "docs_analysis_chapters" / "knowledge_notes_v2.md").write_text("# Notes\n", encoding="utf-8")
             (run_dir / "docs_analysis_chapters" / "deep_report_v2.md").write_text("# Report\n", encoding="utf-8")
@@ -2431,6 +2549,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             preview = public["document_preview"]
 
         self.assertEqual([item["path"] for item in preview["primary"]], [
+            "audio_narration/audio_output/narration_full.wav",
             "operation_manual.md",
             "docs_analysis_chapters/knowledge_notes_v2.md",
             "docs_analysis_chapters/deep_report_v2.md",
@@ -2441,7 +2560,8 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertIn("manual_assets", [item["path"] for item in preview["assets"]])
         self.assertIn("flowchart LR", preview["derivation"]["mermaid"])
         self.assertIn("操作手册", [node["title"] for node in preview["derivation"]["nodes"]])
-        self.assertTrue(preview["primary"][0]["url"].endswith("/resources/operation_manual.md"))
+        self.assertEqual(preview["primary"][0]["mime_type"], "audio/x-wav")
+        self.assertTrue(preview["primary"][0]["url"].endswith("/resources/audio_narration/audio_output/narration_full.wav"))
 
     def test_resource_file_serves_only_run_dir_relative_files(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5118,6 +5238,26 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(by_id["export"]["status"], "succeeded")
         self.assertEqual(by_id["verify"]["status"], "succeeded")
         self.assertEqual(by_id["send"]["status"], "succeeded")
+
+    def test_tts_narration_progress_parses_script_synthesis_and_verification(self):
+        text = "\n".join(
+            [
+                "[audio-narration] source: /tmp/run/operation_manual.md",
+                "[audio-narration] narration_script.md",
+                "[audio-narration] rendering with voice=check_boards_sweet",
+                "[audio-narration] narration_full.wav",
+                "[audio-narration] duration_seconds=45.2",
+                "[audio-narration] narration_metadata.json",
+            ]
+        )
+
+        progress = server_mod.parse_stage_progress("tts-narration", text, "succeeded")
+
+        by_id = {step["id"]: step for step in progress["steps"]}
+        self.assertEqual(by_id["script"]["status"], "succeeded")
+        self.assertEqual(by_id["switch"]["status"], "succeeded")
+        self.assertEqual(by_id["synthesize"]["status"], "succeeded")
+        self.assertEqual(by_id["verify"]["status"], "succeeded")
 
     def test_verify_progress_uses_synthetic_signals_when_stage_has_no_log(self):
         with tempfile.TemporaryDirectory() as tmp:

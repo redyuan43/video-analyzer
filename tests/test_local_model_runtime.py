@@ -31,24 +31,33 @@ class LocalModelRuntimeTests(unittest.TestCase):
                 "vision_base_url": "http://127.0.0.1:18082/v1",
                 "text_base_url": "http://127.0.0.1:18081/v1",
             },
+            "tts": {"enabled": True, "base_url": "http://127.0.0.1:8092"},
         }
 
         self.assertTrue(local_model_stage_needed("asr", config))
         self.assertTrue(local_model_stage_needed("ocr", config))
         self.assertTrue(local_model_stage_needed("vl", config))
         self.assertTrue(local_model_stage_needed("text", config))
+        self.assertTrue(local_model_stage_needed("tts", config))
 
     def test_remote_endpoints_do_not_run_local_stage_switch(self):
         config = {
             "asr": {"vibevoice": {"deep_remote_urls": ["http://edge.taild500c8.ts.net:8012/api/asr/transcribe"]}},
             "ocr": {"base_urls": ["http://spark-31d6.taild500c8.ts.net:8000/v1"]},
             "operation_manual": {"vision_base_url": "http://100.96.79.21:18082/v1"},
+            "tts": {"enabled": True, "base_url": "http://ivan.tailnet:8092"},
         }
 
         self.assertFalse(local_model_stage_needed("asr", config))
         self.assertFalse(local_model_stage_needed("ocr", config))
         self.assertFalse(local_model_stage_needed("vl", config))
         self.assertFalse(local_model_stage_needed("text", config))
+        self.assertFalse(local_model_stage_needed("tts", config))
+
+    def test_disabled_tts_does_not_run_local_stage_switch(self):
+        config = {"tts": {"enabled": False, "base_url": "http://127.0.0.1:8092"}}
+
+        self.assertFalse(local_model_stage_needed("tts", config))
 
     @patch("video_analyzer.local_model_runtime.subprocess.run")
     def test_local_model_stage_unloads_on_exit_when_enabled(self, run):

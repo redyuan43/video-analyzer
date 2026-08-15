@@ -53,6 +53,24 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertTrue(changed["source_stale"])
         self.assertIn("video_analyzer/sample_runtime.py", changed["stale_files"])
 
+    def test_runtime_identity_detects_template_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            template = repo_root / "video-analyzer-ui" / "video_analyzer_ui" / "templates" / "index.html"
+            template.parent.mkdir(parents=True)
+            template.write_text("<main>one</main>\n", encoding="utf-8")
+            runtime = RuntimeIdentity(repo_root)
+            initial = runtime.payload()
+            template.write_text("<main>two</main>\n", encoding="utf-8")
+            changed = runtime.payload()
+
+        self.assertFalse(initial["source_stale"])
+        self.assertTrue(changed["source_stale"])
+        self.assertIn(
+            "video-analyzer-ui/video_analyzer_ui/templates/index.html",
+            changed["stale_files"],
+        )
+
     def test_health_exposes_runtime_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
             ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp), video_link_auto_resume=False)
@@ -123,6 +141,30 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json(), expected)
         test_profile.assert_called_once_with(payload)
+
+    def test_tts_preview_route_returns_inline_wav(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp), video_link_auto_resume=False)
+            wav = b"RIFF" + b"\0" * 64
+            metadata = {"voice": "check_boards_sweet", "text_chars": 8}
+            with patch.object(
+                ui.video_link,
+                "preview_tts_setting",
+                return_value=(wav, metadata),
+            ) as preview:
+                response = ui.app.test_client().post(
+                    "/api/settings/models/tts-indextts25-ray-p40/tts-preview",
+                    json={"text": "这是一段试听。"},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, "audio/wav")
+        self.assertEqual(response.data, wav)
+        self.assertEqual(response.headers["X-TTS-Voice"], "check_boards_sweet")
+        preview.assert_called_once_with(
+            "tts-indextts25-ray-p40",
+            {"text": "这是一段试听。"},
+        )
 
     def test_mobile_audio_upload_route_uses_dedicated_pipeline(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -353,6 +395,7 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn('id="testProfileButton"', html)
         self.assertIn('id="profileTestAvailability"', html)
         self.assertIn('id="profileTestSummary"', html)
+        self.assertIn('id="profileChapterConcurrency"', html)
         self.assertIn('id="profile"', html)
         self.assertIn('id="templateSearch"', html)
         self.assertIn('id="templateCategory"', html)
@@ -378,6 +421,16 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn("vad_max_segment_sec", main_js)
         self.assertIn("后台空闲，可以执行通路测试", main_js)
         self.assertIn("从本机禁用内置运行方案", main_js)
+        self.assertIn('<audio controls preload="metadata"', main_js)
+        self.assertIn("narration-player", main_js)
+        self.assertIn("renderConsoleNarration", main_js)
+        self.assertIn("bindNarrationPlayer", main_js)
+        self.assertIn("narrationMiniProgress", main_js)
+        self.assertIn("loadNarrationTimeline", main_js)
+        self.assertIn("syncNarrationTimeline", main_js)
+        self.assertIn("multidoc_chapter_concurrency", main_js)
+        self.assertIn("TTS 试听", main_js)
+        self.assertIn("/tts-preview", main_js)
         self.assertNotIn("恢复内置运行方案并清除本地覆盖", main_js)
         self.assertIn("【模板指令开始】", main_js)
         self.assertTrue((UI_ROOT / "video_analyzer_ui" / "static" / "data" / "audio_prompt_templates.json").is_file())
@@ -409,6 +462,13 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn("模型执行与文档推导", html)
         self.assertIn('id="consoleSummaryGrid"', html)
         self.assertIn('id="consoleResultSummary"', html)
+        self.assertIn('id="consoleNarrationPanel"', html)
+        self.assertIn('id="consoleNarrationAudio"', html)
+        self.assertIn('id="consoleNarrationTranscript"', html)
+        self.assertIn('id="narrationMiniPlayer"', html)
+        self.assertIn('id="narrationMiniPlayPause"', html)
+        self.assertIn('id="narrationMiniStop"', html)
+        self.assertIn('id="narrationMiniSentence"', html)
         self.assertIn('class="stage-table-details"', html)
         self.assertIn('id="coreDiagnosticsPanel"', html)
         self.assertNotIn('id="previewView"', html)
@@ -997,6 +1057,11 @@ class VideoAnalyzerUITests(unittest.TestCase):
         status_source = (REPO_ROOT / "tools" / "video_link_status_server.py").read_text(encoding="utf-8")
 
         self.assertIn("status-spinner", js)
+        self.assertIn(".doc-preview-body.audio", css)
+        self.assertIn(".narration-player", css)
+        self.assertIn(".console-narration-panel", css)
+        self.assertIn(".narration-mini-player", css)
+        self.assertIn(".narration-transcript-line.active", css)
         self.assertIn("pendingUrls", js)
         self.assertIn("addPendingUrls", js)
         self.assertIn("focusPromptMap", js)

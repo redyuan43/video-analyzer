@@ -1020,6 +1020,7 @@ def main():
                             use_asr_strategy=use_asr_strategy,
                             logger=logger,
                             progress_callback=report_transcription_progress,
+                            runtime_lock_held=local_runtime_active,
                         )
                     )
                     if transcript is None:

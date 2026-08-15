@@ -118,6 +118,8 @@
             "include_subtitles": true,
             "include_comments": true,
             "max_comments": 3000,
+            "study_card_model_id": "study-inherit-text",
+            "multidoc_chapter_concurrency": 10,
             "multidoc_doc_types": [
                 "knowledge_notes",
                 "deep_report",
@@ -131,6 +133,7 @@
             "diarization_model_id": "diarization-3dspeaker-local",
             "ocr_model_id": "ocr-unlimited-local",
             "vision_model_id": "vision-minicpm-v45-local",
+            "study_card_model_id": "study-inherit-text",
             "llm_base_url": "https://api.deepseek.com",
             "vision_base_url": "{minicpm_v100_base_url}",
             "text_base_url": "https://api.deepseek.com",
@@ -176,6 +179,7 @@
             "include_subtitles": true,
             "include_comments": true,
             "max_comments": 3000,
+            "multidoc_chapter_concurrency": 10,
             "multidoc_doc_types": [
                 "knowledge_notes",
                 "deep_report",

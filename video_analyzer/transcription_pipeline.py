@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 import threading
 from pathlib import Path
 from typing import Any, Callable
@@ -76,10 +77,11 @@ if ray is not None:
             audio_path: str,
             config_payload: dict[str, Any],
             speaker_config: dict[str, Any],
+            runtime_lock_held: bool,
         ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
             lock_context = (
                 contextlib.nullcontext()
-                if local_model_stage_needed("asr", config_payload)
+                if runtime_lock_held or local_model_stage_needed("asr", config_payload)
                 else local_model_runtime_lock(
                     config_payload,
                     logging.getLogger("video_analyzer.ray.diarization"),
@@ -280,6 +282,7 @@ def transcribe_and_diarize_configured_audio(
     use_asr_strategy: bool,
     logger: logging.Logger,
     progress_callback: Callable[[str, str, str | None], None] | None = None,
+    runtime_lock_held: bool = False,
 ) -> tuple[AudioTranscript | None, ASRStrategyResult, dict[str, Any] | None]:
     """Run independent speaker-turn detection in parallel with configured ASR."""
     speaker_config = config.get("speaker_diarization") or {}
@@ -339,6 +342,7 @@ def transcribe_and_diarize_configured_audio(
                     config.config,
                     speaker_config,
                     use_asr_strategy=use_asr_strategy,
+                    runtime_lock_held=runtime_lock_held,
                 )
             )
         except ParallelBranchError as exc:
@@ -385,6 +389,7 @@ def run_parallel_transcription_branches(
     speaker_config: dict[str, Any],
     *,
     use_asr_strategy: bool,
+    runtime_lock_held: bool = False,
 ) -> tuple[
     AudioTranscript | None,
     ASRStrategyResult,
@@ -399,16 +404,29 @@ def run_parallel_transcription_branches(
         actors: list[Any] = []
         try:
             if not ray.is_initialized():
-                ray.init(
-                    namespace="video-analyzer-transcription",
-                    ignore_reinit_error=True,
-                    include_dashboard=False,
-                    num_cpus=2,
-                    resources={"p40_diarization": 1},
+                previous_cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+                os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+                os.environ["CUDA_VISIBLE_DEVICES"] = str(
+                    speaker_config.get("gpu_id") or 0
                 )
+                try:
+                    ray.init(
+                        namespace="video-analyzer-transcription",
+                        ignore_reinit_error=True,
+                        include_dashboard=False,
+                        num_cpus=2,
+                        num_gpus=1,
+                        resources={"p40_diarization": 1},
+                    )
+                finally:
+                    if previous_cuda_devices is None:
+                        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                    else:
+                        os.environ["CUDA_VISIBLE_DEVICES"] = previous_cuda_devices
                 started_here = True
             asr_actor = AsrBranchActor.remote()
             diarization_actor = DiarizationBranchActor.options(
+                num_gpus=1,
                 resources={"p40_diarization": 1},
             ).remote()
             actors.extend((asr_actor, diarization_actor))
@@ -422,6 +440,7 @@ def run_parallel_transcription_branches(
                 str(audio_path),
                 config_payload,
                 speaker_config,
+                runtime_lock_held,
             )
             pending = {asr_ref: "asr", diarization_ref: "diarization"}
             results: dict[str, Any] = {}

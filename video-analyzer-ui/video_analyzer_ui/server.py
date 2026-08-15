@@ -196,6 +196,25 @@ class VideoAnalyzerUI:
             except BridgeError as exc:
                 return jsonify({'error': exc.message}), int(exc.status)
 
+        @self.app.route('/api/settings/models/<model_id>/tts-preview', methods=['POST'])
+        def settings_tts_preview(model_id):
+            try:
+                audio, metadata = self.video_link.preview_tts_setting(
+                    model_id,
+                    request.get_json(silent=True) or {},
+                )
+                return Response(
+                    audio,
+                    mimetype='audio/wav',
+                    headers={
+                        'Content-Disposition': 'inline; filename="tts-preview.wav"',
+                        'X-TTS-Voice': str(metadata.get('voice') or ''),
+                        'X-TTS-Text-Chars': str(metadata.get('text_chars') or 0),
+                    },
+                )
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
         @self.app.route('/api/settings/profile-test', methods=['POST'])
         def settings_test_profile():
             try:

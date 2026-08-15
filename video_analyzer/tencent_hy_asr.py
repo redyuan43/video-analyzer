@@ -8,10 +8,12 @@ import hmac
 import json
 import logging
 import os
+import sys
 import threading
 import time
 import uuid
 import wave
+from array import array
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -28,8 +30,8 @@ DEFAULT_ENDPOINT = "wss://asr.cloud.tencent.com/asr/v2"
 DEFAULT_ENGINE = "Hy-ASR-3.0-preview"
 DEFAULT_ENV_FILE = Path("~/.config/video-analyzer/tencentcloud.env").expanduser()
 DEFAULT_CHUNK_SECONDS = 30.0
-DEFAULT_PARALLEL_CHUNKS = 4
-MAX_PREVIEW_PARALLEL_CHUNKS = 4
+DEFAULT_PARALLEL_CHUNKS = 6
+MAX_PREVIEW_PARALLEL_CHUNKS = 6
 PCM_SAMPLE_RATE = 16000
 PCM_SAMPLE_WIDTH = 2
 PCM_CHANNELS = 1
@@ -61,7 +63,9 @@ def transcribe_with_tencent_hy_asr(
         max(1, int(options.get("parallel_chunks") or DEFAULT_PARALLEL_CHUNKS)),
     )
     results: list[tuple[int, float, list[dict[str, Any]], list[dict[str, Any]]]] = []
-    with ThreadPoolExecutor(max_workers=parallel_chunks) as executor:
+    executor = ThreadPoolExecutor(max_workers=parallel_chunks)
+    failed = False
+    try:
         futures = {
             executor.submit(
                 transcribe_pcm_chunk,
@@ -74,8 +78,21 @@ def transcribe_with_tencent_hy_asr(
         }
         for future in as_completed(futures):
             index, offset = futures[future]
-            sentences, responses = future.result()
+            try:
+                sentences, responses = future.result()
+            except Exception as exc:
+                failed = True
+                for pending in futures:
+                    if pending is not future:
+                        pending.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise RuntimeError(
+                    f"Tencent Hy-ASR chunk {index} at {offset:.3f}s failed: {exc}"
+                ) from exc
             results.append((index, offset, sentences, responses))
+    finally:
+        if not failed:
+            executor.shutdown(wait=True)
 
     results.sort(key=lambda item: item[0])
     segments: list[dict[str, Any]] = []
@@ -207,14 +224,51 @@ def transcribe_pcm_chunk(
     options: dict[str, object],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     attempts = max(1, int(options.get("max_attempts") or 2))
+    last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
             return transcribe_pcm_chunk_once(pcm_data, endpoint, credentials, options)
-        except Exception:
+        except Exception as exc:
+            last_error = exc
             if attempt >= attempts:
-                raise
+                break
             time.sleep(float(options.get("retry_delay_seconds") or 2.0))
+
+    gain = float(options.get("decode_error_gain_fallback") or 0.7)
+    if (
+        last_error is not None
+        and "Tencent Hy-ASR error 4007" in str(last_error)
+        and 0.0 < gain < 1.0
+    ):
+        logger.warning(
+            "Tencent Hy-ASR returned 4007 after %d attempt(s); retrying this chunk with PCM gain %.3f",
+            attempts,
+            gain,
+        )
+        return transcribe_pcm_chunk_once(
+            scale_pcm_s16le(pcm_data, gain),
+            endpoint,
+            credentials,
+            options,
+        )
+
+    if last_error is not None:
+        raise last_error
     raise RuntimeError("Tencent Hy-ASR chunk exhausted retries")
+
+
+def scale_pcm_s16le(pcm_data: bytes, gain: float) -> bytes:
+    if not 0.0 < gain <= 1.0:
+        raise ValueError("PCM gain must be greater than 0 and at most 1")
+    samples = array("h")
+    samples.frombytes(pcm_data)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    for index, sample in enumerate(samples):
+        samples[index] = int(sample * gain)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    return samples.tobytes()
 
 
 def transcribe_pcm_chunk_once(
@@ -228,7 +282,9 @@ def transcribe_pcm_chunk_once(
     sentences: list[dict[str, Any]] = []
     receiver_error: list[Exception] = []
     completed = threading.Event()
+    handshake_completed = threading.Event()
     receive_timeout = float(options.get("receive_timeout_seconds") or 90.0)
+    handshake_timeout = float(options.get("handshake_timeout_seconds") or 15.0)
 
     with connect(
         request_url,
@@ -248,6 +304,7 @@ def transcribe_pcm_chunk_once(
                         raise RuntimeError(
                             f"Tencent Hy-ASR error {payload.get('code')}: {payload.get('message')}"
                         )
+                    handshake_completed.set()
                     result = payload.get("result") or {}
                     if int(result.get("slice_type", -1)) == 2:
                         sentences.append(
@@ -262,10 +319,15 @@ def transcribe_pcm_chunk_once(
                         completed.set()
             except Exception as exc:
                 receiver_error.append(exc)
+                handshake_completed.set()
                 completed.set()
 
         receiver = threading.Thread(target=receive_messages, daemon=True)
         receiver.start()
+        if not handshake_completed.wait(timeout=handshake_timeout):
+            raise TimeoutError("Tencent Hy-ASR handshake response timed out")
+        if receiver_error:
+            raise receiver_error[0]
         packet_interval = 0.2 / max(
             0.1,
             float(options.get("send_realtime_factor") or 1.0),

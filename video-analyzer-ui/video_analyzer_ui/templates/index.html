@@ -272,6 +272,22 @@
                     <div id="consoleResultSummary" class="console-result-summary"></div>
                 </section>
 
+                <section id="consoleNarrationPanel" class="panel console-narration-panel" hidden>
+                    <div class="console-narration-copy">
+                        <span class="console-narration-kicker">完整语音讲解</span>
+                        <h2 id="consoleNarrationTitle">播放最终总结</h2>
+                        <p id="consoleNarrationSummary">最终文档的完整语音版本</p>
+                    </div>
+                    <div class="console-narration-player">
+                        <audio id="consoleNarrationAudio" controls preload="metadata"></audio>
+                        <div class="console-narration-meta">
+                            <span id="consoleNarrationDuration">等待音频信息</span>
+                            <a id="consoleNarrationOpenLink" class="secondary-link" href="#" target="_blank" rel="noreferrer">新窗口打开</a>
+                        </div>
+                        <div id="consoleNarrationTranscript" class="narration-transcript" aria-label="同步讲解文字"></div>
+                    </div>
+                </section>
+
                 <section id="coreDiagnosticsPanel" class="panel core-diagnostics-panel" hidden>
                     <div class="panel-head">
                         <div>
@@ -494,6 +510,7 @@
                         </label>
                         <label><span>VL 并发</span><input id="profileVlConcurrency" type="number" min="1" max="32"></label>
                         <label><span>OCR 并发</span><input id="profileOcrConcurrency" type="text" placeholder="auto"></label>
+                        <label><span>章节并发上限</span><input id="profileChapterConcurrency" type="number" min="1" max="10"></label>
                         <label><span>文本超时秒数</span><input id="profileTextTimeout" type="number" min="1"></label>
                         <label class="wide"><span>其他运行参数 JSON</span><textarea id="profileSettingsJson" rows="10">{}</textarea></label>
                     </div>
@@ -802,6 +819,18 @@
             </section>
         </section>
     </main>
+    <aside id="narrationMiniPlayer" class="narration-mini-player" hidden aria-label="完整语音讲解迷你播放器">
+        <div class="narration-mini-controls" role="group" aria-label="语音播放控制">
+            <button id="narrationMiniPlayPause" class="icon-button narration-mini-control" type="button" title="播放" aria-label="播放">▶</button>
+            <button id="narrationMiniStop" class="icon-button narration-mini-control" type="button" title="停止并回到开头" aria-label="停止并回到开头">■</button>
+        </div>
+        <div class="narration-mini-content">
+            <strong id="narrationMiniTitle">完整语音讲解</strong>
+            <span id="narrationMiniSentence" class="narration-mini-sentence"></span>
+            <input id="narrationMiniProgress" type="range" min="0" max="1000" value="0" aria-label="音频播放进度">
+        </div>
+        <time id="narrationMiniTime">0:00 / 0:00</time>
+    </aside>
     <script src="{{ url_for('static', filename='vendor/markdown-it/markdown-it.min.js') }}?v={{ static_version }}"></script>
     <script src="{{ url_for('static', filename='vendor/dompurify/purify.min.js') }}?v={{ static_version }}"></script>
     <script src="{{ url_for('static', filename='vendor/katex/katex.min.js') }}?v={{ static_version }}"></script>

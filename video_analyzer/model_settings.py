@@ -60,6 +60,7 @@ MODEL_KIND_PROTOCOLS = {
     "study": {"openai_compatible", "inherit_text", "none"},
     "triage": {"openai_compatible", "inherit_study", "inherit_text", "none"},
     "image": {"codex_imagegen", "none"},
+    "tts": {"openai_speech", "none"},
 }
 
 ASR_CHUNK_MODES = {"model_default", "custom"}
@@ -107,13 +108,14 @@ PROFILE_MODEL_FIELDS = {
     "study": "study_card_model_id",
     "triage": "triage_model_id",
     "image": "image_model_id",
+    "tts": "tts_model_id",
 }
 
 VIDEO_WORKFLOW_ID = "video_operation_manual"
 AUDIO_WORKFLOW_ID = "audio_nx1"
 
 VIDEO_PROFILE_FLOW = {
-    "version": 4,
+    "version": 5,
     "lanes": [
         {"id": "audio", "label": "音频"},
         {"id": "visual", "label": "视觉"},
@@ -150,10 +152,12 @@ VIDEO_PROFILE_FLOW = {
         {"id": "image_prompts", "step": 19, "column": 17, "row": 3, "mobile_order": 24, "lane": "delivery", "title": "配图提示词", "subtitle": "整理最终文档的配图需求", "stage": "image-prompts"},
         {"id": "image", "step": 20, "column": 18, "row": 3, "mobile_order": 25, "lane": "delivery", "title": "文档配图", "subtitle": "生成或复用最终文档插图", "model_kind": "image", "required": False, "stage": "final-publish", "stage_step": "images"},
         {"id": "final_publish", "step": 21, "column": 19, "row": 2, "mobile_order": 26, "lane": "delivery", "title": "最终定稿与发布", "subtitle": "补齐、插图并校验交付文档", "stage": "final-publish"},
-        {"id": "operation_manual_doc", "step": 22, "column": 20, "row": 1, "mobile_order": 27, "lane": "delivery", "title": "操作手册", "subtitle": "operation_manual.md", "stage": "final-publish", "artifact_path": "operation_manual.md", "node_kind": "output"},
-        {"id": "knowledge_notes_doc", "step": 22, "column": 20, "row": 2, "mobile_order": 28, "lane": "delivery", "title": "逐章知识笔记", "subtitle": "knowledge_notes_v2.md", "stage": "final-publish", "artifact_path": "docs_analysis_chapters/knowledge_notes_v2.md", "node_kind": "output"},
-        {"id": "deep_report_doc", "step": 22, "column": 20, "row": 3, "mobile_order": 29, "lane": "delivery", "title": "深度报告", "subtitle": "deep_report_v2.md", "stage": "final-publish", "artifact_path": "docs_analysis_chapters/deep_report_v2.md", "node_kind": "output"},
-        {"id": "manual_evidence_doc", "step": 22, "column": 20, "row": 4, "mobile_order": 30, "lane": "delivery", "title": "证据审计表", "subtitle": "manual_evidence.md", "stage": "final-publish", "artifact_path": "manual_evidence.md", "node_kind": "output"},
+        {"id": "tts", "step": 22, "column": 20, "row": 5, "mobile_order": 27, "lane": "delivery", "title": "长内容语音", "subtitle": "把最终文档改写并合成为完整讲解", "model_kind": "tts", "required": False, "stage": "tts-narration"},
+        {"id": "narration_audio", "step": 23, "column": 21, "row": 5, "mobile_order": 28, "lane": "delivery", "title": "音频讲解", "subtitle": "audio_narration/audio_output/narration_full.wav", "stage": "tts-narration", "artifact_path": "audio_narration/audio_output/narration_full.wav", "node_kind": "output"},
+        {"id": "operation_manual_doc", "step": 23, "column": 21, "row": 1, "mobile_order": 29, "lane": "delivery", "title": "操作手册", "subtitle": "operation_manual.md", "stage": "final-publish", "artifact_path": "operation_manual.md", "node_kind": "output"},
+        {"id": "knowledge_notes_doc", "step": 23, "column": 21, "row": 2, "mobile_order": 30, "lane": "delivery", "title": "逐章知识笔记", "subtitle": "knowledge_notes_v2.md", "stage": "final-publish", "artifact_path": "docs_analysis_chapters/knowledge_notes_v2.md", "node_kind": "output"},
+        {"id": "deep_report_doc", "step": 23, "column": 21, "row": 3, "mobile_order": 31, "lane": "delivery", "title": "深度报告", "subtitle": "deep_report_v2.md", "stage": "final-publish", "artifact_path": "docs_analysis_chapters/deep_report_v2.md", "node_kind": "output"},
+        {"id": "manual_evidence_doc", "step": 23, "column": 21, "row": 4, "mobile_order": 32, "lane": "delivery", "title": "证据审计表", "subtitle": "manual_evidence.md", "stage": "final-publish", "artifact_path": "manual_evidence.md", "node_kind": "output"},
     ],
     "edges": [
         {"from": "input", "to": "prepare", "lane": "main", "label": "探测与下载"},
@@ -186,6 +190,8 @@ VIDEO_PROFILE_FLOW = {
         {"from": "image_prompts", "to": "image", "lane": "delivery", "label": "配图需求"},
         {"from": "qa_index", "to": "final_publish", "lane": "delivery", "label": "问答索引"},
         {"from": "image", "to": "final_publish", "lane": "delivery", "label": "最终图片"},
+        {"from": "final_publish", "to": "tts", "lane": "delivery", "label": "最终长文"},
+        {"from": "tts", "to": "narration_audio", "lane": "delivery", "label": "完整 WAV"},
         {"from": "final_publish", "to": "operation_manual_doc", "lane": "delivery", "label": "交付"},
         {"from": "final_publish", "to": "knowledge_notes_doc", "lane": "delivery", "label": "交付"},
         {"from": "final_publish", "to": "deep_report_doc", "lane": "delivery", "label": "交付"},
@@ -290,6 +296,7 @@ CONTROL_RESOURCES = (
     ("triage-disabled", "triage", "none", "禁用证据 Triage"),
     ("image-codex-imagegen", "image", "codex_imagegen", "Codex ImageGen"),
     ("image-disabled", "image", "none", "禁用文档配图"),
+    ("tts-disabled", "tts", "none", "禁用长内容语音"),
     ("selector-inherit-text", "selector", "inherit_text", "继承文本模型"),
     ("selector-disabled", "selector", "none", "禁用模板选择模型"),
 )
@@ -429,6 +436,7 @@ def validate_model_resource(model_id: str, payload: dict[str, Any]) -> dict[str,
         "dots_mocr_openai",
         "openai_vision",
         "openai_compatible",
+        "openai_speech",
     }
     if endpoint_required and not endpoints:
         raise SettingsValidationError(f"{protocol} requires at least one endpoint")
@@ -439,6 +447,7 @@ def validate_model_resource(model_id: str, payload: dict[str, Any]) -> dict[str,
         "dots_mocr_openai",
         "openai_vision",
         "openai_compatible",
+        "openai_speech",
     }
     if model_required and not model:
         raise SettingsValidationError(f"{protocol} requires a model name")
@@ -566,7 +575,7 @@ def _add_builtin_model_resources(
                 "secret_key_env": "TENCENTCLOUD_SECRET_KEY",
                 "env_file": "~/.config/video-analyzer/tencentcloud.env",
                 "engine_model_type": "Hy-ASR-3.0-preview",
-                "parallel_chunks": 4,
+                "parallel_chunks": 6,
                 "send_realtime_factor": 1.0,
                 "max_attempts": 2,
                 **ASR_CHUNK_DEFAULTS["tencent_hy_asr_ws"],
@@ -761,6 +770,38 @@ def _add_builtin_model_resources(
                 "text_temperature": 1.0,
                 "deepseek_thinking": "disabled",
                 "text_timeout_seconds": 900,
+            },
+        },
+        "tts-indextts25-ray-p40": {
+            "name": "IndexTTS 2.5（本地五张 P40 · Ray）",
+            "kind": "tts",
+            "protocol": "openai_speech",
+            "model": "/home/ai/github/indextts-2.5",
+            "endpoints": [
+                _builtin_service_url(
+                    config,
+                    "indextts_tts_url",
+                    "http://127.0.0.1:8092",
+                )
+            ],
+            "health_url": _builtin_service_url(
+                config,
+                "indextts_tts_health_url",
+                "http://127.0.0.1:8092/health",
+            ),
+            "options": {
+                "deployment": "local",
+                "voice": "check_boards_sweet",
+                "response_format": "wav",
+                "speed": 0.9,
+                "timeout_seconds": 1800,
+                "extra_params": {
+                    "lang": "zh",
+                    "text_normalization": True,
+                    "emo_vector": [0.58, 0, 0, 0, 0, 0, 0, 0.22],
+                    "emo_alpha": 0.65,
+                    "interval_silence_ms": 180,
+                },
             },
         },
     }
@@ -977,6 +1018,33 @@ def build_settings_document(config: dict[str, Any]) -> dict[str, Any]:
                 catalog,
                 catalog["image-codex-imagegen"],
             )
+
+        if not refs["tts"]:
+            tts_endpoint = profile.get("tts_base_url") or profile.get("tts_endpoint")
+            tts_model = profile.get("tts_model")
+            if tts_endpoint and tts_model:
+                resource = _resource(
+                    "tts",
+                    "openai_speech",
+                    f"{profile_name} TTS",
+                    model=str(tts_model),
+                    endpoints=tts_endpoint,
+                    api_key_env=str(profile.get("tts_api_key_env") or ""),
+                    options={
+                        key.removeprefix("tts_"): value
+                        for key, value in profile.items()
+                        if key in {
+                            "tts_voice",
+                            "tts_speed",
+                            "tts_response_format",
+                            "tts_timeout_seconds",
+                            "tts_extra_params",
+                        }
+                    },
+                )
+                refs["tts"] = _add_resource(catalog, resource)
+            else:
+                refs["tts"] = "tts-disabled"
 
         for kind, field in PROFILE_MODEL_FIELDS.items():
             profile[field] = refs[kind]
@@ -1263,7 +1331,24 @@ def expand_runtime_profile(config: dict[str, Any], profile: dict[str, Any]) -> d
         protocol = str(resource.get("protocol") or "")
         expanded[f"{prefix}_enabled"] = protocol != "none"
         if protocol.startswith("inherit_"):
-            expanded[f"{prefix}_inherit"] = protocol.removeprefix("inherit_")
+            inherited_from = protocol.removeprefix("inherit_")
+            expanded[f"{prefix}_inherit"] = inherited_from
+            if inherited_from == "text":
+                inherited_base_url = str(expanded.get("text_base_url") or "")
+                inherited_model = str(expanded.get("text_model") or "")
+                inherited_api_key_env = str(expanded.get("text_api_key_env") or "")
+            elif inherited_from == "study":
+                inherited_base_url = str(expanded.get("study_card_llm_base_url") or "")
+                inherited_model = str(expanded.get("study_card_model") or "")
+                inherited_api_key_env = str(expanded.get("study_card_api_key_env") or "")
+            else:
+                inherited_base_url = ""
+                inherited_model = ""
+                inherited_api_key_env = ""
+            endpoint_field = f"{prefix}_base_url" if prefix == "review" else f"{prefix}_llm_base_url"
+            expanded[endpoint_field] = inherited_base_url
+            expanded[f"{prefix}_model"] = inherited_model
+            expanded[f"{prefix}_api_key_env"] = inherited_api_key_env
             continue
         if protocol == "none":
             expanded[f"{prefix}_model"] = ""
@@ -1283,6 +1368,22 @@ def expand_runtime_profile(config: dict[str, Any], profile: dict[str, Any]) -> d
         expanded["image_enabled"] = image.get("protocol") != "none"
         expanded["image_provider"] = image.get("protocol")
         expanded["image_model"] = image.get("model")
+
+    tts = model_for("tts")
+    if tts:
+        protocol = str(tts.get("protocol") or "")
+        endpoints = normalize_string_list(tts.get("endpoints"))
+        options = dict(tts.get("options") or {})
+        expanded["tts_enabled"] = protocol != "none"
+        expanded["tts_provider"] = protocol
+        expanded["tts_base_url"] = endpoints[0] if endpoints else ""
+        expanded["tts_model"] = tts.get("model") or ""
+        expanded["tts_api_key_env"] = tts.get("api_key_env") or ""
+        expanded["tts_voice"] = options.get("voice") or "check_boards_sweet"
+        expanded["tts_speed"] = float(options.get("speed") or 0.9)
+        expanded["tts_response_format"] = options.get("response_format") or "wav"
+        expanded["tts_timeout_seconds"] = int(options.get("timeout_seconds") or 1800)
+        expanded["tts_extra_params"] = copy.deepcopy(options.get("extra_params") or {})
     return expanded
 
 
@@ -1312,6 +1413,17 @@ def validate_profile(
     if not 1 <= asr_worker_count <= 5:
         raise SettingsValidationError("asr_worker_count must be between 1 and 5")
     cleaned["asr_worker_count"] = asr_worker_count
+    try:
+        chapter_concurrency = int(cleaned.get("multidoc_chapter_concurrency") or 1)
+    except (TypeError, ValueError) as exc:
+        raise SettingsValidationError(
+            "multidoc_chapter_concurrency must be an integer"
+        ) from exc
+    if not 1 <= chapter_concurrency <= 10:
+        raise SettingsValidationError(
+            "multidoc_chapter_concurrency must be between 1 and 10"
+        )
+    cleaned["multidoc_chapter_concurrency"] = chapter_concurrency
     asr_segmentation_mode = str(
         cleaned.get("asr_segmentation_mode") or ""
     ).strip().lower()
@@ -1478,6 +1590,8 @@ def _health_url_for(resource: dict[str, Any]) -> str:
         "openai_compatible",
     }:
         return f"{endpoint.rstrip('/')}/models"
+    if protocol == "openai_speech":
+        return f"{endpoint.rstrip('/')}/health"
     return endpoint
 
 
@@ -1700,6 +1814,11 @@ class RuntimeSettingsStore:
             manual["vision_base_url"] = endpoints[0] if endpoints else ""
             manual["vision_model"] = item.get("model")
             manual["vision_runtime"] = options
+        elif kind == "tts":
+            runtime_config["tts"] = {
+                "enabled": protocol != "none",
+                "base_url": endpoints[0] if endpoints else "",
+            }
         return runtime_config
 
     def public_settings(self) -> dict[str, Any]:
@@ -1852,18 +1971,32 @@ class RuntimeSettingsStore:
         )
         lock_context = contextlib.nullcontext()
         if needs_local_stage:
-            stage = {"asr": "asr", "ocr": "ocr", "vision": "vl"}.get(
+            stage = {"asr": "asr", "ocr": "ocr", "vision": "vl", "tts": "tts"}.get(
                 str(item.get("kind") or "")
             )
             if stage:
                 from .local_model_runtime import local_model_stage
+                runtime_config = self._model_test_runtime_config(merged, item)
+                if stage == "tts":
+                    @contextlib.contextmanager
+                    def prepared_tts_stage():
+                        with local_model_stage(
+                            stage,
+                            runtime_config,
+                            logger,
+                            f"settings-model-test:{model_id}:prepare",
+                        ):
+                            pass
+                        yield
 
-                lock_context = local_model_stage(
-                    stage,
-                    self._model_test_runtime_config(merged, item),
-                    logger,
-                    f"settings-model-test:{model_id}",
-                )
+                    lock_context = prepared_tts_stage()
+                else:
+                    lock_context = local_model_stage(
+                        stage,
+                        runtime_config,
+                        logger,
+                        f"settings-model-test:{model_id}",
+                    )
             else:
                 from .local_model_runtime import local_model_runtime_lock
 
@@ -1900,6 +2033,62 @@ class RuntimeSettingsStore:
         with self._test_cache_lock:
             self._test_cache[cache_key] = (time.monotonic(), copy.deepcopy(result))
         return result
+
+    def preview_tts(self, model_id: str, text: str) -> tuple[bytes, dict[str, Any]]:
+        text = str(text or "").strip()
+        if not text:
+            raise SettingsValidationError("试听文本不能为空")
+        if len(text) > 500:
+            raise SettingsValidationError("试听文本不能超过 500 字")
+        document = self.public_settings()
+        item = next((candidate for candidate in document["models"] if candidate["id"] == model_id), None)
+        if not item:
+            raise FileNotFoundError(model_id)
+        if item.get("kind") != "tts" or item.get("protocol") != "openai_speech":
+            raise SettingsValidationError("所选模型不支持 TTS 试听")
+        endpoints = normalize_string_list(item.get("endpoints"))
+        if not endpoints:
+            raise SettingsValidationError("TTS 模型未配置端点")
+
+        _defaults, _user, merged = self.load()
+        endpoint = endpoints[0].rstrip("/")
+        if _is_local_url(endpoint):
+            from .local_model_runtime import local_model_stage
+
+            with local_model_stage(
+                "tts",
+                self._model_test_runtime_config(merged, item),
+                logger,
+                f"settings-tts-preview:{model_id}:prepare",
+            ):
+                pass
+
+        options = dict(item.get("options") or {})
+        target = f"{endpoint}/audio/speech" if endpoint.endswith("/v1") else f"{endpoint}/v1/audio/speech"
+        headers, auth_error = _auth_headers(item)
+        if auth_error:
+            raise SettingsValidationError(auth_error)
+        response = _test_session(endpoint).post(
+            target,
+            headers={**headers, "Content-Type": "application/json"},
+            json={
+                "model": item.get("model"),
+                "input": text,
+                "voice": options.get("voice") or "check_boards_sweet",
+                "response_format": "wav",
+                "speed": float(options.get("speed") or 0.9),
+                "extra_params": options.get("extra_params") or {"lang": "zh"},
+            },
+            timeout=int(options.get("timeout_seconds") or 1800),
+        )
+        response.raise_for_status()
+        if not response.content.startswith(b"RIFF"):
+            raise SettingsValidationError("TTS 端点返回的不是 WAV")
+        return response.content, {
+            "model_id": model_id,
+            "voice": options.get("voice") or "check_boards_sweet",
+            "text_chars": len(text),
+        }
 
     def _quick_test_resource(self, item: dict[str, Any]) -> dict[str, Any]:
         protocol = str(item.get("protocol") or "")
@@ -2084,6 +2273,34 @@ class RuntimeSettingsStore:
                 response.raise_for_status()
                 text = str(response.json().get("text") or "").strip()
                 return {"ok": True, "status": "passed", "detail": "微型音频请求成功", "sample": text[:160]}
+            if protocol == "openai_speech":
+                options = dict(item.get("options") or {})
+                speech_endpoint = (
+                    f"{endpoint.rstrip('/')}/audio/speech"
+                    if endpoint.rstrip("/").endswith("/v1")
+                    else f"{endpoint.rstrip('/')}/v1/audio/speech"
+                )
+                response = session.post(
+                    speech_endpoint,
+                    headers={**headers, "Content-Type": "application/json"},
+                    json={
+                        "model": item.get("model"),
+                        "input": "这是长内容语音通路测试。",
+                        "voice": options.get("voice") or "check_boards_sweet",
+                        "response_format": "wav",
+                        "speed": float(options.get("speed") or 0.9),
+                        "extra_params": options.get("extra_params") or {"lang": "zh"},
+                    },
+                    timeout=timeout,
+                )
+                response.raise_for_status()
+                if not response.content.startswith(b"RIFF"):
+                    raise RuntimeError("TTS 端点返回的不是 WAV")
+                return {
+                    "ok": True,
+                    "status": "passed",
+                    "detail": f"最小语音合成成功，返回 {len(response.content)} 字节",
+                }
 
             prompt = "只回复 OK。"
             content: Any = prompt
@@ -2198,7 +2415,7 @@ class RuntimeSettingsStore:
                     }
                     continue
                 item = selected[slot]
-                stage = {"asr": "asr", "ocr": "ocr", "vision": "vl"}.get(
+                stage = {"asr": "asr", "ocr": "ocr", "vision": "vl", "tts": "tts"}.get(
                     str(item.get("kind") or "")
                 )
                 stage_context = contextlib.nullcontext()

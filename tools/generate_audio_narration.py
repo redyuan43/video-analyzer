@@ -4,19 +4,25 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
-import subprocess
 import sys
+import tempfile
+import time
+import wave
 from pathlib import Path
 from typing import Any
+
+import requests
 
 from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient
 from video_analyzer.config import Config, build_openai_extra_body, resolve_api_key, resolve_temperature
 
-DEFAULT_RENDERER = Path.home() / "github/my-skills-repo/audio-narration-script/scripts/render_with_ivan_tts.py"
 DEFAULT_MAX_SOURCE_CHARS = 90000
 DEFAULT_TEMPERATURE = 0.2
+DEFAULT_TTS_TIMEOUT_SECONDS = 1800
+MAX_TTS_INPUT_CHARS = 50000
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -29,15 +35,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--text-model")
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--output-dir", help="Output directory. Defaults to RUN_DIR/audio_narration")
-    parser.add_argument("--speaker", default=os.getenv("IVAN_TTS_SPEAKER", "serena"))
-    parser.add_argument(
-        "--tts-concurrency",
-        type=int,
-        default=int(os.getenv("NARRATION_TTS_CONCURRENCY", "2")),
-        help="Ivan TTS chunk render concurrency. Defaults to 2 to use both gateway workers.",
-    )
-    parser.add_argument("--renderer", type=Path, default=Path(os.getenv("AUDIO_NARRATION_RENDERER", DEFAULT_RENDERER)))
+    parser.add_argument("--tts-base-url")
+    parser.add_argument("--tts-model")
+    parser.add_argument("--voice")
+    parser.add_argument("--tts-speed", type=float)
+    parser.add_argument("--tts-timeout", type=int)
     parser.add_argument("--skip-tts", action="store_true", help="Write narration files without rendering WAV")
+    parser.add_argument("--render-only", action="store_true", help="Render an existing narration_script.txt without calling the text model")
     parser.add_argument("--max-source-chars", type=int, default=DEFAULT_MAX_SOURCE_CHARS)
     return parser.parse_args(argv)
 
@@ -52,60 +56,231 @@ def main(argv: list[str] | None = None) -> int:
     output_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else run_dir / "audio_narration"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    source_text = read_source(source_path, args.max_source_chars)
-    client, model, temperature = create_text_client(args)
-    prompt = build_narration_prompt(source_path, source_text)
-
-    print(f"[audio-narration] source: {source_path}", file=sys.stderr)
-    script_md = generate_text(client, model, prompt, temperature)
-    script_md = normalize_model_markdown(script_md)
-    if len(script_md) < 120:
-        raise RuntimeError("Generated narration script is unexpectedly short")
-
     script_path = output_dir / "narration_script.md"
     text_path = output_dir / "narration_script.txt"
     outline_path = output_dir / "narration_outline.md"
-    script_path.write_text(script_md.rstrip() + "\n", encoding="utf-8")
-    text_path.write_text(markdown_to_spoken_text(script_md), encoding="utf-8")
-    outline_path.write_text(build_outline(script_md), encoding="utf-8")
+    if args.render_only:
+        if not text_path.is_file() or text_path.stat().st_size == 0:
+            raise FileNotFoundError(f"Narration text does not exist: {text_path}")
+    else:
+        source_text = read_source(source_path, args.max_source_chars)
+        client, model, temperature = create_text_client(args)
+        prompt = build_narration_prompt(source_path, source_text)
+
+        print(f"[audio-narration] source: {source_path}", file=sys.stderr)
+        script_md = normalize_model_markdown(generate_text(client, model, prompt, temperature))
+        if len(script_md) < 120:
+            raise RuntimeError("Generated narration script is unexpectedly short")
+        script_path.write_text(script_md.rstrip() + "\n", encoding="utf-8")
+        text_path.write_text(markdown_to_spoken_text(script_md), encoding="utf-8")
+        outline_path.write_text(build_outline(script_md), encoding="utf-8")
 
     if args.skip_tts:
         print(f"[audio-narration] script: {script_path}")
         print(f"[audio-narration] text: {text_path}")
         return 0
 
-    renderer = args.renderer.expanduser().resolve()
-    if not renderer.exists():
-        raise FileNotFoundError(
-            f"Audio narration renderer not found: {renderer}. "
-            "Set AUDIO_NARRATION_RENDERER to the audio-narration-script render_with_ivan_tts.py path."
-        )
-
     audio_dir = output_dir / "audio_output"
-    cmd = [
-        sys.executable,
-        str(renderer),
-        "--input",
-        str(text_path),
-        "--output-dir",
-        str(audio_dir),
-        "--speaker",
-        args.speaker,
-        "--concurrency",
-        str(max(1, args.tts_concurrency)),
-    ]
-    print(f"[audio-narration] rendering WAV with {renderer}", file=sys.stderr)
-    subprocess.run(cmd, check=True)
-
+    audio_dir.mkdir(parents=True, exist_ok=True)
     full_wav = audio_dir / "narration_full.wav"
+    tts = create_tts_config(args)
+    spoken_text = text_path.read_text(encoding="utf-8").strip()
+    timeline = render_tts(spoken_text, full_wav, tts)
     if not full_wav.exists() or full_wav.stat().st_size <= 44:
         raise RuntimeError(f"Narration WAV was not created: {full_wav}")
+    duration_seconds = wav_duration_seconds(full_wav)
+    timeline_path = output_dir / "narration_timeline.json"
+    if timeline:
+        timeline["audio"] = str(full_wav)
+        timeline["duration_seconds"] = round(duration_seconds, 3)
+        timeline_path.write_text(
+            json.dumps(timeline, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    metadata_path = output_dir / "narration_metadata.json"
+    metadata = {
+        "source": str(source_path),
+        "script": str(script_path),
+        "text": str(text_path),
+        "audio": str(full_wav),
+        "text_chars": len(spoken_text),
+        "duration_seconds": round(duration_seconds, 3),
+        "timeline": str(timeline_path) if timeline else "",
+        "timeline_segments": len(timeline.get("segments") or []) if timeline else 0,
+        "tts": {
+            "base_url": tts["base_url"],
+            "model": tts["model"],
+            "voice": tts["voice"],
+            "speed": tts["speed"],
+        },
+    }
+    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     print(f"[audio-narration] outline: {outline_path}")
     print(f"[audio-narration] script: {script_path}")
     print(f"[audio-narration] text: {text_path}")
     print(f"[audio-narration] wav: {full_wav}")
+    print(f"[audio-narration] duration_seconds: {duration_seconds:.3f}")
+    if timeline:
+        print(f"[audio-narration] timeline: {timeline_path}")
+    print(f"[audio-narration] metadata: {metadata_path}")
     return 0
+
+
+def create_tts_config(args: argparse.Namespace) -> dict[str, Any]:
+    profile = Config(args.config).get_runtime_profile(args.profile)
+    base_url = str(args.tts_base_url or profile.get("tts_base_url") or "").rstrip("/")
+    model = str(args.tts_model or profile.get("tts_model") or "")
+    voice = str(args.voice or profile.get("tts_voice") or "check_boards_sweet")
+    speed = float(args.tts_speed if args.tts_speed is not None else profile.get("tts_speed") or 0.9)
+    timeout = int(args.tts_timeout or profile.get("tts_timeout_seconds") or DEFAULT_TTS_TIMEOUT_SECONDS)
+    if not base_url:
+        raise ValueError("Runtime profile must provide tts_base_url")
+    if not model:
+        raise ValueError("Runtime profile must provide tts_model")
+    if not 0.5 <= speed <= 2.0:
+        raise ValueError("TTS speed must be between 0.5 and 2.0")
+    return {
+        "base_url": base_url,
+        "model": model,
+        "voice": voice,
+        "speed": speed,
+        "timeout": max(30, timeout),
+        "api_key_env": str(profile.get("tts_api_key_env") or ""),
+        "extra_params": dict(profile.get("tts_extra_params") or {"lang": "zh"}),
+    }
+
+
+def render_tts(text: str, output: Path, config: dict[str, Any]) -> dict[str, Any] | None:
+    if not text:
+        raise ValueError("Narration text is empty")
+    if len(text) > MAX_TTS_INPUT_CHARS:
+        raise ValueError(f"Narration text exceeds {MAX_TTS_INPUT_CHARS} characters")
+    base_url = str(config["base_url"]).rstrip("/")
+    endpoint = f"{base_url}/audio/speech" if base_url.endswith("/v1") else f"{base_url}/v1/audio/speech"
+    headers = {"Content-Type": "application/json"}
+    api_key_env = str(config.get("api_key_env") or "")
+    if api_key_env:
+        token = os.environ.get(api_key_env)
+        if not token:
+            raise ValueError(f"Missing TTS API key environment variable: {api_key_env}")
+        headers["Authorization"] = f"Bearer {token}"
+    session = requests.Session()
+    session.trust_env = False
+    print(
+        f"[audio-narration] rendering with {config['model']} voice={config['voice']} chars={len(text)}",
+        file=sys.stderr,
+    )
+    payload = {
+        "model": config["model"],
+        "input": text,
+        "voice": config["voice"],
+        "response_format": "wav",
+        "speed": config["speed"],
+        "extra_params": config.get("extra_params") or {},
+    }
+    response = None
+    for attempt in range(1, 4):
+        response = session.post(
+            endpoint,
+            headers=headers,
+            json=payload,
+            timeout=int(config["timeout"]),
+        )
+        if response.status_code not in {429, 503} or attempt == 3:
+            break
+        retry_after = response.headers.get("Retry-After") or ""
+        delay = int(retry_after) if retry_after.isdigit() else 10 * attempt
+        print(
+            f"[audio-narration] TTS busy (HTTP {response.status_code}); retrying in {delay}s "
+            f"({attempt}/3)",
+            file=sys.stderr,
+        )
+        time.sleep(min(60, max(1, delay)))
+    assert response is not None
+    if not response.ok:
+        detail = response.text.strip().replace("\n", " ")[:500]
+        raise RuntimeError(f"TTS request failed with HTTP {response.status_code}: {detail}")
+    if not response.content.startswith(b"RIFF"):
+        raise RuntimeError("TTS service returned a non-WAV response")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(prefix=f".{output.name}.", suffix=".tmp", dir=output.parent, delete=False) as handle:
+        temporary = Path(handle.name)
+        handle.write(response.content)
+    try:
+        temporary.replace(output)
+    finally:
+        temporary.unlink(missing_ok=True)
+    request_id = str(response.headers.get("X-IndexTTS-Request-ID") or "").strip()
+    if not request_id:
+        return None
+    return fetch_indextts_timeline(
+        session,
+        base_url,
+        request_id,
+        int(response.headers.get("X-IndexTTS-Segment-Count") or 0),
+    )
+
+
+def fetch_indextts_timeline(
+    session: requests.Session,
+    base_url: str,
+    request_id: str,
+    expected_segments: int,
+) -> dict[str, Any]:
+    jobs_base = (
+        f"{base_url}/audio/speech/jobs"
+        if base_url.endswith("/v1")
+        else f"{base_url}/v1/audio/speech/jobs"
+    )
+    response = session.get(f"{jobs_base}/{request_id}", timeout=30)
+    response.raise_for_status()
+    payload = response.json()
+    raw_segments = payload.get("segment_results") or []
+    if payload.get("status") != "succeeded":
+        raise RuntimeError(f"IndexTTS timeline job is {payload.get('status')}")
+    if expected_segments and len(raw_segments) != expected_segments:
+        raise RuntimeError(
+            f"IndexTTS timeline segment count mismatch: {len(raw_segments)} != {expected_segments}"
+        )
+    segments = []
+    for expected_index, item in enumerate(
+        sorted(raw_segments, key=lambda value: int(value.get("index") or 0))
+    ):
+        index = int(item.get("index") or 0)
+        start = item.get("start_seconds")
+        end = item.get("end_seconds")
+        duration = item.get("duration_seconds")
+        if index != expected_index or start is None or end is None or duration is None:
+            raise RuntimeError("IndexTTS timeline is incomplete")
+        start_value = float(start)
+        end_value = float(end)
+        duration_value = float(duration)
+        if start_value < 0 or end_value <= start_value or duration_value <= 0:
+            raise RuntimeError("IndexTTS timeline contains invalid timestamps")
+        segments.append(
+            {
+                "index": index,
+                "text": str(item.get("text") or "").strip(),
+                "start_seconds": round(start_value, 6),
+                "end_seconds": round(end_value, 6),
+                "duration_seconds": round(duration_value, 6),
+            }
+        )
+    if not segments:
+        raise RuntimeError("IndexTTS timeline contains no segments")
+    return {
+        "version": 1,
+        "provider": "indextts",
+        "request_id": request_id,
+        "segment_count": len(segments),
+        "segments": segments,
+    }
+
+
+def wav_duration_seconds(path: Path) -> float:
+    with wave.open(str(path), "rb") as handle:
+        return handle.getnframes() / float(handle.getframerate())
 
 
 def create_text_client(args: argparse.Namespace) -> tuple[Any, str, float]:

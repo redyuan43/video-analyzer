@@ -288,9 +288,13 @@ def main() -> int:
         audio_path = extract_audio_to_wav(media_path, output_dir)
         if audio_path is None:
             raise RuntimeError(f"audio extraction produced no audio stream: {media_path}")
+        transcription_runtime_lock_held = local_model_stage_needed(
+            "asr",
+            config.config,
+        )
         transcription_runtime = (
             local_model_runtime_session(config.config, logger, str(output_dir))
-            if local_model_stage_needed("asr", config.config)
+            if transcription_runtime_lock_held
             else contextlib.nullcontext()
         )
         with transcription_runtime:
@@ -302,6 +306,7 @@ def main() -> int:
                     use_asr_strategy=False,
                     logger=logger,
                     progress_callback=node_progress.update,
+                    runtime_lock_held=transcription_runtime_lock_held,
                 )
             )
     if transcript is None or not transcript.text.strip():

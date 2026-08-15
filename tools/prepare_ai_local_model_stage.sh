@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STAGE="${1:-}"
 
 usage() {
-  echo "Usage: $0 asr|ocr|vl|text|stop" >&2
+  echo "Usage: $0 asr|ocr|vl|text|tts|stop" >&2
 }
 
 stop_pids() {
@@ -59,6 +59,34 @@ stop_firered_asr2() {
 
 stop_minicpm() {
   "${ROOT_DIR}/tools/start_minicpm_p40_service.sh" stop >/dev/null 2>&1 || true
+}
+
+stop_indextts() {
+  local endpoint="http://127.0.0.1:${INDEXTTS_PORT:-8092}/internal/backend/unload"
+  local status
+  for _ in $(seq 1 900); do
+    status="$(
+      curl --noproxy "*" -sS -o /dev/null -w '%{http_code}' \
+        -X POST --max-time 125 "${endpoint}" 2>/dev/null || true
+    )"
+    case "${status}" in
+      2??)
+        return 0
+        ;;
+      409)
+        sleep 1
+        ;;
+      *)
+        if ! fuser -n tcp "${INDEXTTS_PORT:-8092}" >/dev/null 2>&1; then
+          return 0
+        fi
+        echo "IndexTTS backend did not unload cleanly (HTTP ${status:-000})" >&2
+        return 1
+        ;;
+    esac
+  done
+  echo "IndexTTS backend stayed busy for 900 seconds" >&2
+  return 1
 }
 
 stop_bonsai() {
@@ -164,12 +192,14 @@ start_minicpm() {
 
 case "${STAGE}" in
   asr)
+    stop_indextts
     stop_bonsai
     stop_minicpm
     stop_ocr
     start_asr
     ;;
   ocr)
+    stop_indextts
     stop_bonsai
     stop_minicpm
     stop_vibevoice
@@ -178,6 +208,7 @@ case "${STAGE}" in
     start_ocr
     ;;
   vl)
+    stop_indextts
     stop_bonsai
     stop_ocr
     stop_vibevoice
@@ -186,6 +217,7 @@ case "${STAGE}" in
     start_minicpm
     ;;
   text)
+    stop_indextts
     stop_ocr
     stop_vibevoice
     stop_qwen3_asr
@@ -193,7 +225,16 @@ case "${STAGE}" in
     stop_minicpm
     start_bonsai
     ;;
+  tts)
+    stop_bonsai
+    stop_ocr
+    stop_vibevoice
+    stop_qwen3_asr
+    stop_firered_asr2
+    stop_minicpm
+    ;;
   stop)
+    stop_indextts
     stop_bonsai
     stop_ocr
     stop_vibevoice

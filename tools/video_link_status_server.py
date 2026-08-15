@@ -260,6 +260,7 @@ MODULE_ORDER = [
     "qa-index",
     "image-prompts",
     "final-publish",
+    "tts-narration",
 ]
 MODULE_LABELS = {
     "probe": "探测时长",
@@ -274,6 +275,7 @@ MODULE_LABELS = {
     "qa-index": "问答证据索引",
     "image-prompts": "生成配图提示词",
     "final-publish": "最终定稿/发布",
+    "tts-narration": "长内容语音",
 }
 MODULE_SPECS = {
     "probe": {"requires": [], "produces": ["duration", "resolved_mode"]},
@@ -297,6 +299,16 @@ MODULE_SPECS = {
     "qa-index": {"requires": ["run_dir", "verified_core"], "produces": ["qa_index"]},
     "image-prompts": {"requires": ["run_dir"], "produces": ["image_prompts"]},
     "final-publish": {"requires": ["run_dir", "verified_core"], "produces": ["exports"]},
+    "tts-narration": {
+        "requires": ["run_dir", "exports"],
+        "produces": [
+            "narration_audio",
+            "narration_script",
+            "narration_text",
+            "narration_metadata",
+            "narration_timeline",
+        ],
+    },
 }
 STAGE_ORDER = MODULE_ORDER
 STAGE_LABELS = MODULE_LABELS
@@ -316,6 +328,9 @@ STAGE_ALIASES = {
     "export_docs": "final-publish",
     "image_prompts": "image-prompts",
     "final_publish": "final-publish",
+    "tts": "tts-narration",
+    "tts_narration": "tts-narration",
+    "audio_narration": "tts-narration",
 }
 STAGE_RESOURCES = {
     "probe": "prepare",
@@ -330,6 +345,7 @@ STAGE_RESOURCES = {
     "qa-index": "qa-index",
     "image-prompts": "image-prompts",
     "final-publish": "final-publish",
+    "tts-narration": "tts",
 }
 RESOURCE_LIMITS = {
     "prepare": 2,
@@ -346,6 +362,7 @@ RESOURCE_LIMITS = {
     "qa-index": 2,
     "image-prompts": 3,
     "final-publish": 3,
+    "tts": 1,
 }
 EXPECTED_FINAL_EXPORTS = (
     "operation_manual.pdf",
@@ -383,8 +400,16 @@ EXECUTION_NODE_ARTIFACTS = {
     "image_prompts": ("baoyu_images/prompts",),
     "image": ("baoyu_images/final",),
     "final_publish": ("final_publish_summary.json",),
+    "tts_narration": (
+        "audio_narration/narration_script.md",
+        "audio_narration/narration_script.txt",
+        "audio_narration/audio_output/narration_full.wav",
+        "audio_narration/narration_metadata.json",
+        "audio_narration/narration_timeline.json",
+    ),
 }
 DOCUMENT_PREVIEW_PRIMARY = (
+    ("audio_narration/audio_output/narration_full.wav", "长内容音频讲解", "最终内容的完整语音版，可直接在线播放。"),
     ("operation_manual.md", "操作手册", "优先阅读：核心结论、流程步骤和关键截图。"),
     ("docs_analysis_chapters/knowledge_notes_v2.md", "逐章知识笔记", "第二阅读：按章节整理概念、背景和要点。"),
     ("docs_analysis_chapters/deep_report_v2.md", "深度报告", "第三阅读：综合分析、风险点和深入判断。"),
@@ -552,6 +577,12 @@ STAGE_PROGRESS_STEPS = {
         ("summary", "写出发布摘要", (r"\[summary\]", r"final_publish_summary\.json")),
         ("send", "发送/跳过发送", (r"\[send\]", r"skipped")),
     ],
+    "tts-narration": [
+        ("script", "生成音频讲解稿", (r"\[audio-narration\] source", r"narration_script\.md")),
+        ("switch", "切换五卡 TTS", (r"\[local-model-lock\].*stage=tts", r"rendering with")),
+        ("synthesize", "并发合成长音频", (r"TTS request", r"narration_full\.wav")),
+        ("verify", "校验音频产物", (r"duration_seconds", r"narration_metadata\.json")),
+    ],
 }
 
 
@@ -688,6 +719,17 @@ class VideoLinkStatusServer:
             return self.runtime_settings.test_profile(payload)
         except SettingsValidationError as exc:
             raise BridgeError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+
+    def preview_tts_setting(self, model_id: str, payload: dict[str, Any]) -> tuple[bytes, dict[str, Any]]:
+        self.ensure_settings_test_idle()
+        try:
+            return self.runtime_settings.preview_tts(model_id, str(payload.get("text") or ""))
+        except FileNotFoundError as exc:
+            raise BridgeError(HTTPStatus.NOT_FOUND, str(exc)) from exc
+        except SettingsValidationError as exc:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+        except requests.RequestException as exc:
+            raise BridgeError(HTTPStatus.BAD_GATEWAY, f"TTS 试听失败：{exc}") from exc
 
     def settings_test_blockers(self) -> list[dict[str, str]]:
         blockers: list[dict[str, str]] = []
@@ -1959,6 +2001,13 @@ class VideoLinkStatusServer:
             return self.public_job(job)
         if stage == "image-prompts" and (job["options"].get("skip_images") or not BAOYU_IMAGE_GENERATION_ENABLED):
             return self.mark_stage_skipped(job, stage, "baoyu image generation is disabled", continue_runner=continue_runner)
+        if stage == "tts-narration" and not self.tts_narration_enabled(job):
+            return self.mark_stage_skipped(
+                job,
+                stage,
+                "runtime profile has no enabled TTS model",
+                continue_runner=continue_runner,
+            )
 
         job = self.select_audio_compute_route(job, stage)
         resource = job_stage_resource(job, stage)
@@ -2134,6 +2183,8 @@ class VideoLinkStatusServer:
                 result = self.run_command_stage(job, stage, self.qa_index_command(job), stage_info["log_path"], stage_info)
             elif stage == "image-prompts":
                 result = self.run_command_stage(job, stage, self.image_prompts_command(job), stage_info["log_path"], stage_info)
+            elif stage == "tts-narration":
+                result = self.stage_tts_narration(job, stage_info["log_path"], stage_info)
             else:
                 result = self.run_command_stage(job, stage, self.final_publish_command(job), stage_info["log_path"], stage_info)
             stage_info.update(result)
@@ -2799,12 +2850,18 @@ class VideoLinkStatusServer:
         )
 
     def multidoc_command(self, job: dict[str, Any]) -> list[str]:
-        profile = (runtime_config().get("runtime_profiles") or {}).get(job["options"]["profile"]) or {}
         command = ["tools/run_multidoc_analysis.sh", str(self.require_run_dir(job)), "--profile", job["options"]["profile"]]
-        concurrency = profile.get("multidoc_chapter_concurrency")
-        if concurrency:
-            command.extend(["--chapter-concurrency", str(concurrency)])
+        command.extend(["--chapter-concurrency", str(self.chapter_concurrency(job))])
         return command
+
+    def chapter_concurrency(self, job: dict[str, Any]) -> int:
+        profile_name = str((job.get("options") or {}).get("profile") or DEFAULT_PROFILE)
+        profile = (runtime_config().get("runtime_profiles") or {}).get(profile_name) or {}
+        try:
+            concurrency = int(profile.get("multidoc_chapter_concurrency") or 1)
+        except (TypeError, ValueError):
+            concurrency = 1
+        return max(1, min(10, concurrency))
 
     def deep_v2_command(self, job: dict[str, Any]) -> list[str]:
         return [
@@ -2814,6 +2871,8 @@ class VideoLinkStatusServer:
             "--profile",
             job["options"]["profile"],
             "--deep-v2",
+            "--chapter-concurrency",
+            str(self.chapter_concurrency(job)),
             "--no-final-synthesis",
             "--no-format-markdown-final",
         ]
@@ -2859,7 +2918,13 @@ class VideoLinkStatusServer:
         ]
 
     def export_command(self, job: dict[str, Any]) -> list[str]:
-        return ["tools/export_video_docs.sh", str(self.require_run_dir(job)), "--final-only", "--jobs", "3"]
+        return [
+            "tools/export_video_docs.sh",
+            str(self.require_run_dir(job)),
+            "--final-only",
+            "--jobs",
+            str(self.chapter_concurrency(job)),
+        ]
 
     def final_publish_command(self, job: dict[str, Any]) -> list[str]:
         self.ensure_publish_not_blocked(job)
@@ -2879,7 +2944,7 @@ class VideoLinkStatusServer:
             "--profile",
             job["options"].get("profile") or DEFAULT_PROFILE,
             "--jobs",
-            "3",
+            str(self.chapter_concurrency(job)),
             "--finalize-only",
             "--skip-pdf",
             "--skip-send",
@@ -2887,6 +2952,55 @@ class VideoLinkStatusServer:
         if job["options"].get("skip_images") or not BAOYU_IMAGE_GENERATION_ENABLED:
             command.append("--skip-images")
         return command
+
+    def tts_narration_enabled(self, job: dict[str, Any]) -> bool:
+        snapshot = job.get("runtime_profile_snapshot") or {}
+        return bool((snapshot.get("models") or {}).get("tts"))
+
+    def audio_narration_command(self, job: dict[str, Any]) -> list[str]:
+        snapshot = job.get("runtime_profile_snapshot") or {}
+        config_dir = str(snapshot.get("config_dir") or "config")
+        profile = str(snapshot.get("profile") or job["options"].get("profile") or DEFAULT_PROFILE)
+        return [
+            "tools/run_audio_narration_stage.sh",
+            str(self.require_run_dir(job)),
+            "--profile",
+            profile,
+            "--config",
+            config_dir,
+        ]
+
+    def stage_tts_narration(
+        self,
+        job: dict[str, Any],
+        log_path: str,
+        stage_info: dict[str, Any],
+    ) -> dict[str, Any]:
+        result = self.run_command_stage(
+            job,
+            "tts-narration",
+            self.audio_narration_command(job),
+            log_path,
+            stage_info,
+        )
+        run_dir = self.require_run_dir(job)
+        paths = {
+            "narration_script": run_dir / "audio_narration" / "narration_script.md",
+            "narration_text": run_dir / "audio_narration" / "narration_script.txt",
+            "narration_audio": run_dir / "audio_narration" / "audio_output" / "narration_full.wav",
+            "narration_metadata": run_dir / "audio_narration" / "narration_metadata.json",
+            "narration_timeline": run_dir / "audio_narration" / "narration_timeline.json",
+        }
+        missing = [name for name, path in paths.items() if not path.is_file() or path.stat().st_size <= 44]
+        if missing:
+            raise BridgeError(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "audio narration output is incomplete: " + ", ".join(missing),
+            )
+        result.setdefault("artifacts", {}).update(
+            {name: str(path) for name, path in paths.items()}
+        )
+        return result
 
     def image_prompts_command(self, job: dict[str, Any]) -> list[str]:
         self.ensure_publish_not_blocked(job)
@@ -6360,6 +6474,10 @@ class VideoLinkStatusServer:
             "analysis_json": ((artifacts.get("analysis_json") or {}).get("value")),
         }
         file_candidates: dict[str, Any] = {
+            "narration_audio": run_dir / "audio_narration" / "audio_output" / "narration_full.wav",
+            "narration_script": run_dir / "audio_narration" / "narration_script.md",
+            "narration_metadata": run_dir / "audio_narration" / "narration_metadata.json",
+            "narration_timeline": run_dir / "audio_narration" / "narration_timeline.json",
             "transcript_json": run_dir / "orin" / "transcript.json",
             "asr_json": run_dir / "orin" / "asr.json",
             "transcription_json": run_dir / "transcription.json",
@@ -6466,6 +6584,7 @@ class VideoLinkStatusServer:
             ("notes", "逐章知识笔记", "knowledge_notes_v2.md", 5, "docs_analysis_chapters/knowledge_notes_v2.md"),
             ("report", "深度报告", "deep_report_v2.md", 5, "docs_analysis_chapters/deep_report_v2.md"),
             ("audit", "证据审计与发布判断", "evidence_review / publish_decision", 6, "evidence_review.json"),
+            ("narration", "长内容音频讲解", "narration_full.wav", 7, "audio_narration/audio_output/narration_full.wav"),
         )
         nodes = [
             {"id": node_id, "title": title, "description": description, "tier": tier, "available": required is None or required in available}
@@ -6484,6 +6603,8 @@ class VideoLinkStatusServer:
             ("notes", "audit", "发布材料"),
             ("report", "audit", "发布材料"),
             ("visual", "audit", "证据复核"),
+            ("manual", "narration", "听觉化改写"),
+            ("report", "narration", "最终内容"),
         ]
         return {
             "nodes": nodes,
@@ -7396,6 +7517,7 @@ class VideoLinkStatusServer:
                 "review": resolved_profile.get("review_model") or resolved_profile.get("text_model"),
                 "study": resolved_profile.get("study_card_model") or resolved_profile.get("text_model"),
                 "image": resolved_profile.get("image_provider") or "codex_imagegen",
+                "tts": resolved_profile.get("tts_model") if resolved_profile.get("tts_enabled") else None,
                 "selector": resolved_profile.get("template_selector_model")
                 or resolved_profile.get("text_model"),
                 "asr_fallback": (

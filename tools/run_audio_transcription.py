@@ -231,6 +231,7 @@ def run(args: argparse.Namespace) -> int:
                     config,
                     use_asr_strategy=False,
                     logger=logger,
+                    runtime_lock_held=True,
                 )
             )
         except ParallelBranchError as exc:

@@ -152,6 +152,9 @@ class TranscriptionPipelineTests(unittest.TestCase):
         self.assertIs(got_result, result)
         self.assertEqual(report["final_speaker_count"], 1)
         parallel_mock.assert_called_once()
+        self.assertFalse(
+            parallel_mock.call_args.kwargs["runtime_lock_held"]
+        )
         self.assertEqual(
             apply_mock.call_args.kwargs["prepared_assignment"][0][0]["speaker"],
             "speaker-1",

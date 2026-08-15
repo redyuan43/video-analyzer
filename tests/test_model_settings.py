@@ -121,7 +121,11 @@ class ModelSettingsTests(unittest.TestCase):
                 {
                     "label": "Custom",
                     "models": models,
-                    "settings": {"pipeline_mode": "deep", "vl_concurrency": 4},
+                    "settings": {
+                        "pipeline_mode": "deep",
+                        "vl_concurrency": 4,
+                        "multidoc_chapter_concurrency": 10,
+                    },
                 },
             )
             _defaults, _user, merged = store.load()
@@ -132,6 +136,75 @@ class ModelSettingsTests(unittest.TestCase):
         self.assertEqual(profile["vision_model"], "minicpm")
         self.assertEqual(profile["text_model"], "text-model")
         self.assertEqual(profile["speaker_diarization"]["enabled"], True)
+        self.assertEqual(profile["multidoc_chapter_concurrency"], 10)
+
+    def test_profile_rejects_chapter_concurrency_above_ten(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_repo(root)
+            settings = store.public_settings()
+            source = settings["profiles"][0]
+            models = {
+                kind: source[field]
+                for kind, field in settings["schema"]["profile_model_fields"].items()
+            }
+
+            with self.assertRaisesRegex(
+                SettingsValidationError,
+                "multidoc_chapter_concurrency must be between 1 and 10",
+            ):
+                store.save_profile(
+                    "too-wide",
+                    {
+                        "label": "Too Wide",
+                        "models": models,
+                        "settings": {"multidoc_chapter_concurrency": 11},
+                    },
+                )
+
+    def test_inherited_study_and_triage_override_legacy_qwen_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_repo(root)
+            default_path = root / "video_analyzer" / "config" / "default_config.json"
+            defaults = json.loads(default_path.read_text(encoding="utf-8"))
+            defaults["study_cards"] = {
+                "llm_base_url": "http://legacy.example/v1",
+                "model": "qwen3:4b-instruct",
+            }
+            defaults["runtime_profiles"]["default"].update(
+                {
+                    "text_model_id": "text-flash",
+                    "study_card_model_id": "study-inherit-text",
+                    "triage_model_id": "triage-inherit-study",
+                    "study_card_llm_base_url": "http://legacy.example/v1",
+                    "study_card_model": "qwen3:4b-instruct",
+                    "study_card_api_key_env": "",
+                }
+            )
+            defaults["model_catalog"] = {
+                "text-flash": {
+                    "name": "DeepSeek Flash",
+                    "kind": "text",
+                    "protocol": "openai_compatible",
+                    "model": "deepseek-v4-flash",
+                    "endpoints": ["https://api.deepseek.com"],
+                    "api_key_env": "DEEPSEEK_API_KEY",
+                }
+            }
+            default_path.write_text(json.dumps(defaults), encoding="utf-8")
+
+            _defaults, _user, merged = store.load()
+            profile = get_runtime_profile(merged, "default")
+
+        self.assertEqual(profile["study_card_inherit"], "text")
+        self.assertEqual(profile["study_card_llm_base_url"], "https://api.deepseek.com")
+        self.assertEqual(profile["study_card_model"], "deepseek-v4-flash")
+        self.assertEqual(profile["study_card_api_key_env"], "DEEPSEEK_API_KEY")
+        self.assertEqual(profile["triage_inherit"], "study")
+        self.assertEqual(profile["triage_llm_base_url"], "https://api.deepseek.com")
+        self.assertEqual(profile["triage_model"], "deepseek-v4-flash")
+        self.assertEqual(profile["triage_api_key_env"], "DEEPSEEK_API_KEY")
 
     def test_settings_expose_fixed_branched_profile_flow(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -141,7 +214,7 @@ class ModelSettingsTests(unittest.TestCase):
         node_ids = {item["id"] for item in flow["nodes"]}
         edges = {(item["from"], item["to"]) for item in flow["edges"]}
         models = {item["id"]: item for item in settings["models"]}
-        self.assertEqual(flow["version"], 4)
+        self.assertEqual(flow["version"], 5)
         self.assertTrue(
             {
                 "asr",
@@ -157,6 +230,8 @@ class ModelSettingsTests(unittest.TestCase):
                 "deep_review",
                 "web_evidence",
                 "final_publish",
+                "tts",
+                "narration_audio",
                 "operation_manual_doc",
             }
             <= node_ids
@@ -177,6 +252,8 @@ class ModelSettingsTests(unittest.TestCase):
         self.assertIn(("text", "text_fallback"), edges)
         self.assertIn(("text_fallback", "core_verify"), edges)
         self.assertIn(("final_publish", "operation_manual_doc"), edges)
+        self.assertIn(("final_publish", "tts"), edges)
+        self.assertIn(("tts", "narration_audio"), edges)
         self.assertEqual(models["vision-disabled"]["protocol"], "none")
         self.assertEqual(models["text-disabled"]["protocol"], "none")
         self.assertEqual(
@@ -185,6 +262,7 @@ class ModelSettingsTests(unittest.TestCase):
         )
         self.assertEqual(models["review-inherit-text"]["protocol"], "inherit_text")
         self.assertEqual(models["image-disabled"]["protocol"], "none")
+        self.assertEqual(models["tts-disabled"]["protocol"], "none")
 
     def test_settings_expose_local_multiworker_model_catalog(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -232,6 +310,34 @@ class ModelSettingsTests(unittest.TestCase):
         self.assertEqual(local_text["options"]["text_worker_count"], 5)
         self.assertEqual(local_text["options"]["text_concurrency"], 5)
         self.assertIn("五张 P40", local_text["name"])
+        local_tts = models["tts-indextts25-ray-p40"]
+        self.assertEqual(local_tts["protocol"], "openai_speech")
+        self.assertEqual(local_tts["endpoints"], ["http://127.0.0.1:8092"])
+        self.assertEqual(local_tts["options"]["voice"], "check_boards_sweet")
+
+    def test_indextts_profile_expands_to_runtime_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self.make_repo(root)
+            settings = store.public_settings()
+            source = settings["profiles"][0]
+            models = {
+                kind: source[field]
+                for kind, field in settings["schema"]["profile_model_fields"].items()
+            }
+            models["tts"] = "tts-indextts25-ray-p40"
+            store.save_profile(
+                "with-tts",
+                {"label": "With TTS", "models": models, "settings": {}},
+            )
+            _defaults, _user, merged = store.load()
+            profile = get_runtime_profile(merged, "with-tts")
+
+        self.assertTrue(profile["tts_enabled"])
+        self.assertEqual(profile["tts_provider"], "openai_speech")
+        self.assertEqual(profile["tts_base_url"], "http://127.0.0.1:8092")
+        self.assertEqual(profile["tts_model"], "/home/ai/github/indextts-2.5")
+        self.assertEqual(profile["tts_voice"], "check_boards_sweet")
 
     def test_settings_expose_tencent_hy_asr_cloud_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -248,6 +354,7 @@ class ModelSettingsTests(unittest.TestCase):
             tencent["options"]["secret_key_env"],
             "TENCENTCLOUD_SECRET_KEY",
         )
+        self.assertEqual(tencent["options"]["parallel_chunks"], 6)
 
     def test_amd_lmstudio_text_model_expands_to_runtime_profile(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -657,6 +764,41 @@ class ModelSettingsTests(unittest.TestCase):
         self.assertEqual(captured["stage"], "ocr")
         self.assertEqual(captured["config"]["ocr"]["base_urls"], ["http://127.0.0.1:18088/v1"])
 
+    def test_tts_preview_prepares_stage_then_returns_wav(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.make_repo(Path(tmp))
+            response = MagicMock()
+            response.content = b"RIFF" + b"\0" * 64
+            response.raise_for_status.return_value = None
+            session = MagicMock()
+            session.post.return_value = response
+            captured = {}
+
+            def stage_context(stage, config, *_args, **_kwargs):
+                captured["stage"] = stage
+                captured["config"] = config
+                return contextlib.nullcontext()
+
+            with (
+                patch(
+                    "video_analyzer.local_model_runtime.local_model_stage",
+                    side_effect=stage_context,
+                ),
+                patch("video_analyzer.model_settings._test_session", return_value=session),
+            ):
+                wav, metadata = store.preview_tts(
+                    "tts-indextts25-ray-p40",
+                    "这是一段前端语音试听。",
+                )
+
+        self.assertTrue(wav.startswith(b"RIFF"))
+        self.assertEqual(metadata["voice"], "check_boards_sweet")
+        self.assertEqual(captured["stage"], "tts")
+        self.assertEqual(captured["config"]["tts"]["base_url"], "http://127.0.0.1:8092")
+        request = session.post.call_args
+        self.assertEqual(request.args[0], "http://127.0.0.1:8092/v1/audio/speech")
+        self.assertEqual(request.kwargs["json"]["input"], "这是一段前端语音试听。")
+
     def test_profile_test_returns_status_for_every_flow_node(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = self.make_repo(Path(tmp))
@@ -737,7 +879,7 @@ class ModelSettingsTests(unittest.TestCase):
         runtime_session.assert_called_once()
         self.assertEqual(
             [call.args[0] for call in model_stage.call_args_list],
-            ["asr", "ocr", "vl"],
+            ["asr", "ocr", "vl", "tts"],
         )
 
     def test_pathway_profile_test_reports_local_stage_start_failure(self):

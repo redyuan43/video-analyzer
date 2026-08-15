@@ -72,11 +72,31 @@ class RuntimeIdentity:
                 continue
             relative = str(relative_path)
             current[relative] = file_hash(path)
+        for path in self._ui_assets():
+            try:
+                relative = str(path.relative_to(self.repo_root))
+            except ValueError:
+                continue
+            current[relative] = file_hash(path)
         for path, digest in current.items():
             self._baseline.setdefault(path, digest)
         for path in self._baseline:
             current.setdefault(path, "")
         return current
+
+    def _ui_assets(self) -> tuple[Path, ...]:
+        asset_roots = (
+            self.repo_root / "video-analyzer-ui" / "video_analyzer_ui" / "templates",
+            self.repo_root / "video-analyzer-ui" / "video_analyzer_ui" / "static" / "js",
+            self.repo_root / "video-analyzer-ui" / "video_analyzer_ui" / "static" / "css",
+            self.repo_root / "video-analyzer-ui" / "video_analyzer_ui" / "static" / "data",
+        )
+        assets: list[Path] = []
+        for root in asset_roots:
+            if not root.is_dir():
+                continue
+            assets.extend(path for path in root.rglob("*") if path.is_file())
+        return tuple(assets)
 
 
 def file_hash(path: Path) -> str:
