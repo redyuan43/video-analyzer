@@ -238,7 +238,15 @@ class Config:
                 manual_config["text_temperature"] = text_temperature
             if text_timeout_seconds is not None:
                 manual_config["text_timeout_seconds"] = int(text_timeout_seconds)
-            if profile.get("text_api_key_env") and _is_deepseek_api(text_base_url):
+            profile_text_base_url = (
+                profile.get("text_base_url")
+                or profile.get("llm_base_url")
+            )
+            uses_profile_text_endpoint = (
+                str(profile_text_base_url or "").rstrip("/")
+                == str(text_base_url or "").rstrip("/")
+            )
+            if profile.get("text_api_key_env") and uses_profile_text_endpoint:
                 manual_config["text_api_key_env"] = profile["text_api_key_env"]
             elif (
                 not _is_deepseek_api(text_base_url)
@@ -279,7 +287,6 @@ class Config:
             if profile_vibevoice_urls and not getattr(args, "vibevoice_url", None):
                 vibevoice["deep_remote_urls"] = profile_vibevoice_urls
             for key in (
-                "worker_count",
                 "use_native_chunking",
                 "single_pass_max_duration_sec",
                 "chunk_duration_sec",
@@ -288,6 +295,17 @@ class Config:
             ):
                 if key in profile:
                     vibevoice[key] = copy.deepcopy(profile[key])
+            # `worker_count` is also used by text/VL resources. The ASR-specific
+            # profile field is authoritative when selecting VibeVoice backends.
+            if profile.get("asr_worker_count") is not None:
+                vibevoice["worker_count"] = copy.deepcopy(
+                    profile["asr_worker_count"]
+                )
+                vibevoice["chunk_parallel_workers"] = copy.deepcopy(
+                    profile["asr_worker_count"]
+                )
+            elif profile.get("worker_count") is not None:
+                vibevoice["worker_count"] = copy.deepcopy(profile["worker_count"])
             profile_remote_urls = normalize_string_list(profile.get("remote_asr_urls") or profile.get("remote_asr_url"))
             if profile_remote_urls and not getattr(args, "remote_asr_url", None):
                 vibevoice["remote_urls"] = profile_remote_urls

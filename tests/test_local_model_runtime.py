@@ -54,6 +54,40 @@ class LocalModelRuntimeTests(unittest.TestCase):
         self.assertFalse(local_model_stage_needed("text", config))
         self.assertFalse(local_model_stage_needed("tts", config))
 
+    def test_remote_profile_loopback_text_endpoint_does_not_start_bonsai(self):
+        config = {
+            "active_runtime_profile": "trae-api",
+            "runtime_profiles": {
+                "trae-api": {
+                    "deployment": "remote",
+                    "provider": "trae_local_api",
+                    "text_base_url": "http://127.0.0.1:19220/v1",
+                }
+            },
+            "operation_manual": {
+                "text_base_url": "http://127.0.0.1:19220/v1",
+            },
+        }
+
+        self.assertFalse(local_model_stage_needed("text", config))
+
+    def test_remote_profile_does_not_mask_explicit_local_text_override(self):
+        config = {
+            "active_runtime_profile": "trae-api",
+            "runtime_profiles": {
+                "trae-api": {
+                    "deployment": "remote",
+                    "provider": "trae_local_api",
+                    "text_base_url": "http://127.0.0.1:19220/v1",
+                }
+            },
+            "operation_manual": {
+                "text_base_url": "http://127.0.0.1:18103/v1",
+            },
+        }
+
+        self.assertTrue(local_model_stage_needed("text", config))
+
     def test_disabled_tts_does_not_run_local_stage_switch(self):
         config = {"tts": {"enabled": False, "base_url": "http://127.0.0.1:8092"}}
 
@@ -154,14 +188,14 @@ class LocalModelRuntimeTests(unittest.TestCase):
         self.assertEqual(env["QWEN3_ASR_CHUNK_OVERLAP_SECONDS"], "12")
 
     @patch("video_analyzer.local_model_runtime.subprocess.run")
-    def test_vibevoice_asr_chunk_settings_are_forwarded(self, run):
+    def test_vibevoice_asr_worker_count_takes_precedence_over_chunk_parallelism(self, run):
         config = {
             "asr": {
                 "provider": "vibevoice",
                 "vibevoice": {
                     "deep_remote_urls": ["http://127.0.0.1:18012/api/asr/transcribe"],
-                    "worker_count": 6,
-                    "chunk_parallel_workers": 5,
+                    "worker_count": 5,
+                    "chunk_parallel_workers": 2,
                     "single_pass_max_duration_sec": 240,
                     "chunk_duration_sec": 180,
                     "chunk_overlap_sec": 12,

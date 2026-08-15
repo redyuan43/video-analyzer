@@ -490,6 +490,11 @@ class ModelSettingsTests(unittest.TestCase):
                 )
                 self.assertEqual(effective["chunk_duration_sec"], chunk_seconds)
                 self.assertEqual(effective["chunk_overlap_sec"], 5)
+                if suffix == "vibevoice":
+                    self.assertEqual(
+                        effective["chunk_parallel_workers"],
+                        effective["worker_count"],
+                    )
 
     def test_firered_profile_accepts_vad_ray_settings(self):
         with tempfile.TemporaryDirectory() as tmp:

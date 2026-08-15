@@ -38,6 +38,28 @@ def has_loopback_endpoint(urls: object) -> bool:
     return any(is_loopback_endpoint(url) for url in normalize_string_list(urls))
 
 
+def remote_runtime_profile_owns_endpoint(
+    config: dict,
+    endpoint: str | None,
+    *,
+    endpoint_keys: tuple[str, ...],
+) -> bool:
+    profile_name = str(config.get("active_runtime_profile") or "").strip()
+    profile = (config.get("runtime_profiles") or {}).get(profile_name) or {}
+    profile_endpoint = next(
+        (profile.get(key) for key in endpoint_keys if profile.get(key)),
+        None,
+    )
+    if (
+        str(profile_endpoint or "").rstrip("/")
+        != str(endpoint or "").rstrip("/")
+    ):
+        return False
+    deployment = str(profile.get("deployment") or "").strip().lower()
+    provider = str(profile.get("provider") or "").strip().lower()
+    return deployment == "remote" or provider == "trae_local_api"
+
+
 def local_model_stage_needed(stage: str, config: dict) -> bool:
     if not (config.get("local_model_runtime") or {}).get("enabled", True):
         return False
@@ -59,7 +81,14 @@ def local_model_stage_needed(stage: str, config: dict) -> bool:
         return is_loopback_endpoint(manual.get("vision_base_url") or manual.get("llm_base_url"))
     if stage == "text":
         manual = config.get("operation_manual") or {}
-        return is_loopback_endpoint(manual.get("text_base_url") or manual.get("llm_base_url"))
+        endpoint = manual.get("text_base_url") or manual.get("llm_base_url")
+        if remote_runtime_profile_owns_endpoint(
+            config,
+            endpoint,
+            endpoint_keys=("text_base_url", "llm_base_url"),
+        ):
+            return False
+        return is_loopback_endpoint(endpoint)
     if stage == "tts":
         tts = config.get("tts") or {}
         return bool(tts.get("enabled", True)) and is_loopback_endpoint(
@@ -214,8 +243,8 @@ def prepare_local_model_stage(stage: str, config: dict, logger: logging.Logger) 
         env["ASR_ENGINE"] = provider
         if provider == "vibevoice":
             env["VIBEVOICE_WORKER_COUNT"] = str(
-                vibevoice.get("chunk_parallel_workers")
-                or vibevoice.get("worker_count")
+                vibevoice.get("worker_count")
+                or vibevoice.get("chunk_parallel_workers")
                 or 5
             )
             if vibevoice.get("single_pass_max_duration_sec") is not None:

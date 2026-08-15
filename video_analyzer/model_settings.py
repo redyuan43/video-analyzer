@@ -1151,6 +1151,8 @@ def expand_runtime_profile(config: dict[str, Any], profile: dict[str, Any]) -> d
         if expanded.get("asr_worker_count") is not None:
             options["worker_count"] = expanded["asr_worker_count"]
             options["concurrency"] = expanded["asr_worker_count"]
+            if protocol == "vibevoice_http":
+                options["chunk_parallel_workers"] = expanded["asr_worker_count"]
         if protocol == "firered_asr2_http":
             if expanded.get("asr_segmentation_mode"):
                 options["segmentation_mode"] = expanded["asr_segmentation_mode"]

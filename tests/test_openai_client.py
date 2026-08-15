@@ -50,6 +50,39 @@ class GenericOpenAIAPIClientTests(unittest.TestCase):
 
         self.assertEqual(manual_config["text_api_key_env"], "DEEPSEEK_API_KEY")
 
+    def test_runtime_profile_keeps_key_env_for_openai_compatible_endpoint(self):
+        config = Config()
+        profile = dict(config.config["runtime_profiles"]["deepseek_v4_pro"])
+        profile.update(
+            {
+                "text_base_url": "https://ivan-superai.taild500c8.ts.net/v1",
+                "llm_base_url": "https://ivan-superai.taild500c8.ts.net/v1",
+                "text_api_key_env": "TRAE_LOCAL_API_KEY",
+            }
+        )
+        config.config["runtime_profiles"]["trae-api-test"] = profile
+
+        config.update_from_args(
+            self._operation_manual_args(
+                profile="trae-api-test",
+                llm_base_url=None,
+                text_base_url=None,
+                vision_base_url=None,
+                text_model=None,
+                vision_model=None,
+            )
+        )
+
+        manual_config = config.get("operation_manual")
+        self.assertEqual(
+            manual_config["text_base_url"],
+            "https://ivan-superai.taild500c8.ts.net/v1",
+        )
+        self.assertEqual(
+            manual_config["text_api_key_env"],
+            "TRAE_LOCAL_API_KEY",
+        )
+
     def test_runtime_profile_forwards_vibevoice_chunk_settings(self):
         config = Config()
         profile = dict(config.config["runtime_profiles"]["deepseek_v4_pro"])
@@ -57,6 +90,7 @@ class GenericOpenAIAPIClientTests(unittest.TestCase):
             {
                 "asr_chunk_mode": "custom",
                 "asr_worker_count": 4,
+                "worker_count": 1,
                 "single_pass_max_duration_sec": 240,
                 "chunk_duration_sec": 180,
                 "chunk_overlap_sec": 12,
@@ -70,6 +104,7 @@ class GenericOpenAIAPIClientTests(unittest.TestCase):
 
         vibevoice = config.get("asr")["vibevoice"]
         self.assertEqual(vibevoice["worker_count"], 4)
+        self.assertEqual(vibevoice["chunk_parallel_workers"], 4)
         self.assertEqual(vibevoice["single_pass_max_duration_sec"], 240)
         self.assertEqual(vibevoice["chunk_duration_sec"], 180)
         self.assertEqual(vibevoice["chunk_overlap_sec"], 12)
