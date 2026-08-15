@@ -23,6 +23,11 @@ DEFAULT_MAX_SOURCE_CHARS = 90000
 DEFAULT_TEMPERATURE = 0.2
 DEFAULT_TTS_TIMEOUT_SECONDS = 1800
 MAX_TTS_INPUT_CHARS = 50000
+NON_SPOKEN_APPENDIX_TITLES = (
+    "术语与读法",
+    "TTS 分段建议",
+    "时长估算",
+)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -85,6 +90,7 @@ def main(argv: list[str] | None = None) -> int:
     full_wav = audio_dir / "narration_full.wav"
     tts = create_tts_config(args)
     spoken_text = text_path.read_text(encoding="utf-8").strip()
+    validate_spoken_text(spoken_text)
     timeline = render_tts(spoken_text, full_wav, tts)
     if not full_wav.exists() or full_wav.stat().st_size <= 44:
         raise RuntimeError(f"Narration WAV was not created: {full_wav}")
@@ -392,6 +398,7 @@ def build_narration_prompt(source_path: Path, source_text: str) -> str:
 - 句子短一些，段落控制在 2 到 5 句。
 - 结尾用 3 到 6 句话复盘最重要的结论。
 - 末尾追加“## 术语与读法”“## TTS 分段建议”“## 时长估算”。
+- 这三个附录仅供合成前核对读音、分段和时长；它们不属于朗读正文。
 - 不要加入背景音乐、音效或停顿指令。
 
 来源文件：{source_path}
@@ -419,7 +426,7 @@ def normalize_model_markdown(text: str) -> str:
 def markdown_to_spoken_text(markdown: str) -> str:
     lines: list[str] = []
     in_code = False
-    for raw in markdown.splitlines():
+    for raw in spoken_markdown_lines(markdown):
         line = raw.strip()
         if line.startswith("```"):
             in_code = not in_code
@@ -436,6 +443,33 @@ def markdown_to_spoken_text(markdown: str) -> str:
         if line:
             lines.append(line)
     return "\n".join(lines).strip() + "\n"
+
+
+def spoken_markdown_lines(markdown: str) -> list[str]:
+    lines: list[str] = []
+    for raw in markdown.splitlines():
+        if is_non_spoken_appendix_heading(raw):
+            break
+        lines.append(raw)
+    return lines
+
+
+def is_non_spoken_appendix_heading(line: str) -> bool:
+    heading = re.sub(r"^#{1,6}\s+", "", line.strip())
+    return heading in NON_SPOKEN_APPENDIX_TITLES and line.lstrip().startswith("#")
+
+
+def validate_spoken_text(text: str) -> None:
+    appendix_titles = {
+        line.strip().lstrip("#").strip()
+        for line in text.splitlines()
+    }.intersection(NON_SPOKEN_APPENDIX_TITLES)
+    if appendix_titles:
+        titles = "、".join(sorted(appendix_titles))
+        raise ValueError(
+            f"Narration text contains non-spoken appendix content: {titles}. "
+            "Regenerate narration_script.txt from narration_script.md before rendering."
+        )
 
 
 def build_outline(markdown: str) -> str:

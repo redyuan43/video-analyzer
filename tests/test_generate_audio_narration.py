@@ -1,10 +1,52 @@
 import unittest
 from unittest.mock import MagicMock
 
-from tools.generate_audio_narration import fetch_indextts_timeline
+from tools.generate_audio_narration import (
+    fetch_indextts_timeline,
+    markdown_to_spoken_text,
+    validate_spoken_text,
+)
 
 
 class GenerateAudioNarrationTests(unittest.TestCase):
+    def test_markdown_to_spoken_text_excludes_tts_reference_appendices(self):
+        markdown = """
+# 音频讲解稿：测试
+
+## 开场
+
+这是需要朗读的正文。
+
+## 术语与读法
+
+- API：诶辟艾
+
+## TTS 分段建议
+
+- 第一段单独合成
+
+## 时长估算
+
+- 约两分钟
+"""
+
+        spoken = markdown_to_spoken_text(markdown)
+
+        self.assertIn("这是需要朗读的正文。", spoken)
+        self.assertNotIn("术语与读法", spoken)
+        self.assertNotIn("诶辟艾", spoken)
+        self.assertNotIn("TTS 分段建议", spoken)
+        self.assertNotIn("时长估算", spoken)
+
+    def test_markdown_to_spoken_text_keeps_body_without_appendices(self):
+        spoken = markdown_to_spoken_text("# 标题\n\n## 第一部分\n\n正文内容。")
+
+        self.assertEqual(spoken, "标题\n第一部分\n正文内容。\n")
+
+    def test_validate_spoken_text_rejects_reference_appendix(self):
+        with self.assertRaisesRegex(ValueError, "non-spoken appendix"):
+            validate_spoken_text("正文内容。\n术语与读法\nAPI：诶辟艾")
+
     def test_fetch_indextts_timeline_normalizes_segments(self):
         response = MagicMock()
         response.json.return_value = {
