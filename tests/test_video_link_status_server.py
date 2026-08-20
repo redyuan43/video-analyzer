@@ -963,6 +963,53 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(first["pipeline_profile"], "audio_nx1")
         self.assertEqual(first["pipeline_kind"], "audio_nx1")
 
+    def test_mobile_audio_attempts_are_scoped_by_tenant(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            source = Path(tmp) / "demo.mp3"
+            source.write_bytes(b"fake audio")
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", repo_root)
+
+            with patch.object(
+                server,
+                "start_run",
+                side_effect=lambda job_id: server.mobile_audio_job(
+                    server.load_job(job_id),
+                    include_resources=True,
+                ),
+            ):
+                nano1 = server.create_mobile_audio_job(
+                    {"external_attempt_id": "shared-attempt"},
+                    source,
+                    "demo.mp3",
+                    tenant_id="nano1",
+                )
+                nano2 = server.create_mobile_audio_job(
+                    {"external_attempt_id": "shared-attempt"},
+                    source,
+                    "demo.mp3",
+                    tenant_id="nano2",
+                )
+
+            nano1_list = server.list_mobile_audio_jobs(tenant_id="nano1")
+            nano2_list = server.list_mobile_audio_jobs(tenant_id="nano2")
+            with self.assertRaisesRegex(
+                server_mod.BridgeError,
+                "audio job not found",
+            ):
+                server.get_mobile_audio_job(nano1["job_id"], "nano2")
+
+        self.assertNotEqual(nano1["job_id"], nano2["job_id"])
+        self.assertEqual(
+            [item["job_id"] for item in nano1_list["jobs"]],
+            [nano1["job_id"]],
+        )
+        self.assertEqual(
+            [item["job_id"] for item in nano2_list["jobs"]],
+            [nano2["job_id"]],
+        )
+
     def test_video_job_rejects_audio_workflow_profile(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs")

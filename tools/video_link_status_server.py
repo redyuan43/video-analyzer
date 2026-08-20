@@ -1023,13 +1023,21 @@ class VideoLinkStatusServer:
             "duplicates": {url: count for url, count in seen.items() if count > 1},
         }
 
-    def list_jobs(self, limit: int = 50) -> dict[str, Any]:
+    def list_jobs(
+        self,
+        limit: int = 50,
+        *,
+        include_mobile_audio: bool = True,
+    ) -> dict[str, Any]:
         jobs = []
         for path in self.jobs_dir.glob("*/job.json"):
             try:
-                jobs.append(self.public_job_summary(self.load_job(path.parent.name)))
+                job = self.load_job(path.parent.name)
             except Exception:
                 continue
+            if not include_mobile_audio and self.is_tenant_mobile_audio_job(job):
+                continue
+            jobs.append(self.public_job_summary(job))
         self.annotate_failure_dispositions(jobs)
         jobs.sort(key=lambda item: item.get("created_at") or "", reverse=True)
         return {
@@ -1039,7 +1047,11 @@ class VideoLinkStatusServer:
             "resources": self.resource_summary(jobs),
         }
 
-    def list_mobile_audio_jobs(self, limit: int = 50) -> dict[str, Any]:
+    def list_mobile_audio_jobs(
+        self,
+        limit: int = 50,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
         self.cleanup_acknowledged_mobile_audio_jobs()
         jobs = []
         for path in self.jobs_dir.glob("*/job.json"):
@@ -1047,20 +1059,34 @@ class VideoLinkStatusServer:
                 job = self.load_job(path.parent.name)
             except Exception:
                 continue
-            if self.is_mobile_audio_job(job):
+            if self.is_mobile_audio_job(job) and self.mobile_audio_tenant_matches(
+                job,
+                tenant_id,
+            ):
                 jobs.append(self.mobile_audio_job(job))
         jobs.sort(key=lambda item: item.get("created_at") or "", reverse=True)
         return {"jobs": jobs[: max(1, min(limit, 100))], "total": len(jobs)}
 
-    def get_mobile_audio_job(self, job_id: str) -> dict[str, Any]:
+    def get_mobile_audio_job(
+        self,
+        job_id: str,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
         job = self.load_job(job_id)
-        if not self.is_mobile_audio_job(job):
+        if not self.is_mobile_audio_job(job) or not self.mobile_audio_tenant_matches(
+            job,
+            tenant_id,
+        ):
             raise BridgeError(HTTPStatus.NOT_FOUND, "audio job not found")
         return self.mobile_audio_job(job, include_resources=True)
 
-    def get_mobile_audio_job_by_attempt(self, external_attempt_id: str) -> dict[str, Any]:
+    def get_mobile_audio_job_by_attempt(
+        self,
+        external_attempt_id: str,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
         external_attempt_id = normalize_external_attempt_id(external_attempt_id)
-        job = self.mobile_audio_job_by_attempt(external_attempt_id)
+        job = self.mobile_audio_job_by_attempt(external_attempt_id, tenant_id)
         if not job:
             raise BridgeError(HTTPStatus.NOT_FOUND, "audio job not found")
         return self.mobile_audio_job(job, include_resources=True)
@@ -1072,6 +1098,7 @@ class VideoLinkStatusServer:
         source_filename: str,
         *,
         pipeline_kind: str = AUDIO_PIPELINE_PROFILE_NX1,
+        tenant_id: str = "nx1",
     ) -> dict[str, Any]:
         requested_pipeline = pipeline_kind
         if pipeline_kind != AUDIO_PIPELINE_KIND_TRANSCRIPTION:
@@ -1102,7 +1129,7 @@ class VideoLinkStatusServer:
         source_sha256 = actual_sha256
 
         if external_attempt_id:
-            existing = self.mobile_audio_job_by_attempt(external_attempt_id)
+            existing = self.mobile_audio_job_by_attempt(external_attempt_id, tenant_id)
             if existing:
                 existing_kind = normalize_audio_pipeline_profile(
                     existing.get("audio_pipeline_kind")
@@ -1162,6 +1189,7 @@ class VideoLinkStatusServer:
         job["source_device"] = str(payload.get("source_device") or "external-audio")
         job["source_file_id"] = str(payload.get("source_file_id") or "")
         job["consumer_acknowledged_at"] = None
+        job["tenant_id"] = tenant_id
         job["audio_pipeline"] = True
         job["audio_pipeline_kind"] = pipeline_kind
         job["audio_pipeline_profile"] = pipeline_kind
@@ -1182,6 +1210,8 @@ class VideoLinkStatusServer:
         payload: dict[str, Any],
         transcript_path: Path,
         source_filename: str,
+        *,
+        tenant_id: str = "nx1",
     ) -> dict[str, Any]:
         external_attempt_id = normalize_external_attempt_id(payload.get("external_attempt_id") or "")
         required = {
@@ -1205,7 +1235,7 @@ class VideoLinkStatusServer:
         if required["source_transcript_sha256"] != actual_transcript_sha256:
             raise BridgeError(HTTPStatus.BAD_REQUEST, "transcript sha256 does not match source_transcript_sha256")
 
-        existing = self.mobile_audio_job_by_attempt(external_attempt_id)
+        existing = self.mobile_audio_job_by_attempt(external_attempt_id, tenant_id)
         if existing:
             matches = bool(existing.get("provided_transcript")) and all(
                 str(existing.get(key) or "") == value for key, value in required.items()
@@ -1254,13 +1284,18 @@ class VideoLinkStatusServer:
             "audio_pipeline_kind": AUDIO_PIPELINE_PROFILE_NX1,
             "audio_pipeline_profile": AUDIO_PIPELINE_PROFILE_NX1,
             "consumer_acknowledged_at": None,
+            "tenant_id": tenant_id,
         })
         if requested_profile != analysis_profile:
             job["legacy_requested_profile"] = requested_profile
         self.save_job(job)
         return self.start_run(job["job_id"])
 
-    def mobile_audio_job_by_attempt(self, external_attempt_id: str) -> dict[str, Any] | None:
+    def mobile_audio_job_by_attempt(
+        self,
+        external_attempt_id: str,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any] | None:
         for path in self.jobs_dir.glob("*/job.json"):
             try:
                 job = self.load_job(path.parent.name)
@@ -1268,14 +1303,22 @@ class VideoLinkStatusServer:
                 continue
             if (
                 self.is_mobile_audio_job(job)
+                and self.mobile_audio_tenant_matches(job, tenant_id)
                 and str(job.get("external_attempt_id") or "") == external_attempt_id
             ):
                 return job
         return None
 
-    def acknowledge_mobile_audio_job(self, job_id: str) -> dict[str, Any]:
+    def acknowledge_mobile_audio_job(
+        self,
+        job_id: str,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
         job = self.load_job(job_id)
-        if not self.is_mobile_audio_job(job):
+        if not self.is_mobile_audio_job(job) or not self.mobile_audio_tenant_matches(
+            job,
+            tenant_id,
+        ):
             raise BridgeError(HTTPStatus.NOT_FOUND, "audio job not found")
         if job.get("status") != "succeeded":
             raise BridgeError(
@@ -1364,6 +1407,22 @@ class VideoLinkStatusServer:
                 or str(job.get("upload_suffix") or "").lower() in AUDIO_MEDIA_EXTENSIONS
             )
         )
+
+    def is_tenant_mobile_audio_job(self, job: dict[str, Any]) -> bool:
+        return self.is_mobile_audio_job(job) and bool(
+            job.get("audio_pipeline") or job.get("tenant_id")
+        )
+
+    @staticmethod
+    def mobile_audio_tenant_id(job: dict[str, Any]) -> str:
+        return str(job.get("tenant_id") or "nx1").strip().lower()
+
+    def mobile_audio_tenant_matches(
+        self,
+        job: dict[str, Any],
+        tenant_id: str | None,
+    ) -> bool:
+        return tenant_id is None or self.mobile_audio_tenant_id(job) == tenant_id
 
     def mobile_audio_job(self, job: dict[str, Any], include_resources: bool = False) -> dict[str, Any]:
         public = self.public_job(job)
