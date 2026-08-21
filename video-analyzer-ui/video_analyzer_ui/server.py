@@ -196,6 +196,7 @@ class VideoAnalyzerUI:
                     'stages': STAGE_ORDER,
                     'runtime': runtime,
                     'activity': self.video_link.runtime_activity(),
+                    'background_workers': self.video_link.background_worker_status(),
                 }
             )
 

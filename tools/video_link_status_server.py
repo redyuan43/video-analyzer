@@ -9,6 +9,7 @@ import fcntl
 import hashlib
 import html
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -86,6 +87,8 @@ from video_analyzer.url_context import (
     materialize_analysis_context,
     safe_slug,
 )
+
+logger = logging.getLogger(__name__)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -598,6 +601,7 @@ class VideoLinkStatusServer:
     def __init__(self, jobs_dir: Path = DEFAULT_JOBS_DIR, repo_root: Path = REPO_ROOT, auto_resume: bool = False):
         self.jobs_dir = jobs_dir
         self.repo_root = repo_root
+        self.auto_resume = auto_resume
         self.runner_lock = threading.Lock()
         self.active_runners: dict[str, threading.Thread] = {}
         self.skill_distillation_lock = threading.Lock()
@@ -614,6 +618,9 @@ class VideoLinkStatusServer:
         self.audio_tts_stop = threading.Event()
         self.audio_tts_thread: threading.Thread | None = None
         self.audio_tts_idle_since: float | None = None
+        self.audio_tts_heartbeat_at: float | None = None
+        self.audio_tts_current_job_id = ""
+        self.audio_tts_last_error = ""
         self.gpu_snapshot_cache: dict[str, Any] | None = None
         self.gpu_snapshot_cache_time = 0.0
         self.resource_locks = {name: threading.BoundedSemaphore(limit) for name, limit in RESOURCE_LIMITS.items()}
@@ -651,6 +658,29 @@ class VideoLinkStatusServer:
             "video_jobs": video_jobs,
             "skill_distillations": skill_distillations,
             "skill_projects": skill_projects,
+        }
+
+    def background_worker_status(self) -> dict[str, Any]:
+        if self.auto_resume and (
+            self.audio_tts_thread is None or not self.audio_tts_thread.is_alive()
+        ):
+            logger.warning("audio TTS scheduler is not alive; restarting it")
+            self.start_audio_tts_loop()
+        heartbeat_age = None
+        if self.audio_tts_heartbeat_at is not None:
+            heartbeat_age = max(
+                0.0,
+                time.monotonic() - self.audio_tts_heartbeat_at,
+            )
+        return {
+            "audio_tts": {
+                "alive": bool(
+                    self.audio_tts_thread and self.audio_tts_thread.is_alive()
+                ),
+                "current_job_id": self.audio_tts_current_job_id,
+                "heartbeat_age_seconds": heartbeat_age,
+                "last_error": self.audio_tts_last_error,
+            }
         }
 
     def options(self) -> dict[str, Any]:
@@ -2023,10 +2053,29 @@ class VideoLinkStatusServer:
                 continue
             tasks = dict(job.get("background_tasks") or {})
             tts = dict(tasks.get("tts_summary") or {})
+            explicit_tenant = bool(str(job.get("tenant_id") or "").strip())
+            if (
+                tts.get("status") in {"queued", "waiting_for_idle"}
+                and not explicit_tenant
+                and int(tts.get("attempt") or 0) == 0
+            ):
+                tts.update(
+                    {
+                        "status": "skipped",
+                        "finished_at": iso_now(),
+                        "error": "legacy audio job has no tenant binding",
+                    }
+                )
+                tasks["tts_summary"] = tts
+                job["background_tasks"] = tasks
+                job["updated_at"] = iso_now()
+                self.save_job(job)
+                continue
             if (
                 not tts
                 and job.get("status") == "succeeded"
                 and self.is_tenant_mobile_audio_job(job)
+                and explicit_tenant
             ):
                 self.queue_audio_tts(job["job_id"])
                 continue
@@ -2072,6 +2121,7 @@ class VideoLinkStatusServer:
         if self.audio_tts_thread and self.audio_tts_thread.is_alive():
             return
         self.audio_tts_stop.clear()
+        self.audio_tts_heartbeat_at = time.monotonic()
         self.audio_tts_thread = threading.Thread(
             target=self._audio_tts_loop,
             daemon=True,
@@ -2081,6 +2131,7 @@ class VideoLinkStatusServer:
 
     def _audio_tts_loop(self) -> None:
         while not self.audio_tts_stop.wait(10):
+            self.audio_tts_heartbeat_at = time.monotonic()
             try:
                 if self.production_audio_local_busy():
                     self.audio_tts_idle_since = None
@@ -2093,9 +2144,16 @@ class VideoLinkStatusServer:
                     continue
                 candidate = self.next_audio_tts_job()
                 if candidate:
-                    self.run_audio_tts(candidate["job_id"])
-                    self.audio_tts_idle_since = None
-            except Exception:
+                    self.audio_tts_current_job_id = candidate["job_id"]
+                    try:
+                        self.run_audio_tts(candidate["job_id"])
+                    finally:
+                        self.audio_tts_current_job_id = ""
+                        self.audio_tts_idle_since = None
+                self.audio_tts_last_error = ""
+            except Exception as exc:
+                self.audio_tts_last_error = str(exc)
+                logger.exception("audio TTS scheduler iteration failed")
                 time.sleep(5)
 
     def next_audio_tts_job(self) -> dict[str, Any] | None:
@@ -2106,7 +2164,10 @@ class VideoLinkStatusServer:
             except Exception:
                 continue
             tts = ((job.get("background_tasks") or {}).get("tts_summary") or {})
-            if tts.get("status") in {"queued", "waiting_for_idle"}:
+            if (
+                str(job.get("tenant_id") or "").strip()
+                and tts.get("status") in {"queued", "waiting_for_idle"}
+            ):
                 candidates.append(job)
         candidates.sort(
             key=lambda item: (

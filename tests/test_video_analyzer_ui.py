@@ -80,6 +80,8 @@ class VideoAnalyzerUITests(unittest.TestCase):
         payload = response.get_json()
         self.assertEqual(response.status_code, 200)
         self.assertIn("runtime", payload)
+        self.assertIn("background_workers", payload)
+        self.assertIn("audio_tts", payload["background_workers"])
         self.assertIn("runtime_id", payload["runtime"])
         self.assertIn("current_fingerprint", payload["runtime"])
         self.assertEqual(

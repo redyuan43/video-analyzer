@@ -1323,6 +1323,59 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             stored["background_tasks"]["tts_summary"]["synced_at"]
         )
 
+    def test_audio_tts_recovery_skips_unbound_legacy_queue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs")
+            job = {
+                "job_id": "f" * 32,
+                "status": "succeeded",
+                "source_type": "upload",
+                "source_name": "legacy.mp3",
+                "audio_pipeline": True,
+                "audio_pipeline_kind": "audio_nx1",
+                "options": {"run_name": "audio-summary"},
+                "background_tasks": {
+                    "tts_summary": {
+                        "status": "queued",
+                        "attempt": 0,
+                        "queued_at": "2026-08-21T17:36:15+0800",
+                    }
+                },
+            }
+            server.save_job(job)
+
+            server.recover_interrupted_audio_tts()
+            stored = server.load_job(job["job_id"])
+
+        self.assertEqual(
+            stored["background_tasks"]["tts_summary"]["status"],
+            "skipped",
+        )
+
+    def test_audio_tts_queue_ignores_unbound_legacy_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs")
+            for job_id, tenant_id, queued_at in (
+                ("1" * 32, "", "2026-08-21T17:00:00+0800"),
+                ("2" * 32, "nano3", "2026-08-21T18:00:00+0800"),
+            ):
+                server.save_job(
+                    {
+                        "job_id": job_id,
+                        "tenant_id": tenant_id,
+                        "background_tasks": {
+                            "tts_summary": {
+                                "status": "queued",
+                                "queued_at": queued_at,
+                            }
+                        },
+                    }
+                )
+
+            selected = server.next_audio_tts_job()
+
+        self.assertEqual(selected["job_id"], "2" * 32)
+
     def test_mobile_audio_legacy_analysis_alias_is_normalized_to_audio_nx1(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp) / "repo"
