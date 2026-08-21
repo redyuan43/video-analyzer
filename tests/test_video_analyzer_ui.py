@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import io
 import json
 import sys
@@ -288,7 +289,7 @@ class VideoAnalyzerUITests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json(), expected)
-        lookup.assert_called_once_with("attempt-1")
+        lookup.assert_called_once_with("attempt-1", "nx1")
 
     def test_mobile_audio_routes_honor_pipeline_token(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -312,6 +313,118 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertEqual(payload["total"], 382)
         self.assertNotIn("prompt_original", payload["templates"][0])
         self.assertNotIn("prompt", payload["templates"][0])
+
+    def test_mobile_audio_routes_resolve_distinct_tenants(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = Path(tmp) / "audio-tenants.json"
+            registry.write_text(
+                json.dumps(
+                    {
+                        "tenants": {
+                            "nano1": {
+                                "token_sha256": hashlib.sha256(
+                                    b"nano1-secret"
+                                ).hexdigest()
+                            },
+                            "nano2": {
+                                "token_sha256": hashlib.sha256(
+                                    b"nano2-secret"
+                                ).hexdigest()
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                "os.environ",
+                {
+                    "VIDEO_ANALYZER_AUDIO_TENANTS_FILE": str(registry),
+                    "VIDEO_ANALYZER_AUDIO_PIPELINE_TOKEN": "",
+                },
+            ):
+                ui = ui_mod.VideoAnalyzerUI(
+                    jobs_dir=Path(tmp) / "jobs",
+                    video_link_auto_resume=False,
+                )
+                with patch.object(
+                    ui.video_link,
+                    "list_mobile_audio_jobs",
+                    return_value={"jobs": [], "total": 0},
+                ) as list_jobs:
+                    denied = ui.app.test_client().get(
+                        "/api/mobile/audio-jobs",
+                        headers={"X-Audio-Pipeline-Token": "wrong"},
+                    )
+                    allowed = ui.app.test_client().get(
+                        "/api/mobile/audio-jobs",
+                        headers={"X-Audio-Pipeline-Token": "nano2-secret"},
+                    )
+
+        self.assertEqual(denied.status_code, 401)
+        self.assertEqual(allowed.status_code, 200)
+        list_jobs.assert_called_once_with(50, "nano2")
+
+    def test_mobile_audio_tts_ack_uses_resolved_tenant(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = Path(tmp) / "audio-tenants.json"
+            registry.write_text(
+                json.dumps(
+                    {
+                        "tenants": {
+                            "nano3": {
+                                "token_sha256": hashlib.sha256(
+                                    b"nano3-secret"
+                                ).hexdigest()
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                "os.environ",
+                {
+                    "VIDEO_ANALYZER_AUDIO_TENANTS_FILE": str(registry),
+                    "VIDEO_ANALYZER_AUDIO_PIPELINE_TOKEN": "",
+                },
+            ):
+                ui = ui_mod.VideoAnalyzerUI(
+                    jobs_dir=Path(tmp) / "jobs",
+                    video_link_auto_resume=False,
+                )
+                with patch.object(
+                    ui.video_link,
+                    "acknowledge_mobile_audio_tts",
+                    return_value={"acknowledged": True},
+                ) as acknowledge:
+                    response = ui.app.test_client().post(
+                        "/api/mobile/audio-jobs/job-1/background-tasks/tts/ack",
+                        headers={"X-Audio-Pipeline-Token": "nano3-secret"},
+                    )
+
+        self.assertEqual(response.status_code, 200)
+        acknowledge.assert_called_once_with("job-1", "nano3")
+
+    def test_operator_audio_jobs_route_lists_selected_tenant(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(
+                jobs_dir=Path(tmp) / "jobs",
+                video_link_auto_resume=False,
+            )
+            expected = {"jobs": [], "total": 0}
+            with patch.object(
+                ui.video_link,
+                "list_operator_audio_jobs",
+                return_value=expected,
+            ) as list_jobs:
+                response = ui.app.test_client().get(
+                    "/api/operator/audio-jobs?tenant_id=nano3&limit=25"
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), expected)
+        list_jobs.assert_called_once_with(25, "nano3")
 
     def test_stale_runtime_rejects_new_job_mutation(self):
         with tempfile.TemporaryDirectory() as tmp:

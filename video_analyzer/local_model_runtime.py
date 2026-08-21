@@ -133,6 +133,50 @@ def local_model_runtime_lock(
 
 
 @contextlib.contextmanager
+def try_local_model_runtime_lock(
+    config: dict,
+    logger: logging.Logger,
+    owner: str,
+    *,
+    stage: str = "text",
+) -> Iterator[bool]:
+    """Try to reserve the shared local-model runtime without waiting."""
+    runtime = config.get("local_model_runtime") or {}
+    lock_path = Path(
+        os.environ.get("VIDEO_ANALYZER_LOCAL_MODEL_LOCK")
+        or runtime.get("lock_path")
+        or DEFAULT_LOCK_PATH
+    )
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    acquired = False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except BlockingIOError:
+            logger.info(
+                "[local-model-lock] busy stage=%s owner=%s; using fallback",
+                stage,
+                owner,
+            )
+            yield False
+            return
+        _write_lock_metadata(fd, stage, owner)
+        logger.info(
+            "[local-model-lock] acquired without waiting stage=%s owner=%s",
+            stage,
+            owner,
+        )
+        yield True
+    finally:
+        if acquired:
+            os.ftruncate(fd, 0)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+@contextlib.contextmanager
 def local_model_stage(stage: str, config: dict, logger: logging.Logger, owner: str) -> Iterator[None]:
     """Switch to a local GPU model stage without letting another task preempt it."""
     if not local_model_stage_needed(stage, config):
@@ -326,12 +370,24 @@ def prepare_local_model_stage(stage: str, config: dict, logger: logging.Logger) 
     elif stage == "text":
         manual = config.get("operation_manual") or {}
         env["BONSAI_LOCAL_PORT"] = str(manual.get("text_port") or 18103)
-        worker_count = manual.get("text_worker_count")
-        if worker_count:
-            env["BONSAI_LOCAL_WORKER_COUNT"] = str(worker_count)
-        gpu_ids = manual.get("text_gpu_ids")
-        if gpu_ids:
-            env["BONSAI_LOCAL_GPU_IDS"] = ",".join(str(item) for item in gpu_ids)
+        worker_count = int(manual.get("text_worker_count") or 6)
+        if not 1 <= worker_count <= 6:
+            raise ValueError("text_worker_count must be between 1 and 6")
+        gpu_ids = list(manual.get("text_gpu_ids") or [3, 0, 1, 2, 4, 5])
+        if worker_count > len(gpu_ids):
+            raise ValueError("text_worker_count exceeds configured text_gpu_ids")
+        env["BONSAI_LOCAL_WORKER_COUNT"] = str(worker_count)
+        env["BONSAI_LOCAL_GPU_IDS"] = ",".join(
+            str(item) for item in gpu_ids[:worker_count]
+        )
+        context_length = int(
+            manual.get("text_context_length")
+            or manual.get("context_length")
+            or 65536
+        )
+        if not 1024 <= context_length <= 262144:
+            raise ValueError("text_context_length must be between 1024 and 262144")
+        env["BONSAI_LOCAL_CONTEXT_SIZE"] = str(context_length)
     elif stage == "tts":
         tts = config.get("tts") or {}
         endpoint = str(tts.get("base_url") or tts.get("endpoint") or "")

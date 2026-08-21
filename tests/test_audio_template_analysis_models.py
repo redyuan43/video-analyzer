@@ -40,16 +40,17 @@ class AudioTemplateAnalysisModelTests(unittest.TestCase):
     def test_audio_deepseek_flash_profile_uses_audio_workflow(self):
         config = Config('config')
         profile = config.get_runtime_profile('audio_nx1_deepseek_flash')
-        _client, model, base_url, temperature = (
-            run_audio_template_analysis.build_content_analysis_client(
-                config,
-                'audio_nx1_deepseek_flash',
+        with patch.dict('os.environ', {'TRAE_LOCAL_API_KEY': 'test-key'}):
+            _client, model, base_url, temperature = (
+                run_audio_template_analysis.build_content_analysis_client(
+                    config,
+                    'audio_nx1_deepseek_flash',
+                )
             )
-        )
 
         self.assertEqual(profile['workflow_id'], 'audio_nx1')
-        self.assertEqual(model, 'deepseek-v4-flash')
-        self.assertEqual(base_url, 'https://api.deepseek.com')
+        self.assertEqual(model, 'DeepSeek-V4-Flash-Official')
+        self.assertEqual(base_url, 'http://127.0.0.1:19220/v1')
         self.assertEqual(temperature, 1.0)
 
     def test_audio_local_quality_profile_uses_tuned_bonsai_settings(self):
@@ -63,10 +64,10 @@ class AudioTemplateAnalysisModelTests(unittest.TestCase):
         )
 
         self.assertEqual(profile['workflow_id'], 'audio_nx1')
-        self.assertEqual(model, 'prism-ml/bonsai-27b')
+        self.assertEqual(model, 'Qwen/Qwen3.8-27B-Q2-MTP4')
         self.assertEqual(base_url, 'http://127.0.0.1:18103/v1')
-        self.assertEqual(temperature, 0.2)
-        self.assertEqual(client.extra_body['repeat_penalty'], 1.1)
+        self.assertEqual(temperature, 0.7)
+        self.assertEqual(client.extra_body['top_k'], 20)
         self.assertEqual(profile['summary_single_pass_chars'], 12000)
         self.assertEqual(profile['summary_map_chunk_chars'], 8000)
 
@@ -145,14 +146,12 @@ class AudioTemplateAnalysisModelTests(unittest.TestCase):
                 patch.object(run_audio_template_analysis, 'write_operation_manual', return_value=output / 'operation_manual.md'),
                 patch.object(run_audio_template_analysis, 'write_manual_evidence', return_value=output / 'manual_evidence.md'),
                 patch.object(run_audio_template_analysis, 'write_analysis_json', return_value=output / 'analysis.json'),
-                patch.object(run_audio_template_analysis, 'local_model_stage') as text_stage,
             ):
                 self.assertEqual(run_audio_template_analysis.main(), 0)
 
         extract_mock.assert_not_called()
         asr_mock.assert_not_called()
         diarization_mock.assert_not_called()
-        self.assertEqual(text_stage.call_args.args[0], 'text')
         self.assertEqual(result.strategy, 'provided_transcript')
         self.assertEqual(result.providers_run, [])
 

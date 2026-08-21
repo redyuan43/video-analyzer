@@ -34,7 +34,24 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   PYTHON_BIN="$(command -v python3)"
 fi
 
+restore_text_pool() {
+  local restore_status
+  trap - EXIT
+  set +e
+  "$PYTHON_BIN" tools/run_local_model_stage.py \
+    --stage text \
+    --config "$CONFIG_DIR" \
+    --profile "$PROFILE" \
+    --prepare-only
+  restore_status=$?
+  set -e
+  if (( restore_status != 0 )); then
+    echo "Warning: failed to restore the local text model pool after audio narration." >&2
+  fi
+}
+
 cd "$ROOT_DIR"
+trap restore_text_pool EXIT
 "$PYTHON_BIN" tools/run_local_model_stage.py \
   --stage text \
   --config "$CONFIG_DIR" \

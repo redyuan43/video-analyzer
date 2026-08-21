@@ -263,6 +263,7 @@ class TranscriptionPipelineTests(unittest.TestCase):
                         "enabled": True,
                         "assignment_enabled": True,
                         "backend": "3dspeaker",
+                        "required": True,
                     }
                 return default
 
@@ -288,6 +289,48 @@ class TranscriptionPipelineTests(unittest.TestCase):
                     FakeConfig(),
                     logger=logging.getLogger(__name__),
                 )
+
+    def test_external_diarization_error_degrades_when_optional(self):
+        transcript = transcription_pipeline.AudioTranscript(
+            text="hello",
+            segments=[{"start": 0, "end": 1, "text": "hello"}],
+            language="en",
+        )
+
+        class FakeConfig:
+            config = {}
+
+            def get(self, key, default=None):
+                if key == "speaker_diarization":
+                    return {
+                        "enabled": True,
+                        "assignment_enabled": True,
+                        "backend": "3dspeaker",
+                        "required": False,
+                    }
+                return default
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(
+                transcription_pipeline,
+                "process_transcript_speakers",
+                return_value=(
+                    transcript,
+                    {"enabled": True, "error": "no usable speech window"},
+                ),
+            ),
+        ):
+            refined, report = transcription_pipeline.apply_speaker_diarization(
+                Path("/tmp/audio.wav"),
+                transcript,
+                Path(tmp),
+                FakeConfig(),
+                logger=logging.getLogger(__name__),
+            )
+
+        self.assertIs(refined, transcript)
+        self.assertEqual(report["error"], "no usable speech window")
 
     def test_parallel_marker_is_written_to_diarization_report(self):
         transcript = transcription_pipeline.AudioTranscript(

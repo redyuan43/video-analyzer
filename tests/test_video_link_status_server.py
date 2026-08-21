@@ -963,6 +963,53 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(first["pipeline_profile"], "audio_nx1")
         self.assertEqual(first["pipeline_kind"], "audio_nx1")
 
+    def test_mobile_audio_attempts_are_scoped_by_tenant(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            repo_root.mkdir()
+            source = Path(tmp) / "demo.mp3"
+            source.write_bytes(b"fake audio")
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", repo_root)
+
+            with patch.object(
+                server,
+                "start_run",
+                side_effect=lambda job_id: server.mobile_audio_job(
+                    server.load_job(job_id),
+                    include_resources=True,
+                ),
+            ):
+                nano1 = server.create_mobile_audio_job(
+                    {"external_attempt_id": "shared-attempt"},
+                    source,
+                    "demo.mp3",
+                    tenant_id="nano1",
+                )
+                nano2 = server.create_mobile_audio_job(
+                    {"external_attempt_id": "shared-attempt"},
+                    source,
+                    "demo.mp3",
+                    tenant_id="nano2",
+                )
+
+            nano1_list = server.list_mobile_audio_jobs(tenant_id="nano1")
+            nano2_list = server.list_mobile_audio_jobs(tenant_id="nano2")
+            with self.assertRaisesRegex(
+                server_mod.BridgeError,
+                "audio job not found",
+            ):
+                server.get_mobile_audio_job(nano1["job_id"], "nano2")
+
+        self.assertNotEqual(nano1["job_id"], nano2["job_id"])
+        self.assertEqual(
+            [item["job_id"] for item in nano1_list["jobs"]],
+            [nano1["job_id"]],
+        )
+        self.assertEqual(
+            [item["job_id"] for item in nano2_list["jobs"]],
+            [nano2["job_id"]],
+        )
+
     def test_video_job_rejects_audio_workflow_profile(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs")
@@ -1007,7 +1054,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         )
         self.assertEqual(
             fallback["diarization"]["id"],
-            "diarization-3dspeaker-local",
+            "diarization-asr-embedded",
         )
 
     def test_failed_audio_diarization_blocks_unreached_flow_nodes(self):
@@ -1149,10 +1196,8 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             }
             with patch.object(
                 server,
-                "live_resource_users",
-                side_effect=lambda resource, **_kwargs: (
-                    [{"job_id": "busy"}] if resource == "core" else []
-                ),
+                "production_audio_local_busy",
+                return_value=True,
             ), patch.object(server, "save_job"):
                 routed = server.select_audio_compute_route(job, "analyze-core")
 
@@ -1160,6 +1205,14 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(
             server_mod.job_stage_resource(routed, "analyze-core"),
             "audio-cloud-analysis",
+        )
+        self.assertEqual(
+            routed["execution_routes"]["summary"]["provider"],
+            "local_qwen_or_trae",
+        )
+        self.assertEqual(
+            routed["execution_routes"]["summary"]["local_wait_seconds"],
+            0,
         )
 
     def test_tencent_audio_fallback_waits_locally_until_credentials_exist(self):
@@ -1179,11 +1232,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
                 },
             }
             with (
-                patch.object(
-                    server,
-                    "live_resource_users",
-                    return_value=[{"job_id": "busy"}],
-                ),
+                patch.object(server, "production_audio_local_busy", return_value=True),
                 patch.object(server, "save_job"),
                 patch.object(
                     server_mod,
@@ -1197,6 +1246,81 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(
             routed["compute_route_reason"],
             "cloud_fallback_credentials_missing",
+        )
+
+    def test_production_audio_busy_check_includes_queued_video_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs")
+            server.save_job(
+                {
+                    "job_id": "c" * 32,
+                    "status": "queued",
+                    "runner": {"status": "queued"},
+                }
+            )
+
+            self.assertTrue(server.production_audio_local_busy())
+
+    def test_audio_tts_is_queued_without_changing_main_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs")
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            (run_dir / "operation_manual.md").write_text(
+                "# 总结\n\n" + "这是有效总结。" * 30,
+                encoding="utf-8",
+            )
+            job = {
+                "job_id": "d" * 32,
+                "status": "succeeded",
+                "source_type": "upload",
+                "source_name": "demo.mp3",
+                "audio_pipeline": True,
+                "audio_pipeline_kind": "audio_nx1",
+                "audio_pipeline_profile": "audio_nx1",
+                "tenant_id": "nano3",
+                "run_dir": str(run_dir),
+                "options": {"run_name": "audio-summary"},
+            }
+            server.save_job(job)
+
+            queued = server.queue_audio_tts(job["job_id"])
+            stored = server.load_job(job["job_id"])
+
+        self.assertEqual(queued["status"], "queued")
+        self.assertEqual(stored["status"], "succeeded")
+
+    def test_audio_tts_ack_records_nano_sync_without_changing_main_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs")
+            job = {
+                "job_id": "e" * 32,
+                "status": "succeeded",
+                "source_type": "upload",
+                "source_name": "demo.mp3",
+                "audio_pipeline": True,
+                "audio_pipeline_kind": "audio_nx1",
+                "tenant_id": "nano3",
+                "options": {"run_name": "audio-summary"},
+                "background_tasks": {
+                    "tts_summary": {
+                        "status": "succeeded",
+                        "artifacts": {"narration_audio": "/tmp/demo.wav"},
+                    }
+                },
+            }
+            server.save_job(job)
+
+            result = server.acknowledge_mobile_audio_tts(
+                job["job_id"],
+                "nano3",
+            )
+            stored = server.load_job(job["job_id"])
+
+        self.assertTrue(result["acknowledged"])
+        self.assertEqual(stored["status"], "succeeded")
+        self.assertTrue(
+            stored["background_tasks"]["tts_summary"]["synced_at"]
         )
 
     def test_mobile_audio_legacy_analysis_alias_is_normalized_to_audio_nx1(self):
@@ -2214,6 +2338,8 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         wrapper = (REPO_ROOT / "tools" / "run_audio_narration_stage.sh").read_text(encoding="utf-8")
         self.assertIn("--stage tts", wrapper)
         self.assertIn("--prepare-only", wrapper)
+        self.assertIn("trap restore_text_pool EXIT", wrapper)
+        self.assertIn("failed to restore the local text model pool", wrapper)
 
     def test_tts_narration_stage_records_all_outputs(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -48,6 +48,7 @@ let consoleFlowScale = 1;
 let refreshTimer = null;
 let currentJob = null;
 let latestJobs = [];
+let selectedJobSource = window.localStorage.getItem('video-analyzer-job-source') || 'video';
 let showNonRerunFailures = false;
 let currentView = ['qa', 'vscode', 'settings'].includes(initialParams.get('view'))
     ? initialParams.get('view')
@@ -261,6 +262,7 @@ const nodes = {
     globalSummary: document.getElementById('globalSummary'),
     resourceLanes: document.getElementById('resourceLanes'),
     refreshJobsButton: document.getElementById('refreshJobsButton'),
+    jobSource: document.getElementById('jobSource'),
     showNonRerunFailures: document.getElementById('showNonRerunFailures'),
     jobList: document.getElementById('jobList'),
     runButton: document.getElementById('runButton'),
@@ -2174,7 +2176,10 @@ function jobDisplayTitle(job) {
 }
 
 function jobSourceLabel(job) {
-    return job.source_name || job.video_url || '-';
+    const source = job.source_name || job.video_url || '-';
+    return job.job_kind === 'audio'
+        ? `${job.tenant_id?.toUpperCase() || 'AUDIO'} · ${source}`
+        : source;
 }
 
 function renderJobList(jobs) {
@@ -2199,7 +2204,7 @@ function renderJobList(jobs) {
                 <span class="job-url" title="${url}">${url}</span>
                 <span class="job-status-line">${escapeHtml(statusLabel)} · ${escapeHtml(stageNames[stage] || stage)}</span>
             </button>
-            <button class="icon-button light delete-job" type="button" data-job-id="${escapeHtml(job.job_id)}" title="删除任务" aria-label="删除任务">×</button>
+            ${job.operator_read_only ? '' : `<button class="icon-button light delete-job" type="button" data-job-id="${escapeHtml(job.job_id)}" title="删除任务" aria-label="删除任务">×</button>`}
         </div>`;
     }).join('') : '<div class="empty">当前没有需要续跑的失败任务</div>';
     bindJobButtons();
@@ -2232,7 +2237,7 @@ function renderSelectedJobSnapshot(jobs) {
 }
 
 async function refreshJobs() {
-    const data = await getJson('/api/video-link/jobs?limit=50');
+    const data = await getJson(jobCollectionUrl());
     renderGlobal(data);
     const jobs = data.jobs || [];
     latestJobs = jobs;
@@ -2258,13 +2263,33 @@ async function refreshSelectedJob() {
 }
 
 async function refreshJobsNoSelect() {
-    const data = await getJson('/api/video-link/jobs?limit=50');
+    const data = await getJson(jobCollectionUrl());
     renderGlobal(data);
     const jobs = data.jobs || [];
     latestJobs = jobs;
     updateProfileTestAvailability();
     renderJobList(jobs);
     renderSelectedJobSnapshot(jobs);
+}
+
+function jobCollectionUrl() {
+    if (selectedJobSource === 'video') return '/api/video-link/jobs?limit=50';
+    return `/api/operator/audio-jobs?limit=50&tenant_id=${encodeURIComponent(selectedJobSource)}`;
+}
+
+async function loadJobSources() {
+    const payload = await getJson('/api/operator/audio-tenants').catch(() => ({ tenants: [] }));
+    const options = [
+        '<option value="video">本机视频</option>',
+        ...(payload.tenants || []).map(tenant => (
+            `<option value="${escapeHtml(tenant.id)}">${escapeHtml(tenant.label || tenant.id)} · Audio</option>`
+        ))
+    ];
+    nodes.jobSource.innerHTML = options.join('');
+    if (![...nodes.jobSource.options].some(option => option.value === selectedJobSource)) {
+        selectedJobSource = 'video';
+    }
+    nodes.jobSource.value = selectedJobSource;
 }
 
 function renderGlobal(data) {
@@ -7788,6 +7813,14 @@ async function boot() {
     });
     renderUrlList();
     nodes.refreshJobsButton.addEventListener('click', refreshJobs);
+    nodes.jobSource?.addEventListener('change', async event => {
+        selectedJobSource = event.target.value || 'video';
+        window.localStorage.setItem('video-analyzer-job-source', selectedJobSource);
+        selectedJobId = null;
+        currentJob = null;
+        renderEmpty();
+        await refreshJobs();
+    });
     nodes.showNonRerunFailures?.addEventListener('change', event => {
         showNonRerunFailures = Boolean(event.target.checked);
         renderJobList(latestJobs);
@@ -7883,6 +7916,7 @@ async function boot() {
     setView(currentView, true);
     setResourceView(currentResourceView, currentView === 'vscode');
     setSkillsScope(currentSkillsScope, false);
+    await loadJobSources();
     await refreshJobs();
     if (selectedJobId) await refreshSelectedJob();
     window.setInterval(updateSkillLiveClock, 1000);

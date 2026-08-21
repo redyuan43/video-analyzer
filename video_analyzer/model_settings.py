@@ -206,6 +206,7 @@ AUDIO_PROFILE_FLOW = {
         {"id": "fallback", "label": "云端回退"},
         {"id": "analysis", "label": "内容分析"},
         {"id": "delivery", "label": "NX1 交付"},
+        {"id": "background", "label": "空闲算力"},
     ],
     "nodes": [
         {"id": "audio_input", "step": 1, "column": 1, "row": 2, "mobile_order": 1, "lane": "primary", "title": "NX1 音频输入", "subtitle": "原始文件由 NX1 持久管理", "stage": "prepare"},
@@ -218,6 +219,9 @@ AUDIO_PROFILE_FLOW = {
         {"id": "text", "step": 5, "column": 5, "row": 2, "mobile_order": 8, "lane": "analysis", "title": "总结与脑图", "subtitle": "按所选模板生成最终内容", "model_slot": "text", "model_kind": "text", "required": True, "stage": "analyze-core"},
         {"id": "artifact_package", "step": 6, "column": 6, "row": 2, "mobile_order": 9, "lane": "delivery", "title": "产物封装", "subtitle": "整理转写、总结和结构化结果", "stage": "analyze-core"},
         {"id": "nx1_sync", "step": 7, "column": 7, "row": 2, "mobile_order": 10, "lane": "delivery", "title": "回传 NX1", "subtitle": "镜像资源、发布结果并确认", "stage": "final-publish"},
+        {"id": "tts_summary", "step": 7, "column": 7, "row": 4, "mobile_order": 11, "lane": "background", "title": "后台 TTS", "subtitle": "等待空闲算力生成语音总结", "node_kind": "background_task", "background_task": "tts_summary"},
+        {"id": "narration_audio", "step": 8, "column": 8, "row": 4, "mobile_order": 12, "lane": "background", "title": "语音总结", "subtitle": "生成完整讲解音频", "node_kind": "background_output", "artifact_path": "audio_narration/audio_output/narration_full.wav"},
+        {"id": "nx1_tts_sync", "step": 9, "column": 9, "row": 4, "mobile_order": 13, "lane": "background", "title": "回传 Nano", "subtitle": "镜像 TTS 资源并确认", "node_kind": "background_sync"},
     ],
     "edges": [
         {"from": "audio_input", "to": "asr", "lane": "primary"},
@@ -232,6 +236,9 @@ AUDIO_PROFILE_FLOW = {
         {"from": "template_selector", "to": "text", "lane": "analysis"},
         {"from": "text", "to": "artifact_package", "lane": "analysis"},
         {"from": "artifact_package", "to": "nx1_sync", "lane": "delivery"},
+        {"from": "artifact_package", "to": "tts_summary", "lane": "background"},
+        {"from": "tts_summary", "to": "narration_audio", "lane": "background"},
+        {"from": "narration_audio", "to": "nx1_tts_sync", "lane": "background"},
     ],
 }
 
@@ -719,27 +726,39 @@ def _add_builtin_model_resources(
             },
         },
         "text-local-bonsai-27b-6gpu": {
-            "name": "BONSAI 27B（本地五张 P40 按需池）",
+            "name": "Qwen3.8 27B Q2 MTP4（本地六卡按需池）",
             "kind": "text",
             "protocol": "openai_compatible",
-            "model": "prism-ml/bonsai-27b",
+            "model": "Qwen/Qwen3.8-27B-Q2-MTP4",
             "endpoints": ["http://127.0.0.1:18103/v1"],
             "options": {
                 "deployment": "local",
                 "runtime": "llama.cpp",
-                "text_gpu_ids": [0, 1, 2, 4, 5],
-                "text_worker_count": 5,
-                "text_concurrency": 5,
-                "worker_count": 5,
-                "concurrency": 5,
-                "quantization": "Q1_0",
-                "context_length": 128405,
-                "cache_type_k": "f16",
-                "cache_type_v": "f16",
+                "text_gpu_ids": [3, 0, 1, 2, 4, 5],
+                "text_worker_count": 6,
+                "text_concurrency": 6,
+                "worker_count": 6,
+                "concurrency": 6,
+                "quantization": "Q2_K_XL",
+                "context_length": 65536,
+                "text_context_length": 65536,
+                "cache_type_k": "q8_0",
+                "cache_type_v": "q8_0",
+                "speculative_type": "draft-mtp",
+                "speculative_draft_n_max": 4,
                 "text_temperature": 0.7,
                 "top_k": 20,
-                "top_p": 0.95,
-                "enable_thinking": True,
+                "top_p": 0.8,
+                "extra_body": {
+                    "top_k": 20,
+                    "top_p": 0.8,
+                    "presence_penalty": 1.5,
+                    "chat_template_kwargs": {
+                        "enable_thinking": False,
+                        "preserve_thinking": False,
+                    },
+                },
+                "enable_thinking": False,
                 "preserve_thinking": False,
                 "text_timeout_seconds": 1800,
             },
@@ -1318,6 +1337,15 @@ def expand_runtime_profile(config: dict[str, Any], profile: dict[str, Any]) -> d
 
     text = model_for("text")
     if text and text.get("protocol") != "none":
+        profile_text_overrides = {
+            key: copy.deepcopy(expanded[key])
+            for key in (
+                "text_worker_count",
+                "text_gpu_ids",
+                "text_context_length",
+            )
+            if expanded.get(key) is not None
+        }
         endpoints = normalize_string_list(text.get("endpoints"))
         expanded["text_base_url"] = endpoints[0] if endpoints else ""
         expanded["llm_base_url"] = expanded["text_base_url"]
@@ -1325,6 +1353,11 @@ def expand_runtime_profile(config: dict[str, Any], profile: dict[str, Any]) -> d
         expanded["text_api_key_env"] = text.get("api_key_env")
         for key, value in (text.get("options") or {}).items():
             expanded[key] = value
+        expanded.update(profile_text_overrides)
+        if expanded.get("text_worker_count") is not None:
+            expanded["text_concurrency"] = expanded["text_worker_count"]
+        if expanded.get("text_context_length") is not None:
+            expanded["context_length"] = expanded["text_context_length"]
 
     for kind, prefix in (("review", "review"), ("study", "study_card"), ("triage", "triage")):
         resource = model_for(kind)
@@ -1415,6 +1448,30 @@ def validate_profile(
     if not 1 <= asr_worker_count <= 5:
         raise SettingsValidationError("asr_worker_count must be between 1 and 5")
     cleaned["asr_worker_count"] = asr_worker_count
+    if cleaned.get("text_worker_count") is not None:
+        try:
+            text_worker_count = int(cleaned["text_worker_count"])
+        except (TypeError, ValueError) as exc:
+            raise SettingsValidationError(
+                "text_worker_count must be an integer"
+            ) from exc
+        if not 1 <= text_worker_count <= 6:
+            raise SettingsValidationError(
+                "text_worker_count must be between 1 and 6"
+            )
+        cleaned["text_worker_count"] = text_worker_count
+    if cleaned.get("text_context_length") is not None:
+        try:
+            text_context_length = int(cleaned["text_context_length"])
+        except (TypeError, ValueError) as exc:
+            raise SettingsValidationError(
+                "text_context_length must be an integer"
+            ) from exc
+        if not 1024 <= text_context_length <= 262144:
+            raise SettingsValidationError(
+                "text_context_length must be between 1024 and 262144"
+            )
+        cleaned["text_context_length"] = text_context_length
     try:
         chapter_concurrency = int(cleaned.get("multidoc_chapter_concurrency") or 1)
     except (TypeError, ValueError) as exc:

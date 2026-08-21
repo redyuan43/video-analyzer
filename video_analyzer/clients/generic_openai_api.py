@@ -60,6 +60,7 @@ class GenericOpenAIAPIClient(LLMClient):
         max_retries: int = DEFAULT_MAX_RETRIES,
         timeout_seconds: int | None = None,
         extra_body: Optional[Dict[str, Any]] = None,
+        request_headers: Optional[Dict[str, str]] = None,
     ):
         self.api_key = api_key
         self.base_url = api_url.rstrip('/')  # Remove trailing slash if present
@@ -71,6 +72,7 @@ class GenericOpenAIAPIClient(LLMClient):
             else os.environ.get("VIDEO_ANALYZER_TEXT_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS)
         )
         self.extra_body = dict(extra_body or {})
+        self.request_headers = dict(request_headers or {})
         self.session = requests.Session()
         if self._should_bypass_env_proxy():
             self.session.trust_env = False
@@ -120,6 +122,7 @@ class GenericOpenAIAPIClient(LLMClient):
             "X-Title": "Video Analyzer",
             "Content-Type": "application/json"
         }
+        headers.update(self.request_headers)
 
         attempts = max(1, self.max_retries)
         for attempt in range(attempts):

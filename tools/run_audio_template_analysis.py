@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import re
+import requests
 import subprocess
 import sys
 import time
@@ -37,6 +38,7 @@ from video_analyzer.local_model_runtime import (  # noqa: E402
     local_model_runtime_session,
     local_model_stage,
     local_model_stage_needed,
+    try_local_model_runtime_lock,
 )
 from video_analyzer.resource_locks import analyzer_resource_lock  # noqa: E402
 from video_analyzer.transcription_pipeline import (  # noqa: E402
@@ -190,6 +192,7 @@ def selector_client_spec(client: GenericOpenAIAPIClient) -> dict[str, Any]:
         "max_retries": client.max_retries,
         "timeout_seconds": client.timeout_seconds,
         "extra_body": dict(client.extra_body or {}),
+        "request_headers": dict(client.request_headers or {}),
     }
 
 
@@ -309,24 +312,82 @@ def main() -> int:
                     runtime_lock_held=transcription_runtime_lock_held,
                 )
             )
-    if transcript is None or not transcript.text.strip():
+    if transcript is None or not has_meaningful_speech(transcript.text):
         raise RuntimeError(
-            "No recognizable speech was produced by ASR for uploaded audio"
+            "NO_SPEECH: no recognizable human speech was produced by ASR"
         )
     if asr_result:
         asr_result.transcript = transcript
     transcript_path = write_transcript_markdown(transcript, output_dir / "transcript.md")
 
-    selector_client, selector_model, selector_base_url, _selector_temperature = build_template_selector_client(config)
-    content_client, content_model, content_base_url, content_temperature = build_content_analysis_client(config, args.profile)
-    summary_settings = summary_generation_settings(
-        config.get_runtime_profile(args.profile)
-    )
     analysis_transcript = format_transcript_for_analysis(transcript)
     selector_executed = args.template_id == DEFAULT_TEMPLATE_ID
-    if selector_executed:
-        node_progress.update("template_selector", "running", "selecting summary template")
-    with local_model_stage("text", config.config, logger, str(output_dir)):
+    primary_profile = config.get_runtime_profile(args.profile)
+    fallback_profile_value = primary_profile.get("llm_fallback_profile")
+    fallback_profile_name = (
+        fallback_profile_value.strip()
+        if isinstance(fallback_profile_value, str)
+        else ""
+    )
+    local_candidate = bool(
+        fallback_profile_name and local_text_capacity_ready(primary_profile)
+    )
+    lock_context = (
+        try_local_model_runtime_lock(
+            config.config,
+            logger,
+            str(output_dir),
+            stage="text",
+        )
+        if local_candidate
+        else contextlib.nullcontext(False)
+    )
+    with lock_context as local_lock_acquired:
+        text_route = (
+            "local"
+            if local_candidate and local_lock_acquired
+            else ("cloud_fallback" if fallback_profile_name else "configured")
+        )
+        text_route_reason = (
+            "local_ready"
+            if text_route == "local"
+            else (
+                "local_model_lock_busy"
+                if local_candidate
+                else "local_model_unavailable_or_busy"
+            )
+        )
+        selected_config = config
+        selected_profile_name = args.profile
+        if text_route == "cloud_fallback":
+            selected_config = load_profile_config(args.config, fallback_profile_name)
+            selected_profile_name = fallback_profile_name
+        selector_client, selector_model, selector_base_url, _selector_temperature = (
+            build_template_selector_client(
+                selected_config,
+                immediate_local=text_route == "local",
+            )
+        )
+        content_client, content_model, content_base_url, content_temperature = (
+            build_content_analysis_client(
+                selected_config,
+                selected_profile_name,
+                immediate_local=text_route == "local",
+            )
+        )
+        summary_settings = summary_generation_settings(
+            selected_config.get_runtime_profile(selected_profile_name)
+        )
+        if selector_executed:
+            node_progress.update(
+                "template_selector",
+                "running",
+                (
+                    "selecting summary template locally"
+                    if text_route == "local"
+                    else "local text capacity busy; selecting template with Trae"
+                ),
+            )
         try:
             selected, classification = choose_template(
                 client=selector_client,
@@ -338,19 +399,56 @@ def main() -> int:
                 output_dir=output_dir,
             )
         except Exception as exc:
-            if selector_executed:
-                node_progress.update("template_selector", "failed", str(exc))
-            raise
+            if text_route != "local" or not fallback_profile_name or not local_text_busy_error(exc):
+                if selector_executed:
+                    node_progress.update("template_selector", "failed", str(exc))
+                raise
+            text_route = "cloud_fallback"
+            text_route_reason = "local_worker_race_busy"
+            selected_config = load_profile_config(args.config, fallback_profile_name)
+            selected_profile_name = fallback_profile_name
+            selector_client, selector_model, selector_base_url, _selector_temperature = (
+                build_template_selector_client(selected_config)
+            )
+            content_client, content_model, content_base_url, content_temperature = (
+                build_content_analysis_client(
+                    selected_config,
+                    selected_profile_name,
+                )
+            )
+            summary_settings = summary_generation_settings(
+                selected_config.get_runtime_profile(selected_profile_name)
+            )
+            node_progress.update(
+                "template_selector",
+                "running",
+                "local text worker became busy; retrying immediately with Trae",
+            )
+            selected, classification = choose_template(
+                client=selector_client,
+                model=selector_model,
+                templates=templates,
+                transcript_text=analysis_transcript,
+                focus_prompt=focus_prompt,
+                explicit_template_id=args.template_id,
+                output_dir=output_dir,
+            )
+        classification["execution_route"] = text_route
+        classification["execution_route_reason"] = text_route_reason
         node_progress.update(
             "template_selector",
             "succeeded",
+            f"template {selected.get('id')} · {selected.get('title_zh') or selected.get('title')} selected via {text_route}",
+        )
+        node_progress.update(
+            "text",
+            "running",
             (
-                "summary template selected"
-                if selector_executed
-                else "used explicitly selected template"
+                "generating summary and mind map locally"
+                if text_route == "local"
+                else "generating summary and mind map with Trae"
             ),
         )
-        node_progress.update("text", "running", "generating summary and mind map")
         try:
             summary = summarize_with_template(
                 client=content_client,
@@ -373,9 +471,52 @@ def main() -> int:
                 content_temperature,
             )
         except Exception as exc:
-            node_progress.update("text", "failed", str(exc))
-            raise
-        node_progress.update("text", "succeeded", "summary and mind map ready")
+            if text_route != "local" or not fallback_profile_name or not local_text_busy_error(exc):
+                node_progress.update("text", "failed", str(exc))
+                raise
+            text_route = "cloud_fallback"
+            text_route_reason = "local_worker_race_busy"
+            selected_config = load_profile_config(args.config, fallback_profile_name)
+            selected_profile_name = fallback_profile_name
+            content_client, content_model, content_base_url, content_temperature = (
+                build_content_analysis_client(
+                    selected_config,
+                    selected_profile_name,
+                )
+            )
+            summary_settings = summary_generation_settings(
+                selected_config.get_runtime_profile(selected_profile_name)
+            )
+            node_progress.update(
+                "text",
+                "running",
+                "local text worker became busy; retrying immediately with Trae",
+            )
+            summary = summarize_with_template(
+                client=content_client,
+                model=content_model,
+                template=selected,
+                transcript_text=analysis_transcript,
+                focus_prompt=focus_prompt,
+                language=args.language,
+                temperature=content_temperature,
+                source_name=args.source_name or media_path.name,
+                settings=summary_settings,
+            )
+            summary_quality = assess_summary_quality(summary, summary_settings)
+            study_guide_path = build_light_study_guide(
+                content_client,
+                content_model,
+                output_dir,
+                transcript,
+                summary,
+                content_temperature,
+            )
+        node_progress.update(
+            "text",
+            "succeeded",
+            f"summary and mind map ready via {text_route}",
+        )
     node_progress.update("artifact_package", "running", "writing final audio artifacts")
     write_audio_only_manifest(output_dir, media_path, audio_path)
 
@@ -401,6 +542,30 @@ def main() -> int:
         timings=node_progress.timings,
         compute_route=args.compute_route,
         summary_quality=summary_quality,
+        execution_routes={
+            "template_selector": {
+                "route": text_route,
+                "provider": (
+                    "trae_deepseek"
+                    if text_route == "cloud_fallback"
+                    else "local_qwen"
+                ),
+                "model": selector_model,
+                "reason": text_route_reason,
+                "local_wait_seconds": 0,
+            },
+            "summary": {
+                "route": text_route,
+                "provider": (
+                    "trae_deepseek"
+                    if text_route == "cloud_fallback"
+                    else "local_qwen"
+                ),
+                "model": content_model,
+                "reason": text_route_reason,
+                "local_wait_seconds": 0,
+            },
+        },
     )
     node_progress.update("artifact_package", "succeeded", "final audio artifacts written")
     node_progress.finish(
@@ -429,6 +594,62 @@ def load_operation_config(args: argparse.Namespace) -> Config:
     if args.compute_route == "cloud_fallback":
         apply_cloud_fallback(config, args.profile)
     return config
+
+
+def load_profile_config(config_dir: str, profile_name: str) -> Config:
+    config = Config(config_dir)
+    config.update_from_args(
+        argparse.Namespace(
+            task="operation_manual",
+            profile=profile_name,
+            client=None,
+            asr_provider=None,
+        )
+    )
+    return config
+
+
+def local_text_capacity_ready(profile: dict[str, Any]) -> bool:
+    base_url = str(
+        profile.get("text_base_url")
+        or profile.get("llm_base_url")
+        or ""
+    ).rstrip("/")
+    if not base_url.startswith(("http://127.0.0.1", "http://localhost")):
+        return False
+    required = max(
+        1,
+        min(
+            TEMPLATE_SELECTOR_SHARD_COUNT,
+            int(profile.get("text_worker_count") or profile.get("worker_count") or 1),
+        ),
+    )
+    try:
+        response = requests.get(
+            f"{base_url.removesuffix('/v1')}/api/health",
+            timeout=(1, 2),
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (requests.RequestException, ValueError):
+        return False
+    return bool(payload.get("ok")) and int(
+        payload.get("available_workers") or 0
+    ) >= required
+
+
+def local_text_busy_error(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    text = str(exc).lower()
+    return status_code == 503 or any(
+        marker in text
+        for marker in (
+            "worker pool is busy",
+            "model-resource-busy",
+            "local-model-lock",
+            "503",
+        )
+    )
 
 
 def apply_cloud_fallback(config: Config, profile_name: str | None) -> None:
@@ -471,11 +692,14 @@ def apply_cloud_fallback(config: Config, profile_name: str | None) -> None:
         vibevoice["asr_api_key_env"] = asr.get("api_key_env")
 
     diarization_protocol = str(diarization.get("protocol") or "")
-    if diarization_protocol == "asr_embedded":
+    diarization_deployment = str(
+        (diarization.get("options") or {}).get("deployment") or ""
+    )
+    if diarization_protocol == "asr_embedded" or diarization_deployment == "local":
         config.config["speaker_diarization"] = {
             "enabled": False,
             "assignment_enabled": False,
-            "source": "asr_embedded",
+            "source": "cloud_asr_without_local_wait",
         }
     else:
         backend = {
@@ -761,7 +985,11 @@ def truthy_config_value(value: Any, default: bool = False) -> bool:
     return bool(value)
 
 
-def build_template_selector_client(config: Config) -> tuple[GenericOpenAIAPIClient, str, str, float]:
+def build_template_selector_client(
+    config: Config,
+    *,
+    immediate_local: bool = False,
+) -> tuple[GenericOpenAIAPIClient, str, str, float]:
     profile = config.get_runtime_profile(None)
     study_config = config.get("study_cards") or {}
     inherit_text = profile.get("template_selector_inherit") == "text"
@@ -801,11 +1029,22 @@ def build_template_selector_client(config: Config) -> tuple[GenericOpenAIAPIClie
         api_url=base_url,
         timeout_seconds=int(study_config.get("timeout_seconds", 600)),
         extra_body=extra_body,
+        max_retries=1 if immediate_local else 3,
+        request_headers=(
+            {"X-Bonsai-Acquire-Timeout": "0"}
+            if immediate_local
+            else None
+        ),
     )
     return client, model, base_url, temperature
 
 
-def build_content_analysis_client(config: Config, profile_name: str | None) -> tuple[GenericOpenAIAPIClient, str, str, float]:
+def build_content_analysis_client(
+    config: Config,
+    profile_name: str | None,
+    *,
+    immediate_local: bool = False,
+) -> tuple[GenericOpenAIAPIClient, str, str, float]:
     profile = config.get_runtime_profile(profile_name)
     manual_config = config.get("operation_manual") or {}
     base_url = (
@@ -818,9 +1057,26 @@ def build_content_analysis_client(config: Config, profile_name: str | None) -> t
     if not base_url or not model:
         raise ValueError(f"runtime profile {profile_name or '(default)'} is missing text model configuration")
     temperature = resolve_temperature(profile, resolve_temperature(manual_config, 0.2))
+    profile_has_endpoint = bool(
+        profile.get("text_base_url") or profile.get("llm_base_url")
+    )
     api_key = resolve_api_key(
-        profile.get("api_key") or manual_config.get("text_api_key") or manual_config.get("api_key"),
-        profile.get("text_api_key_env") or profile.get("api_key_env") or manual_config.get("text_api_key_env") or manual_config.get("api_key_env"),
+        (
+            profile.get("api_key")
+            if profile_has_endpoint
+            else (
+                manual_config.get("text_api_key")
+                or manual_config.get("api_key")
+            )
+        ),
+        (
+            profile.get("text_api_key_env") or profile.get("api_key_env")
+            if profile_has_endpoint
+            else (
+                manual_config.get("text_api_key_env")
+                or manual_config.get("api_key_env")
+            )
+        ),
         base_url,
     )
     client = GenericOpenAIAPIClient(
@@ -828,6 +1084,12 @@ def build_content_analysis_client(config: Config, profile_name: str | None) -> t
         api_url=base_url,
         timeout_seconds=int(profile.get("timeout_seconds") or manual_config.get("timeout_seconds") or 600),
         extra_body=build_openai_extra_body(profile, base_url, prefix=""),
+        max_retries=1 if immediate_local else 3,
+        request_headers=(
+            {"X-Bonsai-Acquire-Timeout": "0"}
+            if immediate_local
+            else None
+        ),
     )
     return client, model, base_url, temperature
 
@@ -2723,6 +2985,7 @@ def write_analysis_json(
     timings: dict[str, float] | None = None,
     compute_route: str = "local",
     summary_quality: dict[str, Any] | None = None,
+    execution_routes: dict[str, Any] | None = None,
 ) -> Path:
     orin = output_dir / "orin"
     orin.mkdir(parents=True, exist_ok=True)
@@ -2761,6 +3024,7 @@ def write_analysis_json(
         "template_selector_model": selector_model,
         "summary_model": content_model,
         "quality": quality,
+        "execution_routes": dict(execution_routes or {}),
     }
     write_json(output_dir / "audio_template_analysis.json", audio_template_analysis)
     payload = {
@@ -2789,6 +3053,7 @@ def write_analysis_json(
                 **dict(timings or {}),
                 "total_seconds": elapsed_seconds,
             },
+            "execution_routes": dict(execution_routes or {}),
         },
         "transcript": {
             "text": transcript.text,

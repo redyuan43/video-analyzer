@@ -13,6 +13,7 @@ from video_analyzer.local_model_runtime import (
     local_model_stage,
     local_model_stage_needed,
     prepare_local_model_stage,
+    try_local_model_runtime_lock,
 )
 
 
@@ -93,6 +94,32 @@ class LocalModelRuntimeTests(unittest.TestCase):
 
         self.assertFalse(local_model_stage_needed("tts", config))
 
+    def test_try_local_model_runtime_lock_does_not_wait(self):
+        with TemporaryDirectory() as tmp:
+            config = {
+                "local_model_runtime": {
+                    "lock_path": str(Path(tmp) / "local.lock"),
+                }
+            }
+            logger = __import__("logging").getLogger(__name__)
+            acquired = threading.Event()
+            release = threading.Event()
+
+            def holder():
+                with local_model_runtime_lock(config, logger, "holder"):
+                    acquired.set()
+                    release.wait(2)
+
+            thread = threading.Thread(target=holder)
+            thread.start()
+            self.assertTrue(acquired.wait(1))
+            started = time.monotonic()
+            with try_local_model_runtime_lock(config, logger, "probe") as locked:
+                self.assertFalse(locked)
+            self.assertLess(time.monotonic() - started, 0.2)
+            release.set()
+            thread.join(2)
+
     @patch("video_analyzer.local_model_runtime.subprocess.run")
     def test_local_model_stage_unloads_on_exit_when_enabled(self, run):
         with TemporaryDirectory() as tmp:
@@ -133,13 +160,14 @@ class LocalModelRuntimeTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["timeout"], 7)
 
     @patch("video_analyzer.local_model_runtime.subprocess.run")
-    def test_text_stage_forwards_local_bonsai_topology(self, run):
+    def test_text_stage_forwards_qwen38_topology_and_context(self, run):
         config = {
             "operation_manual": {
                 "text_base_url": "http://127.0.0.1:18103/v1",
                 "text_port": 18103,
-                "text_worker_count": 5,
-                "text_gpu_ids": [0, 1, 2, 4, 5],
+                "text_worker_count": 3,
+                "text_gpu_ids": [3, 0, 1, 2, 4, 5],
+                "text_context_length": 65536,
             },
             "local_model_runtime": {
                 "stage_commands": {"text": ["/bin/echo", "text"]},
@@ -154,8 +182,9 @@ class LocalModelRuntimeTests(unittest.TestCase):
 
         env = run.call_args.kwargs["env"]
         self.assertEqual(env["BONSAI_LOCAL_PORT"], "18103")
-        self.assertEqual(env["BONSAI_LOCAL_WORKER_COUNT"], "5")
-        self.assertEqual(env["BONSAI_LOCAL_GPU_IDS"], "0,1,2,4,5")
+        self.assertEqual(env["BONSAI_LOCAL_WORKER_COUNT"], "3")
+        self.assertEqual(env["BONSAI_LOCAL_GPU_IDS"], "3,0,1")
+        self.assertEqual(env["BONSAI_LOCAL_CONTEXT_SIZE"], "65536")
 
     @patch("video_analyzer.local_model_runtime.subprocess.run")
     def test_qwen3_asr_model_id_does_not_override_local_model_path(self, run):

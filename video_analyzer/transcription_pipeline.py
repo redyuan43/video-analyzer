@@ -96,10 +96,6 @@ if ray is not None:
                 )
             report = dict(report or {})
             report["dispatch_mode"] = "ray_actor"
-            if report.get("error"):
-                raise RuntimeError(str(report["error"]))
-            if not turns:
-                raise RuntimeError("selected speaker diarization model produced no turns")
             return turns, report
 
 
@@ -237,7 +233,7 @@ def apply_speaker_diarization(
         write_json(qa_dir / "speaker_diarization_report.json", report)
         return transcript, report
     speaker_config = config.get("speaker_diarization") or {}
-    strict_external = (
+    diarization_required = _truthy(speaker_config.get("required"), default=False) and (
         _truthy(speaker_config.get("enabled"), default=True)
         and _truthy(speaker_config.get("assignment_enabled"), default=True)
         and str(speaker_config.get("backend") or "").strip()
@@ -258,11 +254,11 @@ def apply_speaker_diarization(
             )
     except Exception as exc:
         logger.warning("speaker diarization failed: %s", exc)
-        if strict_external:
+        if diarization_required:
             raise RuntimeError(f"selected speaker diarization model failed: {exc}") from exc
         refined = transcript
         report = {"enabled": True, "error": str(exc)}
-    if strict_external and report.get("error"):
+    if diarization_required and report.get("error"):
         raise RuntimeError(
             f"selected speaker diarization model failed: {report['error']}"
         )
@@ -317,7 +313,7 @@ def transcribe_and_diarize_configured_audio(
             config,
             logger=logger,
         )
-        report_status = "failed" if report.get("error") else "succeeded"
+        report_status = "skipped" if report.get("error") else "succeeded"
         progress_message = report.get("error") or "speaker diarization finished"
         report_progress("diarization", report_status, progress_message)
         report_progress("transcript_merge", "running", "finalizing aligned transcript")
@@ -356,7 +352,13 @@ def transcribe_and_diarize_configured_audio(
             )
             raise
         report_progress("asr", "succeeded" if transcript is not None else "failed", "ASR finished")
-        report_progress("diarization", "succeeded", "speaker turns prepared")
+        prepared_turns, prepared_report = prepared_assignment
+        if prepared_report.get("error"):
+            report_progress("diarization", "skipped", str(prepared_report["error"]))
+        elif not prepared_turns:
+            report_progress("diarization", "skipped", "speaker diarization produced no turns")
+        else:
+            report_progress("diarization", "succeeded", "speaker turns prepared")
 
     if transcript is None:
         return transcript, asr_result, None
@@ -375,7 +377,7 @@ def transcribe_and_diarize_configured_audio(
         raise
     report_progress(
         "transcript_merge",
-        "failed" if report.get("error") else "succeeded",
+        "skipped" if report.get("error") else "succeeded",
         report.get("error") or "aligned transcript ready",
     )
     asr_result.transcript = transcript

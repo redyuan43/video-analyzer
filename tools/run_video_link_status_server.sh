@@ -6,6 +6,14 @@ RUNTIME_DIR="$ROOT_DIR/tmp/video-link-status"
 PID_FILE="$RUNTIME_DIR/server.pid"
 LOG_FILE="$RUNTIME_DIR/server.log"
 STATUS_FILE="$RUNTIME_DIR/supervisor.json"
+AUDIO_PIPELINE_ENV="${VIDEO_ANALYZER_AUDIO_PIPELINE_ENV:-$HOME/.config/video-analyzer/audio-pipeline.env}"
+if [[ -f "$AUDIO_PIPELINE_ENV" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$AUDIO_PIPELINE_ENV"
+  set +a
+fi
+
 default_host() {
   if command -v tailscale >/dev/null 2>&1; then
     tailscale ip -4 2>/dev/null | head -n 1

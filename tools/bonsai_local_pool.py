@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""On-demand five-P40 OpenAI-compatible pool for the local Bonsai GGUF model."""
+"""On-demand OpenAI-compatible pool for the local text GGUF model.
+
+The BONSAI_LOCAL_* names are retained as a compatibility interface for the
+existing service and workflow configuration.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +12,7 @@ import atexit
 import json
 import os
 import queue
+import shlex
 import signal
 import subprocess
 import sys
@@ -21,42 +26,75 @@ from flask import Flask, Response, jsonify, request
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNTIME_DIR = Path(os.environ.get("BONSAI_LOCAL_RUNTIME_DIR", ROOT / "tmp" / "bonsai-local-pool"))
+DEFAULT_RUNTIME_DIR = ROOT / "tmp" / "bonsai-local-pool"
+RUNTIME_DIR = Path(os.environ.get("BONSAI_LOCAL_RUNTIME_DIR", DEFAULT_RUNTIME_DIR))
 PID_PATH = RUNTIME_DIR / "pool.pid"
 STATE_PATH = RUNTIME_DIR / "state.json"
 LOG_DIR = RUNTIME_DIR / "logs"
-HOST = os.environ.get("BONSAI_LOCAL_HOST", "127.0.0.1")
-PORT = int(os.environ.get("BONSAI_LOCAL_PORT", "18103"))
-BACKEND_BASE_PORT = int(os.environ.get("BONSAI_LOCAL_BACKEND_BASE_PORT", "18110"))
+CONFIG_PATH = Path(os.environ.get("BONSAI_LOCAL_CONFIG", RUNTIME_DIR / "config.json"))
+
+
+def _load_runtime_config() -> dict[str, Any]:
+    use_runtime_config = (
+        os.environ.get("BONSAI_LOCAL_USE_RUNTIME_CONFIG") == "1"
+        or (len(sys.argv) > 1 and sys.argv[1] == "serve")
+    )
+    if not use_runtime_config:
+        return {}
+    try:
+        payload = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Local text pool config must be a JSON object: {CONFIG_PATH}")
+    return payload
+
+
+RUNTIME_CONFIG = _load_runtime_config()
+
+
+def _setting(name: str, default: str) -> str:
+    return str(os.environ.get(name, RUNTIME_CONFIG.get(name, default)))
+
+
+HOST = _setting("BONSAI_LOCAL_HOST", "127.0.0.1")
+PORT = int(_setting("BONSAI_LOCAL_PORT", "18103"))
+BACKEND_BASE_PORT = int(_setting("BONSAI_LOCAL_BACKEND_BASE_PORT", "18110"))
 GPU_IDS = tuple(
     item.strip()
-    for item in os.environ.get("BONSAI_LOCAL_GPU_IDS", "0,1,2,4,5").split(",")
+    for item in _setting("BONSAI_LOCAL_GPU_IDS", "3,0,1,2,4,5").split(",")
     if item.strip()
 )
-WORKER_COUNT = int(os.environ.get("BONSAI_LOCAL_WORKER_COUNT", str(len(GPU_IDS))))
+WORKER_COUNT = int(_setting("BONSAI_LOCAL_WORKER_COUNT", str(len(GPU_IDS))))
 MODEL_PATH = Path(
-    os.environ.get(
+    _setting(
         "BONSAI_LOCAL_MODEL",
-        "/home/ai/.lmstudio/models/lmstudio-community/Bonsai-27B-GGUF/Bonsai-27B-Q1_0.gguf",
+        "/home/ai/model-sources/unsloth-Qwen3.8-27B-Q2_K_XL/"
+        "Qwen3.8-27B-UD-Q2_K_XL.gguf",
     )
 )
-MMPROJ_PATH = Path(
-    os.environ.get(
-        "BONSAI_LOCAL_MMPROJ",
-        "/home/ai/.lmstudio/models/lmstudio-community/Bonsai-27B-GGUF/mmproj-Bonsai-27B-BF16.gguf",
-    )
-)
+MMPROJ_VALUE = _setting("BONSAI_LOCAL_MMPROJ", "").strip()
+MMPROJ_PATH = Path(MMPROJ_VALUE) if MMPROJ_VALUE else None
 LLAMA_SERVER = Path(
-    os.environ.get(
+    _setting(
         "BONSAI_LOCAL_LLAMA_SERVER",
-        "/home/ai/llama.cpp-github/build-cuda-p40/bin/llama-server",
+        "/home/ai/llama.cpp-github/build-cuda-qwen38-sm61-sm70/bin/llama-server",
     )
 )
-MODEL_ALIAS = os.environ.get("BONSAI_LOCAL_MODEL_ALIAS", "prism-ml/bonsai-27b")
-CONTEXT_SIZE = int(os.environ.get("BONSAI_LOCAL_CONTEXT_SIZE", "128405"))
-REQUEST_TIMEOUT = float(os.environ.get("BONSAI_LOCAL_REQUEST_TIMEOUT", "1800"))
-ACQUIRE_TIMEOUT = float(os.environ.get("BONSAI_LOCAL_ACQUIRE_TIMEOUT", "900"))
-STARTUP_TIMEOUT = float(os.environ.get("BONSAI_LOCAL_STARTUP_TIMEOUT", "900"))
+MODEL_ALIAS = _setting("BONSAI_LOCAL_MODEL_ALIAS", "Qwen/Qwen3.8-27B-Q2-MTP4")
+CONTEXT_SIZE = int(_setting("BONSAI_LOCAL_CONTEXT_SIZE", "65536"))
+CACHE_TYPE_K = _setting("BONSAI_LOCAL_CACHE_TYPE_K", "q8_0")
+CACHE_TYPE_V = _setting("BONSAI_LOCAL_CACHE_TYPE_V", "q8_0")
+SPEC_TYPE = _setting("BONSAI_LOCAL_SPEC_TYPE", "draft-mtp")
+SPEC_DRAFT_N_MAX = int(_setting("BONSAI_LOCAL_SPEC_DRAFT_N_MAX", "4"))
+DEFAULT_ENABLE_THINKING = (
+    _setting("BONSAI_LOCAL_ENABLE_THINKING", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+EXTRA_ARGS = tuple(shlex.split(_setting("BONSAI_LOCAL_EXTRA_ARGS", "")))
+REQUEST_TIMEOUT = float(_setting("BONSAI_LOCAL_REQUEST_TIMEOUT", "1800"))
+ACQUIRE_TIMEOUT = float(_setting("BONSAI_LOCAL_ACQUIRE_TIMEOUT", "900"))
+STARTUP_TIMEOUT = float(_setting("BONSAI_LOCAL_STARTUP_TIMEOUT", "900"))
 
 
 @dataclass(frozen=True)
@@ -105,9 +143,9 @@ def configured_workers() -> list[Worker]:
         if gpu_id not in inventory:
             raise RuntimeError(f"Configured BONSAI GPU {gpu_id} is not present")
         gpu_uuid, name = inventory[gpu_id]
-        if "P40" not in name:
+        if "P40" not in name and "V100" not in name:
             raise RuntimeError(
-                f"Configured BONSAI GPU {gpu_id} is not a Tesla P40: {name}"
+                f"Configured local text GPU {gpu_id} is not a Tesla P40 or V100: {name}"
             )
         workers.append(Worker(gpu_id, gpu_uuid, name, BACKEND_BASE_PORT + offset))
     if not workers:
@@ -116,7 +154,7 @@ def configured_workers() -> list[Worker]:
 
 
 def worker_command(worker: Worker) -> list[str]:
-    return [
+    command = [
         str(LLAMA_SERVER),
         "--host",
         "127.0.0.1",
@@ -126,18 +164,18 @@ def worker_command(worker: Worker) -> list[str]:
         "CUDA0",
         "--model",
         str(MODEL_PATH),
-        "--mmproj",
-        str(MMPROJ_PATH),
         "--alias",
         MODEL_ALIAS,
         "--ctx-size",
         str(CONTEXT_SIZE),
         "--n-gpu-layers",
-        "999",
+        "all",
         "--split-mode",
         "none",
         "--main-gpu",
         "0",
+        "--fit",
+        "off",
         "--parallel",
         "1",
         "--batch-size",
@@ -145,18 +183,42 @@ def worker_command(worker: Worker) -> list[str]:
         "--ubatch-size",
         "1024",
         "--cache-type-k",
-        "f16",
+        CACHE_TYPE_K,
         "--cache-type-v",
-        "f16",
+        CACHE_TYPE_V,
         "--flash-attn",
         "on",
         "--kv-offload",
-        "--mmproj-offload",
-        "--image-min-tokens",
-        "1024",
         "--jinja",
         "--no-webui",
     ]
+    if SPEC_TYPE != "none":
+        command.extend(
+            [
+                "--spec-type",
+                SPEC_TYPE,
+                "--spec-draft-n-max",
+                str(SPEC_DRAFT_N_MAX),
+                "--spec-draft-ngl",
+                "all",
+                "--spec-draft-type-k",
+                CACHE_TYPE_K,
+                "--spec-draft-type-v",
+                CACHE_TYPE_V,
+            ]
+        )
+    if MMPROJ_PATH is not None:
+        command.extend(
+            [
+                "--mmproj",
+                str(MMPROJ_PATH),
+                "--mmproj-offload",
+                "--image-min-tokens",
+                "1024",
+            ]
+        )
+    command.extend(EXTRA_ARGS)
+    return command
 
 
 def worker_env(worker: Worker) -> dict[str, str]:
@@ -213,7 +275,8 @@ def write_state(workers: list[Worker]) -> None:
         "port": PORT,
         "model": MODEL_ALIAS,
         "context_size": CONTEXT_SIZE,
-        "cache": {"k": "f16", "v": "f16"},
+        "cache": {"k": CACHE_TYPE_K, "v": CACHE_TYPE_V},
+        "speculative": {"type": SPEC_TYPE, "draft_n_max": SPEC_DRAFT_N_MAX},
         "workers": [asdict(worker) for worker in workers],
         "started_at": time.time(),
     }
@@ -339,11 +402,26 @@ def stop_pool() -> int:
 class PoolServer:
     def __init__(self, workers: list[Worker]) -> None:
         self.workers = workers
-        self.available: queue.Queue[Worker] = queue.Queue()
+        self.worker_priority = {
+            worker.port: priority for priority, worker in enumerate(workers)
+        }
+        self.available: queue.PriorityQueue[tuple[int, Worker]] = (
+            queue.PriorityQueue()
+        )
         for worker in workers:
-            self.available.put(worker)
+            self._release(worker)
         self.app = Flask("bonsai_local_pool")
         self._register_routes()
+
+    def _release(self, worker: Worker) -> None:
+        self.available.put((self.worker_priority[worker.port], worker))
+
+    def _available_gpu_ids(self) -> list[str]:
+        with self.available.mutex:
+            return [
+                worker.gpu_id
+                for _, worker in sorted(self.available.queue)
+            ]
 
     def _register_routes(self) -> None:
         @self.app.get("/api/health")
@@ -357,8 +435,13 @@ class PoolServer:
                     "worker_count": len(self.workers),
                     "ready_workers": ready,
                     "available_workers": self.available.qsize(),
+                    "available_gpu_ids": self._available_gpu_ids(),
                     "context_size": CONTEXT_SIZE,
-                    "cache": {"k": "f16", "v": "f16"},
+                    "cache": {"k": CACHE_TYPE_K, "v": CACHE_TYPE_V},
+                    "speculative": {
+                        "type": SPEC_TYPE,
+                        "draft_n_max": SPEC_DRAFT_N_MAX,
+                    },
                     "workers": [
                         {
                             "gpu_id": worker.gpu_id,
@@ -377,8 +460,25 @@ class PoolServer:
 
         @self.app.route("/v1/<path:path>", methods=["POST"])
         def forward(path: str) -> Response:
+            acquire_timeout = ACQUIRE_TIMEOUT
+            requested_timeout = request.headers.get("X-Bonsai-Acquire-Timeout")
+            if requested_timeout is not None:
+                try:
+                    acquire_timeout = min(
+                        ACQUIRE_TIMEOUT,
+                        max(0.0, float(requested_timeout)),
+                    )
+                except (TypeError, ValueError):
+                    return jsonify(
+                        {
+                            "error": {
+                                "message": "invalid X-Bonsai-Acquire-Timeout",
+                                "type": "invalid_request_error",
+                            }
+                        }
+                    ), 400
             try:
-                worker = self.available.get(timeout=ACQUIRE_TIMEOUT)
+                _, worker = self.available.get(timeout=acquire_timeout)
             except queue.Empty:
                 return jsonify({"error": {"message": "BONSAI worker pool is busy", "type": "server_error"}}), 503
             try:
@@ -387,7 +487,10 @@ class PoolServer:
                     body.setdefault("model", MODEL_ALIAS)
                     template_kwargs = body.setdefault("chat_template_kwargs", {})
                     if isinstance(template_kwargs, dict):
-                        template_kwargs.setdefault("enable_thinking", True)
+                        template_kwargs.setdefault(
+                            "enable_thinking",
+                            DEFAULT_ENABLE_THINKING,
+                        )
                         template_kwargs.setdefault("preserve_thinking", False)
                     payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
                 else:
@@ -411,7 +514,7 @@ class PoolServer:
                             yield from response.iter_content(chunk_size=8192)
                         finally:
                             response.close()
-                            self.available.put(worker)
+                            self._release(worker)
 
                     return Response(stream(), status=response.status_code, content_type=response.headers.get("content-type"))
                 return Response(
@@ -423,14 +526,16 @@ class PoolServer:
                 return jsonify({"error": {"message": str(error), "type": "backend_error"}}), 502
             finally:
                 if not (isinstance(locals().get("body"), dict) and locals()["body"].get("stream")):
-                    self.available.put(worker)
+                    self._release(worker)
 
 
 def serve_pool() -> int:
     if not LLAMA_SERVER.is_file() or not os.access(LLAMA_SERVER, os.X_OK):
         raise RuntimeError(f"llama-server is not executable: {LLAMA_SERVER}")
-    if not MODEL_PATH.is_file() or not MMPROJ_PATH.is_file():
-        raise RuntimeError(f"BONSAI model files are missing: model={MODEL_PATH} mmproj={MMPROJ_PATH}")
+    if not MODEL_PATH.is_file():
+        raise RuntimeError(f"Local text model file is missing: {MODEL_PATH}")
+    if MMPROJ_PATH is not None and not MMPROJ_PATH.is_file():
+        raise RuntimeError(f"Local text mmproj file is missing: {MMPROJ_PATH}")
     workers = configured_workers()
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     processes: list[subprocess.Popen[bytes]] = []

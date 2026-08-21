@@ -18,6 +18,11 @@ class PrepareAiLocalModelStageTests(unittest.TestCase):
             "systemctl --user start bonsai-local-pool.service",
             script,
         )
+        self.assertIn(
+            "systemctl --user restart bonsai-local-pool.service",
+            script,
+        )
+        self.assertIn("write_bonsai_runtime_config", script)
         self.assertIn("curl --noproxy", script)
         self.assertNotIn('bonsai_local_pool.py" stop', script)
         self.assertNotIn('bonsai_local_pool.py" start', script)

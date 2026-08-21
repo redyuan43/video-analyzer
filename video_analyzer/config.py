@@ -238,6 +238,15 @@ class Config:
                 manual_config["text_temperature"] = text_temperature
             if text_timeout_seconds is not None:
                 manual_config["text_timeout_seconds"] = int(text_timeout_seconds)
+            for text_runtime_key in (
+                "text_worker_count",
+                "text_gpu_ids",
+                "text_context_length",
+            ):
+                if profile.get(text_runtime_key) is not None:
+                    manual_config[text_runtime_key] = copy.deepcopy(
+                        profile[text_runtime_key]
+                    )
             profile_text_base_url = (
                 profile.get("text_base_url")
                 or profile.get("llm_base_url")

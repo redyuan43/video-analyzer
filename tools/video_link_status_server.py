@@ -103,6 +103,7 @@ AUDIO_JOB_RETENTION_DAYS = max(
     int(os.environ.get("VIDEO_ANALYZER_AUDIO_RETENTION_DAYS", "7")),
 )
 AUDIO_PIPELINE_PROFILE_NX1 = "audio_nx1"
+AUDIO_PRODUCTION_PROFILE = "audio_nx1_deepseek_flash"
 AUDIO_PIPELINE_KIND_TRANSCRIPTION = "transcription"
 AUDIO_PIPELINE_PROFILE_ALIASES = {
     "": AUDIO_PIPELINE_PROFILE_NX1,
@@ -610,6 +611,9 @@ class VideoLinkStatusServer:
         self.vscode_lock = threading.Lock()
         self.auto_retry_stop = threading.Event()
         self.auto_retry_thread: threading.Thread | None = None
+        self.audio_tts_stop = threading.Event()
+        self.audio_tts_thread: threading.Thread | None = None
+        self.audio_tts_idle_since: float | None = None
         self.gpu_snapshot_cache: dict[str, Any] | None = None
         self.gpu_snapshot_cache_time = 0.0
         self.resource_locks = {name: threading.BoundedSemaphore(limit) for name, limit in RESOURCE_LIMITS.items()}
@@ -619,6 +623,8 @@ class VideoLinkStatusServer:
             self.recover_interrupted_skill_distillations()
             self.recover_interrupted_skill_projects()
             self.start_auto_retry_loop()
+            self.recover_interrupted_audio_tts()
+            self.start_audio_tts_loop()
 
     def runtime_activity(self) -> dict[str, Any]:
         with self.runner_lock:
@@ -1023,13 +1029,21 @@ class VideoLinkStatusServer:
             "duplicates": {url: count for url, count in seen.items() if count > 1},
         }
 
-    def list_jobs(self, limit: int = 50) -> dict[str, Any]:
+    def list_jobs(
+        self,
+        limit: int = 50,
+        *,
+        include_mobile_audio: bool = True,
+    ) -> dict[str, Any]:
         jobs = []
         for path in self.jobs_dir.glob("*/job.json"):
             try:
-                jobs.append(self.public_job_summary(self.load_job(path.parent.name)))
+                job = self.load_job(path.parent.name)
             except Exception:
                 continue
+            if not include_mobile_audio and self.is_tenant_mobile_audio_job(job):
+                continue
+            jobs.append(self.public_job_summary(job))
         self.annotate_failure_dispositions(jobs)
         jobs.sort(key=lambda item: item.get("created_at") or "", reverse=True)
         return {
@@ -1039,7 +1053,11 @@ class VideoLinkStatusServer:
             "resources": self.resource_summary(jobs),
         }
 
-    def list_mobile_audio_jobs(self, limit: int = 50) -> dict[str, Any]:
+    def list_mobile_audio_jobs(
+        self,
+        limit: int = 50,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
         self.cleanup_acknowledged_mobile_audio_jobs()
         jobs = []
         for path in self.jobs_dir.glob("*/job.json"):
@@ -1047,20 +1065,63 @@ class VideoLinkStatusServer:
                 job = self.load_job(path.parent.name)
             except Exception:
                 continue
-            if self.is_mobile_audio_job(job):
+            if self.is_mobile_audio_job(job) and self.mobile_audio_tenant_matches(
+                job,
+                tenant_id,
+            ):
                 jobs.append(self.mobile_audio_job(job))
         jobs.sort(key=lambda item: item.get("created_at") or "", reverse=True)
         return {"jobs": jobs[: max(1, min(limit, 100))], "total": len(jobs)}
 
-    def get_mobile_audio_job(self, job_id: str) -> dict[str, Any]:
+    def list_operator_audio_jobs(
+        self,
+        limit: int = 50,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
+        jobs = []
+        for path in self.jobs_dir.glob("*/job.json"):
+            try:
+                job = self.load_job(path.parent.name)
+            except Exception:
+                continue
+            if not self.is_tenant_mobile_audio_job(job):
+                continue
+            if not self.mobile_audio_tenant_matches(job, tenant_id):
+                continue
+            item = self.public_job_summary(job)
+            item["tenant_id"] = self.mobile_audio_tenant_id(job)
+            item["job_kind"] = "audio"
+            item["operator_read_only"] = True
+            jobs.append(item)
+        self.annotate_failure_dispositions(jobs)
+        jobs.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+        return {
+            "jobs": jobs[: max(1, min(limit, 200))],
+            "total": len(jobs),
+            "summary": self.jobs_summary(jobs),
+            "resources": self.resource_summary(jobs),
+        }
+
+    def get_mobile_audio_job(
+        self,
+        job_id: str,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
         job = self.load_job(job_id)
-        if not self.is_mobile_audio_job(job):
+        if not self.is_mobile_audio_job(job) or not self.mobile_audio_tenant_matches(
+            job,
+            tenant_id,
+        ):
             raise BridgeError(HTTPStatus.NOT_FOUND, "audio job not found")
         return self.mobile_audio_job(job, include_resources=True)
 
-    def get_mobile_audio_job_by_attempt(self, external_attempt_id: str) -> dict[str, Any]:
+    def get_mobile_audio_job_by_attempt(
+        self,
+        external_attempt_id: str,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
         external_attempt_id = normalize_external_attempt_id(external_attempt_id)
-        job = self.mobile_audio_job_by_attempt(external_attempt_id)
+        job = self.mobile_audio_job_by_attempt(external_attempt_id, tenant_id)
         if not job:
             raise BridgeError(HTTPStatus.NOT_FOUND, "audio job not found")
         return self.mobile_audio_job(job, include_resources=True)
@@ -1072,6 +1133,7 @@ class VideoLinkStatusServer:
         source_filename: str,
         *,
         pipeline_kind: str = AUDIO_PIPELINE_PROFILE_NX1,
+        tenant_id: str = "nx1",
     ) -> dict[str, Any]:
         requested_pipeline = pipeline_kind
         if pipeline_kind != AUDIO_PIPELINE_KIND_TRANSCRIPTION:
@@ -1102,7 +1164,7 @@ class VideoLinkStatusServer:
         source_sha256 = actual_sha256
 
         if external_attempt_id:
-            existing = self.mobile_audio_job_by_attempt(external_attempt_id)
+            existing = self.mobile_audio_job_by_attempt(external_attempt_id, tenant_id)
             if existing:
                 existing_kind = normalize_audio_pipeline_profile(
                     existing.get("audio_pipeline_kind")
@@ -1162,6 +1224,7 @@ class VideoLinkStatusServer:
         job["source_device"] = str(payload.get("source_device") or "external-audio")
         job["source_file_id"] = str(payload.get("source_file_id") or "")
         job["consumer_acknowledged_at"] = None
+        job["tenant_id"] = tenant_id
         job["audio_pipeline"] = True
         job["audio_pipeline_kind"] = pipeline_kind
         job["audio_pipeline_profile"] = pipeline_kind
@@ -1182,6 +1245,8 @@ class VideoLinkStatusServer:
         payload: dict[str, Any],
         transcript_path: Path,
         source_filename: str,
+        *,
+        tenant_id: str = "nx1",
     ) -> dict[str, Any]:
         external_attempt_id = normalize_external_attempt_id(payload.get("external_attempt_id") or "")
         required = {
@@ -1205,7 +1270,7 @@ class VideoLinkStatusServer:
         if required["source_transcript_sha256"] != actual_transcript_sha256:
             raise BridgeError(HTTPStatus.BAD_REQUEST, "transcript sha256 does not match source_transcript_sha256")
 
-        existing = self.mobile_audio_job_by_attempt(external_attempt_id)
+        existing = self.mobile_audio_job_by_attempt(external_attempt_id, tenant_id)
         if existing:
             matches = bool(existing.get("provided_transcript")) and all(
                 str(existing.get(key) or "") == value for key, value in required.items()
@@ -1254,13 +1319,18 @@ class VideoLinkStatusServer:
             "audio_pipeline_kind": AUDIO_PIPELINE_PROFILE_NX1,
             "audio_pipeline_profile": AUDIO_PIPELINE_PROFILE_NX1,
             "consumer_acknowledged_at": None,
+            "tenant_id": tenant_id,
         })
         if requested_profile != analysis_profile:
             job["legacy_requested_profile"] = requested_profile
         self.save_job(job)
         return self.start_run(job["job_id"])
 
-    def mobile_audio_job_by_attempt(self, external_attempt_id: str) -> dict[str, Any] | None:
+    def mobile_audio_job_by_attempt(
+        self,
+        external_attempt_id: str,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any] | None:
         for path in self.jobs_dir.glob("*/job.json"):
             try:
                 job = self.load_job(path.parent.name)
@@ -1268,14 +1338,22 @@ class VideoLinkStatusServer:
                 continue
             if (
                 self.is_mobile_audio_job(job)
+                and self.mobile_audio_tenant_matches(job, tenant_id)
                 and str(job.get("external_attempt_id") or "") == external_attempt_id
             ):
                 return job
         return None
 
-    def acknowledge_mobile_audio_job(self, job_id: str) -> dict[str, Any]:
+    def acknowledge_mobile_audio_job(
+        self,
+        job_id: str,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
         job = self.load_job(job_id)
-        if not self.is_mobile_audio_job(job):
+        if not self.is_mobile_audio_job(job) or not self.mobile_audio_tenant_matches(
+            job,
+            tenant_id,
+        ):
             raise BridgeError(HTTPStatus.NOT_FOUND, "audio job not found")
         if job.get("status") != "succeeded":
             raise BridgeError(
@@ -1305,6 +1383,9 @@ class VideoLinkStatusServer:
             except Exception:
                 continue
             if not self.is_mobile_audio_job(job):
+                continue
+            tts = ((job.get("background_tasks") or {}).get("tts_summary") or {})
+            if tts.get("status") in {"queued", "waiting_for_idle", "running"}:
                 continue
             acknowledged = parse_iso_timestamp(job.get("consumer_acknowledged_at"))
             if acknowledged is None or acknowledged > cutoff:
@@ -1365,6 +1446,22 @@ class VideoLinkStatusServer:
             )
         )
 
+    def is_tenant_mobile_audio_job(self, job: dict[str, Any]) -> bool:
+        return self.is_mobile_audio_job(job) and bool(
+            job.get("audio_pipeline") or job.get("tenant_id")
+        )
+
+    @staticmethod
+    def mobile_audio_tenant_id(job: dict[str, Any]) -> str:
+        return str(job.get("tenant_id") or "nx1").strip().lower()
+
+    def mobile_audio_tenant_matches(
+        self,
+        job: dict[str, Any],
+        tenant_id: str | None,
+    ) -> bool:
+        return tenant_id is None or self.mobile_audio_tenant_id(job) == tenant_id
+
     def mobile_audio_job(self, job: dict[str, Any], include_resources: bool = False) -> dict[str, Any]:
         public = self.public_job(job)
         prompt = public.get("prompt_template") or {}
@@ -1411,6 +1508,8 @@ class VideoLinkStatusServer:
                 "requested": requested,
                 "actual": actual,
             },
+            "background_tasks": copy.deepcopy(job.get("background_tasks") or {}),
+            "execution_routes": copy.deepcopy(job.get("execution_routes") or {}),
         }
         if include_resources:
             item["result_resources"] = public.get("result_resources") or {}
@@ -1877,6 +1976,232 @@ class VideoLinkStatusServer:
         info = resources.get(resource) or {}
         return int(info.get("running_count") or 0) > 0
 
+    def queue_audio_tts(self, job_id: str) -> dict[str, Any] | None:
+        job = self.load_job(job_id)
+        pipeline_kind = normalize_audio_pipeline_profile(
+            job.get("audio_pipeline_kind")
+            or job.get("audio_pipeline_profile")
+        )
+        if (
+            not self.is_tenant_mobile_audio_job(job)
+            or pipeline_kind == AUDIO_PIPELINE_KIND_TRANSCRIPTION
+            or job.get("status") != "succeeded"
+        ):
+            return None
+        run_dir = self.discover_run_dir(job)
+        manual = run_dir / "operation_manual.md" if run_dir else None
+        if not manual or not manual.is_file() or manual.stat().st_size < 120:
+            return None
+        tasks = dict(job.get("background_tasks") or {})
+        current = dict(tasks.get("tts_summary") or {})
+        if current.get("status") in {
+            "queued",
+            "waiting_for_idle",
+            "running",
+            "succeeded",
+        }:
+            return current
+        tasks["tts_summary"] = {
+            "status": "queued",
+            "attempt": int(current.get("attempt") or 0),
+            "queued_at": iso_now(),
+            "started_at": None,
+            "finished_at": None,
+            "error": "",
+            "artifacts": {},
+        }
+        job["background_tasks"] = tasks
+        job["updated_at"] = iso_now()
+        self.save_job(job)
+        return tasks["tts_summary"]
+
+    def recover_interrupted_audio_tts(self) -> None:
+        for path in self.jobs_dir.glob("*/job.json"):
+            try:
+                job = self.load_job(path.parent.name)
+            except Exception:
+                continue
+            tasks = dict(job.get("background_tasks") or {})
+            tts = dict(tasks.get("tts_summary") or {})
+            if (
+                not tts
+                and job.get("status") == "succeeded"
+                and self.is_tenant_mobile_audio_job(job)
+            ):
+                self.queue_audio_tts(job["job_id"])
+                continue
+            if tts.get("status") != "running":
+                continue
+            tts["status"] = "queued"
+            tts["error"] = "AI service restarted; waiting for idle capacity"
+            tts["queued_at"] = iso_now()
+            tasks["tts_summary"] = tts
+            job["background_tasks"] = tasks
+            self.save_job(job)
+
+    def acknowledge_mobile_audio_tts(
+        self,
+        job_id: str,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        if not self.is_mobile_audio_job(job) or not self.mobile_audio_tenant_matches(
+            job,
+            tenant_id,
+        ):
+            raise BridgeError(HTTPStatus.NOT_FOUND, "audio job not found")
+        tasks = dict(job.get("background_tasks") or {})
+        tts = dict(tasks.get("tts_summary") or {})
+        if tts.get("status") != "succeeded":
+            raise BridgeError(
+                HTTPStatus.CONFLICT,
+                "audio TTS cannot be acknowledged before it succeeds",
+            )
+        tts["synced_at"] = iso_now()
+        tasks["tts_summary"] = tts
+        job["background_tasks"] = tasks
+        job["updated_at"] = iso_now()
+        self.save_job(job)
+        return {
+            "acknowledged": True,
+            "job_id": job_id,
+            "synced_at": tts["synced_at"],
+        }
+
+    def start_audio_tts_loop(self) -> None:
+        if self.audio_tts_thread and self.audio_tts_thread.is_alive():
+            return
+        self.audio_tts_stop.clear()
+        self.audio_tts_thread = threading.Thread(
+            target=self._audio_tts_loop,
+            daemon=True,
+            name="audio-tts-background",
+        )
+        self.audio_tts_thread.start()
+
+    def _audio_tts_loop(self) -> None:
+        while not self.audio_tts_stop.wait(10):
+            try:
+                if self.production_audio_local_busy():
+                    self.audio_tts_idle_since = None
+                    continue
+                now = time.monotonic()
+                if self.audio_tts_idle_since is None:
+                    self.audio_tts_idle_since = now
+                    continue
+                if now - self.audio_tts_idle_since < 60:
+                    continue
+                candidate = self.next_audio_tts_job()
+                if candidate:
+                    self.run_audio_tts(candidate["job_id"])
+                    self.audio_tts_idle_since = None
+            except Exception:
+                time.sleep(5)
+
+    def next_audio_tts_job(self) -> dict[str, Any] | None:
+        candidates = []
+        for path in self.jobs_dir.glob("*/job.json"):
+            try:
+                job = self.load_job(path.parent.name)
+            except Exception:
+                continue
+            tts = ((job.get("background_tasks") or {}).get("tts_summary") or {})
+            if tts.get("status") in {"queued", "waiting_for_idle"}:
+                candidates.append(job)
+        candidates.sort(
+            key=lambda item: (
+                (
+                    (
+                        (item.get("background_tasks") or {})
+                        .get("tts_summary", {})
+                        .get("queued_at")
+                    )
+                    or ""
+                ),
+                item.get("job_id") or "",
+            )
+        )
+        return candidates[0] if candidates else None
+
+    def run_audio_tts(self, job_id: str) -> dict[str, Any]:
+        job = self.load_job(job_id)
+        tasks = dict(job.get("background_tasks") or {})
+        tts = dict(tasks.get("tts_summary") or {})
+        run_dir = self.require_run_dir(job)
+        tts.update(
+            {
+                "status": "running",
+                "attempt": int(tts.get("attempt") or 0) + 1,
+                "started_at": iso_now(),
+                "finished_at": None,
+                "error": "",
+            }
+        )
+        tasks["tts_summary"] = tts
+        job["background_tasks"] = tasks
+        self.save_job(job)
+        log_path = str(
+            self.job_dir(job_id) / "logs" / "tts-summary-background.log"
+        )
+        command = [
+            "tools/run_audio_narration_stage.sh",
+            str(run_dir),
+            "--profile",
+            os.environ.get("VIDEO_ANALYZER_AUDIO_TTS_PROFILE", "local_new"),
+            "--config",
+            "config",
+        ]
+        try:
+            self.run_command(command, log_path)
+            artifacts = {
+                name: str(path)
+                for name, path in {
+                    "narration_audio": (
+                        run_dir
+                        / "audio_narration"
+                        / "audio_output"
+                        / "narration_full.wav"
+                    ),
+                    "narration_script": (
+                        run_dir / "audio_narration" / "narration_script.md"
+                    ),
+                    "narration_metadata": (
+                        run_dir / "audio_narration" / "narration_metadata.json"
+                    ),
+                    "narration_timeline": (
+                        run_dir / "audio_narration" / "narration_timeline.json"
+                    ),
+                }.items()
+                if path.is_file() and path.stat().st_size > 0
+            }
+            if "narration_audio" not in artifacts:
+                raise RuntimeError(
+                    "background TTS did not produce narration audio"
+                )
+            tts.update(
+                {
+                    "status": "succeeded",
+                    "finished_at": iso_now(),
+                    "error": "",
+                    "artifacts": artifacts,
+                }
+            )
+        except Exception as exc:
+            tts.update(
+                {
+                    "status": "failed",
+                    "finished_at": iso_now(),
+                    "error": str(exc),
+                }
+            )
+        current = self.load_job(job_id)
+        current_tasks = dict(current.get("background_tasks") or {})
+        current_tasks["tts_summary"] = tts
+        current["background_tasks"] = current_tasks
+        current["updated_at"] = iso_now()
+        self.save_job(current)
+        return tts
+
     def _run_remaining_stages(self, job_id: str) -> None:
         self._run_remaining_stages_serial(job_id)
 
@@ -1885,10 +2210,14 @@ class VideoLinkStatusServer:
         try:
             while True:
                 job = self.load_job(job_id)
+                if job.get("status") == "no_speech":
+                    self.update_runner(job, "no_speech", current_stage=None, finished=True)
+                    return
                 stage = self.next_stage(job)
                 if not stage:
                     job["status"] = "succeeded"
                     self.update_runner(job, "succeeded", current_stage=None, finished=True)
+                    self.queue_audio_tts(job_id)
                     return
                 if transition_count > len(self.stage_order_for_job(job)):
                     raise BridgeError(
@@ -1962,6 +2291,8 @@ class VideoLinkStatusServer:
             job["status"] = "succeeded"
         elif status == "failed":
             job["status"] = "failed"
+        elif status == "no_speech":
+            job["status"] = "no_speech"
         self.save_job(job)
 
     def run_stage(self, job_id: str, stage: str, continue_runner: bool = False) -> dict[str, Any]:
@@ -2057,10 +2388,7 @@ class VideoLinkStatusServer:
         fallback_credentials_ready = self.audio_cloud_fallback_credentials_ready(
             fallback
         )
-        local_busy = any(
-            self.live_resource_users(resource, exclude_job_id=job.get("job_id"))
-            for resource in ("core", "audio-analysis", "asr", "ocr", "vl")
-        )
+        local_busy = self.production_audio_local_busy(job.get("job_id"))
         job["compute_route"] = (
             "cloud_fallback"
             if local_busy and fallback.get("enabled") and fallback_credentials_ready
@@ -2075,9 +2403,54 @@ class VideoLinkStatusServer:
                 else "local_first"
             )
         )
+        cloud = job["compute_route"] == "cloud_fallback"
+        job["execution_routes"] = {
+            "asr": {
+                "route": "cloud" if cloud else "local",
+                "provider": "tencent_hy_asr" if cloud else "vibevoice",
+                "reason": job["compute_route_reason"],
+                "local_wait_seconds": 0,
+            },
+            "diarization": {
+                "route": "cloud" if cloud else "local",
+                "provider": "asr_embedded" if cloud else "3dspeaker",
+                "degraded": cloud,
+            },
+            "template_selector": {
+                "route": "pending",
+                "provider": "local_qwen_or_trae",
+                "reason": "checked_immediately_before_text_phase",
+                "local_wait_seconds": 0,
+            },
+            "summary": {
+                "route": "pending",
+                "provider": "local_qwen_or_trae",
+                "reason": "checked_immediately_before_text_phase",
+                "local_wait_seconds": 0,
+            },
+        }
         job["updated_at"] = iso_now()
         self.save_job(job)
         return job
+
+    def production_audio_local_busy(self, exclude_job_id: str | None = None) -> bool:
+        for path in self.jobs_dir.glob("*/job.json"):
+            if exclude_job_id and path.parent.name == exclude_job_id:
+                continue
+            try:
+                candidate = self.load_job(path.parent.name)
+            except Exception:
+                continue
+            runner = candidate.get("runner") or {}
+            if (
+                candidate.get("status") in {"running", "queued"}
+                or runner.get("status") in {"running", "queued"}
+            ):
+                return True
+        return any(
+            self.live_resource_users(resource, exclude_job_id=exclude_job_id)
+            for resource in ("core", "audio-analysis", "asr", "ocr", "vl", "tts")
+        )
 
     @staticmethod
     def audio_cloud_fallback_credentials_ready(
@@ -2196,6 +2569,11 @@ class VideoLinkStatusServer:
             stage_info["finished_at"] = iso_now()
             job["status"] = "succeeded" if self.next_stage(job) is None else "running"
         except Exception as exc:
+            no_speech = (
+                stage == "analyze-core"
+                and self.is_mobile_audio_job(job)
+                and "NO_SPEECH:" in self.exception_text(exc)
+            )
             failure = self.stage_failure(stage_info, exc)
             retry_reason = self.retryable_stage_failure_reason(
                 job,
@@ -2236,6 +2614,12 @@ class VideoLinkStatusServer:
                 stage_info["warning"] = warning["message"]
                 stage_info["soft_failed"] = True
                 job["status"] = "running"
+            elif no_speech:
+                stage_info["status"] = "skipped"
+                stage_info["error"] = "未检测到可转写的人声"
+                stage_info["error_code"] = "no_speech"
+                stage_info["no_speech"] = True
+                job["status"] = "no_speech"
             else:
                 stage_info["error"] = str(failure.get("message") or str(exc))
                 job["status"] = "failed"
@@ -2477,6 +2861,12 @@ class VideoLinkStatusServer:
         actual_template = self.audio_prompt_template_actual(run_dir_path)
         if actual_template:
             job["prompt_template_actual"] = actual_template
+        actual_routes = self.audio_execution_routes(run_dir_path)
+        if actual_routes:
+            job["execution_routes"] = {
+                **dict(job.get("execution_routes") or {}),
+                **actual_routes,
+            }
         warning = self.core_quality_warning(run_dir_path)
         if warning:
             self.add_warning(job, "analyze-core", warning)
@@ -3064,6 +3454,13 @@ class VideoLinkStatusServer:
             runner["queued_for"] = job_stage_resource(job, stage)
             runner["error"] = stage_info.get("retry_reason")
             runner.pop("finished_at", None)
+        elif job["status"] == "no_speech":
+            runner["status"] = "no_speech"
+            runner["current_stage"] = None
+            runner["queued_for"] = None
+            runner["error"] = stage_info.get("error")
+            runner["error_code"] = "no_speech"
+            runner["finished_at"] = now
         elif next_stage is None:
             job["status"] = "succeeded"
             runner["status"] = "succeeded"
@@ -3356,6 +3753,12 @@ class VideoLinkStatusServer:
         actual_template = self.audio_prompt_template_actual(run_dir)
         if actual_template:
             job["prompt_template_actual"] = actual_template
+        actual_routes = self.audio_execution_routes(run_dir)
+        if actual_routes:
+            job["execution_routes"] = {
+                **dict(job.get("execution_routes") or {}),
+                **actual_routes,
+            }
         warning = self.core_quality_warning(run_dir)
         if warning:
             self.add_warning(job, "analyze-core", warning)
@@ -5562,6 +5965,10 @@ class VideoLinkStatusServer:
         current_stage = public.get("current_stage")
         current_info = public["stages"].get(current_stage or "", {})
         public["process"] = self.public_process_info(current_info.get("process"))
+        if self.is_tenant_mobile_audio_job(job):
+            public["tenant_id"] = self.mobile_audio_tenant_id(job)
+            public["job_kind"] = "audio"
+            public["operator_read_only"] = True
         return public
 
     def execution_flow(self, job: dict[str, Any]) -> dict[str, Any]:
@@ -5581,8 +5988,19 @@ class VideoLinkStatusServer:
         snapshot_models = snapshot.get("models") if isinstance(snapshot.get("models"), dict) else {}
 
         nodes = []
+        prompt_template = self.prompt_template_metadata(job)
+        actual_template = prompt_template.get("actual") or {}
         for spec in schema.get("nodes") or []:
             node = dict(spec)
+            if node.get("id") == "template_selector" and actual_template:
+                template_label = (
+                    actual_template.get("title_zh")
+                    or actual_template.get("title")
+                    or "未命名模板"
+                )
+                node["subtitle"] = (
+                    f"模板 {actual_template.get('id') or '-'} · {template_label}"
+                )
             model_kind = str(node.get("model_kind") or "")
             model_role = str(node.get("model_slot") or model_kind)
             model = (
@@ -5590,6 +6008,30 @@ class VideoLinkStatusServer:
                 if model_kind
                 else None
             )
+            route_key = {
+                "template_selector": "template_selector",
+                "text": "summary",
+            }.get(str(node.get("id") or ""))
+            actual_route = (
+                (job.get("execution_routes") or {}).get(route_key) or {}
+                if route_key
+                else {}
+            )
+            if model and actual_route.get("model"):
+                model.update(
+                    {
+                        "model": actual_route.get("model"),
+                        "label": actual_route.get("model"),
+                        "provider": actual_route.get("provider"),
+                        "deployment": (
+                            "云端"
+                            if actual_route.get("route") == "cloud_fallback"
+                            else "本机"
+                        ),
+                        "route": actual_route.get("route"),
+                        "route_reason": actual_route.get("reason"),
+                    }
+                )
             artifacts = self.execution_node_artifacts(
                 run_dir,
                 node,
@@ -5953,6 +6395,49 @@ class VideoLinkStatusServer:
             (job.get("runtime_profile_snapshot") or {}).get("workflow_id")
             or VIDEO_WORKFLOW_ID
         )
+        if workflow_id == AUDIO_WORKFLOW_ID and node.get("node_kind") in {
+            "background_task",
+            "background_output",
+            "background_sync",
+        }:
+            tts = (
+                (job.get("background_tasks") or {}).get("tts_summary") or {}
+            )
+            tts_status = str(tts.get("status") or "pending")
+            if node.get("node_kind") == "background_task":
+                status = {
+                    "waiting_for_idle": "queued",
+                }.get(tts_status, tts_status)
+                messages = {
+                    "pending": "等待主任务完成",
+                    "queued": "等待空闲算力",
+                    "waiting_for_idle": "等待空闲算力",
+                    "running": "正在生成语音总结",
+                    "succeeded": "语音总结已生成",
+                    "failed": tts.get("error") or "TTS 生成失败",
+                }
+                return {
+                    "status": status,
+                    "message": messages.get(tts_status, tts_status),
+                    "queued_at": tts.get("queued_at"),
+                    "started_at": tts.get("started_at"),
+                    "finished_at": tts.get("finished_at"),
+                }
+            if node.get("node_kind") == "background_output":
+                if artifacts:
+                    return {"status": "succeeded", "message": "语音总结文件已生成"}
+                if tts_status == "failed":
+                    return {"status": "failed", "message": tts.get("error") or "TTS 生成失败"}
+                if tts_status == "succeeded":
+                    return {"status": "failed", "message": "TTS 未生成有效音频文件"}
+                return {"status": "pending", "message": "等待后台 TTS"}
+            if tts.get("synced_at"):
+                return {"status": "succeeded", "message": "Nano 已镜像 TTS 资源并确认"}
+            if tts_status == "succeeded":
+                return {"status": "pending", "message": "等待 Nano 拉取 TTS 资源"}
+            if tts_status == "failed":
+                return {"status": "blocked", "message": "TTS 失败，未执行资源回传"}
+            return {"status": "pending", "message": "等待语音总结生成"}
         if workflow_id == AUDIO_WORKFLOW_ID and node_id == "nx1_sync":
             if job.get("consumer_acknowledged_at"):
                 return {"status": "succeeded", "message": "NX1 已镜像产物并确认"}
@@ -5995,8 +6480,15 @@ class VideoLinkStatusServer:
 
         exact_state = node_states.get(node_id)
         if isinstance(exact_state, dict):
+            exact_status = str(exact_state.get("status") or "pending")
+            if (
+                exact_status == "skipped"
+                and node.get("required")
+                and job.get("status") not in {"succeeded", "failed", "no_speech"}
+            ):
+                exact_status = "pending"
             return {
-                "status": str(exact_state.get("status") or "pending"),
+                "status": exact_status,
                 "message": exact_state.get("message"),
                 "queued_at": exact_state.get("queued_at"),
                 "started_at": exact_state.get("started_at"),
@@ -6427,6 +6919,26 @@ class VideoLinkStatusServer:
                     "prompt": selected.get("prompt_original"),
                 }
         return None
+
+    def audio_execution_routes(self, run_dir: Path) -> dict[str, Any]:
+        for path in (run_dir / "audio_template_analysis.json", run_dir / "analysis.json"):
+            if not path.is_file():
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            analysis = (
+                payload.get("audio_template_analysis")
+                if path.name == "analysis.json"
+                else payload
+            ) or {}
+            routes = analysis.get("execution_routes") or (
+                (payload.get("metadata") or {}).get("execution_routes")
+            )
+            if isinstance(routes, dict):
+                return copy.deepcopy(routes)
+        return {}
 
     def prompt_template_metadata(self, job: dict[str, Any]) -> dict[str, Any]:
         opts = job.get("options") or {}
@@ -7155,6 +7667,8 @@ class VideoLinkStatusServer:
         return None
 
     def next_stage(self, job: dict[str, Any]) -> str | None:
+        if job.get("status") == "no_speech":
+            return None
         for stage in self.stage_order_for_job(job):
             status = job.get("stages", {}).get(stage, {}).get("status")
             if status == "skipped" and self.skipped_stage_outputs_incomplete(job, stage):

@@ -8,7 +8,11 @@ from unittest.mock import MagicMock, patch
 import requests
 
 from video_analyzer.config import Config, get_runtime_profile
-from video_analyzer.model_settings import RuntimeSettingsStore, SettingsValidationError
+from video_analyzer.model_settings import (
+    RuntimeSettingsStore,
+    SettingsValidationError,
+    expand_runtime_profile,
+)
 
 
 class ModelSettingsTests(unittest.TestCase):
@@ -306,14 +310,72 @@ class ModelSettingsTests(unittest.TestCase):
         self.assertEqual(amd_text["options"]["runtime"], "lm_studio")
         self.assertEqual(amd_text["options"]["reasoning_effort"], "none")
         local_text = models["text-local-bonsai-27b-6gpu"]
-        self.assertEqual(local_text["options"]["text_gpu_ids"], [0, 1, 2, 4, 5])
-        self.assertEqual(local_text["options"]["text_worker_count"], 5)
-        self.assertEqual(local_text["options"]["text_concurrency"], 5)
-        self.assertIn("五张 P40", local_text["name"])
+        self.assertEqual(local_text["model"], "Qwen/Qwen3.8-27B-Q2-MTP4")
+        self.assertEqual(local_text["options"]["text_gpu_ids"], [3, 0, 1, 2, 4, 5])
+        self.assertEqual(local_text["options"]["text_worker_count"], 6)
+        self.assertEqual(local_text["options"]["text_concurrency"], 6)
+        self.assertEqual(local_text["options"]["text_context_length"], 65536)
+        self.assertEqual(local_text["options"]["text_temperature"], 0.7)
+        self.assertEqual(
+            local_text["options"]["extra_body"],
+            {
+                "top_k": 20,
+                "top_p": 0.8,
+                "presence_penalty": 1.5,
+                "chat_template_kwargs": {
+                    "enable_thinking": False,
+                    "preserve_thinking": False,
+                },
+            },
+        )
+        self.assertIn("Qwen3.8", local_text["name"])
         local_tts = models["tts-indextts25-ray-p40"]
         self.assertEqual(local_tts["protocol"], "openai_speech")
         self.assertEqual(local_tts["endpoints"], ["http://127.0.0.1:8092"])
         self.assertEqual(local_tts["options"]["voice"], "check_boards_sweet")
+
+    def test_local_text_profile_can_override_card_count_and_context(self):
+        config = {}
+        profile = {
+            "workflow_id": "video_operation_manual",
+            "text_model_id": "text-local-bonsai-27b-6gpu",
+            "text_worker_count": 1,
+            "text_context_length": 8192,
+        }
+
+        expanded = expand_runtime_profile(config, profile)
+
+        self.assertEqual(expanded["text_worker_count"], 1)
+        self.assertEqual(expanded["text_concurrency"], 1)
+        self.assertEqual(expanded["text_context_length"], 8192)
+        self.assertEqual(expanded["context_length"], 8192)
+
+    def test_local_text_profile_rejects_invalid_card_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.make_repo(Path(tmp))
+            settings = store.public_settings()
+            source = settings["profiles"][0]
+            models = {
+                kind: source[field]
+                for kind, field in settings["schema"]["profile_model_fields"].items()
+            }
+            models["text"] = "text-local-bonsai-27b-6gpu"
+
+            with self.assertRaisesRegex(
+                SettingsValidationError,
+                "text_worker_count must be between 1 and 6",
+            ):
+                store.save_profile(
+                    "invalid-local-text",
+                    {
+                        "label": "Invalid local text",
+                        "models": models,
+                        "settings": {
+                            "text_worker_count": 7,
+                            "text_context_length": 65536,
+                        },
+                    },
+                )
 
     def test_indextts_profile_expands_to_runtime_fields(self):
         with tempfile.TemporaryDirectory() as tmp:

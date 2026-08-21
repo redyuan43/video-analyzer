@@ -103,8 +103,16 @@ stop_bonsai() {
 }
 
 start_bonsai() {
+  local config_changed
   local health_payload
-  systemctl --user start bonsai-local-pool.service
+  config_changed="$(write_bonsai_runtime_config)"
+  if systemctl --user is-active --quiet bonsai-local-pool.service; then
+    if [[ "${config_changed}" == "1" ]]; then
+      systemctl --user restart bonsai-local-pool.service
+    fi
+  else
+    systemctl --user start bonsai-local-pool.service
+  fi
   for _ in $(seq 1 900); do
     health_payload="$(
       curl --noproxy "*" -fsS "http://127.0.0.1:${BONSAI_LOCAL_PORT:-18103}/api/health" \
@@ -128,6 +136,44 @@ raise SystemExit(0 if payload.get("ok") else 1)
   done
   echo "BONSAI local pool did not become ready within 900 seconds" >&2
   return 1
+}
+
+write_bonsai_runtime_config() {
+  local runtime_dir="${BONSAI_LOCAL_RUNTIME_DIR:-${ROOT_DIR}/tmp/bonsai-local-pool}"
+  local config_path="${BONSAI_LOCAL_CONFIG:-${runtime_dir}/config.json}"
+  mkdir -p "${runtime_dir}"
+  BONSAI_LOCAL_CONFIG="${config_path}" \
+    "${ROOT_DIR}/.venv/bin/python" - <<'PY'
+import json
+import os
+from pathlib import Path
+
+path = Path(os.environ["BONSAI_LOCAL_CONFIG"])
+keys = (
+    "BONSAI_LOCAL_HOST",
+    "BONSAI_LOCAL_PORT",
+    "BONSAI_LOCAL_BACKEND_BASE_PORT",
+    "BONSAI_LOCAL_GPU_IDS",
+    "BONSAI_LOCAL_WORKER_COUNT",
+    "BONSAI_LOCAL_CONTEXT_SIZE",
+)
+payload = {key: os.environ[key] for key in keys if os.environ.get(key)}
+current = None
+try:
+    current = json.loads(path.read_text(encoding="utf-8"))
+except (FileNotFoundError, json.JSONDecodeError):
+    pass
+if current == payload:
+    print("0")
+    raise SystemExit
+temporary = path.with_suffix(path.suffix + ".tmp")
+temporary.write_text(
+    json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+temporary.replace(path)
+print("1")
+PY
 }
 
 start_vibevoice() {
