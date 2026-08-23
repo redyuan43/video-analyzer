@@ -372,6 +372,7 @@ RESOURCE_LIMITS = {
     "image-prompts": 3,
     "final-publish": 3,
     "tts": 1,
+    "tts-cloud": 3,
 }
 EXPECTED_FINAL_EXPORTS = (
     "operation_manual.pdf",
@@ -2457,6 +2458,7 @@ class VideoLinkStatusServer:
             )
 
         job = self.select_audio_compute_route(job, stage)
+        job = self.select_audio_tts_route(job, stage)
         resource = job_stage_resource(job, stage)
         self.mark_stage_queued(job, stage, resource)
         self.wait_for_resource_slot(resource, job_id)
@@ -2574,6 +2576,43 @@ class VideoLinkStatusServer:
             self.live_resource_users(resource, exclude_job_id=exclude_job_id)
             for resource in ("core", "audio-analysis", "asr", "ocr", "vl", "tts")
         )
+
+    def select_audio_tts_route(
+        self,
+        job: dict[str, Any],
+        stage: str,
+    ) -> dict[str, Any]:
+        if normalize_stage_name(stage) != "tts-narration":
+            return job
+        if job.get("tts_route") in {"local", "cloud_fallback"}:
+            return job
+        snapshot = job.get("runtime_profile_snapshot") or {}
+        fallback = snapshot.get("tts_cloud_fallback") or {}
+        if not fallback.get("enabled"):
+            job["tts_route"] = "local"
+            job["tts_route_reason"] = "no_cloud_fallback"
+            self.save_job(job)
+            return job
+        key_env = str(fallback.get("api_key_env") or "").strip()
+        credentials_ready = not key_env or bool(
+            str(os.environ.get(key_env) or "").strip()
+        )
+        local_busy = bool(
+            self.live_resource_users("tts", exclude_job_id=job.get("job_id"))
+        )
+        if local_busy and credentials_ready:
+            job["tts_route"] = "cloud_fallback"
+            job["tts_route_reason"] = "local_tts_queue_detected"
+        else:
+            job["tts_route"] = "local"
+            job["tts_route_reason"] = (
+                "cloud_tts_credentials_missing"
+                if local_busy
+                else "local_tts_slot_available"
+            )
+        job["updated_at"] = iso_now()
+        self.save_job(job)
+        return job
 
     @staticmethod
     def audio_cloud_fallback_credentials_ready(
@@ -8189,6 +8228,11 @@ class VideoLinkStatusServer:
                 "study": resolved_profile.get("study_card_model") or resolved_profile.get("text_model"),
                 "image": resolved_profile.get("image_provider") or "codex_imagegen",
                 "tts": resolved_profile.get("tts_model") if resolved_profile.get("tts_enabled") else None,
+                "tts_fallback": (
+                    resolved_profile.get("tts_fallback_model")
+                    if resolved_profile.get("tts_fallback_enabled")
+                    else None
+                ),
                 "selector": resolved_profile.get("template_selector_model")
                 or resolved_profile.get("text_model"),
                 "asr_fallback": (
@@ -8203,6 +8247,12 @@ class VideoLinkStatusServer:
                 ),
             },
             "audio_cloud_fallback": resolved_profile.get("audio_cloud_fallback") or {},
+            "tts_cloud_fallback": {
+                "enabled": bool(resolved_profile.get("tts_fallback_enabled")),
+                "provider": resolved_profile.get("tts_fallback_provider"),
+                "model": resolved_profile.get("tts_fallback_model"),
+                "api_key_env": resolved_profile.get("tts_fallback_api_key_env"),
+            },
             "content_cloud_fallback": {
                 "enabled": bool(
                     resolved_profile.get("text_fallback_enabled")
@@ -8255,7 +8305,12 @@ class VideoLinkStatusServer:
             )
             self.save_job(job)
             config_dir = str((job.get("runtime_profile_snapshot") or {}).get("config_dir") or "")
-        return {"VIDEO_ANALYZER_CONFIG_DIR": config_dir} if config_dir else {}
+        environment = (
+            {"VIDEO_ANALYZER_CONFIG_DIR": config_dir} if config_dir else {}
+        )
+        if job.get("tts_route") == "cloud_fallback":
+            environment["VIDEO_ANALYZER_TTS_ROUTE"] = "cloud_fallback"
+        return environment
 
     def job_dir(self, job_id: str) -> Path:
         return self.jobs_dir / job_id
@@ -8370,6 +8425,11 @@ def stage_resource(stage: str) -> str:
 
 
 def job_stage_resource(job: dict[str, Any], stage: str) -> str:
+    if (
+        normalize_stage_name(stage) == "tts-narration"
+        and job.get("tts_route") == "cloud_fallback"
+    ):
+        return "tts-cloud"
     if normalize_stage_name(stage) == "analyze-core":
         raw_pipeline_kind = (
             job.get("audio_pipeline_kind")

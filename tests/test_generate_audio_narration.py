@@ -1,9 +1,12 @@
+import tempfile
 import unittest
-from unittest.mock import MagicMock
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from tools.generate_audio_narration import (
     fetch_indextts_timeline,
     markdown_to_spoken_text,
+    render_tts,
     validate_spoken_text,
 )
 
@@ -105,6 +108,62 @@ class GenerateAudioNarrationTests(unittest.TestCase):
                 "speech-1",
                 1,
             )
+
+    def test_render_mimo_tts_decodes_chat_completion_wav(self):
+        response = MagicMock()
+        response.status_code = 200
+        response.ok = True
+        response.content = b""
+        response.headers = {}
+        response.json.return_value = {
+            "choices": [{"message": {"audio": {"data": "UklGRg=="}}}]
+        }
+        session = MagicMock()
+        session.post.return_value = response
+        config = {
+            "provider": "xiaomi_mimo_tts",
+            "base_url": "https://api.xiaomimimo.com/v1",
+            "model": "mimo-v2.5-tts",
+            "voice": "冰糖",
+            "speed": 0.9,
+            "timeout": 180,
+            "api_key_env": "XIAOMI_MIMO_API_KEY",
+            "extra_params": {},
+            "style_prompt": "清晰地播报",
+        }
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            "os.environ", {"XIAOMI_MIMO_API_KEY": "test-key"}, clear=False
+        ), patch(
+            "tools.generate_audio_narration.requests.Session",
+            return_value=session,
+        ):
+            output = Path(tmp) / "mimo.wav"
+            timeline = render_tts("这是测试。", output, config)
+            rendered = output.read_bytes()
+
+        self.assertIsNone(timeline)
+        self.assertEqual(rendered, b"RIFF")
+        payload = session.post.call_args.kwargs["json"]
+        self.assertEqual(
+            session.post.call_args.args[0],
+            "https://api.xiaomimimo.com/v1/chat/completions",
+        )
+        self.assertEqual(
+            session.post.call_args.kwargs["headers"]["api-key"], "test-key"
+        )
+        self.assertEqual(
+            payload,
+            {
+                "model": "mimo-v2.5-tts",
+                "messages": [
+                    {"role": "user", "content": "清晰地播报"},
+                    {"role": "assistant", "content": "这是测试。"},
+                ],
+                "audio": {"format": "wav", "voice": "冰糖"},
+                "stream": False,
+            },
+        )
 
 
 if __name__ == "__main__":

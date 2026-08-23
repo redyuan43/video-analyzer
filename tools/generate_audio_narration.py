@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -135,25 +136,45 @@ def main(argv: list[str] | None = None) -> int:
 
 def create_tts_config(args: argparse.Namespace) -> dict[str, Any]:
     profile = Config(args.config).get_runtime_profile(args.profile)
-    base_url = str(args.tts_base_url or profile.get("tts_base_url") or "").rstrip("/")
-    model = str(args.tts_model or profile.get("tts_model") or "")
-    voice = str(args.voice or profile.get("tts_voice") or "check_boards_sweet")
-    speed = float(args.tts_speed if args.tts_speed is not None else profile.get("tts_speed") or 0.9)
-    timeout = int(args.tts_timeout or profile.get("tts_timeout_seconds") or DEFAULT_TTS_TIMEOUT_SECONDS)
+    fallback = (
+        os.environ.get("VIDEO_ANALYZER_TTS_ROUTE") == "cloud_fallback"
+        and bool(profile.get("tts_fallback_enabled"))
+    )
+    prefix = "tts_fallback_" if fallback else "tts_"
+    base_url = str(
+        args.tts_base_url or profile.get(f"{prefix}base_url") or ""
+    ).rstrip("/")
+    model = str(args.tts_model or profile.get(f"{prefix}model") or "")
+    voice = str(args.voice or profile.get(f"{prefix}voice") or "check_boards_sweet")
+    speed = float(
+        args.tts_speed
+        if args.tts_speed is not None
+        else profile.get(f"{prefix}speed") or 0.9
+    )
+    timeout = int(
+        args.tts_timeout
+        or profile.get(f"{prefix}timeout_seconds")
+        or DEFAULT_TTS_TIMEOUT_SECONDS
+    )
+    provider = str(profile.get(f"{prefix}provider") or "openai_speech")
     if not base_url:
         raise ValueError("Runtime profile must provide tts_base_url")
     if not model:
         raise ValueError("Runtime profile must provide tts_model")
-    if not 0.5 <= speed <= 2.0:
+    if provider == "openai_speech" and not 0.5 <= speed <= 2.0:
         raise ValueError("TTS speed must be between 0.5 and 2.0")
     return {
+        "provider": provider,
         "base_url": base_url,
         "model": model,
         "voice": voice,
         "speed": speed,
         "timeout": max(30, timeout),
-        "api_key_env": str(profile.get("tts_api_key_env") or ""),
-        "extra_params": dict(profile.get("tts_extra_params") or {"lang": "zh"}),
+        "api_key_env": str(profile.get(f"{prefix}api_key_env") or ""),
+        "extra_params": dict(
+            profile.get(f"{prefix}extra_params") or {"lang": "zh"}
+        ),
+        "style_prompt": str(profile.get(f"{prefix}style_prompt") or ""),
     }
 
 
@@ -163,28 +184,52 @@ def render_tts(text: str, output: Path, config: dict[str, Any]) -> dict[str, Any
     if len(text) > MAX_TTS_INPUT_CHARS:
         raise ValueError(f"Narration text exceeds {MAX_TTS_INPUT_CHARS} characters")
     base_url = str(config["base_url"]).rstrip("/")
-    endpoint = f"{base_url}/audio/speech" if base_url.endswith("/v1") else f"{base_url}/v1/audio/speech"
+    provider = str(config.get("provider") or "openai_speech")
+    endpoint = (
+        f"{base_url}/chat/completions"
+        if provider == "xiaomi_mimo_tts"
+        else (
+            f"{base_url}/audio/speech"
+            if base_url.endswith("/v1")
+            else f"{base_url}/v1/audio/speech"
+        )
+    )
     headers = {"Content-Type": "application/json"}
     api_key_env = str(config.get("api_key_env") or "")
     if api_key_env:
         token = os.environ.get(api_key_env)
         if not token:
             raise ValueError(f"Missing TTS API key environment variable: {api_key_env}")
-        headers["Authorization"] = f"Bearer {token}"
+        if provider == "xiaomi_mimo_tts":
+            headers["api-key"] = token
+        else:
+            headers["Authorization"] = f"Bearer {token}"
     session = requests.Session()
     session.trust_env = False
     print(
-        f"[audio-narration] rendering with {config['model']} voice={config['voice']} chars={len(text)}",
+        f"[audio-narration] rendering with {config['model']} provider={provider} voice={config['voice']} chars={len(text)}",
         file=sys.stderr,
     )
-    payload = {
-        "model": config["model"],
-        "input": text,
-        "voice": config["voice"],
-        "response_format": "wav",
-        "speed": config["speed"],
-        "extra_params": config.get("extra_params") or {},
-    }
+    if provider == "xiaomi_mimo_tts":
+        messages = []
+        if config.get("style_prompt"):
+            messages.append({"role": "user", "content": config["style_prompt"]})
+        messages.append({"role": "assistant", "content": text})
+        payload = {
+            "model": config["model"],
+            "messages": messages,
+            "audio": {"format": "wav", "voice": config["voice"]},
+            "stream": False,
+        }
+    else:
+        payload = {
+            "model": config["model"],
+            "input": text,
+            "voice": config["voice"],
+            "response_format": "wav",
+            "speed": config["speed"],
+            "extra_params": config.get("extra_params") or {},
+        }
     response = None
     for attempt in range(1, 4):
         response = session.post(
@@ -207,16 +252,29 @@ def render_tts(text: str, output: Path, config: dict[str, Any]) -> dict[str, Any
     if not response.ok:
         detail = response.text.strip().replace("\n", " ")[:500]
         raise RuntimeError(f"TTS request failed with HTTP {response.status_code}: {detail}")
-    if not response.content.startswith(b"RIFF"):
+    body = response.content
+    if provider == "xiaomi_mimo_tts":
+        try:
+            encoded = str(
+                response.json()["choices"][0]["message"]["audio"]["data"]
+            ).strip()
+            body = base64.b64decode(encoded, validate=True)
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "MiMo TTS response does not contain base64 WAV audio"
+            ) from exc
+    if not body.startswith(b"RIFF"):
         raise RuntimeError("TTS service returned a non-WAV response")
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(prefix=f".{output.name}.", suffix=".tmp", dir=output.parent, delete=False) as handle:
         temporary = Path(handle.name)
-        handle.write(response.content)
+        handle.write(body)
     try:
         temporary.replace(output)
     finally:
         temporary.unlink(missing_ok=True)
+    if provider != "openai_speech":
+        return None
     request_id = str(response.headers.get("X-IndexTTS-Request-ID") or "").strip()
     if not request_id:
         return None

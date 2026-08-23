@@ -46,7 +46,7 @@ KIND_PROTOCOLS = {
     },
     "selector": {"openai_compatible", "ollama_chat", "inherit_text", "none"},
     "text": {"openai_compatible", "ollama_chat", "none"},
-    "tts": {"openai_speech", "none"},
+    "tts": {"openai_speech", "xiaomi_mimo_tts", "none"},
 }
 MODEL_ALIASES = {
     "nano-firered-asr2": "asr-firered2-local",
@@ -59,6 +59,7 @@ MODEL_ALIASES = {
     "ai-cloud-text": "text-deepseek-v4-flash",
     "nano-cloud-text": "text-deepseek-v4-flash",
     "ai-indextts": "tts-indextts25-ray-p40",
+    "ai-xiaomi-mimo-tts": "tts-xiaomi-mimo-v25-cloud",
 }
 SECRET_FIELDS = {
     "api_key",
@@ -339,6 +340,8 @@ def resolve_audio_workflow_profile(
             return cloud_id, ""
         if policy == "auto":
             return local_id, cloud_id
+        if policy == "background_local" and node_id == "tts":
+            return local_id, cloud_id
         return local_id, ""
 
     asr_primary, asr_fallback = primary_and_fallback("asr")
@@ -347,7 +350,7 @@ def resolve_audio_workflow_profile(
     )
     selector_primary, selector_fallback = primary_and_fallback("selector")
     text_primary, text_fallback = primary_and_fallback("summary")
-    tts_primary, _tts_fallback = primary_and_fallback("tts")
+    tts_primary, tts_fallback = primary_and_fallback("tts")
 
     working_profile.update(
         {
@@ -393,6 +396,38 @@ def resolve_audio_workflow_profile(
     else:
         resolved["template_selector_fallback_enabled"] = False
         resolved["template_selector_fallback_model_id"] = ""
+    if tts_fallback:
+        tts_resource = model_catalog[tts_fallback]
+        tts_endpoints = list(tts_resource.get("endpoints") or [])
+        tts_options = copy.deepcopy(tts_resource.get("options") or {})
+        resolved.update(
+            {
+                "tts_fallback_enabled": True,
+                "tts_fallback_model_id": tts_fallback,
+                "tts_fallback_provider": str(tts_resource.get("protocol") or ""),
+                "tts_fallback_base_url": (
+                    tts_endpoints[0] if tts_endpoints else ""
+                ),
+                "tts_fallback_model": str(tts_resource.get("model") or ""),
+                "tts_fallback_api_key_env": str(
+                    tts_resource.get("api_key_env") or ""
+                ),
+                "tts_fallback_voice": str(tts_options.get("voice") or "冰糖"),
+                "tts_fallback_speed": float(tts_options.get("speed") or 0.9),
+                "tts_fallback_timeout_seconds": int(
+                    tts_options.get("timeout_seconds") or 180
+                ),
+                "tts_fallback_extra_params": copy.deepcopy(
+                    tts_options.get("extra_params") or {}
+                ),
+                "tts_fallback_style_prompt": str(
+                    tts_options.get("style_prompt") or ""
+                ),
+            }
+        )
+    else:
+        resolved["tts_fallback_enabled"] = False
+        resolved["tts_fallback_model_id"] = ""
     metadata = {
         "source": "nano_workflow_snapshot",
         "workflow_id": snapshot["workflow_id"],

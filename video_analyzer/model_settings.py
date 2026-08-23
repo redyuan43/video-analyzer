@@ -61,7 +61,7 @@ MODEL_KIND_PROTOCOLS = {
     "study": {"openai_compatible", "inherit_text", "none"},
     "triage": {"openai_compatible", "inherit_study", "inherit_text", "none"},
     "image": {"codex_imagegen", "none"},
-    "tts": {"openai_speech", "none"},
+    "tts": {"openai_speech", "xiaomi_mimo_tts", "none"},
 }
 
 ASR_CHUNK_MODES = {"model_default", "custom"}
@@ -445,6 +445,7 @@ def validate_model_resource(model_id: str, payload: dict[str, Any]) -> dict[str,
         "openai_vision",
         "openai_compatible",
         "openai_speech",
+        "xiaomi_mimo_tts",
     }
     if endpoint_required and not endpoints:
         raise SettingsValidationError(f"{protocol} requires at least one endpoint")
@@ -456,6 +457,7 @@ def validate_model_resource(model_id: str, payload: dict[str, Any]) -> dict[str,
         "openai_vision",
         "openai_compatible",
         "openai_speech",
+        "xiaomi_mimo_tts",
     }
     if model_required and not model:
         raise SettingsValidationError(f"{protocol} requires a model name")
@@ -822,6 +824,20 @@ def _add_builtin_model_resources(
                     "emo_alpha": 0.65,
                     "interval_silence_ms": 180,
                 },
+            },
+        },
+        "tts-xiaomi-mimo-v25-cloud": {
+            "name": "MiMo V2.5 TTS（小米云端）",
+            "kind": "tts",
+            "protocol": "xiaomi_mimo_tts",
+            "model": "mimo-v2.5-tts",
+            "endpoints": ["https://api.xiaomimimo.com/v1"],
+            "api_key_env": "XIAOMI_MIMO_API_KEY",
+            "options": {
+                "deployment": "cloud",
+                "voice": "冰糖",
+                "response_format": "wav",
+                "timeout_seconds": 180,
             },
         },
     }
