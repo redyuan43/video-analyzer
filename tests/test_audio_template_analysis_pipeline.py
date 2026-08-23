@@ -117,6 +117,56 @@ class AudioTemplateCatalogTests(unittest.TestCase):
             {"reasoning_effort": "none"},
         )
 
+    def test_cloud_route_switches_summary_and_selector_fallback_models(self):
+        class FakeConfig:
+            def __init__(self):
+                self.config = {
+                    "active_runtime_profile": "audio_nx1",
+                    "runtime_profiles": {
+                        "audio_nx1": {
+                            "workflow_id": "audio_nx1",
+                            "text_base_url": "http://127.0.0.1:18103/v1",
+                            "text_model": "local-summary",
+                            "text_fallback_enabled": True,
+                            "text_fallback_base_url": "https://api.deepseek.com",
+                            "text_fallback_model": "deepseek-v4-flash",
+                            "text_fallback_api_key_env": "DEEPSEEK_API_KEY",
+                            "template_selector_inherit": "text",
+                            "template_selector_fallback_enabled": True,
+                            "template_selector_fallback_base_url": "https://api.deepseek.com",
+                            "template_selector_fallback_model": "deepseek-v4-flash",
+                            "template_selector_fallback_api_key_env": "DEEPSEEK_API_KEY",
+                            "template_selector_fallback_options": {
+                                "temperature": 0.1
+                            },
+                            "audio_cloud_fallback": {"enabled": False},
+                        }
+                    },
+                }
+
+            def get_runtime_profile(self, profile_name):
+                return self.config["runtime_profiles"][profile_name]
+
+        config = FakeConfig()
+
+        run_audio_template_analysis.apply_cloud_fallback(
+            config,
+            "audio_nx1",
+        )
+
+        profile = config.config["runtime_profiles"]["audio_nx1"]
+        self.assertEqual(profile["text_model"], "deepseek-v4-flash")
+        self.assertEqual(profile["text_base_url"], "https://api.deepseek.com")
+        self.assertEqual(
+            profile["template_selector_model"],
+            "deepseek-v4-flash",
+        )
+        self.assertEqual(
+            profile["template_selector_base_url"],
+            "https://api.deepseek.com",
+        )
+        self.assertEqual(profile["template_selector_temperature"], 0.1)
+
     def test_invalid_selector_result_uses_content_form_fallback(self):
         client = FakeClient(
             lambda _prompt, _call: json.dumps(
