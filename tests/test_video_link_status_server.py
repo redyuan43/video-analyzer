@@ -1379,6 +1379,43 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             "cloud_fallback_credentials_missing",
         )
 
+    def test_content_fallback_can_select_cloud_without_asr_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs")
+            job = {
+                "job_id": "c" * 32,
+                "audio_pipeline_kind": "audio_nx1",
+                "runtime_profile_snapshot": {
+                    "audio_cloud_fallback": {"enabled": False},
+                    "content_cloud_fallback": {
+                        "enabled": True,
+                        "text": {
+                            "enabled": True,
+                            "api_key_env": "DEEPSEEK_API_KEY",
+                        },
+                    },
+                },
+            }
+            with (
+                patch.dict(
+                    os.environ,
+                    {"DEEPSEEK_API_KEY": "configured"},
+                    clear=False,
+                ),
+                patch.object(
+                    server,
+                    "live_resource_users",
+                    return_value=[{"job_id": "busy"}],
+                ),
+                patch.object(server, "save_job"),
+            ):
+                routed = server.select_audio_compute_route(
+                    job,
+                    "analyze-core",
+                )
+
+        self.assertEqual(routed["compute_route"], "cloud_fallback")
+
     def test_mobile_audio_legacy_analysis_alias_is_normalized_to_audio_nx1(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp) / "repo"

@@ -2109,8 +2109,15 @@ class VideoLinkStatusServer:
         fallback = (job.get("runtime_profile_snapshot") or {}).get(
             "audio_cloud_fallback"
         ) or {}
+        content_fallback = (job.get("runtime_profile_snapshot") or {}).get(
+            "content_cloud_fallback"
+        ) or {}
         fallback_credentials_ready = self.audio_cloud_fallback_credentials_ready(
-            fallback
+            fallback,
+            content_fallback,
+        )
+        fallback_enabled = bool(
+            fallback.get("enabled") or content_fallback.get("enabled")
         )
         local_busy = any(
             self.live_resource_users(resource, exclude_job_id=job.get("job_id"))
@@ -2118,7 +2125,7 @@ class VideoLinkStatusServer:
         )
         job["compute_route"] = (
             "cloud_fallback"
-            if local_busy and fallback.get("enabled") and fallback_credentials_ready
+            if local_busy and fallback_enabled and fallback_credentials_ready
             else "local"
         )
         job["compute_route_reason"] = (
@@ -2126,7 +2133,7 @@ class VideoLinkStatusServer:
             if job["compute_route"] == "cloud_fallback"
             else (
                 "cloud_fallback_credentials_missing"
-                if local_busy and fallback.get("enabled")
+                if local_busy and fallback_enabled
                 else "local_first"
             )
         )
@@ -2137,11 +2144,21 @@ class VideoLinkStatusServer:
     @staticmethod
     def audio_cloud_fallback_credentials_ready(
         fallback: dict[str, Any],
+        content_fallback: dict[str, Any] | None = None,
     ) -> bool:
         asr = fallback.get("asr") or {}
-        if str(asr.get("protocol") or "") != "tencent_hy_asr_ws":
-            return True
-        return not missing_tencent_credentials(dict(asr.get("options") or {}))
+        if (
+            str(asr.get("protocol") or "") == "tencent_hy_asr_ws"
+            and missing_tencent_credentials(dict(asr.get("options") or {}))
+        ):
+            return False
+        for stage in (content_fallback or {}).values():
+            if not isinstance(stage, dict) or not stage.get("enabled"):
+                continue
+            key_env = str(stage.get("api_key_env") or "").strip()
+            if key_env and not str(os.environ.get(key_env) or "").strip():
+                return False
+        return True
 
     def live_resource_users(self, resource: str, exclude_job_id: str | None = None) -> list[dict[str, Any]]:
         users = []
@@ -7545,9 +7562,14 @@ class VideoLinkStatusServer:
         if not isinstance(raw_profile, dict):
             raise BridgeError(HTTPStatus.BAD_REQUEST, f"unknown runtime profile: {profile_name}")
         nano_workflow = None
+        runtime_model_catalog = None
         if audio_workflow_snapshot:
             try:
-                resolved_profile, nano_workflow = resolve_audio_workflow_profile(
+                (
+                    resolved_profile,
+                    nano_workflow,
+                    runtime_model_catalog,
+                ) = resolve_audio_workflow_profile(
                     config,
                     profile_name,
                     audio_workflow_snapshot,
@@ -7564,6 +7586,7 @@ class VideoLinkStatusServer:
         snapshot_payload = {
             "active_runtime_profile": profile_name,
             "runtime_profiles": {profile_name: resolved_profile},
+            "model_catalog": copy.deepcopy(runtime_model_catalog or {}),
             "endpoints": copy.deepcopy(config.get("endpoints") or {}),
             "local_model_runtime": copy.deepcopy(
                 config.get("local_model_runtime") or {}
@@ -7605,6 +7628,42 @@ class VideoLinkStatusServer:
                 ),
             },
             "audio_cloud_fallback": resolved_profile.get("audio_cloud_fallback") or {},
+            "content_cloud_fallback": {
+                "enabled": bool(
+                    resolved_profile.get("text_fallback_enabled")
+                    or resolved_profile.get(
+                        "template_selector_fallback_enabled"
+                    )
+                ),
+                "text": {
+                    "enabled": bool(
+                        resolved_profile.get("text_fallback_enabled")
+                    ),
+                    "base_url": resolved_profile.get(
+                        "text_fallback_base_url"
+                    ),
+                    "model": resolved_profile.get("text_fallback_model"),
+                    "api_key_env": resolved_profile.get(
+                        "text_fallback_api_key_env"
+                    ),
+                },
+                "selector": {
+                    "enabled": bool(
+                        resolved_profile.get(
+                            "template_selector_fallback_enabled"
+                        )
+                    ),
+                    "base_url": resolved_profile.get(
+                        "template_selector_fallback_base_url"
+                    ),
+                    "model": resolved_profile.get(
+                        "template_selector_fallback_model"
+                    ),
+                    "api_key_env": resolved_profile.get(
+                        "template_selector_fallback_api_key_env"
+                    ),
+                },
+            },
         }
         if nano_workflow:
             job["runtime_profile_snapshot"]["nano_workflow"] = nano_workflow

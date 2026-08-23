@@ -303,7 +303,7 @@ def resolve_audio_workflow_profile(
     config: dict[str, Any],
     base_profile_name: str,
     snapshot: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any]]:
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, Any]]]:
     profiles = config.get("runtime_profiles") or {}
     base_profile = profiles.get(base_profile_name)
     if not isinstance(base_profile, dict):
@@ -316,6 +316,7 @@ def resolve_audio_workflow_profile(
     model_catalog = working_config.setdefault("model_catalog", {})
     nodes = snapshot["node_configs"]
     selected_ids: dict[str, str] = {}
+    runtime_model_ids: list[str] = []
 
     def install(node_id: str, route: str) -> str:
         model = (nodes.get(node_id) or {}).get(route)
@@ -323,6 +324,7 @@ def resolve_audio_workflow_profile(
             return ""
         runtime_id = f"audio-snapshot-{node_id}-{route.removesuffix('_model')}"
         model_catalog[runtime_id] = _runtime_model(model, catalog)
+        runtime_model_ids.append(runtime_id)
         selected_ids[f"{node_id}.{route}"] = str(model.get("id") or runtime_id)
         return runtime_id
 
@@ -343,7 +345,7 @@ def resolve_audio_workflow_profile(
     diarization_primary, diarization_fallback = primary_and_fallback(
         "diarization"
     )
-    selector_primary, _selector_fallback = primary_and_fallback("selector")
+    selector_primary, selector_fallback = primary_and_fallback("selector")
     text_primary, text_fallback = primary_and_fallback("summary")
     tts_primary, _tts_fallback = primary_and_fallback("tts")
 
@@ -367,6 +369,30 @@ def resolve_audio_workflow_profile(
         }
     )
     resolved = expand_runtime_profile(working_config, working_profile)
+    if selector_fallback:
+        selector_resource = model_catalog[selector_fallback]
+        selector_endpoints = list(selector_resource.get("endpoints") or [])
+        resolved.update(
+            {
+                "template_selector_fallback_enabled": True,
+                "template_selector_fallback_model_id": selector_fallback,
+                "template_selector_fallback_base_url": (
+                    selector_endpoints[0] if selector_endpoints else ""
+                ),
+                "template_selector_fallback_model": str(
+                    selector_resource.get("model") or ""
+                ),
+                "template_selector_fallback_api_key_env": str(
+                    selector_resource.get("api_key_env") or ""
+                ),
+                "template_selector_fallback_options": copy.deepcopy(
+                    selector_resource.get("options") or {}
+                ),
+            }
+        )
+    else:
+        resolved["template_selector_fallback_enabled"] = False
+        resolved["template_selector_fallback_model_id"] = ""
     metadata = {
         "source": "nano_workflow_snapshot",
         "workflow_id": snapshot["workflow_id"],
@@ -379,4 +405,8 @@ def resolve_audio_workflow_profile(
         },
         "selected_model_ids": selected_ids,
     }
-    return resolved, metadata
+    runtime_models = {
+        model_id: copy.deepcopy(model_catalog[model_id])
+        for model_id in runtime_model_ids
+    }
+    return resolved, metadata, runtime_models

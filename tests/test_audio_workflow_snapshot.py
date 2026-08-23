@@ -88,13 +88,19 @@ def long_audio_snapshot(profile_id="long-default", revision=1):
             },
             "selector": {
                 "enabled": True,
-                "route_policy": "local_only",
+                "route_policy": "auto",
                 "local_model": audio_model(
                     "ai-local-selector",
                     "selector",
                     "inherit_text",
                 ),
-                "cloud_model": None,
+                "cloud_model": audio_model(
+                    "ai-cloud-selector",
+                    "selector",
+                    "openai_compatible",
+                    deployment="cloud",
+                    model="deepseek-v4-flash",
+                ),
             },
             "summary": {
                 "enabled": True,
@@ -152,7 +158,7 @@ class AudioWorkflowSnapshotTests(unittest.TestCase):
             json.dumps(long_audio_snapshot(), ensure_ascii=False)
         )
 
-        profile, metadata = resolve_audio_workflow_profile(
+        profile, metadata, runtime_models = resolve_audio_workflow_profile(
             self.config(),
             "audio_nx1",
             snapshot,
@@ -169,6 +175,11 @@ class AudioWorkflowSnapshotTests(unittest.TestCase):
         )
         self.assertEqual(profile["text_model"], "prism-ml/bonsai-27b")
         self.assertEqual(profile["text_fallback_model"], "deepseek-v4-flash")
+        self.assertTrue(profile["template_selector_fallback_enabled"])
+        self.assertEqual(
+            profile["template_selector_fallback_model"],
+            "deepseek-v4-flash",
+        )
         self.assertTrue(profile["audio_cloud_fallback"]["enabled"])
         self.assertEqual(
             profile["audio_cloud_fallback"]["asr"]["protocol"],
@@ -176,6 +187,8 @@ class AudioWorkflowSnapshotTests(unittest.TestCase):
         )
         self.assertEqual(metadata["source"], "nano_workflow_snapshot")
         self.assertEqual(metadata["profile_revision"], 1)
+        self.assertIn("audio-snapshot-summary-local", runtime_models)
+        self.assertIn("audio-snapshot-summary-cloud", runtime_models)
 
     def test_cloud_only_uses_cloud_model_as_primary(self):
         payload = long_audio_snapshot()
@@ -191,7 +204,7 @@ class AudioWorkflowSnapshotTests(unittest.TestCase):
             ).encode("utf-8")
         ).hexdigest()
 
-        profile, _metadata = resolve_audio_workflow_profile(
+        profile, _metadata, _runtime_models = resolve_audio_workflow_profile(
             self.config(),
             "audio_nx1",
             parse_audio_workflow_snapshot(payload),
