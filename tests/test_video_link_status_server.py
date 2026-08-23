@@ -2431,6 +2431,43 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         wrapper = (REPO_ROOT / "tools" / "run_audio_narration_stage.sh").read_text(encoding="utf-8")
         self.assertIn("--stage tts", wrapper)
         self.assertIn("--prepare-only", wrapper)
+        self.assertIn("VIDEO_ANALYZER_TTS_ROUTE", wrapper)
+
+    def test_tts_switches_to_cloud_when_local_tts_slot_is_busy(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"XIAOMI_MIMO_API_KEY": "test-key"}, clear=False
+        ):
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            loaded["runtime_profile_snapshot"] = {
+                "config_dir": "/tmp/video-analyzer-config",
+                "tts_cloud_fallback": {
+                    "enabled": True,
+                    "provider": "xiaomi_mimo_tts",
+                    "model": "mimo-v2.5-tts",
+                    "api_key_env": "XIAOMI_MIMO_API_KEY",
+                },
+            }
+            server.save_job(loaded)
+
+            with patch.object(server, "live_resource_users", return_value=[{}]):
+                selected = server.select_audio_tts_route(
+                    loaded, "tts-narration"
+                )
+
+        self.assertEqual(selected["tts_route"], "cloud_fallback")
+        self.assertEqual(
+            selected["tts_route_reason"], "local_tts_queue_detected"
+        )
+        self.assertEqual(
+            server_mod.job_stage_resource(selected, "tts-narration"),
+            "tts-cloud",
+        )
+        self.assertEqual(
+            server.job_runtime_env(selected)["VIDEO_ANALYZER_TTS_ROUTE"],
+            "cloud_fallback",
+        )
 
     def test_tts_narration_stage_records_all_outputs(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -44,11 +44,15 @@ cd "$ROOT_DIR"
     --config "$CONFIG_DIR" \
     --skip-tts
 
-"$PYTHON_BIN" tools/run_local_model_stage.py \
-  --stage tts \
-  --config "$CONFIG_DIR" \
-  --profile "$PROFILE" \
-  --prepare-only
+if [[ "${VIDEO_ANALYZER_TTS_ROUTE:-local}" != "cloud_fallback" ]]; then
+  "$PYTHON_BIN" tools/run_local_model_stage.py \
+    --stage tts \
+    --config "$CONFIG_DIR" \
+    --profile "$PROFILE" \
+    --prepare-only
+else
+  echo "[audio-narration] using cloud TTS fallback; skipping local TTS preparation"
+fi
 
 "$PYTHON_BIN" tools/generate_audio_narration.py "$RUN_DIR" \
   --profile "$PROFILE" \
