@@ -34,6 +34,11 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
 from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient
+from video_analyzer.audio_workflow_snapshot import (
+    AudioWorkflowSnapshotError,
+    parse_audio_workflow_snapshot,
+    resolve_audio_workflow_profile,
+)
 from video_analyzer.config import (
     Config,
     build_openai_extra_body,
@@ -1073,6 +1078,12 @@ class VideoLinkStatusServer:
         *,
         pipeline_kind: str = AUDIO_PIPELINE_PROFILE_NX1,
     ) -> dict[str, Any]:
+        try:
+            audio_workflow_snapshot = parse_audio_workflow_snapshot(
+                payload.get("workflow_snapshot")
+            )
+        except AudioWorkflowSnapshotError as exc:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
         requested_pipeline = pipeline_kind
         if pipeline_kind != AUDIO_PIPELINE_KIND_TRANSCRIPTION:
             requested_pipeline = (
@@ -1118,6 +1129,19 @@ class VideoLinkStatusServer:
                         HTTPStatus.CONFLICT,
                         "external_attempt_id is already bound to another audio file",
                     )
+                existing_nano_snapshot = (
+                    existing.get("runtime_profile_snapshot") or {}
+                ).get("nano_workflow") or {}
+                incoming_fingerprint = str(
+                    (audio_workflow_snapshot or {}).get("fingerprint") or ""
+                )
+                if incoming_fingerprint and incoming_fingerprint != str(
+                    existing_nano_snapshot.get("fingerprint") or ""
+                ):
+                    raise BridgeError(
+                        HTTPStatus.CONFLICT,
+                        "external_attempt_id is already bound to another workflow snapshot",
+                    )
                 return self.mobile_audio_job(existing, include_resources=True)
 
         create_payload = dict(payload)
@@ -1157,6 +1181,12 @@ class VideoLinkStatusServer:
             source_filename,
         )
         job = self.load_job(created["job_id"])
+        if audio_workflow_snapshot:
+            self.write_runtime_snapshot(
+                job,
+                analysis_profile,
+                audio_workflow_snapshot=audio_workflow_snapshot,
+            )
         job["external_attempt_id"] = external_attempt_id or uuid.uuid4().hex
         job["source_sha256"] = source_sha256
         job["source_device"] = str(payload.get("source_device") or "external-audio")
@@ -1183,6 +1213,12 @@ class VideoLinkStatusServer:
         transcript_path: Path,
         source_filename: str,
     ) -> dict[str, Any]:
+        try:
+            audio_workflow_snapshot = parse_audio_workflow_snapshot(
+                payload.get("workflow_snapshot")
+            )
+        except AudioWorkflowSnapshotError as exc:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
         external_attempt_id = normalize_external_attempt_id(payload.get("external_attempt_id") or "")
         required = {
             "source_sha256": str(payload.get("source_sha256") or "").strip().lower(),
@@ -1212,6 +1248,19 @@ class VideoLinkStatusServer:
             )
             if not matches:
                 raise BridgeError(HTTPStatus.CONFLICT, "external_attempt_id is already bound to another transcript source")
+            existing_nano_snapshot = (
+                existing.get("runtime_profile_snapshot") or {}
+            ).get("nano_workflow") or {}
+            incoming_fingerprint = str(
+                (audio_workflow_snapshot or {}).get("fingerprint") or ""
+            )
+            if incoming_fingerprint and incoming_fingerprint != str(
+                existing_nano_snapshot.get("fingerprint") or ""
+            ):
+                raise BridgeError(
+                    HTTPStatus.CONFLICT,
+                    "external_attempt_id is already bound to another workflow snapshot",
+                )
             return self.mobile_audio_job(existing, include_resources=True)
 
         create_payload = dict(payload)
@@ -1234,6 +1283,12 @@ class VideoLinkStatusServer:
             upload_suffix=".json",
         )
         job = self.load_job(created["job_id"])
+        if audio_workflow_snapshot:
+            self.write_runtime_snapshot(
+                job,
+                analysis_profile,
+                audio_workflow_snapshot=audio_workflow_snapshot,
+            )
         video_dir = self.upload_video_dir(job["job_id"])
         video_dir.mkdir(parents=True, exist_ok=True)
         provided_path = video_dir / "provided_transcript.json"
@@ -7476,15 +7531,33 @@ class VideoLinkStatusServer:
         tmp_path.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp_path.replace(path)
 
-    def write_runtime_snapshot(self, job: dict[str, Any], profile_name: str, *, legacy: bool = False) -> dict[str, Any]:
+    def write_runtime_snapshot(
+        self,
+        job: dict[str, Any],
+        profile_name: str,
+        *,
+        legacy: bool = False,
+        audio_workflow_snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         config = runtime_config()
         profiles = config.get("runtime_profiles") or {}
         raw_profile = profiles.get(profile_name)
         if not isinstance(raw_profile, dict):
             raise BridgeError(HTTPStatus.BAD_REQUEST, f"unknown runtime profile: {profile_name}")
-        settings_document = build_settings_document(config)
-        decorated_profile = (settings_document.get("profiles") or {}).get(profile_name) or raw_profile
-        resolved_profile = expand_runtime_profile(config, decorated_profile)
+        nano_workflow = None
+        if audio_workflow_snapshot:
+            try:
+                resolved_profile, nano_workflow = resolve_audio_workflow_profile(
+                    config,
+                    profile_name,
+                    audio_workflow_snapshot,
+                )
+            except AudioWorkflowSnapshotError as exc:
+                raise BridgeError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+        else:
+            settings_document = build_settings_document(config)
+            decorated_profile = (settings_document.get("profiles") or {}).get(profile_name) or raw_profile
+            resolved_profile = expand_runtime_profile(config, decorated_profile)
         snapshot_dir = self.job_dir(job["job_id"]) / "runtime-config"
         snapshot_dir.mkdir(parents=True, exist_ok=True)
         snapshot_path = snapshot_dir / "config.json"
@@ -7533,6 +7606,8 @@ class VideoLinkStatusServer:
             },
             "audio_cloud_fallback": resolved_profile.get("audio_cloud_fallback") or {},
         }
+        if nano_workflow:
+            job["runtime_profile_snapshot"]["nano_workflow"] = nano_workflow
         return job["runtime_profile_snapshot"]
 
     def job_runtime_env(self, job: dict[str, Any]) -> dict[str, str]:
