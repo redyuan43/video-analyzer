@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -16,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
 from typing import Any
+
+import requests
 
 from .audio_processor import AudioTranscript
 
@@ -116,11 +119,119 @@ def run_diarization_assignment(
     backend = str(config.get("backend") or "3dspeaker")
     if backend == "3dspeaker":
         return run_3dspeaker_assignment(audio_path, config)
+    if backend == "remote_3dspeaker_http":
+        turns, report = run_remote_3dspeaker_assignment(audio_path, config)
+        if report.get("error") and config.get("fallback_backend") == "3dspeaker":
+            fallback_turns, fallback_report = run_3dspeaker_assignment(
+                audio_path,
+                {
+                    key: value
+                    for key, value in config.items()
+                    if key
+                    not in {
+                        "backend",
+                        "endpoint",
+                        "endpoints",
+                        "token_env",
+                        "fallback_backend",
+                    }
+                },
+            )
+            fallback_report = dict(fallback_report or {})
+            fallback_report["fallback_reason"] = report["error"]
+            fallback_report["route"] = "ai_local_fallback"
+            return fallback_turns, fallback_report
+        return turns, report
     if backend == "pyannote_community":
         return run_pyannote_assignment(audio_path, config)
     if backend == "wespeaker":
         return run_wespeaker_assignment(audio_path, config)
     return [], {"backend": backend, "error": f"unknown diarization backend: {backend}"}
+
+
+def run_remote_3dspeaker_assignment(
+    audio_path: Path,
+    config: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    config = config or {}
+    endpoints = config.get("endpoints") or []
+    endpoint = str(
+        config.get("endpoint")
+        or (endpoints[0] if isinstance(endpoints, list) and endpoints else "")
+        or ""
+    ).strip()
+    report: dict[str, Any] = {
+        "backend": "remote_3dspeaker_http",
+        "endpoint": endpoint,
+        "route": "nano_gpu",
+    }
+    if not endpoint:
+        report["error"] = "missing Nano diarization endpoint"
+        return [], report
+    token_env = str(config.get("token_env") or "NANO_DIARIZATION_TOKEN")
+    token = str(os.environ.get(token_env) or "").strip()
+    if not token:
+        report["error"] = f"missing diarization token environment: {token_env}"
+        return [], report
+    started = time.perf_counter()
+    digest = hashlib.sha256()
+    try:
+        with audio_path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        headers = {
+            "Content-Type": "application/octet-stream",
+            "X-Audio-Diarization-Token": token,
+            "X-Audio-Filename": audio_path.name,
+            "X-Audio-SHA256": digest.hexdigest(),
+        }
+        speaker_num = config.get("speaker_num")
+        if speaker_num not in (None, "", 0, "0"):
+            headers["X-Speaker-Num"] = str(int(speaker_num))
+        client = requests.Session()
+        client.trust_env = False
+        try:
+            with audio_path.open("rb") as source:
+                response = client.post(
+                    endpoint,
+                    data=source,
+                    headers=headers,
+                    timeout=(
+                        float(config.get("connect_timeout_seconds") or 10),
+                        float(
+                            config.get("assignment_timeout_seconds")
+                            or DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS
+                        ),
+                    ),
+                    allow_redirects=False,
+                )
+            response.raise_for_status()
+            payload = response.json()
+        finally:
+            client.close()
+    except (OSError, ValueError, requests.RequestException) as exc:
+        report["error"] = f"Nano diarization request failed: {exc}"
+        report["elapsed_seconds"] = round(time.perf_counter() - started, 3)
+        return [], report
+    turns = payload.get("turns") if isinstance(payload, dict) else None
+    if not isinstance(turns, list):
+        report["error"] = "Nano diarization response does not contain turns"
+        report["elapsed_seconds"] = round(time.perf_counter() - started, 3)
+        return [], report
+    report.update(
+        {
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+            "remote_elapsed_seconds": payload.get("elapsed_seconds"),
+            "node": payload.get("node"),
+            "device": payload.get("device"),
+            "turn_count": int(payload.get("turn_count") or len(turns)),
+            "detected_speakers": list(payload.get("detected_speakers") or []),
+            "detected_speaker_count": int(
+                payload.get("detected_speaker_count") or 0
+            ),
+        }
+    )
+    return turns, report
 
 
 def _run_assignment_command(

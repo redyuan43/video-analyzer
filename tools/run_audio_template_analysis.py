@@ -480,6 +480,7 @@ def apply_cloud_fallback(config: Config, profile_name: str | None) -> None:
     else:
         backend = {
             "three_d_speaker": "3dspeaker",
+            "three_d_speaker_http": "remote_3dspeaker_http",
             "pyannote_community": "pyannote_community",
             "wespeaker_diarization": "wespeaker",
         }.get(diarization_protocol)
@@ -489,6 +490,14 @@ def apply_cloud_fallback(config: Config, profile_name: str | None) -> None:
                 f"{diarization_protocol or '(missing)'}"
             )
         speaker_config = dict(diarization.get("options") or {})
+        endpoints = [
+            str(item)
+            for item in (diarization.get("endpoints") or [])
+            if str(item)
+        ]
+        if diarization_protocol == "three_d_speaker_http":
+            speaker_config["endpoints"] = endpoints
+            speaker_config["endpoint"] = endpoints[0] if endpoints else ""
         speaker_config.update(
             {
                 "enabled": True,
