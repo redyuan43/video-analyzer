@@ -39,6 +39,96 @@ url_context_mod = load_module(URL_CONTEXT_PATH, "video_analyzer_url_context")
 REAL_RUNTIME_CONFIG = server_mod.runtime_config
 
 
+def nano_audio_workflow_snapshot(profile_id="long-default", revision=1):
+    def model(model_id, kind, protocol, **overrides):
+        payload = {
+            "id": model_id,
+            "label": model_id,
+            "kind": kind,
+            "protocol": protocol,
+            "execution_target": "ai",
+            "deployment": "local",
+            "model": "",
+            "endpoints": [],
+            "health_endpoint": "",
+            "options": {},
+            "built_in": True,
+        }
+        payload.update(overrides)
+        return payload
+
+    snapshot = {
+        "schema_version": 1,
+        "workflow_id": "audio_long_v1",
+        "profile_id": profile_id,
+        "profile_revision": revision,
+        "node_configs": {
+            "asr": {
+                "enabled": True,
+                "route_policy": "local_only",
+                "local_model": model(
+                    "ai-vibevoice-asr",
+                    "asr",
+                    "vibevoice_http",
+                ),
+                "cloud_model": None,
+            },
+            "diarization": {
+                "enabled": True,
+                "route_policy": "local_only",
+                "local_model": model(
+                    "nano-3dspeaker",
+                    "diarization",
+                    "three_d_speaker_http",
+                    execution_target="nano",
+                    endpoints=[
+                        "http://100.64.0.1:5021/api/diarization/turns"
+                    ],
+                    options={
+                        "token_env": "NANO_DIARIZATION_TOKEN",
+                        "fallback_backend": "3dspeaker",
+                        "parallel_with_asr": True,
+                    },
+                ),
+                "cloud_model": None,
+            },
+            "selector": {
+                "enabled": False,
+                "route_policy": "local_only",
+                "local_model": None,
+                "cloud_model": None,
+            },
+            "summary": {
+                "enabled": True,
+                "route_policy": "cloud_only",
+                "local_model": None,
+                "cloud_model": model(
+                    "ai-cloud-text",
+                    "text",
+                    "openai_compatible",
+                    deployment="cloud",
+                    model="deepseek-v4-flash",
+                ),
+            },
+            "tts": {
+                "enabled": False,
+                "route_policy": "background_local",
+                "local_model": None,
+                "cloud_model": None,
+            },
+        },
+    }
+    snapshot["fingerprint"] = hashlib.sha256(
+        json.dumps(
+            snapshot,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return snapshot
+
+
 class VideoLinkStatusServerTests(unittest.TestCase):
     def setUp(self):
         default_config = json.loads(
@@ -1010,6 +1100,96 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             "diarization-3dspeaker-local",
         )
 
+    def test_audio_job_uses_nano_workflow_snapshot_as_runtime_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "demo.mp3"
+            source.write_bytes(b"fake audio")
+            server = server_mod.VideoLinkStatusServer(
+                Path(tmp) / "jobs",
+                REPO_ROOT,
+            )
+            nano_snapshot = nano_audio_workflow_snapshot()
+            with patch.object(
+                server,
+                "start_run",
+                side_effect=lambda job_id: server.mobile_audio_job(
+                    server.load_job(job_id),
+                    include_resources=True,
+                ),
+            ):
+                created = server.create_mobile_audio_job(
+                    {
+                        "external_attempt_id": "nano-snapshot-attempt",
+                        "workflow_snapshot": json.dumps(
+                            nano_snapshot,
+                            ensure_ascii=False,
+                        ),
+                    },
+                    source,
+                    "demo.mp3",
+                )
+            stored = server.load_job(created["job_id"])
+            runtime_snapshot = stored["runtime_profile_snapshot"]
+            runtime_payload = json.loads(
+                (
+                    Path(runtime_snapshot["config_dir"]) / "config.json"
+                ).read_text(encoding="utf-8")
+            )
+            runtime_profile = runtime_payload["runtime_profiles"]["audio_nx1"]
+
+        self.assertEqual(
+            runtime_snapshot["nano_workflow"]["fingerprint"],
+            nano_snapshot["fingerprint"],
+        )
+        self.assertEqual(
+            runtime_profile["speaker_diarization"]["backend"],
+            "remote_3dspeaker_http",
+        )
+        self.assertEqual(runtime_profile["text_model"], "deepseek-v4-flash")
+        self.assertFalse(runtime_profile["tts_enabled"])
+
+    def test_audio_job_retry_rejects_a_different_nano_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "demo.mp3"
+            source.write_bytes(b"fake audio")
+            server = server_mod.VideoLinkStatusServer(
+                Path(tmp) / "jobs",
+                REPO_ROOT,
+            )
+            first_snapshot = nano_audio_workflow_snapshot()
+            with patch.object(
+                server,
+                "start_run",
+                side_effect=lambda job_id: server.mobile_audio_job(
+                    server.load_job(job_id),
+                    include_resources=True,
+                ),
+            ):
+                server.create_mobile_audio_job(
+                    {
+                        "external_attempt_id": "immutable-snapshot-attempt",
+                        "workflow_snapshot": json.dumps(first_snapshot),
+                    },
+                    source,
+                    "demo.mp3",
+                )
+                changed_snapshot = nano_audio_workflow_snapshot(
+                    profile_id="long-revised",
+                    revision=2,
+                )
+                with self.assertRaisesRegex(
+                    server_mod.BridgeError,
+                    "another workflow snapshot",
+                ):
+                    server.create_mobile_audio_job(
+                        {
+                            "external_attempt_id": "immutable-snapshot-attempt",
+                            "workflow_snapshot": json.dumps(changed_snapshot),
+                        },
+                        source,
+                        "demo.mp3",
+                    )
+
     def test_failed_audio_diarization_blocks_unreached_flow_nodes(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs")
@@ -1198,6 +1378,43 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             routed["compute_route_reason"],
             "cloud_fallback_credentials_missing",
         )
+
+    def test_content_fallback_can_select_cloud_without_asr_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs")
+            job = {
+                "job_id": "c" * 32,
+                "audio_pipeline_kind": "audio_nx1",
+                "runtime_profile_snapshot": {
+                    "audio_cloud_fallback": {"enabled": False},
+                    "content_cloud_fallback": {
+                        "enabled": True,
+                        "text": {
+                            "enabled": True,
+                            "api_key_env": "DEEPSEEK_API_KEY",
+                        },
+                    },
+                },
+            }
+            with (
+                patch.dict(
+                    os.environ,
+                    {"DEEPSEEK_API_KEY": "configured"},
+                    clear=False,
+                ),
+                patch.object(
+                    server,
+                    "live_resource_users",
+                    return_value=[{"job_id": "busy"}],
+                ),
+                patch.object(server, "save_job"),
+            ):
+                routed = server.select_audio_compute_route(
+                    job,
+                    "analyze-core",
+                )
+
+        self.assertEqual(routed["compute_route"], "cloud_fallback")
 
     def test_mobile_audio_legacy_analysis_alias_is_normalized_to_audio_nx1(self):
         with tempfile.TemporaryDirectory() as tmp:

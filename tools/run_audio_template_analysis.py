@@ -434,79 +434,138 @@ def load_operation_config(args: argparse.Namespace) -> Config:
 def apply_cloud_fallback(config: Config, profile_name: str | None) -> None:
     profile = config.get_runtime_profile(profile_name)
     fallback = profile.get("audio_cloud_fallback") or {}
-    if not fallback.get("enabled"):
+    text_fallback_enabled = bool(profile.get("text_fallback_enabled"))
+    selector_fallback_enabled = bool(
+        profile.get("template_selector_fallback_enabled")
+    )
+    if (
+        not fallback.get("enabled")
+        and not text_fallback_enabled
+        and not selector_fallback_enabled
+    ):
         raise ValueError(
             f"runtime profile {profile_name or '(default)'} does not enable audio cloud fallback"
         )
-    asr = fallback.get("asr") or {}
-    diarization = fallback.get("diarization") or {}
-    protocol = str(asr.get("protocol") or "")
-    endpoints = [str(item) for item in (asr.get("endpoints") or []) if str(item)]
-    provider = {
-        "vibevoice_http": "vibevoice",
-        "generic_http": "remote_http",
-        "firered_3dspeaker_http": "firered_3dspeaker",
-        "openai_audio": "openai_audio",
-        "tencent_hy_asr_ws": "tencent_hy_asr",
-    }.get(protocol)
-    if not provider or not endpoints:
-        raise ValueError(f"unsupported audio cloud fallback ASR protocol: {protocol or '(missing)'}")
-    asr_config = config.config.setdefault("asr", {})
-    asr_config["provider"] = provider
-    vibevoice = asr_config.setdefault("vibevoice", {})
-    if protocol == "vibevoice_http":
-        vibevoice["deep_remote_urls"] = endpoints
-    elif protocol == "generic_http":
-        vibevoice["remote_urls"] = endpoints
-    elif protocol == "firered_3dspeaker_http":
-        vibevoice["firered_3dspeaker_url"] = endpoints[0]
-    elif protocol == "openai_audio":
-        vibevoice["openai_audio_url"] = endpoints[0]
-        vibevoice["openai_audio_model"] = asr.get("model")
-        vibevoice["asr_api_key_env"] = asr.get("api_key_env")
-    elif protocol == "tencent_hy_asr_ws":
-        vibevoice["tencent_hy_asr_endpoint"] = endpoints[0]
-        vibevoice["tencent_hy_asr_model"] = asr.get("model")
-        vibevoice["tencent_hy_asr_options"] = dict(asr.get("options") or {})
-        vibevoice["asr_api_key_env"] = asr.get("api_key_env")
+    if fallback.get("enabled"):
+        asr = fallback.get("asr") or {}
+        diarization = fallback.get("diarization") or {}
+        protocol = str(asr.get("protocol") or "")
+        endpoints = [str(item) for item in (asr.get("endpoints") or []) if str(item)]
+        provider = {
+            "vibevoice_http": "vibevoice",
+            "generic_http": "remote_http",
+            "firered_3dspeaker_http": "firered_3dspeaker",
+            "openai_audio": "openai_audio",
+            "tencent_hy_asr_ws": "tencent_hy_asr",
+        }.get(protocol)
+        if not provider or not endpoints:
+            raise ValueError(f"unsupported audio cloud fallback ASR protocol: {protocol or '(missing)'}")
+        asr_config = config.config.setdefault("asr", {})
+        asr_config["provider"] = provider
+        vibevoice = asr_config.setdefault("vibevoice", {})
+        if protocol == "vibevoice_http":
+            vibevoice["deep_remote_urls"] = endpoints
+        elif protocol == "generic_http":
+            vibevoice["remote_urls"] = endpoints
+        elif protocol == "firered_3dspeaker_http":
+            vibevoice["firered_3dspeaker_url"] = endpoints[0]
+        elif protocol == "openai_audio":
+            vibevoice["openai_audio_url"] = endpoints[0]
+            vibevoice["openai_audio_model"] = asr.get("model")
+            vibevoice["asr_api_key_env"] = asr.get("api_key_env")
+        elif protocol == "tencent_hy_asr_ws":
+            vibevoice["tencent_hy_asr_endpoint"] = endpoints[0]
+            vibevoice["tencent_hy_asr_model"] = asr.get("model")
+            vibevoice["tencent_hy_asr_options"] = dict(asr.get("options") or {})
+            vibevoice["asr_api_key_env"] = asr.get("api_key_env")
 
-    diarization_protocol = str(diarization.get("protocol") or "")
-    if diarization_protocol == "asr_embedded":
-        config.config["speaker_diarization"] = {
-            "enabled": False,
-            "assignment_enabled": False,
-            "source": "asr_embedded",
-        }
-    else:
-        backend = {
-            "three_d_speaker": "3dspeaker",
-            "three_d_speaker_http": "remote_3dspeaker_http",
-            "pyannote_community": "pyannote_community",
-            "wespeaker_diarization": "wespeaker",
-        }.get(diarization_protocol)
-        if not backend:
-            raise ValueError(
-                f"unsupported audio cloud fallback diarization protocol: "
-                f"{diarization_protocol or '(missing)'}"
+        diarization_protocol = str(diarization.get("protocol") or "")
+        if diarization_protocol == "asr_embedded":
+            config.config["speaker_diarization"] = {
+                "enabled": False,
+                "assignment_enabled": False,
+                "source": "asr_embedded",
+            }
+        else:
+            backend = {
+                "three_d_speaker": "3dspeaker",
+                "three_d_speaker_http": "remote_3dspeaker_http",
+                "pyannote_community": "pyannote_community",
+                "wespeaker_diarization": "wespeaker",
+            }.get(diarization_protocol)
+            if not backend:
+                raise ValueError(
+                    f"unsupported audio cloud fallback diarization protocol: "
+                    f"{diarization_protocol or '(missing)'}"
+                )
+            speaker_config = dict(diarization.get("options") or {})
+            diarization_endpoints = [
+                str(item)
+                for item in (diarization.get("endpoints") or [])
+                if str(item)
+            ]
+            if diarization_protocol == "three_d_speaker_http":
+                speaker_config["endpoints"] = diarization_endpoints
+                speaker_config["endpoint"] = (
+                    diarization_endpoints[0] if diarization_endpoints else ""
+                )
+            speaker_config.update(
+                {
+                    "enabled": True,
+                    "assignment_enabled": True,
+                    "parallel_with_asr": True,
+                    "backend": backend,
+                }
             )
-        speaker_config = dict(diarization.get("options") or {})
-        endpoints = [
-            str(item)
-            for item in (diarization.get("endpoints") or [])
-            if str(item)
-        ]
-        if diarization_protocol == "three_d_speaker_http":
-            speaker_config["endpoints"] = endpoints
-            speaker_config["endpoint"] = endpoints[0] if endpoints else ""
-        speaker_config.update(
+            config.config["speaker_diarization"] = speaker_config
+
+    if text_fallback_enabled:
+        profile.update(
             {
-                "enabled": True,
-                "assignment_enabled": True,
-                "parallel_with_asr": True,
-                "backend": backend,
+                "text_model_id": profile.get("text_fallback_model_id"),
+                "text_base_url": profile.get("text_fallback_base_url"),
+                "llm_base_url": profile.get("text_fallback_base_url"),
+                "text_model": profile.get("text_fallback_model"),
+                "text_api_key_env": profile.get("text_fallback_api_key_env"),
             }
         )
-        config.config["speaker_diarization"] = speaker_config
+        for key, value in list(profile.items()):
+            if key.startswith("text_fallback_") and key not in {
+                "text_fallback_enabled",
+                "text_fallback_base_url",
+                "text_fallback_model",
+                "text_fallback_api_key_env",
+            }:
+                profile[key.removeprefix("text_fallback_")] = value
+
+    if selector_fallback_enabled:
+        profile.update(
+            {
+                "template_selector_model_id": profile.get(
+                    "template_selector_fallback_model_id"
+                ),
+                "template_selector_inherit": "",
+                "template_selector_base_url": profile.get(
+                    "template_selector_fallback_base_url"
+                ),
+                "template_selector_model": profile.get(
+                    "template_selector_fallback_model"
+                ),
+                "template_selector_api_key_env": profile.get(
+                    "template_selector_fallback_api_key_env"
+                ),
+            }
+        )
+        for key, value in (
+            profile.get("template_selector_fallback_options") or {}
+        ).items():
+            profile[f"template_selector_{key}"] = value
+
+    resolved_name = str(
+        profile_name or config.config.get("active_runtime_profile") or ""
+    )
+    if resolved_name:
+        config.config.setdefault("runtime_profiles", {})[resolved_name] = profile
 
 
 def client_focus_supplement(value: str) -> str:
