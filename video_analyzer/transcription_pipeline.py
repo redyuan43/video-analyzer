@@ -404,6 +404,10 @@ def run_parallel_transcription_branches(
     with RAY_TRANSCRIPTION_LOCK:
         started_here = False
         actors: list[Any] = []
+        remote_diarization = (
+            str(speaker_config.get("backend") or "")
+            == "remote_3dspeaker_http"
+        )
         try:
             if not ray.is_initialized():
                 previous_cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -412,13 +416,17 @@ def run_parallel_transcription_branches(
                     speaker_config.get("gpu_id") or 0
                 )
                 try:
+                    ray_options = {
+                        "namespace": "video-analyzer-transcription",
+                        "ignore_reinit_error": True,
+                        "include_dashboard": False,
+                        "num_cpus": 2,
+                        "num_gpus": 0 if remote_diarization else 1,
+                    }
+                    if not remote_diarization:
+                        ray_options["resources"] = {"p40_diarization": 1}
                     ray.init(
-                        namespace="video-analyzer-transcription",
-                        ignore_reinit_error=True,
-                        include_dashboard=False,
-                        num_cpus=2,
-                        num_gpus=1,
-                        resources={"p40_diarization": 1},
+                        **ray_options,
                     )
                 finally:
                     if previous_cuda_devices is None:
@@ -427,9 +435,11 @@ def run_parallel_transcription_branches(
                         os.environ["CUDA_VISIBLE_DEVICES"] = previous_cuda_devices
                 started_here = True
             asr_actor = AsrBranchActor.remote()
+            diarization_options = {"num_gpus": 0 if remote_diarization else 1}
+            if not remote_diarization:
+                diarization_options["resources"] = {"p40_diarization": 1}
             diarization_actor = DiarizationBranchActor.options(
-                num_gpus=1,
-                resources={"p40_diarization": 1},
+                **diarization_options
             ).remote()
             actors.extend((asr_actor, diarization_actor))
             asr_ref = asr_actor.transcribe.remote(
