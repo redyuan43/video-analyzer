@@ -127,7 +127,14 @@ def long_audio_snapshot(profile_id="long-default", revision=1):
                     "tts",
                     "openai_speech",
                 ),
-                "cloud_model": None,
+                "cloud_model": audio_model(
+                    "ai-xiaomi-mimo-tts",
+                    "tts",
+                    "xiaomi_mimo_tts",
+                    deployment="cloud",
+                    model="mimo-v2.5-tts",
+                    options={"voice": "冰糖"},
+                ),
             },
         },
     }
@@ -181,6 +188,9 @@ class AudioWorkflowSnapshotTests(unittest.TestCase):
             "deepseek-v4-flash",
         )
         self.assertTrue(profile["audio_cloud_fallback"]["enabled"])
+        self.assertTrue(profile["tts_fallback_enabled"])
+        self.assertEqual(profile["tts_fallback_provider"], "xiaomi_mimo_tts")
+        self.assertEqual(profile["tts_fallback_model"], "mimo-v2.5-tts")
         self.assertEqual(
             profile["audio_cloud_fallback"]["asr"]["protocol"],
             "tencent_hy_asr_ws",
