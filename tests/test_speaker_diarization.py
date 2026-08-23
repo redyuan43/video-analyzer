@@ -1,6 +1,8 @@
 from pathlib import Path
 from unittest.mock import patch
 
+import requests
+
 from video_analyzer.audio_processor import AudioTranscript
 from video_analyzer.speaker_diarization import (
     SpeakerEstimate,
@@ -144,6 +146,95 @@ def test_3dspeaker_assignment_uses_native_helper_inside_branch_actor(tmp_path):
 
     command = run.call_args.args[0]
     assert command[1].endswith("run_3dspeaker_turns.py")
+
+
+def test_remote_3dspeaker_streams_audio_with_token(tmp_path, monkeypatch):
+    from video_analyzer import speaker_diarization
+
+    audio_path = tmp_path / "audio.wav"
+    audio_path.write_bytes(b"audio")
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "turns": [
+                    {
+                        "speaker": "spk_01",
+                        "start": 0.0,
+                        "end": 1.0,
+                        "duration": 1.0,
+                    }
+                ],
+                "turn_count": 1,
+                "detected_speakers": ["spk_01"],
+                "detected_speaker_count": 1,
+                "node": "nano1",
+                "device": "cuda",
+                "elapsed_seconds": 0.5,
+            }
+
+    class Session:
+        trust_env = True
+
+        def post(self, endpoint, **kwargs):
+            assert endpoint == "http://nano1:5021/api/diarization/turns"
+            assert kwargs["headers"]["X-Audio-Diarization-Token"] == "secret"
+            assert kwargs["data"].read() == b"audio"
+            return Response()
+
+        def close(self):
+            return None
+
+    monkeypatch.setenv("NANO_DIARIZATION_TOKEN", "secret")
+    monkeypatch.setattr(requests, "Session", Session)
+    turns, report = speaker_diarization.run_remote_3dspeaker_assignment(
+        audio_path,
+        {
+            "endpoint": "http://nano1:5021/api/diarization/turns",
+            "token_env": "NANO_DIARIZATION_TOKEN",
+        },
+    )
+
+    assert len(turns) == 1
+    assert report["node"] == "nano1"
+    assert report["device"] == "cuda"
+    assert report["route"] == "nano_gpu"
+
+
+def test_remote_3dspeaker_falls_back_to_ai_local(tmp_path):
+    from video_analyzer import speaker_diarization
+
+    audio_path = tmp_path / "audio.wav"
+    audio_path.write_bytes(b"audio")
+    with (
+        patch.object(
+            speaker_diarization,
+            "run_remote_3dspeaker_assignment",
+            return_value=([], {"error": "nano busy"}),
+        ),
+        patch.object(
+            speaker_diarization,
+            "run_3dspeaker_assignment",
+            return_value=(
+                [{"speaker": "spk_01", "start": 0.0, "end": 1.0}],
+                {"backend": "3dspeaker"},
+            ),
+        ),
+    ):
+        turns, report = speaker_diarization.run_diarization_assignment(
+            audio_path,
+            {
+                "backend": "remote_3dspeaker_http",
+                "fallback_backend": "3dspeaker",
+            },
+        )
+
+    assert len(turns) == 1
+    assert report["route"] == "ai_local_fallback"
+    assert report["fallback_reason"] == "nano busy"
 
 
 def test_prepared_assignment_is_reused_after_parallel_asr():

@@ -42,6 +42,7 @@ MODEL_KIND_PROTOCOLS = {
     "diarization": {
         "asr_embedded",
         "three_d_speaker",
+        "three_d_speaker_http",
         "pyannote_community",
         "wespeaker_diarization",
         "none",
@@ -1205,9 +1206,14 @@ def expand_runtime_profile(config: dict[str, Any], profile: dict[str, Any]) -> d
         )
         backend = {
             "three_d_speaker": "3dspeaker",
+            "three_d_speaker_http": "remote_3dspeaker_http",
             "pyannote_community": "pyannote_community",
             "wespeaker_diarization": "wespeaker",
         }.get(protocol)
+        endpoints = normalize_string_list(diarization.get("endpoints"))
+        if protocol == "three_d_speaker_http":
+            options["endpoints"] = endpoints
+            options["endpoint"] = endpoints[0] if endpoints else ""
         options["enabled"] = backend is not None
         options["assignment_enabled"] = backend is not None
         if backend:
@@ -1240,6 +1246,7 @@ def expand_runtime_profile(config: dict[str, Any], profile: dict[str, Any]) -> d
         and fallback_diarization.get("protocol") in {
             "asr_embedded",
             "three_d_speaker",
+            "three_d_speaker_http",
             "pyannote_community",
             "wespeaker_diarization",
         }
@@ -1498,6 +1505,7 @@ def validate_profile(
             not in {
                 "asr_embedded",
                 "three_d_speaker",
+                "three_d_speaker_http",
                 "pyannote_community",
                 "wespeaker_diarization",
                 "none",
@@ -2108,6 +2116,7 @@ class RuntimeSettingsStore:
             }
         if protocol in {
             "three_d_speaker",
+            "three_d_speaker_http",
             "pyannote_community",
             "wespeaker_diarization",
             "faster_whisper",
