@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from tools.bonsai_local_pool import (
+from tools.ops.bonsai_local_pool import (
     PoolServer,
     Worker,
     configured_workers,
@@ -16,7 +16,7 @@ class BonsaiLocalPoolTests(unittest.TestCase):
             Worker("5", "GPU-p40-5", "Tesla P40", 18114),
         ]
 
-    @patch("tools.bonsai_local_pool.worker_ready", return_value=True)
+    @patch("tools.ops.bonsai_local_pool.worker_ready", return_value=True)
     def test_health_reports_all_p40_workers(self, _ready):
         response = PoolServer(self.workers).app.test_client().get("/api/health")
 
@@ -56,11 +56,11 @@ class BonsaiLocalPoolTests(unittest.TestCase):
         self.assertIn("busy", response.get_json()["error"]["message"])
 
     @patch(
-        "tools.bonsai_local_pool.gpu_inventory",
+        "tools.ops.bonsai_local_pool.gpu_inventory",
         return_value={"3": ("GPU-v100", "Tesla V100-SXM2-16GB")},
     )
-    @patch("tools.bonsai_local_pool.WORKER_COUNT", 1)
-    @patch("tools.bonsai_local_pool.GPU_IDS", ("3",))
+    @patch("tools.ops.bonsai_local_pool.WORKER_COUNT", 1)
+    @patch("tools.ops.bonsai_local_pool.GPU_IDS", ("3",))
     def test_configured_workers_accepts_v100(self, _inventory):
         workers = configured_workers()
 

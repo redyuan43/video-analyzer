@@ -10,7 +10,7 @@ from video_analyzer.audio_processor import AudioTranscript
 from video_analyzer.config import Config
 
 ROOT = Path(__file__).resolve().parents[1]
-MODULE_PATH = ROOT / 'tools' / 'run_audio_template_analysis.py'
+MODULE_PATH = ROOT / 'tools' / 'pipelines' / 'run_audio_template_analysis.py'
 SPEC = importlib.util.spec_from_file_location('run_audio_template_analysis', MODULE_PATH)
 run_audio_template_analysis = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None

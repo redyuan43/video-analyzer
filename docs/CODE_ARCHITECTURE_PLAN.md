@@ -180,7 +180,9 @@ web_debug_console/            # 并入 video_analyzer_ui 或独立发布包（�
   - 测试统一：新增 `tests/__init__.py`；`test_operation_manual.py`、`test_prompt_loading.py` 迁入 `tests/`
   - 顺带修复：`tools/video_link_status_server.py` 缺失 `requests` 导入的潜在 NameError；清除 60+ 处未用导入/导入排序问题
 - ✅ **Phase 3a 已完成**（2026-08-27）：引擎 `video_link_status_server.py` 迁入正式包 `video_analyzer/jobengine/`；UI 反向依赖改为 `from video_analyzer.jobengine... import`；修正 REPO_ROOT 解析（`parents[1]`→`parents[2]`）；同步测试/CI/文档路径引用
-- ⏳ **Phase 3b（tools/ 分目录）与 Phase 4-6 待实施**（每阶段独立可回滚）
+- ✅ **Phase 3b 已完成**（2026-08-27）：`tools/` 按目标结构分目录（asr_servers/ocr_servers/pipelines/publish/benchmarks/ops/video_link），旧路径保留 53 个兼容 shim，真实重启验证通过；详见 [PHASE_3B_MIGRATION_REPORT.md](PHASE_3B_MIGRATION_REPORT.md)
+- ✅ **Phase 4 已完成**（2026-08-27）：jobengine 按 mixin 切片拆出 settings/mobile_audio/background_loops/stage_runner/_shared/errors（主模块 11,600→10,323 行）；cli.py 拆出 cli_helpers/cli_parser（1,983→1,283 行，参数面 65 项不变，兼容 re-export）；UI 真实重启验证通过；详见 [PHASE_4_MIGRATION_REPORT.md](PHASE_4_MIGRATION_REPORT.md)
+- ⏳ **Phase 3c 与 Phase 5-6 待实施**（每阶段独立可回滚）
 
 ### Phase 0 基线固化（低风险）
 - 运行全量测试并记录基线：`tests/` 604 + 根目录 82，当前全部通过
@@ -202,16 +204,17 @@ web_debug_console/            # 并入 video_analyzer_ui 或独立发布包（�
 - 将 `tools/` 按 3.2 目标结构分目录，同步更新 `run_*.sh`、systemd、skills 中的路径引用
 - 保留薄包装器到最终收敛，先保证行为不变
 
-### Phase 4 巨型模块拆分（高风险，分多次提交）
-- `cli.py`：把 `main()` 拆为 `pipeline/operation_manual.py` 等子流水线 + 参数解析留在 `cli.py`
-- `video_link_status_server.py`：按职责拆出 `jobs/`（生命周期）、`mobile_audio/`、`settings/`、`stages/`
-- `run_audio_template_analysis.py`：逻辑下沉 `video_analyzer/pipeline/audio/`
+### Phase 4 巨型模块拆分（高风险，分多次提交）✅ 已完成（2026-08-27）
+- `cli.py`：已拆出 `cli_helpers.py`（24 个 helper）与 `cli_parser.py`（65 项参数面），兼容 re-export；`main()` 流水线本体因共享状态多暂缓切片
+- `video_link_status_server.py`：已按 mixin 拆出 `settings.py`、`mobile_audio.py`、`background_loops.py`、`stage_runner.py` + `_shared.py`/`errors.py`
+- `run_audio_template_analysis.py`：逻辑下沉 `video_analyzer/pipeline/audio/` —— 未实施，推迟
 - 每个拆分子任务先抽公共函数 → 单测覆盖 → 再移动
 
-### Phase 5 冗余消除（中风险）
-- 删除/收敛 re-export 包装器，入口脚本改为直接调用主包
-- 抽取统一 `repo_root/sys.path` 引导样板为公共 util，删除 40+ 处重复插入
-- 常量去重、重复辅助函数下沉基础层
+### Phase 5 冗余消除（中风险）——进行中（2026-08-27 首批完成）
+- ✅ shim 收敛首批：54 个兼容 shim 删除 11 个（4 个零引用 + 7 个随 systemd/文档引用改指新路径后收敛）；5 个 systemd 用户单元 ExecStart 改为新路径并 daemon-reload；`tools/asr_servers/generate_30s_agx_tts.sh` deprecated 壳一并移除，skills 指向 `tools/pipelines/generate_audio_narration.sh`
+- ✅ 死导入清理：`cli.py` 删除 7 个无消费者的 cli_helpers 回导；jobengine 主模块 `_shared` 导入去重（保留 4 个被 `server_mod.*` 测试断言引用的常量）
+- ⏭️ `sys.path` 引导样板不抽公共 util：`python tools/xxx/foo.py` 直跑时 sys.path[0] 为脚本目录，util 自身无法被导入（鸡生蛋）；仅将 `os.sys.path` 异形写法归一为标准 `sys.path`。3 行标准样板保留为惯例
+- 常量去重、重复辅助函数下沉基础层 —— 待后续批次
 
 ### Phase 6 收尾（低风险）
 - 全量回归：`py_compile` + 全部单测 + 手工冒烟（CLI 帮助/UI 启动）

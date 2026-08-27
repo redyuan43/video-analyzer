@@ -56,7 +56,7 @@ When the user asks for `音频讲解`, `讲解稿`, `Markdown 转音频`, `生�
 Run:
 
 ```bash
-tools/generate_audio_narration.sh RUN_DIR --profile local_lan
+tools/pipelines/generate_audio_narration.sh RUN_DIR --profile local_lan
 ```
 
 The tool defaults to `--tts-concurrency 2` so the Ivan gateway can use both ready Qwen3-TTS workers. Lower it only when the user explicitly asks to keep TTS load minimal.
@@ -75,7 +75,7 @@ Outputs are written under `RUN_DIR/audio_narration/`:
 - `audio_output/narration_full.wav`
 - `audio_output/manifest.json`
 
-Do not call `tools/generate_30s_agx_tts.sh` for audio narration requests. That script is now only a deprecated compatibility wrapper and forwards to `tools/pipelines/generate_audio_narration.sh`.
+Do not look for `tools/generate_30s_agx_tts.sh` for audio narration requests; it was removed. Use `tools/pipelines/generate_audio_narration.sh` directly for full Markdown narration + Ivan TTS WAV.
 
 ## Evidence policy
 

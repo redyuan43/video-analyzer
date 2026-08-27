@@ -7,7 +7,7 @@ import unittest
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-SCRIPT_PATH = ROOT_DIR / "tools" / "resume_operation_manual_from_frames.py"
+SCRIPT_PATH = ROOT_DIR / "tools" / "pipelines" / "resume_operation_manual_from_frames.py"
 SPEC = importlib.util.spec_from_file_location("resume_operation_manual_from_frames", SCRIPT_PATH)
 resume_module = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None

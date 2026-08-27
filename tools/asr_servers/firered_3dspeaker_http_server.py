@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import hashlib
 import json
 import tempfile
@@ -16,8 +17,8 @@ import requests
 from flask import Flask, jsonify, request
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in os.sys.path:
-    os.sys.path.insert(0, str(REPO_ROOT))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from video_analyzer.audio_processor import AudioTranscript
 from video_analyzer.speaker_diarization import (

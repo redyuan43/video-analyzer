@@ -434,7 +434,7 @@ class VideoAnalyzerUITests(unittest.TestCase):
             stale_runtime = {
                 "runtime_id": "old-runtime",
                 "source_stale": True,
-                "stale_files": ["tools/video_link_status_server.py"],
+                "stale_files": ["video_analyzer/jobengine/video_link_status_server.py"],
             }
             with patch.object(ui.runtime_identity, "payload", return_value=stale_runtime):
                 with patch.object(ui.video_link, "create_job") as create_job:

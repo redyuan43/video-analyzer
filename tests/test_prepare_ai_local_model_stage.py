@@ -7,6 +7,7 @@ class PrepareAiLocalModelStageTests(unittest.TestCase):
         script = (
             Path(__file__).resolve().parents[1]
             / "tools"
+            / "ops"
             / "prepare_ai_local_model_stage.sh"
         ).read_text(encoding="utf-8")
 
@@ -31,6 +32,7 @@ class PrepareAiLocalModelStageTests(unittest.TestCase):
         script = (
             Path(__file__).resolve().parents[1]
             / "tools"
+            / "ops"
             / "prepare_ai_local_model_stage.sh"
         ).read_text(encoding="utf-8")
 
