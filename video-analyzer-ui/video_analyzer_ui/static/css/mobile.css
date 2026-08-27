@@ -1,0 +1,402 @@
+/*
+ * Mobile / iOS adaptation layer.
+ *
+ * Loaded after styles.css and scoped inside `@media (max-width: 860px)` so the
+ * desktop layout is untouched. 860px covers iPhone 15 in both orientations
+ * (393pt portrait, 852pt landscape).
+ *
+ * This builds on the existing `@media (max-width: 980px)` block in styles.css,
+ * which already switches the app from "fixed shell with inner scroll panes" to
+ * whole-page scrolling. We keep that model rather than fighting it, and add
+ * the three things it does not cover:
+ *
+ *   1. a sticky topbar, so the drawer button stays reachable once the page
+ *      has scrolled;
+ *   2. the `.view-tabs` nav re-positioned as a bottom tab bar (pure CSS —
+ *      `setView` in main.js keeps driving it, no markup duplication);
+ *   3. the remaining multi-column grids collapsed to one column.
+ */
+
+:root {
+    --mobile-tabbar-height: 56px;
+    --mobile-gutter: 12px;
+}
+
+/*
+ * mobile.js injects the drawer toggle and backdrop unconditionally so it does
+ * not have to re-run on every resize. They are phone-only chrome, so keep them
+ * out of the desktop layout entirely — as `.app-shell` grid children they
+ * would otherwise take a row and swallow clicks.
+ */
+.mobile-drawer-toggle,
+.mobile-drawer-backdrop {
+    display: none;
+}
+
+@media (max-width: 860px) {
+    /* ---------------------------------------------------------------- shell */
+
+    /*
+     * Longhands, not the `padding` shorthand: a four-value shorthand built out
+     * of calc(env(...)) is fragile across engines, and the bottom value has to
+     * reserve room for the fixed tab bar regardless.
+     */
+    .app-shell {
+        gap: 10px;
+        padding-top: 0;
+        padding-right: calc(env(safe-area-inset-right) + var(--mobile-gutter));
+        padding-bottom: calc(
+            var(--mobile-tabbar-height) + env(safe-area-inset-bottom) + 16px
+        );
+        padding-left: calc(env(safe-area-inset-left) + var(--mobile-gutter));
+    }
+
+    /* --------------------------------------------------------------- topbar */
+
+    /*
+     * The page scrolls as a whole here, so a static topbar would carry the
+     * drawer button off-screen and strand the task list. Stick it to the top
+     * and bleed it across the shell gutters so it covers the full width.
+     *
+     * Deliberately an opaque background rather than a backdrop blur: the tab
+     * bar below is a `.view-tabs` descendant of this element, and any of
+     * backdrop-filter/filter/transform here would make the topbar the
+     * containing block for it, pinning the tab bar inside the header instead
+     * of to the viewport.
+     */
+    .topbar {
+        position: sticky;
+        z-index: 55;
+        top: 0;
+        /* The 980px block switches this to `display: grid`, which stacks the
+           drawer button above the title. One row is all we need.
+           `space-between` also has to go: with the tab nav taken out of flow
+           there are only two children left, and it would fling the title to
+           the far edge instead of leaving it beside the drawer button. */
+        display: flex;
+        align-items: center;
+        justify-content: flex-start;
+        gap: 10px;
+        margin-right: calc(-1 * (env(safe-area-inset-right) + var(--mobile-gutter)));
+        margin-left: calc(-1 * (env(safe-area-inset-left) + var(--mobile-gutter)));
+        padding-top: calc(env(safe-area-inset-top) + 10px);
+        padding-right: calc(env(safe-area-inset-right) + var(--mobile-gutter));
+        padding-bottom: 10px;
+        padding-left: calc(env(safe-area-inset-left) + var(--mobile-gutter));
+        border-bottom: 1px solid #e4e9f0;
+        background: #f5f7fa;
+    }
+
+    .topbar h1 {
+        font-size: 19px;
+    }
+
+    /* The subtitle is decoration; the vertical space is worth more. */
+    .topbar p {
+        display: none;
+    }
+
+    /* ------------------------------------------------- tabs -> bottom tab bar */
+
+    .view-tabs {
+        position: fixed;
+        z-index: 60;
+        right: 0;
+        bottom: 0;
+        left: 0;
+        display: grid;
+        grid-auto-flow: column;
+        grid-auto-columns: minmax(0, 1fr);
+        gap: 0;
+        height: calc(var(--mobile-tabbar-height) + env(safe-area-inset-bottom));
+        padding: 0 0 env(safe-area-inset-bottom);
+        border: 0;
+        border-top: 1px solid #d7dde5;
+        border-radius: 0;
+        background: rgba(255, 255, 255, 0.94);
+        backdrop-filter: saturate(180%) blur(12px);
+        -webkit-backdrop-filter: saturate(180%) blur(12px);
+    }
+
+    .view-tab {
+        min-width: 0;
+        min-height: 44px;
+        padding: 0 4px;
+        border-radius: 0;
+        font-size: 12px;
+        line-height: 1.2;
+    }
+
+    /* A filled black pill reads as "selected" at desktop size but as a solid
+       black block in a tab bar. Use an accent bar instead. */
+    .view-tab.active {
+        position: relative;
+        background: transparent;
+        color: #111827;
+        font-weight: 600;
+    }
+
+    .view-tab.active::after {
+        position: absolute;
+        top: 0;
+        left: 50%;
+        width: 28px;
+        height: 3px;
+        border-radius: 0 0 3px 3px;
+        background: #111827;
+        content: '';
+        transform: translateX(-50%);
+    }
+
+    /* Skills focus mode hides the topbar on desktop; on a phone that would
+       strand the user in a view with no way back, so keep the bar. */
+    .app-shell.skills-focus-mode .topbar {
+        display: flex;
+    }
+
+    .app-shell.skills-focus-mode .topbar h1 {
+        display: none;
+    }
+
+    /* ----------------------------------------------- debug console launcher */
+
+    /*
+     * The launcher parks itself 18px from the bottom, which lands squarely on
+     * the 设置 tab. Lift it clear of the tab bar. (This file is loaded after
+     * debug-console.css so the plain selector is enough.)
+     */
+    .web-debug-launcher {
+        bottom: calc(var(--mobile-tabbar-height) + env(safe-area-inset-bottom) + 12px);
+    }
+
+    /* ------------------------------------------------- console: sidebar drawer */
+
+    .workspace {
+        grid-template-columns: minmax(0, 1fr);
+        gap: 0;
+    }
+
+    /* Fixed, so page scrolling does not drag the drawer around with it. */
+    .sidebar {
+        position: fixed;
+        z-index: 70;
+        top: 0;
+        bottom: 0;
+        left: 0;
+        width: min(86vw, 380px);
+        padding: calc(env(safe-area-inset-top) + 12px) 12px
+                 calc(var(--mobile-tabbar-height) + env(safe-area-inset-bottom) + 12px);
+        overflow: auto;
+        background: #f5f7fa;
+        box-shadow: 0 0 40px rgba(15, 23, 42, 0.28);
+        transform: translateX(-102%);
+        transition: transform 0.24s ease;
+        -webkit-overflow-scrolling: touch;
+    }
+
+    .app-shell.mobile-drawer-open .sidebar {
+        transform: translateX(0);
+    }
+
+    .mobile-drawer-backdrop {
+        display: block;
+        position: fixed;
+        z-index: 65;
+        inset: 0;
+        background: rgba(15, 23, 42, 0.42);
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.24s ease;
+    }
+
+    .app-shell.mobile-drawer-open .mobile-drawer-backdrop {
+        opacity: 1;
+        pointer-events: auto;
+    }
+
+    /* Injected by mobile.js so the desktop DOM stays clean. */
+    .mobile-drawer-toggle {
+        display: inline-flex;
+        flex: 0 0 auto;
+        align-items: center;
+        justify-content: center;
+        width: 44px;
+        min-height: 44px;
+        padding: 0;
+        border: 1px solid #d7dde5;
+        border-radius: 10px;
+        background: #fff;
+        color: #1f2933;
+        font-size: 17px;
+        line-height: 1;
+    }
+
+    /* Desktop stretches the last panel to fill its column. Stacked on a phone
+       that starves everything above it. */
+    .sidebar > .panel:last-child,
+    .main-panel > .panel:last-child {
+        flex: 0 0 auto;
+    }
+
+    .main-panel > .panel:last-child {
+        display: block;
+    }
+
+    /* A full-height log pane would bury the panels under it; cap it and let it
+       scroll on its own. */
+    .main-panel > .panel:last-child pre {
+        height: auto;
+        max-height: 45vh;
+    }
+
+    /* ------------------------------------------------------------- qa view */
+
+    /* The 980px block collapses most layouts but leaves this one three-column. */
+    .qa-layout {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-rows: auto;
+        overflow: visible;
+    }
+
+    /* Video first: on a phone the player is why you opened this view. */
+    .qa-side-panel {
+        order: -1;
+    }
+
+    .qa-chat-panel {
+        min-height: 60vh;
+    }
+
+    /* --------------------------------------------- learning resources / skills */
+
+    /*
+     * The 980px block already drops these to two columns; 393pt cannot carry
+     * two, so finish the job.
+     */
+    .skills-current-grid,
+    .skill-library-grid,
+    .skill-projects-grid {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-rows: auto;
+        min-height: 0;
+    }
+
+    .skill-project-main,
+    .skills-current-grid > *,
+    .skill-library-grid > *,
+    .skill-projects-grid > * {
+        border-right: 0;
+    }
+
+    /* Drag-to-resize is a pointer affordance with no touch equivalent. The
+       980px block hides the docs and skills handles; this covers Q&A too. */
+    .pane-resizer {
+        display: none;
+    }
+
+    .vscode-shell iframe {
+        min-height: 60vh;
+    }
+
+    /* ----------------------------------------------------------- settings */
+
+    .profile-flow-inspector {
+        grid-template-columns: minmax(0, 1fr);
+        gap: 12px;
+    }
+
+    /* Fixed 196px columns: scroll the flow sideways rather than crush it. */
+    .profile-flow-track,
+    .profile-flow-grid {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+    }
+
+    /* ------------------------------------------------- misc panel collapses */
+
+    .console-narration-panel {
+        grid-template-columns: minmax(0, 1fr);
+        gap: 12px;
+    }
+
+    .skill-panel-head {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .panel {
+        padding: 14px;
+    }
+
+    .panel-head {
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+
+    /* --------------------------------------------------------------- tables */
+
+    .table-wrap {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+    }
+
+    .table-wrap table {
+        min-width: 520px;
+    }
+
+    /* ----------------------------------------------------- touch ergonomics */
+
+    /* iOS auto-zooms any focused control under 16px and leaves the page
+       scrolled sideways afterwards. Never go below 16px. */
+    input,
+    select,
+    textarea {
+        font-size: 16px;
+    }
+
+    button,
+    .view-tab,
+    .intent-card,
+    .icon-button {
+        min-height: 44px;
+    }
+
+    .icon-button {
+        min-width: 44px;
+    }
+
+    pre,
+    .job-list,
+    .settings-item-list,
+    .qa-messages,
+    .template-list {
+        -webkit-overflow-scrolling: touch;
+    }
+
+    /* Stop long URLs and log lines forcing a horizontal page scroll. */
+    pre {
+        white-space: pre-wrap;
+        word-break: break-word;
+    }
+}
+
+/* The page scrolls as a whole, so the drawer needs the page frozen behind it
+   or the backdrop scrolls while the drawer sits still. */
+body.mobile-drawer-locked {
+    overflow: hidden;
+}
+
+/* Landscape phones are only ~390pt tall; give the content back its vertical
+   space by shrinking the chrome. */
+@media (max-width: 860px) and (orientation: landscape) and (max-height: 480px) {
+    :root {
+        --mobile-tabbar-height: 44px;
+    }
+
+    .topbar h1 {
+        font-size: 16px;
+    }
+
+    .qa-chat-panel {
+        min-height: 0;
+    }
+}

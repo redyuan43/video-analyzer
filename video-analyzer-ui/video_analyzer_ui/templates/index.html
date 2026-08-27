@@ -2,14 +2,25 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <meta name="web-debug-token" content="{{ debug_console_token }}">
+    <!-- iOS Safari still only honours the apple- prefixed form; the
+         unprefixed one is the standardised replacement. Keep both. -->
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="apple-mobile-web-app-title" content="Video Analyzer">
+    <meta name="format-detection" content="telephone=no">
     <link rel="icon" href="data:,">
+    <link rel="apple-touch-icon" href="{{ url_for('static', filename='icons/apple-touch-icon.png') }}?v={{ static_version }}">
     <title>Video Analyzer</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='vendor/katex/katex.min.css') }}?v={{ static_version }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}?v={{ static_version }}">
     <link rel="stylesheet" href="{{ url_for('web_debug_console.static', filename='vendor/xterm/xterm.css') }}?v={{ static_version }}">
     <link rel="stylesheet" href="{{ url_for('web_debug_console.static', filename='debug-console.css') }}?v={{ static_version }}">
+    <!-- Last: the narrow-screen layer overrides every stylesheet above it,
+         including the debug console's own fixed-position chrome. -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/mobile.css') }}?v={{ static_version }}">
 </head>
 <body>
     <main class="app-shell" data-initial-job="{{ request.args.get('job', '') }}">
@@ -20,6 +31,7 @@
             </div>
             <nav class="view-tabs" aria-label="视图切换">
                 <button id="consoleTab" class="view-tab active" type="button" data-view="console">控制台</button>
+                <button id="taskPreviewTab" class="view-tab" type="button" data-view="preview">任务预览</button>
                 <button id="qaTab" class="view-tab" type="button" data-view="qa">问答</button>
                 <button id="vscodeTab" class="view-tab" type="button" data-view="vscode">学习/资源</button>
                 <button id="settingsTab" class="view-tab" type="button" data-view="settings">设置</button>
@@ -111,10 +123,15 @@
                         </label>
                         <div class="option-grid">
                             <label class="check"><input id="keepExisting" type="checkbox"><span>复用已有下载</span></label>
+                            <label class="check"><input id="expandBilibiliParts" type="checkbox"><span>展开 B站视频选集</span></label>
                             <label class="check"><input id="includeSubtitles" type="checkbox"><span>纳入字幕</span></label>
                             <label class="check"><input id="includeComments" type="checkbox"><span>纳入评论</span></label>
                             <label class="check"><input id="refreshContext" type="checkbox"><span>刷新上下文</span></label>
                         </div>
+                        <label>
+                            <span>定时启动</span>
+                            <input id="scheduleTime" name="schedule_time" type="datetime-local" step="60" title="留空则创建后立即启动">
+                        </label>
                         <details class="advanced">
                             <summary>更多参数</summary>
                             <label class="check"><input id="preferSubtitleTranscript" type="checkbox"><span>优先字幕 transcript</span></label>
@@ -330,6 +347,26 @@
                     <div id="copyMessage" class="muted"></div>
                 </section>
             </section>
+        </section>
+
+        <section id="taskPreviewView" class="preview-view view-panel" hidden>
+            <section class="panel preview-toolbar">
+                <div>
+                    <h2>任务预览</h2>
+                    <p id="previewSummary">最近任务</p>
+                </div>
+                <div class="preview-filters">
+                    <div id="previewStatusFilters" class="preview-chips" role="group" aria-label="按状态筛选任务"></div>
+                    <input id="previewSearch" class="preview-search" type="search" placeholder="搜索标题或链接" aria-label="搜索任务">
+                </div>
+                <div id="previewPagination" class="preview-pagination" hidden>
+                    <button id="previewPreviousPage" class="icon-button light" type="button" title="上一页" aria-label="上一页">‹</button>
+                    <span id="previewPageLabel">1 / 1</span>
+                    <button id="previewNextPage" class="icon-button light" type="button" title="下一页" aria-label="下一页">›</button>
+                </div>
+                <button id="refreshPreviewButton" class="secondary" type="button">刷新</button>
+            </section>
+            <section id="taskPreviewGrid" class="task-preview-grid"></section>
         </section>
 
         <section id="qaView" class="qa-view view-panel" hidden>
@@ -822,6 +859,73 @@
             </section>
         </section>
     </main>
+    <section id="previewModal" class="preview-modal" hidden>
+        <div class="preview-modal-backdrop" data-close-preview-modal="1"></div>
+        <section class="preview-modal-panel" role="dialog" aria-modal="true" aria-labelledby="previewModalTitle">
+            <header class="pm-header">
+                <div class="pm-heading">
+                    <h3 id="previewModalTitle">任务详情</h3>
+                    <div class="pm-meta">
+                        <span id="pmStatusBadge"></span>
+                        <span id="pmStageText"></span>
+                        <span id="pmUpdatedText"></span>
+                    </div>
+                </div>
+                <button id="previewModalClose" class="icon-button light" type="button" title="关闭预览" aria-label="关闭预览">×</button>
+            </header>
+            <div class="pm-body">
+                <div class="pm-main">
+                    <div class="pm-tabs" role="tablist">
+                        <button id="pmVideoTab" class="pm-tab active" type="button" role="tab">视频</button>
+                        <button id="pmDocsTab" class="pm-tab" type="button" role="tab">产物文档</button>
+                    </div>
+                    <div id="pmVideoPane" class="pm-pane active">
+                        <div class="pm-video-stage">
+                            <video id="pmVideo" controls preload="metadata" playsinline hidden></video>
+                            <div id="pmVideoPlaceholder" class="preview-placeholder">等待视频</div>
+                        </div>
+                        <div id="pmScanMeter" class="scan-meter" data-scan data-status="created" data-duration="" data-started-at="" data-progress="0">
+                            <div class="scan-meter-head">
+                                <span>扫描</span>
+                                <strong class="scan-percent">0%</strong>
+                            </div>
+                            <div class="bar scan-bar"><div class="preview-scan-progress" style="width:0%"></div></div>
+                        </div>
+                    </div>
+                    <div id="pmDocsPane" class="pm-pane" hidden>
+                        <div class="pm-docs-layout">
+                            <div id="pmDocList" class="pm-doc-list"></div>
+                            <div class="pm-doc-preview">
+                                <header class="pm-doc-header">
+                                    <strong id="pmDocTitle">选择文档</strong>
+                                    <div class="pm-doc-actions">
+                                        <a id="pmDocOpenLink" class="secondary-link" href="#" target="_blank" rel="noreferrer" hidden>新窗口打开</a>
+                                        <button id="pmDocRefresh" class="icon-button light" type="button" title="重新加载" aria-label="重新加载">↻</button>
+                                    </div>
+                                </header>
+                                <div id="pmDocBody" class="doc-preview-body">选择左侧文档开始预览</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <aside class="pm-side">
+                    <section class="pm-section">
+                        <h4>概要</h4>
+                        <div id="pmInfoGrid" class="pm-info-grid"></div>
+                    </section>
+                    <section class="pm-section">
+                        <h4>阶段</h4>
+                        <div id="pmStageList" class="pm-stage-list"></div>
+                    </section>
+                    <section class="pm-section pm-actions">
+                        <button id="pmOpenConsole" class="secondary" type="button">打开控制台</button>
+                        <a id="pmSourceLink" class="button-link secondary" href="#" target="_blank" rel="noreferrer" hidden>原站链接</a>
+                        <button id="pmOpenRunDir" class="secondary" type="button" hidden>打开资源目录</button>
+                    </section>
+                </aside>
+            </div>
+        </section>
+    </section>
     <aside id="narrationMiniPlayer" class="narration-mini-player" hidden aria-label="完整语音讲解迷你播放器">
         <div class="narration-mini-controls" role="group" aria-label="语音播放控制">
             <button id="narrationMiniPlayPause" class="icon-button narration-mini-control" type="button" title="播放" aria-label="播放">▶</button>
@@ -840,6 +944,7 @@
     <script src="{{ url_for('static', filename='vendor/katex/contrib/auto-render.min.js') }}?v={{ static_version }}"></script>
     <script src="{{ url_for('static', filename='vendor/mermaid/mermaid.min.js') }}?v={{ static_version }}"></script>
     <script src="{{ url_for('static', filename='js/main.js') }}?v={{ static_version }}"></script>
+    <script src="{{ url_for('static', filename='js/mobile.js') }}?v={{ static_version }}"></script>
     <script type="module" src="{{ url_for('web_debug_console.static', filename='debug-console.js') }}?v={{ static_version }}"></script>
 </body>
 </html>

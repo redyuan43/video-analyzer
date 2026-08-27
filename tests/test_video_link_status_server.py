@@ -12,7 +12,7 @@ import unittest
 from http import HTTPStatus
 from io import BytesIO
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from video_analyzer import cli as cli_mod
 from video_analyzer import douyin_browser as douyin_browser_mod
@@ -287,6 +287,63 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
         self.assertIsNone(reason)
 
+    def test_youtube_prepare_rate_limit_retries_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            log_path = Path(tmp) / "prepare.log"
+            log_path.write_text(
+                "ERROR: Unable to download video subtitles for 'zh-Hans': HTTP Error 429: Too Many Requests\n",
+                encoding="utf-8",
+            )
+            error = subprocess.CalledProcessError(1, ["yt-dlp"])
+            job = {"video_url": "https://www.youtube.com/watch?v=b7IMBHMjNv8"}
+
+            first_reason = server.retryable_stage_failure_reason(job, "prepare", error, str(log_path), {})
+            second_reason = server.retryable_stage_failure_reason(
+                job,
+                "prepare",
+                error,
+                str(log_path),
+                {"retry": {"auto_attempts": 1}},
+            )
+
+        self.assertEqual(first_reason, server_mod.TRANSIENT_API_REQUEUE_MESSAGE)
+        self.assertIsNone(second_reason)
+
+    def test_non_youtube_prepare_rate_limit_does_not_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            log_path = Path(tmp) / "prepare.log"
+            log_path.write_text("HTTP Error 429: Too Many Requests\n", encoding="utf-8")
+            error = subprocess.CalledProcessError(1, ["yt-dlp"])
+
+            reason = server.retryable_stage_failure_reason(
+                {"video_url": "https://example.com/video"},
+                "prepare",
+                error,
+                str(log_path),
+                {},
+            )
+
+        self.assertIsNone(reason)
+
+    def test_subtitle_segments_accept_vtt_cue_settings(self):
+        cleaned = url_context_mod.clean_text_subtitles(
+            "\n".join(
+                [
+                    "WEBVTT",
+                    "",
+                    "00:00:02.390 --> 00:00:04.190 align:start position:0%",
+                    "像 Qwen 3.8 这样的大型模型",
+                    "",
+                ]
+            )
+        )
+
+        segments = url_context_mod.parse_cleaned_subtitle_segments(cleaned)
+
+        self.assertEqual(segments, [("00:00:02", "00:00:04", "像 Qwen 3.8 这样的大型模型")])
+
     def test_stage_retry_archives_the_first_log(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
@@ -538,6 +595,17 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(
             url_context_mod.infer_video_id_from_url("https://www.bilibili.com/video/BV1YtVz6eEAz/?spm_id_from=333"),
             "BV1YtVz6eEAz",
+        )
+        self.assertEqual(
+            url_context_mod.infer_video_id_from_url("https://www.bilibili.com/video/BV1YtVz6eEAz?p=2"),
+            "BV1YtVz6eEAz-p002",
+        )
+        self.assertEqual(
+            url_context_mod.download_directory_id(
+                "https://www.bilibili.com/video/BV1YtVz6eEAz?p=2",
+                {"id": "BV1YtVz6eEAz"},
+            ),
+            "BV1YtVz6eEAz-p002",
         )
 
     def test_existing_video_dir_for_url_uses_cached_youtube_id(self):
@@ -2923,6 +2991,51 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
         self.assertIn("402 Insufficient Balance", raised.exception.message)
 
+    def test_verify_core_regenerates_manual_before_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            (run_dir / "analysis.json").write_text("{}", encoding="utf-8")
+            (run_dir / "manual_evidence.md").write_text("# Evidence\n", encoding="utf-8")
+            (run_dir / "operation_manual.quality_failed.md").write_text(
+                "Error generating operation manual: 502 provider unavailable\n",
+                encoding="utf-8",
+            )
+            loaded["run_dir"] = str(run_dir)
+            log_path = str(Path(tmp) / "verify-core.log")
+
+            def regenerate(_job, stage, command, _log_path, _stage_info):
+                self.assertEqual(stage, "verify-core")
+                self.assertIn("tools/regenerate_operation_manual.py", command)
+                (run_dir / "operation_manual.md").write_text(
+                    "# Manual\n",
+                    encoding="utf-8",
+                )
+                return {
+                    "artifacts": {"command": command},
+                    "stdout_tail": ["quality_gate_passed: True"],
+                }
+
+            with patch.object(
+                server,
+                "run_command_stage",
+                side_effect=regenerate,
+            ):
+                result = server.stage_verify_core(
+                    loaded,
+                    log_path,
+                    {"status": "running"},
+                )
+
+        self.assertEqual(result["artifacts"]["missing"], [])
+        self.assertIn(
+            "tools/regenerate_operation_manual.py",
+            result["artifacts"]["manual_regeneration"]["command"],
+        )
+
     def test_load_job_corrects_false_success_with_incomplete_exports(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
@@ -3151,6 +3264,77 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             self.assertNotIn("exports", refreshed["artifacts"])
             self.assertEqual(refreshed["warnings"], [{"stage": "verify-core", "message": "keep"}])
             run_remaining.assert_called_once()
+
+    def test_rerun_from_stage_can_wait_in_the_requested_resource_queue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
+            job = server.create_job(
+                {
+                    "video_url": "https://www.youtube.com/watch?v=example",
+                    "auto_start": False,
+                }
+            )
+            loaded = server.load_job(job["job_id"])
+            loaded["status"] = "failed"
+            loaded["runner"] = {
+                "status": "failed",
+                "current_stage": None,
+                "error": "prepare failed",
+            }
+            loaded["stages"] = {
+                "probe": {"status": "succeeded"},
+                "prepare": {
+                    "status": "failed",
+                    "error": "HTTP Error 429: Too Many Requests",
+                    "failure": {"kind": "unknown"},
+                },
+            }
+            server.save_job(loaded)
+
+            with patch.object(server, "start_run") as start_run:
+                result = server.rerun_from_stage(
+                    job["job_id"],
+                    "analyze-core",
+                    enqueue=True,
+                )
+            refreshed = server.load_job(job["job_id"])
+
+            start_run.assert_not_called()
+            self.assertEqual(result["status"], "queued")
+            self.assertEqual(refreshed["runner"]["current_stage"], "prepare")
+            self.assertEqual(refreshed["runner"]["queued_for"], "core")
+            self.assertIsNone(refreshed["runner"]["error"])
+            self.assertEqual(
+                refreshed["stages"]["prepare"]["retry_reason"],
+                server_mod.MANUAL_RERUN_REQUEUE_MESSAGE,
+            )
+            self.assertEqual(
+                refreshed["stages"]["prepare"]["last_error"],
+                "HTTP Error 429: Too Many Requests",
+            )
+            retry = server.auto_retry_info(refreshed, now=time.time() + 1)
+            self.assertTrue(retry["ready"])
+            self.assertEqual(retry["resource"], "core")
+            with patch.object(
+                server,
+                "resource_has_running_work",
+                return_value=True,
+            ), patch.object(server, "start_run") as queued_start:
+                self.assertEqual(
+                    server.auto_retry_queued_jobs_once(now=time.time() + 1),
+                    [],
+                )
+            queued_start.assert_not_called()
+            with patch.object(
+                server,
+                "resource_has_running_work",
+                return_value=False,
+            ), patch.object(server, "start_run") as ready_start:
+                self.assertEqual(
+                    server.auto_retry_queued_jobs_once(now=time.time() + 1),
+                    [job["job_id"]],
+                )
+            ready_start.assert_called_once_with(job["job_id"])
 
     def test_final_publish_command_skips_pdfs_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3979,13 +4163,56 @@ class VideoLinkStatusServerTests(unittest.TestCase):
     def test_list_jobs_uses_lightweight_summaries(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
-            server.create_job({"video_url": "https://example.com/one"})
+            created = server.create_job({"video_url": "https://example.com/one"})
+            job = server.load_job(created["job_id"])
+            job["stages"]["prepare"] = {
+                "status": "succeeded",
+                "duration_seconds": 2.5,
+                "stdout_tail": ["large", "payload"],
+            }
+            server.save_job(job)
 
             with patch.object(server, "core_diagnostics", side_effect=AssertionError("too expensive")):
                 result = server.list_jobs()
 
         self.assertEqual(result["total"], 1)
         self.assertNotIn("core_diagnostics", result["jobs"][0])
+        self.assertEqual(result["jobs"][0]["stages"]["prepare"]["duration_seconds"], 2.5)
+        self.assertNotIn("stdout_tail", result["jobs"][0]["stages"]["prepare"])
+
+    def test_list_jobs_builds_queue_positions_without_rescanning_job_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(
+                Path(tmp),
+                REPO_ROOT,
+                auto_resume=False,
+            )
+            job_ids = []
+            for index in range(2):
+                created = server.create_job({"video_url": f"https://example.com/{index}"})
+                job = server.load_job(created["job_id"])
+                job["status"] = "queued"
+                job["runner"] = {
+                    "status": "queued",
+                    "current_stage": "analyze-core",
+                    "queued_for": "core",
+                    "server_pid": os.getpid(),
+                }
+                job["updated_at"] = f"2026-01-01T00:00:0{index}+0800"
+                server.save_job(job)
+                job_ids.append(job["job_id"])
+
+            with patch.object(
+                server,
+                "queue_info",
+                side_effect=AssertionError("list_jobs must reuse its loaded job snapshot"),
+            ):
+                result = server.list_jobs()
+
+        by_id = {job["job_id"]: job for job in result["jobs"]}
+        self.assertEqual(by_id[job_ids[0]]["queue"]["position"], 1)
+        self.assertEqual(by_id[job_ids[1]]["queue"]["position"], 2)
+        self.assertEqual(by_id[job_ids[0]]["queue"]["size"], 2)
 
     def test_public_job_derives_title_from_info_json(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4019,6 +4246,99 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             self.assertTrue(run_dir.exists())
             self.assertFalse((Path(tmp) / "jobs" / job["job_id"]).exists())
 
+    def test_create_job_cleans_directory_when_initialization_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_dir = Path(tmp) / "jobs"
+            server = server_mod.VideoLinkStatusServer(jobs_dir, REPO_ROOT)
+
+            with patch.object(
+                server,
+                "write_runtime_snapshot",
+                side_effect=RuntimeError("snapshot failed"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    server.create_job({"video_url": "https://example.com/video"})
+
+            self.assertEqual(list(jobs_dir.iterdir()), [])
+
+    def test_delete_job_rejects_active_collection_child(self):
+        parts = [
+            {
+                "bvid": "BV1Hf8A6sEbN",
+                "index": index,
+                "url": f"https://www.bilibili.com/video/BV1Hf8A6sEbN?p={index}",
+                "title": f"P{index}",
+                "collection_title": "知识库开发实战",
+                "duration_seconds": 100 + index,
+            }
+            for index in (1, 2)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            with patch.object(server, "discover_bilibili_parts", return_value=parts):
+                result = server.create_jobs(
+                    {
+                        "video_urls_text": "https://www.bilibili.com/video/BV1Hf8A6sEbN/",
+                        "expand_bilibili_parts": True,
+                        "auto_start": False,
+                    }
+                )
+            child_id = result["jobs"][1]["job_id"]
+
+            with self.assertRaises(server_mod.BridgeError) as raised:
+                server.delete_job(child_id)
+
+            manifest = server.load_collection(result["collection"]["id"])
+            self.assertEqual(raised.exception.status, HTTPStatus.CONFLICT)
+            self.assertTrue(server.job_dir(child_id).is_dir())
+            self.assertEqual(
+                [child["job_id"] for child in manifest["children"]],
+                [job["job_id"] for job in result["jobs"]],
+            )
+
+    def test_delete_job_updates_completed_collection_manifest(self):
+        parts = [
+            {
+                "bvid": "BV1Hf8A6sEbN",
+                "index": index,
+                "url": f"https://www.bilibili.com/video/BV1Hf8A6sEbN?p={index}",
+                "title": f"P{index}",
+                "collection_title": "知识库开发实战",
+                "duration_seconds": 100 + index,
+            }
+            for index in (1, 2)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            with patch.object(server, "discover_bilibili_parts", return_value=parts):
+                result = server.create_jobs(
+                    {
+                        "video_urls_text": "https://www.bilibili.com/video/BV1Hf8A6sEbN/",
+                        "expand_bilibili_parts": True,
+                        "auto_start": False,
+                    }
+                )
+            child_id = result["jobs"][0]["job_id"]
+            collection_id = result["collection"]["id"]
+            manifest = server.load_collection(collection_id)
+            manifest["status"] = "completed_with_errors"
+            manifest["failures"] = [{"job_id": child_id, "index": 1, "error": "failed"}]
+            server.save_collection(manifest)
+
+            deleted = server.delete_job(child_id)
+            updated = server.load_collection(collection_id)
+
+            self.assertTrue(deleted["deleted"])
+            self.assertEqual(deleted["collection_id"], collection_id)
+            self.assertFalse(server.job_dir(child_id).exists())
+            self.assertNotIn(child_id, [child["job_id"] for child in updated["children"]])
+            self.assertNotIn(child_id, [failure["job_id"] for failure in updated["failures"]])
+            self.assertIsNone(updated["current_job_id"])
+            self.assertIsNone(updated["current_index"])
+            self.assertEqual(server.public_collection(updated)["total"], 2)
+            remaining = server.load_job(result["jobs"][1]["job_id"])
+            self.assertEqual(server.public_job_collection(remaining)["total"], 2)
+
     def test_create_jobs_batch_partially_accepts_valid_urls(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
@@ -4050,6 +4370,524 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(result["created"], 2)
         self.assertEqual(result["duplicates"], {"https://example.com/same": 2})
         self.assertEqual([job["options"]["run_name"] for job in result["jobs"]], ["same-run-001", "same-run-002"])
+
+    def test_bilibili_collection_discovery_uses_structured_ytdlp_output(self):
+        payload = {
+            "id": "BV1Hf8A6sEbN",
+            "title": "知识库开发实战",
+            "entries": [
+                {
+                    "playlist_index": 1,
+                    "title": "P1 入门",
+                    "duration": 296,
+                },
+                {
+                    "playlist_index": 2,
+                    "title": "P2 原理",
+                    "duration": 1334,
+                },
+            ],
+        }
+        completed = subprocess.CompletedProcess(
+            ["yt-dlp"],
+            0,
+            stdout=json.dumps(payload),
+            stderr="",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            with patch.object(
+                server_mod,
+                "can_connect_local_proxy",
+                return_value=True,
+            ), patch.object(server_mod.subprocess, "run", return_value=completed) as run:
+                parts = server.discover_bilibili_parts(
+                    "https://www.bilibili.com/video/BV1Hf8A6sEbN/?spm_id_from=333",
+                    {"cookies_from_browser": "none"},
+                )
+
+        command = run.call_args.args[0]
+        self.assertIn("--proxy", command)
+        self.assertIn("http://127.0.0.1:10808", command)
+        self.assertIn("--js-runtimes", command)
+        self.assertIn("--remote-components", command)
+        self.assertIn("Origin: https://www.bilibili.com", command)
+        self.assertEqual([item["index"] for item in parts], [1, 2])
+        self.assertEqual(
+            [item["url"] for item in parts],
+            [
+                "https://www.bilibili.com/video/BV1Hf8A6sEbN?p=1",
+                "https://www.bilibili.com/video/BV1Hf8A6sEbN?p=2",
+            ],
+        )
+        self.assertEqual(parts[1]["title"], "原理")
+
+    def test_bilibili_collection_discovery_trims_repeated_collection_title(self):
+        payload = {
+            "id": "BV1Hf8A6sEbN",
+            "title": "知识库开发实战",
+            "entries": [
+                {
+                    "playlist_index": 2,
+                    "title": "知识库开发实战 p02 2.项目回顾",
+                    "duration": 1334,
+                },
+            ],
+        }
+        completed = subprocess.CompletedProcess(
+            ["yt-dlp"],
+            0,
+            stdout=json.dumps(payload),
+            stderr="",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            with patch.object(server_mod.subprocess, "run", return_value=completed):
+                parts = server.discover_bilibili_parts(
+                    "https://www.bilibili.com/video/BV1Hf8A6sEbN",
+                    {"cookies_from_browser": "none"},
+                )
+
+        self.assertEqual(parts[0]["title"], "2.项目回顾")
+
+    def test_single_bilibili_part_falls_back_to_normal_job(self):
+        source_url = "https://www.bilibili.com/video/BV1Hf8A6sEbN/?spm_id_from=333"
+        part = {
+            "bvid": "BV1Hf8A6sEbN",
+            "index": 1,
+            "url": "https://www.bilibili.com/video/BV1Hf8A6sEbN?p=1",
+            "title": "单集",
+            "collection_title": "单集",
+            "duration_seconds": 100,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            with patch.object(server, "discover_bilibili_parts", return_value=[part]):
+                result = server.create_jobs(
+                    {
+                        "video_urls_text": source_url,
+                        "expand_bilibili_parts": True,
+                        "auto_start": False,
+                    }
+                )
+
+        self.assertNotIn("collection", result)
+        self.assertEqual(result["created"], 1)
+        self.assertEqual(result["jobs"][0]["video_url"], source_url)
+
+    def test_bilibili_collection_discovery_failure_creates_no_children(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_dir = Path(tmp) / "jobs"
+            server = server_mod.VideoLinkStatusServer(jobs_dir, REPO_ROOT)
+            with patch.object(
+                server,
+                "discover_bilibili_parts",
+                side_effect=server_mod.BridgeError(
+                    HTTPStatus.BAD_GATEWAY,
+                    "discovery failed",
+                ),
+            ):
+                with self.assertRaises(server_mod.BridgeError):
+                    server.create_jobs(
+                        {
+                            "video_urls_text": "https://www.bilibili.com/video/BV1Hf8A6sEbN",
+                            "expand_bilibili_parts": True,
+                            "auto_start": False,
+                        }
+                    )
+
+            job_files = list(jobs_dir.glob("*/job.json"))
+            collection_files = list(server.collections_dir.glob("*.json"))
+
+        self.assertEqual(job_files, [])
+        self.assertEqual(collection_files, [])
+
+    def test_bilibili_collection_child_creation_failure_rolls_back_created_jobs(self):
+        parts = [
+            {
+                "bvid": "BV1Hf8A6sEbN",
+                "index": index,
+                "url": f"https://www.bilibili.com/video/BV1Hf8A6sEbN?p={index}",
+                "title": f"P{index}",
+                "collection_title": "知识库开发实战",
+                "duration_seconds": 100 + index,
+            }
+            for index in (1, 2)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_dir = Path(tmp) / "jobs"
+            server = server_mod.VideoLinkStatusServer(jobs_dir, REPO_ROOT)
+            original_create_job = server.create_job
+            calls = 0
+
+            def create_job(payload):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise server_mod.BridgeError(
+                        HTTPStatus.BAD_GATEWAY,
+                        "child failed",
+                    )
+                return original_create_job(payload)
+
+            with patch.object(server, "discover_bilibili_parts", return_value=parts), patch.object(
+                server,
+                "create_job",
+                side_effect=create_job,
+            ):
+                with self.assertRaises(server_mod.BridgeError):
+                    server.create_jobs(
+                        {
+                            "video_urls_text": "https://www.bilibili.com/video/BV1Hf8A6sEbN",
+                            "expand_bilibili_parts": True,
+                            "auto_start": False,
+                        }
+                    )
+
+            self.assertEqual(list(jobs_dir.glob("*/job.json")), [])
+            self.assertEqual(list(server.collections_dir.glob("*.json")), [])
+
+    def test_bilibili_collection_creates_children_and_starts_only_first(self):
+        parts = [
+            {
+                "bvid": "BV1Hf8A6sEbN",
+                "index": index,
+                "url": f"https://www.bilibili.com/video/BV1Hf8A6sEbN?p={index}",
+                "title": f"P{index}",
+                "collection_title": "知识库开发实战",
+                "duration_seconds": 100 + index,
+            }
+            for index in (1, 2)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            with patch.object(server, "discover_bilibili_parts", return_value=parts), patch.object(
+                server,
+                "start_run",
+                side_effect=lambda job_id, **_: server.public_job(server.load_job(job_id)),
+            ) as start_run:
+                result = server.create_jobs(
+                    {
+                        "video_urls_text": "https://www.bilibili.com/video/BV1Hf8A6sEbN/",
+                        "expand_bilibili_parts": True,
+                        "auto_start": True,
+                        "run_name": "operation-manual",
+                    }
+                )
+            manifest = server.load_collection(result["collection"]["id"])
+
+        self.assertEqual(result["created"], 2)
+        self.assertEqual([job["collection"]["index"] for job in result["jobs"]], [1, 2])
+        self.assertEqual([job["options"]["run_name"] for job in result["jobs"]], ["operation-manual", "operation-manual"])
+        self.assertEqual(manifest["current_index"], 1)
+        start_run.assert_called_once_with(
+            result["jobs"][0]["job_id"],
+            resume_collection=False,
+        )
+
+    def test_bilibili_collection_initial_start_failure_pauses_manifest(self):
+        parts = [
+            {
+                "bvid": "BV1Hf8A6sEbN",
+                "index": index,
+                "url": f"https://www.bilibili.com/video/BV1Hf8A6sEbN?p={index}",
+                "title": f"P{index}",
+                "collection_title": "知识库开发实战",
+                "duration_seconds": 100 + index,
+            }
+            for index in (1, 2)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            with patch.object(server, "discover_bilibili_parts", return_value=parts), patch.object(
+                server,
+                "start_run",
+                side_effect=server_mod.BridgeError(
+                    HTTPStatus.CONFLICT,
+                    "runner unavailable",
+                ),
+            ):
+                with self.assertRaises(server_mod.BridgeError):
+                    server.create_jobs(
+                        {
+                            "video_urls_text": "https://www.bilibili.com/video/BV1Hf8A6sEbN/",
+                            "expand_bilibili_parts": True,
+                            "auto_start": True,
+                        }
+                    )
+
+            collection_files = list(server.collections_dir.glob("*.json"))
+            self.assertEqual(len(collection_files), 1)
+            manifest = json.loads(collection_files[0].read_text(encoding="utf-8"))
+            self.assertEqual(manifest["status"], "paused")
+            self.assertEqual(manifest["paused_reason"], "runner unavailable")
+
+    def test_bilibili_collection_rejects_multiple_or_non_bilibili_urls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+
+            with self.assertRaises(server_mod.BridgeError) as multiple:
+                server.create_jobs(
+                    {
+                        "video_urls": [
+                            "https://www.bilibili.com/video/BV1Hf8A6sEbN",
+                            "https://www.bilibili.com/video/BV1YtVz6eEAz",
+                        ],
+                        "expand_bilibili_parts": True,
+                        "auto_start": False,
+                    }
+                )
+            with self.assertRaises(server_mod.BridgeError) as non_bilibili:
+                server.create_jobs(
+                    {
+                        "video_urls_text": "https://example.com/video",
+                        "expand_bilibili_parts": True,
+                        "auto_start": False,
+                    }
+                )
+
+        self.assertEqual(multiple.exception.status, HTTPStatus.BAD_REQUEST)
+        self.assertIn("exactly one", multiple.exception.message)
+        self.assertEqual(non_bilibili.exception.status, HTTPStatus.BAD_REQUEST)
+        self.assertIn("Bilibili video URLs only", non_bilibili.exception.message)
+        self.assertTrue(
+            server_mod.is_bilibili_url(
+                "https://bilibili.com/video/BV1Hf8A6sEbN"
+            )
+        )
+
+    def test_bilibili_collection_advances_after_success_and_failure(self):
+        parts = [
+            {
+                "bvid": "BV1Hf8A6sEbN",
+                "index": index,
+                "url": f"https://www.bilibili.com/video/BV1Hf8A6sEbN?p={index}",
+                "title": f"P{index}",
+                "collection_title": "知识库开发实战",
+                "duration_seconds": 100 + index,
+            }
+            for index in (1, 2)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            with patch.object(server, "discover_bilibili_parts", return_value=parts):
+                result = server.create_jobs(
+                    {
+                        "video_urls_text": "https://www.bilibili.com/video/BV1Hf8A6sEbN/",
+                        "expand_bilibili_parts": True,
+                        "auto_start": False,
+                    }
+                )
+            first_id, second_id = [job["job_id"] for job in result["jobs"]]
+            first = server.load_job(first_id)
+            first["status"] = "succeeded"
+            first["runner"] = {"status": "succeeded", "current_stage": None}
+            server.save_job(first)
+            with patch.object(server, "start_run") as start_run:
+                server.advance_collection_after_job(first_id)
+            start_run.assert_called_once_with(
+                second_id,
+                resume_collection=False,
+            )
+            second = server.load_job(second_id)
+            second["status"] = "failed"
+            second["runner"] = {"status": "failed", "error": "download failed"}
+            server.save_job(second)
+            server.advance_collection_after_job(second_id)
+            manifest = server.load_collection(result["collection"]["id"])
+
+        self.assertEqual(manifest["status"], "completed_with_errors")
+        self.assertEqual(manifest["failures"][0]["job_id"], second_id)
+
+    def test_failed_collection_part_can_queue_independent_rerun(self):
+        parts = [
+            {
+                "bvid": "BV1Hf8A6sEbN",
+                "index": index,
+                "url": f"https://www.bilibili.com/video/BV1Hf8A6sEbN?p={index}",
+                "title": f"P{index}",
+                "collection_title": "知识库开发实战",
+                "duration_seconds": 100 + index,
+            }
+            for index in (1, 2)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            with patch.object(server, "discover_bilibili_parts", return_value=parts):
+                result = server.create_jobs(
+                    {
+                        "video_urls_text": "https://www.bilibili.com/video/BV1Hf8A6sEbN/",
+                        "expand_bilibili_parts": True,
+                        "auto_start": False,
+                    }
+                )
+            first_id, second_id = [job["job_id"] for job in result["jobs"]]
+            first = server.load_job(first_id)
+            first["status"] = "failed"
+            first["runner"] = {"status": "failed", "error": "core failed"}
+            first["stages"]["probe"] = {"status": "succeeded"}
+            first["stages"]["prepare"] = {"status": "succeeded"}
+            first["stages"]["analyze-core"] = {
+                "status": "failed",
+                "error": "core failed",
+            }
+            server.save_job(first)
+            manifest = server.load_collection(result["collection"]["id"])
+            manifest["status"] = "running"
+            manifest["current_index"] = 2
+            manifest["current_job_id"] = second_id
+            manifest["failures"] = [
+                {
+                    "job_id": first_id,
+                    "index": 1,
+                    "error": "core failed",
+                    "failed_at": server_mod.iso_now(),
+                }
+            ]
+            server.save_collection(manifest)
+
+            queued = server.rerun_from_stage(
+                first_id,
+                "analyze-core",
+                enqueue=True,
+            )
+            queued_job = server.load_job(first_id)
+            server.prepare_collection_job_start(
+                queued_job,
+                resume_paused=False,
+            )
+
+            self.assertEqual(queued["status"], "queued")
+            self.assertTrue(queued_job["collection_rerun"])
+            self.assertEqual(
+                server.load_collection(result["collection"]["id"])["current_job_id"],
+                second_id,
+            )
+
+            queued_job["status"] = "succeeded"
+            queued_job["runner"] = {"status": "succeeded", "error": None}
+            server.save_job(queued_job)
+            server.advance_collection_after_job(first_id)
+            updated = server.load_collection(result["collection"]["id"])
+            finished = server.load_job(first_id)
+
+            self.assertEqual(updated["current_job_id"], second_id)
+            self.assertEqual(updated["failures"], [])
+            self.assertNotIn("collection_rerun", finished)
+
+    def test_bilibili_collection_stop_pauses_and_future_part_cannot_start(self):
+        parts = [
+            {
+                "bvid": "BV1Hf8A6sEbN",
+                "index": index,
+                "url": f"https://www.bilibili.com/video/BV1Hf8A6sEbN?p={index}",
+                "title": f"P{index}",
+                "collection_title": "知识库开发实战",
+                "duration_seconds": 100 + index,
+            }
+            for index in (1, 2)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            with patch.object(server, "discover_bilibili_parts", return_value=parts):
+                result = server.create_jobs(
+                    {
+                        "video_urls_text": "https://www.bilibili.com/video/BV1Hf8A6sEbN/",
+                        "expand_bilibili_parts": True,
+                        "auto_start": False,
+                    }
+                )
+            first_id, second_id = [job["job_id"] for job in result["jobs"]]
+            with self.assertRaises(server_mod.BridgeError):
+                server.start_run(second_id)
+            server.stop_job(first_id)
+            manifest = server.load_collection(result["collection"]["id"])
+            public_collection = server.public_collection(manifest)
+            with self.assertRaises(server_mod.BridgeError):
+                server.start_run(first_id, resume_collection=False)
+            with patch.object(server_mod.threading, "Thread") as thread:
+                server.start_run(first_id)
+            resumed_manifest = server.load_collection(result["collection"]["id"])
+
+        self.assertEqual(manifest["status"], "paused")
+        self.assertEqual(manifest["paused_reason"], "stopped by user")
+        self.assertEqual(public_collection["completed"], 0)
+        self.assertEqual(resumed_manifest["status"], "running")
+        thread.return_value.start.assert_called_once()
+
+    def test_bilibili_collection_does_not_advance_while_current_is_queued(self):
+        parts = [
+            {
+                "bvid": "BV1Hf8A6sEbN",
+                "index": index,
+                "url": f"https://www.bilibili.com/video/BV1Hf8A6sEbN?p={index}",
+                "title": f"P{index}",
+                "collection_title": "知识库开发实战",
+                "duration_seconds": 100 + index,
+            }
+            for index in (1, 2)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            with patch.object(server, "discover_bilibili_parts", return_value=parts):
+                result = server.create_jobs(
+                    {
+                        "video_urls_text": "https://www.bilibili.com/video/BV1Hf8A6sEbN",
+                        "expand_bilibili_parts": True,
+                        "auto_start": False,
+                    }
+                )
+            first_id = result["jobs"][0]["job_id"]
+            first = server.load_job(first_id)
+            first["status"] = "queued"
+            first["runner"] = {
+                "status": "queued",
+                "current_stage": "prepare",
+                "queued_for": "download",
+            }
+            server.save_job(first)
+
+            with patch.object(server, "start_run") as start_run:
+                server.advance_collection_after_job(first_id)
+            manifest = server.load_collection(result["collection"]["id"])
+
+        self.assertEqual(manifest["current_job_id"], first_id)
+        self.assertEqual(manifest["current_index"], 1)
+        start_run.assert_not_called()
+
+    def test_bilibili_collection_does_not_resume_before_stopped_runner_exits(self):
+        parts = [
+            {
+                "bvid": "BV1Hf8A6sEbN",
+                "index": index,
+                "url": f"https://www.bilibili.com/video/BV1Hf8A6sEbN?p={index}",
+                "title": f"P{index}",
+                "collection_title": "知识库开发实战",
+                "duration_seconds": 100 + index,
+            }
+            for index in (1, 2)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            with patch.object(server, "discover_bilibili_parts", return_value=parts):
+                result = server.create_jobs(
+                    {
+                        "video_urls_text": "https://www.bilibili.com/video/BV1Hf8A6sEbN",
+                        "expand_bilibili_parts": True,
+                        "auto_start": False,
+                    }
+                )
+            first_id = result["jobs"][0]["job_id"]
+            active_runner = MagicMock()
+            active_runner.is_alive.return_value = True
+            server.active_runners[first_id] = active_runner
+
+            server.stop_job(first_id)
+            server.start_run(first_id)
+            manifest = server.load_collection(result["collection"]["id"])
+
+        self.assertEqual(manifest["status"], "paused")
+        self.assertEqual(manifest["current_job_id"], first_id)
 
     def test_resource_summary_reports_running_and_queued_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4241,6 +5079,53 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         start_run.assert_not_called()
         self.assertEqual(recovered["status"], "queued")
         self.assertTrue(resumed.auto_retry_info(recovered).get("auto_retry"))
+
+    def test_collection_recovery_starts_only_the_current_part(self):
+        parts = [
+            {
+                "bvid": "BV1Hf8A6sEbN",
+                "index": index,
+                "url": f"https://www.bilibili.com/video/BV1Hf8A6sEbN?p={index}",
+                "title": f"P{index}",
+                "collection_title": "知识库开发实战",
+                "duration_seconds": 100 + index,
+            }
+            for index in (1, 2)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_dir = Path(tmp) / "jobs"
+            server = server_mod.VideoLinkStatusServer(jobs_dir, REPO_ROOT)
+            with patch.object(server, "discover_bilibili_parts", return_value=parts):
+                result = server.create_jobs(
+                    {
+                        "video_urls_text": "https://www.bilibili.com/video/BV1Hf8A6sEbN",
+                        "expand_bilibili_parts": True,
+                        "auto_start": False,
+                    }
+                )
+            manifest = server.load_collection(result["collection"]["id"])
+            manifest["status"] = "running"
+            server.save_collection(manifest)
+
+            with patch.object(
+                server_mod.VideoLinkStatusServer,
+                "start_run",
+                autospec=True,
+            ) as start_run, patch.object(
+                server_mod.VideoLinkStatusServer,
+                "start_auto_retry_loop",
+                autospec=True,
+            ):
+                server_mod.VideoLinkStatusServer(
+                    jobs_dir,
+                    REPO_ROOT,
+                    auto_resume=True,
+                )
+
+        start_run.assert_called_once()
+        self.assertEqual(start_run.call_args.args[1], result["jobs"][0]["job_id"])
+        self.assertNotEqual(start_run.call_args.args[1], result["jobs"][1]["job_id"])
+        self.assertFalse(start_run.call_args.kwargs["resume_collection"])
 
     def test_auto_retry_starts_ready_interrupted_job(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4810,6 +5695,22 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertTrue(result["source_player"]["can_embed"])
         self.assertEqual(result["source_player"]["embed_url"], "https://player.bilibili.com/player.html?bvid=BV1xx411c7mD")
         self.assertEqual(result["source_player"]["watch_url"], "https://www.bilibili.com/video/BV1xx411c7mD")
+
+    def test_public_job_preserves_bilibili_part_in_source_player(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job = server.create_job({"video_url": "https://www.bilibili.com/video/BV1xx411c7mD?p=3"})
+
+            result = server.public_job(server.load_job(job["job_id"]))
+
+        self.assertEqual(
+            result["source_player"]["embed_url"],
+            "https://player.bilibili.com/player.html?bvid=BV1xx411c7mD&page=3",
+        )
+        self.assertEqual(
+            result["source_player"]["watch_url"],
+            "https://www.bilibili.com/video/BV1xx411c7mD?p=3",
+        )
 
     def test_public_job_marks_unknown_source_as_external_player(self):
         with tempfile.TemporaryDirectory() as tmp:

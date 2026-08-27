@@ -91,6 +91,7 @@ from video_analyzer.url_context import (
     infer_video_id_from_url,
     materialize_analysis_context,
     safe_slug,
+    ytdlp_site_headers,
 )
 
 logger = logging.getLogger(__name__)
@@ -98,6 +99,7 @@ logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_JOBS_DIR = REPO_ROOT / "tmp" / "video-link-status" / "jobs"
+COLLECTION_ID_PATTERN = re.compile(r"^[a-f0-9]{32}$")
 AUDIO_TEMPLATE_CATALOG = (
     REPO_ROOT
     / "video-analyzer-ui"
@@ -471,11 +473,13 @@ ORPHANED_PROCESS_REQUEUE_MESSAGE = (
 TRANSIENT_RESOURCE_REQUEUE_MESSAGE = "remote/system resource is temporarily busy; queued for retry"
 TRANSIENT_API_REQUEUE_MESSAGE = "text API is temporarily unavailable; queued for one automatic retry"
 YOUTUBE_FORMAT_REQUEUE_MESSAGE = "YouTube returned no downloadable formats; queued for one automatic retry"
+MANUAL_RERUN_REQUEUE_MESSAGE = "queued by user to rerun with the current profile"
 AUTO_RETRY_REASONS = {
     ORPHANED_PROCESS_REQUEUE_MESSAGE,
     TRANSIENT_RESOURCE_REQUEUE_MESSAGE,
     TRANSIENT_API_REQUEUE_MESSAGE,
     YOUTUBE_FORMAT_REQUEUE_MESSAGE,
+    MANUAL_RERUN_REQUEUE_MESSAGE,
 }
 TRANSIENT_RESOURCE_BUSY_PATTERNS = (
     "ray.exceptions.OutOfMemoryError",
@@ -484,12 +488,14 @@ TRANSIENT_RESOURCE_BUSY_PATTERNS = (
     "Ray killed this worker",
 )
 YOUTUBE_FORMAT_UNAVAILABLE_PATTERN = "Requested format is not available"
+YOUTUBE_RATE_LIMIT_PATTERNS = ("HTTP Error 429", "Too Many Requests")
 MAX_YOUTUBE_FORMAT_RETRIES = 1
 MAX_TRANSIENT_API_RETRIES = 1
 MAX_INTERRUPTED_RETRIES = 1
 RESOURCE_WAIT_SECONDS = 5.0
 AUTO_RETRY_DELAY_SECONDS = float(os.environ.get("VIDEO_LINK_AUTO_RETRY_DELAY_SECONDS", "60"))
 AUTO_RETRY_POLL_SECONDS = float(os.environ.get("VIDEO_LINK_AUTO_RETRY_POLL_SECONDS", "5"))
+SCHEDULE_POLL_SECONDS = float(os.environ.get("VIDEO_LINK_SCHEDULE_POLL_SECONDS", "5"))
 ANALYSIS_PROGRESS_FILENAME = "progress.json"
 CORE_PROGRESS_STEPS = [
     ("ray", "Ray 集群准备", (r"\[jetson-ray\]", r"Ray runtime started")),
@@ -608,7 +614,9 @@ class VideoLinkStatusServer:
         self.jobs_dir = jobs_dir
         self.repo_root = repo_root
         self.auto_resume = auto_resume
+        self.collections_dir = self.jobs_dir.parent / "collections"
         self.runner_lock = threading.Lock()
+        self.collection_lock = threading.Lock()
         self.active_runners: dict[str, threading.Thread] = {}
         self.skill_distillation_lock = threading.Lock()
         self.active_skill_distillations: dict[str, threading.Thread] = {}
@@ -621,6 +629,8 @@ class VideoLinkStatusServer:
         self.vscode_lock = threading.Lock()
         self.auto_retry_stop = threading.Event()
         self.auto_retry_thread: threading.Thread | None = None
+        self.schedule_stop = threading.Event()
+        self.schedule_thread: threading.Thread | None = None
         self.audio_tts_stop = threading.Event()
         self.audio_tts_thread: threading.Thread | None = None
         self.audio_tts_idle_since: float | None = None
@@ -631,13 +641,16 @@ class VideoLinkStatusServer:
         self.gpu_snapshot_cache_time = 0.0
         self.resource_locks = {name: threading.BoundedSemaphore(limit) for name, limit in RESOURCE_LIMITS.items()}
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
+        self.collections_dir.mkdir(parents=True, exist_ok=True)
         if auto_resume:
             self.recover_interrupted_jobs(auto_start=True)
+            self.recover_collections()
             self.recover_interrupted_skill_distillations()
             self.recover_interrupted_skill_projects()
             self.start_auto_retry_loop()
             self.recover_interrupted_audio_tts()
             self.start_audio_tts_loop()
+        self.start_schedule_loop()
 
     def runtime_activity(self) -> dict[str, Any]:
         with self.runner_lock:
@@ -701,6 +714,7 @@ class VideoLinkStatusServer:
                 "run_name": DEFAULT_RUN_NAME,
                 "cookies_from_browser": "none",
                 "download_device": "local",
+                "expand_bilibili_parts": False,
                 "skip_images": True,
                 "keep_existing": True,
                 "include_subtitles": True,
@@ -962,6 +976,7 @@ class VideoLinkStatusServer:
         template_title = normalize_optional_template(payload.get("template_title") if "template_title" in payload else payload.get("templateTitle", ""))
         template_title_zh = normalize_optional_template(payload.get("template_title_zh") if "template_title_zh" in payload else payload.get("templateTitleZh", ""))
         template_category = normalize_optional_template(payload.get("template_category") if "template_category" in payload else payload.get("templateCategory", ""))
+        schedule = self.parse_schedule_payload(payload) if source_type != UPLOAD_SOURCE_TYPE else None
 
         job_id = uuid.uuid4().hex
         job_dir = self.job_dir(job_id)
@@ -997,6 +1012,7 @@ class VideoLinkStatusServer:
                 "template_title_zh": template_title_zh,
                 "template_category": template_category,
             },
+            "schedule": schedule,
             "resolved_mode": None,
             "run_dir": None,
             "artifacts": {},
@@ -1005,25 +1021,57 @@ class VideoLinkStatusServer:
             "warnings": [],
             "runner": {"status": "idle", "current_stage": None, "error": None},
         }
-        self.write_runtime_snapshot(job, profile)
-        skill_project_id = str(payload.get("skill_project_id") or payload.get("skillProjectId") or "").strip()
-        material_request_id = str(
-            payload.get("material_request_id") or payload.get("materialRequestId") or ""
-        ).strip()
-        if skill_project_id:
-            self.skill_projects.load(skill_project_id)
-            job["skill_project_id"] = skill_project_id
-        if material_request_id:
-            job["material_request_id"] = material_request_id[:96]
-        self.save_job(job)
-        if auto_start:
+        collection = payload.get("_collection")
+        if isinstance(collection, dict):
+            job["collection"] = copy.deepcopy(collection)
+            job["source_name"] = str(collection.get("part_title") or source_name or "").strip() or source_name
+        try:
+            self.write_runtime_snapshot(job, profile)
+            skill_project_id = str(payload.get("skill_project_id") or payload.get("skillProjectId") or "").strip()
+            material_request_id = str(
+                payload.get("material_request_id") or payload.get("materialRequestId") or ""
+            ).strip()
+            if skill_project_id:
+                self.skill_projects.load(skill_project_id)
+                job["skill_project_id"] = skill_project_id
+            if material_request_id:
+                job["material_request_id"] = material_request_id[:96]
+            self.save_job(job)
+        except Exception:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            raise
+        if auto_start and not schedule:
             return self.start_run(job_id)
         return self.public_job(job)
+
+    def parse_schedule_payload(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        raw = payload.get("schedule_time") if "schedule_time" in payload else payload.get("scheduleTime", "")
+        value = str(raw or "").strip()
+        if not value:
+            return None
+        parsed = parse_schedule_datetime(value)
+        if parsed is None:
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "schedule_time must be an ISO datetime such as 2026-08-25T14:30")
+        if parsed.timestamp() <= time.time():
+            raise BridgeError(HTTPStatus.BAD_REQUEST, "schedule_time must be in the future")
+        return {
+            "start_at": parsed.isoformat(timespec="seconds"),
+            "status": "scheduled",
+            "created_at": iso_now(),
+        }
 
     def create_jobs(self, payload: dict[str, Any]) -> dict[str, Any]:
         urls = extract_batch_urls(payload)
         if not urls:
             raise BridgeError(HTTPStatus.BAD_REQUEST, "video_urls must include at least one http(s) URL")
+        if parse_bool(
+            normalize_optional_template(
+                payload.get("expand_bilibili_parts")
+                if "expand_bilibili_parts" in payload
+                else payload.get("expandBilibiliParts", False)
+            )
+        ):
+            return self.create_bilibili_collection(payload, urls)
 
         auto_start = parse_bool(normalize_optional_template(payload.get("auto_start") if "auto_start" in payload else payload.get("autoStart", True)))
         base_run_name = sanitize_run_name(str(payload.get("run_name") or payload.get("runName") or self.options()["defaults"]["run_name"]))
@@ -1050,6 +1098,9 @@ class VideoLinkStatusServer:
         if auto_start:
             started = []
             for job in created:
+                if (job.get("schedule") or {}).get("status") == "scheduled":
+                    started.append(job)
+                    continue
                 try:
                     started.append(self.start_run(job["job_id"]))
                 except BridgeError as exc:
@@ -1065,13 +1116,274 @@ class VideoLinkStatusServer:
             "duplicates": {url: count for url, count in seen.items() if count > 1},
         }
 
+    def create_bilibili_collection(self, payload: dict[str, Any], urls: list[str]) -> dict[str, Any]:
+        if len(urls) != 1:
+            raise BridgeError(
+                HTTPStatus.BAD_REQUEST,
+                "expand_bilibili_parts requires exactly one Bilibili URL",
+            )
+        source_url = urls[0]
+        if not is_bilibili_url(source_url):
+            raise BridgeError(
+                HTTPStatus.BAD_REQUEST,
+                "expand_bilibili_parts supports Bilibili video URLs only",
+            )
+        parts = self.discover_bilibili_parts(source_url, payload)
+        if len(parts) <= 1:
+            single_payload = dict(payload)
+            single_payload["expand_bilibili_parts"] = False
+            single_payload["video_urls"] = [source_url]
+            single_payload.pop("video_urls_text", None)
+            return self.create_jobs(single_payload)
+
+        auto_start = parse_bool(
+            normalize_optional_template(
+                payload.get("auto_start")
+                if "auto_start" in payload
+                else payload.get("autoStart", True)
+            )
+        )
+        collection_id = uuid.uuid4().hex
+        base_run_name = sanitize_run_name(
+            str(
+                payload.get("run_name")
+                or payload.get("runName")
+                or self.options()["defaults"]["run_name"]
+            )
+        )
+        children: list[dict[str, Any]] = []
+        total = len(parts)
+        try:
+            for part in parts:
+                index = int(part["index"])
+                collection_job = {
+                    "id": collection_id,
+                    "bvid": part["bvid"],
+                    "index": index,
+                    "total": total,
+                    "part_title": part["title"],
+                    "part_duration_seconds": part.get("duration_seconds"),
+                    "execution": "sequential",
+                    "failure_policy": "continue",
+                }
+                child_payload = dict(payload)
+                child_payload["video_url"] = part["url"]
+                child_payload["run_name"] = base_run_name
+                child_payload["auto_start"] = False
+                child_payload["focus_prompt"] = focus_prompt_for_url(
+                    payload,
+                    part["url"],
+                    index,
+                )
+                child_payload["_collection"] = collection_job
+                job = self.create_job(child_payload)
+                children.append(
+                    {
+                        "job_id": job["job_id"],
+                        "index": index,
+                        "url": part["url"],
+                        "title": part["title"],
+                        "duration_seconds": part.get("duration_seconds"),
+                    }
+                )
+
+            manifest = {
+                "id": collection_id,
+                "provider": "bilibili",
+                "source_url": source_url,
+                "bvid": parts[0]["bvid"],
+                "title": parts[0]["collection_title"],
+                "total": total,
+                "status": "running" if auto_start else "created",
+                "failure_policy": "continue",
+                "execution": "sequential",
+                "created_at": iso_now(),
+                "updated_at": iso_now(),
+                "current_index": int(children[0]["index"]),
+                "current_job_id": children[0]["job_id"],
+                "children": children,
+                "failures": [],
+            }
+            self.save_collection(manifest)
+        except Exception:
+            for child in children:
+                shutil.rmtree(
+                    self.job_dir(str(child.get("job_id") or "")),
+                    ignore_errors=True,
+                )
+            raise
+        if auto_start:
+            try:
+                self.start_run(
+                    children[0]["job_id"],
+                    resume_collection=False,
+                )
+            except Exception as exc:
+                manifest["status"] = "paused"
+                manifest["paused_reason"] = (
+                    exc.message
+                    if isinstance(exc, BridgeError)
+                    else str(exc)
+                )
+                manifest["updated_at"] = iso_now()
+                self.save_collection(manifest)
+                raise
+        jobs = [self.public_job(self.load_job(child["job_id"])) for child in children]
+        return {
+            "collection": self.public_collection(manifest),
+            "jobs": jobs,
+            "errors": [],
+            "created": len(jobs),
+            "failed": 0,
+            "total": len(jobs),
+            "duplicates": {},
+        }
+
+    def discover_bilibili_parts(self, url: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        environment = operation_env()
+        command = ["yt-dlp", "--dump-single-json", "--skip-download"]
+        if can_connect_local_proxy():
+            command.extend(["--proxy", "http://127.0.0.1:10808"])
+        profiles = runtime_config().get("runtime_profiles") or {}
+        requested_profile = str(
+            payload.get("profile")
+            or payload.get("analysis_profile")
+            or active_runtime_profile(list(profiles))
+        ).strip()
+        profile = profiles.get(requested_profile) or {}
+        js_runtime = str(profile.get("ytdlp_js_runtimes") or "auto").strip()
+        if js_runtime.lower() == "auto":
+            js_runtime = (
+                "node"
+                if shutil.which("node", path=environment.get("PATH"))
+                else ""
+            )
+        if js_runtime.lower() not in {
+            "",
+            "none",
+            "no",
+            "off",
+            "false",
+            "disabled",
+        }:
+            command.extend(["--js-runtimes", js_runtime])
+            remote_components = str(
+                profile.get("ytdlp_remote_components") or "ejs:github"
+            ).strip()
+            if remote_components.lower() not in {
+                "",
+                "none",
+                "no",
+                "off",
+                "false",
+                "disabled",
+            }:
+                command.extend(["--remote-components", remote_components])
+        extractor_args = str(profile.get("ytdlp_extractor_args") or "").strip()
+        if extractor_args.lower() not in {
+            "",
+            "none",
+            "no",
+            "off",
+            "false",
+            "disabled",
+        }:
+            command.extend(["--extractor-args", extractor_args])
+        cookie_browser = normalize_cookie_browser(
+            payload.get("cookies_from_browser") or payload.get("cookiesFromBrowser")
+        )
+        if cookie_browser and cookie_browser != "none":
+            command.extend(["--cookies-from-browser", cookie_browser])
+        for header in ytdlp_site_headers(url):
+            command.extend(["--add-header", header])
+        command.append(url)
+        try:
+            completed = subprocess.run(
+                command,
+                check=True,
+                cwd=self.repo_root,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=120,
+            )
+            data = json.loads(completed.stdout)
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+            detail = str(exc)
+            if isinstance(exc, subprocess.CalledProcessError):
+                detail = (exc.stderr or exc.stdout or detail).strip()
+            raise BridgeError(
+                HTTPStatus.BAD_GATEWAY,
+                f"failed to discover Bilibili parts: {detail}",
+            ) from exc
+
+        bvid = str(data.get("id") or bilibili_url_parts(url)[0] or "").strip()
+        entries = data.get("entries") if isinstance(data.get("entries"), list) else []
+        if not bvid:
+            raise BridgeError(
+                HTTPStatus.BAD_GATEWAY,
+                "failed to discover Bilibili parts: yt-dlp returned no Bilibili video id",
+            )
+        if not entries:
+            return [
+                {
+                    "bvid": bvid,
+                    "index": 1,
+                    "url": canonical_bilibili_url(
+                        f"https://www.bilibili.com/video/{bvid}",
+                        1,
+                    ),
+                    "title": str(data.get("title") or "P01"),
+                    "collection_title": str(data.get("title") or bvid),
+                    "duration_seconds": data.get("duration"),
+                }
+            ]
+        collection_title = str(data.get("title") or bvid)
+        parts = []
+        seen_indexes: set[int] = set()
+        for fallback_index, entry in enumerate(entries, start=1):
+            if not isinstance(entry, dict):
+                continue
+            index = parse_int(entry.get("playlist_index")) or fallback_index
+            if index in seen_indexes:
+                raise BridgeError(
+                    HTTPStatus.BAD_GATEWAY,
+                    f"failed to discover Bilibili parts: duplicate part index {index}",
+                )
+            seen_indexes.add(index)
+            part_title = clean_bilibili_part_title(
+                str(entry.get("title") or ""),
+                collection_title,
+                index,
+            )
+            parts.append(
+                {
+                    "bvid": bvid,
+                    "index": index,
+                    "url": canonical_bilibili_url(
+                        f"https://www.bilibili.com/video/{bvid}",
+                        index,
+                    ),
+                    "title": part_title or f"P{index:02d}",
+                    "collection_title": collection_title,
+                    "duration_seconds": entry.get("duration"),
+                }
+            )
+        if not parts:
+            raise BridgeError(
+                HTTPStatus.BAD_GATEWAY,
+                "failed to discover Bilibili parts: yt-dlp returned no usable entries",
+            )
+        return sorted(parts, key=lambda item: item["index"])
+
     def list_jobs(
         self,
         limit: int = 50,
         *,
         include_mobile_audio: bool = True,
     ) -> dict[str, Any]:
-        jobs = []
+        loaded_jobs = []
         for path in self.jobs_dir.glob("*/job.json"):
             try:
                 job = self.load_job(path.parent.name)
@@ -1079,7 +1391,16 @@ class VideoLinkStatusServer:
                 continue
             if not include_mobile_audio and self.is_tenant_mobile_audio_job(job):
                 continue
-            jobs.append(self.public_job_summary(job))
+            loaded_jobs.append(job)
+        queue_index = self.queue_index(loaded_jobs)
+        jobs = [
+            self.public_job_summary(
+                job,
+                queue_index=queue_index,
+                include_failure_disposition=False,
+            )
+            for job in loaded_jobs
+        ]
         self.annotate_failure_dispositions(jobs)
         jobs.sort(key=lambda item: item.get("created_at") or "", reverse=True)
         return {
@@ -1707,10 +2028,53 @@ class VideoLinkStatusServer:
         if pid and process_alive(pid):
             raise BridgeError(HTTPStatus.CONFLICT, f"job process is still running: {pid}")
 
+        collection = job.get("collection")
+        collection_id = ""
+        collection_manifest: dict[str, Any] | None = None
+        if isinstance(collection, dict):
+            collection_id = str(collection.get("id") or "")
+            with self.collection_lock:
+                try:
+                    collection_manifest = self.load_collection(collection_id)
+                except BridgeError as exc:
+                    if exc.status != HTTPStatus.NOT_FOUND:
+                        raise
+                if (
+                    collection_manifest
+                    and collection_manifest.get("status")
+                    not in {"succeeded", "completed_with_errors"}
+                ):
+                    raise BridgeError(
+                        HTTPStatus.CONFLICT,
+                        "collection jobs cannot be deleted until the collection is complete",
+                    )
+
         with self.vscode_lock:
             self._stop_vscode_session_locked(job_id)
         shutil.rmtree(self.job_dir(job_id))
-        return {"deleted": True, "job_id": job_id}
+        if collection_manifest:
+            with self.collection_lock:
+                manifest = self.load_collection(collection_id)
+                manifest["children"] = [
+                    child
+                    for child in manifest.get("children") or []
+                    if str(child.get("job_id") or "") != job_id
+                ]
+                manifest["failures"] = [
+                    failure
+                    for failure in manifest.get("failures") or []
+                    if str(failure.get("job_id") or "") != job_id
+                ]
+                if str(manifest.get("current_job_id") or "") == job_id:
+                    manifest["current_job_id"] = None
+                    manifest["current_index"] = None
+                manifest["updated_at"] = iso_now()
+                self.save_collection(manifest)
+        return {
+            "deleted": True,
+            "job_id": job_id,
+            "collection_id": collection_id or None,
+        }
 
     def jobs_summary(self, jobs: list[dict[str, Any]]) -> dict[str, Any]:
         counts = {status: 0 for status in ("created", "running", "queued", "succeeded", "failed")}
@@ -1829,15 +2193,28 @@ class VideoLinkStatusServer:
             )
         return users
 
-    def start_run(self, job_id: str, profile: str | None = None) -> dict[str, Any]:
+    def start_run(
+        self,
+        job_id: str,
+        profile: str | None = None,
+        *,
+        resume_collection: bool = True,
+    ) -> dict[str, Any]:
         job = self.load_job(job_id)
         with self.runner_lock:
             active = self.active_runners.get(job_id)
             if active and active.is_alive():
                 return self.public_job(job)
             self.active_runners.pop(job_id, None)
+            self.prepare_collection_job_start(
+                job,
+                resume_paused=resume_collection,
+            )
 
             now = iso_now()
+            schedule = job.get("schedule") or {}
+            if schedule.get("status") == "scheduled":
+                job["schedule"] = {**schedule, "status": "triggered", "triggered_at": now}
             if profile:
                 profile = str(profile).strip()
                 snapshot_profile = str((job.get("runtime_profile_snapshot") or {}).get("profile") or "")
@@ -1874,6 +2251,7 @@ class VideoLinkStatusServer:
         *,
         profile: str | None = None,
         refresh_runtime_profile: bool = False,
+        enqueue: bool = False,
     ) -> dict[str, Any]:
         stage = normalize_stage_name(stage)
         job = self.load_job(job_id)
@@ -1906,11 +2284,33 @@ class VideoLinkStatusServer:
         job["status"] = "queued"
         job["updated_at"] = iso_now()
         job["summary"] = self.collect_summary(job)
+        if enqueue:
+            collection = job.get("collection")
+            if isinstance(collection, dict):
+                with self.collection_lock:
+                    manifest = self.load_collection(str(collection.get("id") or ""))
+                    failed_job_ids = {
+                        str(item.get("job_id") or "")
+                        for item in manifest.get("failures") or []
+                        if isinstance(item, dict)
+                    }
+                if job_id in failed_job_ids:
+                    job["collection_rerun"] = True
+            self.prepare_collection_job_start(job, resume_paused=True)
+            resume_stage = self.next_stage(job) or stage
+            self.mark_stage_queued(
+                job,
+                resume_stage,
+                job_stage_resource(job, stage),
+                retry_reason=MANUAL_RERUN_REQUEUE_MESSAGE,
+            )
+            return self.public_job(self.load_job(job_id))
         self.save_job(job)
         return self.start_run(job_id)
 
     def stop_job(self, job_id: str) -> dict[str, Any]:
         job = self.load_job(job_id)
+        self.pause_collection_for_job(job)
         stage = normalize_stage_name((job.get("runner") or {}).get("current_stage") or self.current_stage(job) or self.next_stage(job) or "")
         stage_info = dict((job.get("stages") or {}).get(stage) or {})
         process_info = dict(stage_info.get("process") or job.get("process") or {})
@@ -1974,12 +2374,45 @@ class VideoLinkStatusServer:
         if not auto_start:
             return
         for recovered in recovered_jobs:
+            if isinstance(recovered.get("collection"), dict):
+                continue
             recovered_runner = recovered.get("runner") or {}
             if not (auto_start and recovered.get("status") == "queued" and recovered_runner.get("status") == "queued"):
                 continue
             if self.is_auto_retry_job(recovered):
                 continue
             self.start_run(recovered["job_id"])
+
+    def recover_collections(self) -> None:
+        for path in sorted(self.collections_dir.glob("*.json")):
+            try:
+                manifest = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if manifest.get("status") != "running":
+                continue
+            current_job_id = str(manifest.get("current_job_id") or "")
+            if not current_job_id:
+                continue
+            try:
+                job = self.load_job(current_job_id)
+            except BridgeError:
+                continue
+            try:
+                if job.get("status") in {"succeeded", "failed", "no_speech"}:
+                    self.advance_collection_after_job(current_job_id)
+                    continue
+                if self.is_auto_retry_job(job):
+                    continue
+                self.start_run(
+                    current_job_id,
+                    resume_collection=False,
+                )
+            except BridgeError as exc:
+                manifest["status"] = "paused"
+                manifest["paused_reason"] = exc.message
+                manifest["updated_at"] = iso_now()
+                self.save_collection(manifest)
 
     def start_auto_retry_loop(self) -> None:
         if self.auto_retry_thread and self.auto_retry_thread.is_alive():
@@ -2019,9 +2452,56 @@ class VideoLinkStatusServer:
             job_id = str(job.get("job_id") or "")
             if not job_id:
                 continue
-            self.start_run(job_id)
+            if isinstance(job.get("collection"), dict):
+                self.start_run(job_id, resume_collection=False)
+            else:
+                self.start_run(job_id)
             started.append(job_id)
             started_resources.add(resource)
+        return started
+
+    def start_schedule_loop(self) -> None:
+        if self.schedule_thread and self.schedule_thread.is_alive():
+            return
+        thread = threading.Thread(target=self._schedule_loop, daemon=True)
+        self.schedule_thread = thread
+        thread.start()
+
+    def _schedule_loop(self) -> None:
+        while not self.schedule_stop.wait(max(1.0, SCHEDULE_POLL_SECONDS)):
+            try:
+                self.start_due_scheduled_jobs_once()
+            except Exception:
+                continue
+
+    def start_due_scheduled_jobs_once(self, now: float | None = None) -> list[str]:
+        now = time.time() if now is None else now
+        started: list[str] = []
+        for path in sorted(self.jobs_dir.glob("*/job.json")):
+            try:
+                job = self.load_job(path.parent.name)
+            except Exception:
+                continue
+            schedule = job.get("schedule") or {}
+            if schedule.get("status") != "scheduled":
+                continue
+            start_at = parse_schedule_datetime(schedule.get("start_at"))
+            if start_at is None or start_at.timestamp() > now:
+                continue
+            job_id = str(job.get("job_id") or "")
+            if not job_id:
+                continue
+            job["schedule"] = {**schedule, "status": "triggered", "triggered_at": iso_now()}
+            job["updated_at"] = iso_now()
+            self.save_job(job)
+            try:
+                self.start_run(job_id)
+                started.append(job_id)
+            except BridgeError as exc:
+                job = self.load_job(job_id)
+                job["schedule"] = {**(job.get("schedule") or {}), "status": "error", "error": exc.message}
+                job["updated_at"] = iso_now()
+                self.save_job(job)
         return started
 
     def is_auto_retry_job(self, job: dict[str, Any]) -> bool:
@@ -2379,6 +2859,162 @@ class VideoLinkStatusServer:
         finally:
             with self.runner_lock:
                 self.active_runners.pop(job_id, None)
+            self.advance_collection_after_job(job_id)
+
+    def prepare_collection_job_start(
+        self,
+        job: dict[str, Any],
+        *,
+        resume_paused: bool = True,
+    ) -> None:
+        collection = job.get("collection")
+        if not isinstance(collection, dict):
+            return
+        collection_id = str(collection.get("id") or "")
+        with self.collection_lock:
+            manifest = self.load_collection(collection_id)
+            if job.get("collection_rerun"):
+                failed_job_ids = {
+                    str(item.get("job_id") or "")
+                    for item in manifest.get("failures") or []
+                    if isinstance(item, dict)
+                }
+                if job["job_id"] not in failed_job_ids:
+                    raise BridgeError(
+                        HTTPStatus.CONFLICT,
+                        "collection part is not eligible for a failure rerun",
+                    )
+                return
+            if str(manifest.get("current_job_id") or "") != job["job_id"]:
+                raise BridgeError(
+                    HTTPStatus.CONFLICT,
+                    "another Bilibili collection part must run first",
+                )
+            if manifest.get("status") in {"succeeded", "completed_with_errors"}:
+                raise BridgeError(HTTPStatus.CONFLICT, "Bilibili collection is already complete")
+            if manifest.get("status") == "paused" and not resume_paused:
+                raise BridgeError(HTTPStatus.CONFLICT, "Bilibili collection is paused")
+            if manifest.get("status") in {"created", "paused"}:
+                manifest["status"] = "running"
+                manifest["paused_reason"] = None
+                manifest["updated_at"] = iso_now()
+                self.save_collection(manifest)
+
+    def pause_collection_for_job(self, job: dict[str, Any]) -> None:
+        collection = job.get("collection")
+        if not isinstance(collection, dict):
+            return
+        if job.get("collection_rerun"):
+            return
+        collection_id = str(collection.get("id") or "")
+        with self.collection_lock:
+            manifest = self.load_collection(collection_id)
+            if str(manifest.get("current_job_id") or "") != job["job_id"]:
+                return
+            manifest["status"] = "paused"
+            manifest["paused_reason"] = "stopped by user"
+            manifest["updated_at"] = iso_now()
+            self.save_collection(manifest)
+
+    def advance_collection_after_job(self, job_id: str) -> None:
+        try:
+            job = self.load_job(job_id)
+        except BridgeError:
+            return
+        collection = job.get("collection")
+        if not isinstance(collection, dict):
+            return
+        if job.get("status") not in {"succeeded", "failed", "no_speech"}:
+            return
+        collection_id = str(collection.get("id") or "")
+        next_job_id = ""
+        with self.collection_lock:
+            manifest = self.load_collection(collection_id)
+            if job.get("collection_rerun"):
+                failures = [
+                    item
+                    for item in manifest.get("failures") or []
+                    if isinstance(item, dict)
+                    and str(item.get("job_id") or "") != job_id
+                ]
+                if job.get("status") == "failed":
+                    failures.append(
+                        {
+                            "job_id": job_id,
+                            "index": int(collection.get("index") or 1),
+                            "error": str((job.get("runner") or {}).get("error") or "job failed"),
+                            "failed_at": iso_now(),
+                        }
+                    )
+                manifest["failures"] = failures
+                if manifest.get("status") in {"succeeded", "completed_with_errors"}:
+                    manifest["status"] = (
+                        "completed_with_errors"
+                        if failures
+                        else "succeeded"
+                    )
+                    manifest["finished_at"] = iso_now()
+                manifest["updated_at"] = iso_now()
+                self.save_collection(manifest)
+                job.pop("collection_rerun", None)
+                self.save_job(job)
+                return
+            if manifest.get("status") == "paused":
+                return
+            if str(manifest.get("current_job_id") or "") != job_id:
+                return
+            children = list(manifest.get("children") or [])
+            current_index = int(manifest.get("current_index") or collection.get("index") or 1)
+            if job.get("status") == "failed":
+                failures = list(manifest.get("failures") or [])
+                if not any(item.get("job_id") == job_id for item in failures if isinstance(item, dict)):
+                    failures.append(
+                        {
+                            "job_id": job_id,
+                            "index": current_index,
+                            "error": str((job.get("runner") or {}).get("error") or "job failed"),
+                            "failed_at": iso_now(),
+                        }
+                    )
+                manifest["failures"] = failures
+            next_child = next(
+                (
+                    child
+                    for child in children
+                    if int(child.get("index") or 0) > current_index
+                ),
+                None,
+            )
+            if next_child:
+                manifest["status"] = "running"
+                manifest["current_index"] = int(next_child["index"])
+                manifest["current_job_id"] = str(next_child["job_id"])
+                manifest["updated_at"] = iso_now()
+                self.save_collection(manifest)
+                next_job_id = str(next_child["job_id"])
+            else:
+                manifest["status"] = (
+                    "completed_with_errors"
+                    if manifest.get("failures")
+                    else "succeeded"
+                )
+                manifest["finished_at"] = iso_now()
+                manifest["updated_at"] = manifest["finished_at"]
+                self.save_collection(manifest)
+        if next_job_id:
+            try:
+                self.start_run(
+                    next_job_id,
+                    resume_collection=False,
+                )
+            except BridgeError as exc:
+                with self.collection_lock:
+                    manifest = self.load_collection(collection_id)
+                    if manifest.get("status") != "paused":
+                        manifest["status"] = "paused"
+                        manifest["paused_reason"] = exc.message
+                        manifest["updated_at"] = iso_now()
+                        self.save_collection(manifest)
 
     def update_runner(
         self,
@@ -2713,7 +3349,11 @@ class VideoLinkStatusServer:
             elif stage == "analyze-core":
                 result = self.stage_analyze_core(job, stage_info["log_path"], stage_info)
             elif stage == "verify-core":
-                result = self.stage_verify_core(job)
+                result = self.stage_verify_core(
+                    job,
+                    stage_info["log_path"],
+                    stage_info,
+                )
             elif stage == "multidoc":
                 result = self.run_command_stage(job, stage, self.multidoc_command(job), stage_info["log_path"], stage_info)
             elif stage == "deep-v2":
@@ -2816,6 +3456,7 @@ class VideoLinkStatusServer:
         previous_stage_info = previous_stage_info or {}
         failure = failure or {}
         retry = dict(previous_stage_info.get("retry") or {})
+        normalized_stage = normalize_stage_name(stage)
         if failure.get("kind") == "transient_resource":
             if int(retry.get("auto_attempts") or 0) < MAX_TRANSIENT_API_RETRIES:
                 return TRANSIENT_RESOURCE_REQUEUE_MESSAGE
@@ -2824,8 +3465,6 @@ class VideoLinkStatusServer:
             if int(retry.get("auto_attempts") or 0) < MAX_TRANSIENT_API_RETRIES:
                 return TRANSIENT_API_REQUEUE_MESSAGE
             return None
-        if normalize_stage_name(stage) != "analyze-core":
-            return None
         text = self.exception_text(exc)
         output = getattr(exc, "output", None)
         if not output:
@@ -2833,6 +3472,16 @@ class VideoLinkStatusServer:
                 text += "\n" + Path(log_path).read_text(encoding="utf-8", errors="replace")
             except Exception:
                 pass
+        if (
+            normalized_stage == "prepare"
+            and is_youtube_url(str(job.get("video_url") or ""))
+            and any(pattern in text for pattern in YOUTUBE_RATE_LIMIT_PATTERNS)
+        ):
+            if int(retry.get("auto_attempts") or 0) < MAX_TRANSIENT_API_RETRIES:
+                return TRANSIENT_API_REQUEUE_MESSAGE
+            return None
+        if normalized_stage != "analyze-core":
+            return None
         retry_reason = self.retryable_stage_failure_text(stage, text)
         if retry_reason:
             return retry_reason
@@ -2920,7 +3569,14 @@ class VideoLinkStatusServer:
         job["updated_at"] = now
         self.save_job(job)
 
-    def mark_stage_queued(self, job: dict[str, Any], stage: str, resource: str) -> None:
+    def mark_stage_queued(
+        self,
+        job: dict[str, Any],
+        stage: str,
+        resource: str,
+        *,
+        retry_reason: str | None = None,
+    ) -> None:
         now = iso_now()
         stage_info = dict((job.get("stages") or {}).get(stage) or {})
         stage_info.update(
@@ -2931,9 +3587,23 @@ class VideoLinkStatusServer:
                 "log_path": stage_info.get("log_path") or str(self.stage_log_path(job["job_id"], stage)),
             }
         )
+        if retry_reason:
+            previous_error = stage_info.pop("error", None)
+            if previous_error:
+                stage_info["last_error"] = previous_error
+            previous_failure = stage_info.pop("failure", None)
+            if previous_failure:
+                stage_info["last_failure"] = previous_failure
+            stage_info["retry_reason"] = retry_reason
+            stage_info["retry"] = {
+                "auto_attempts": 0,
+                "max_auto_attempts": 0,
+                "next_retry_at": now,
+            }
         stage_info.pop("finished_at", None)
         stage_info.pop("exit_code", None)
         stage_info.pop("queue_duration_seconds", None)
+        stage_info.pop("process", None)
         job.setdefault("stages", {})[stage] = stage_info
         job["status"] = "queued"
         runner = dict(job.get("runner") or {})
@@ -2944,6 +3614,7 @@ class VideoLinkStatusServer:
         runner["server_pid"] = os.getpid()
         runner["error"] = None
         runner.pop("wait_reason", None)
+        runner.pop("finished_at", None)
         if "started_at" not in runner:
             runner["started_at"] = now
         job["runner"] = runner
@@ -3082,9 +3753,24 @@ class VideoLinkStatusServer:
             raise error
         return {"command": [str(script)], "stdout_tail": tail_lines(preflight_log)}
 
-    def stage_verify_core(self, job: dict[str, Any]) -> dict[str, Any]:
+    def stage_verify_core(
+        self,
+        job: dict[str, Any],
+        log_path: str | None = None,
+        stage_info: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         run_dir = self.require_run_dir(job)
         generation_error = self.core_manual_generation_error(run_dir)
+        regeneration: dict[str, Any] = {}
+        if generation_error and log_path:
+            regeneration = self.run_command_stage(
+                job,
+                "verify-core",
+                self.regenerate_operation_manual_command(job),
+                log_path,
+                stage_info,
+            )
+            generation_error = self.core_manual_generation_error(run_dir)
         if generation_error:
             raise BridgeError(HTTPStatus.INTERNAL_SERVER_ERROR, generation_error)
         missing = self.missing_core_artifacts(run_dir)
@@ -3094,7 +3780,19 @@ class VideoLinkStatusServer:
         warnings = []
         if warning:
             warnings.append(self.add_warning(job, "verify-core", warning))
-        return {"artifacts": {"required": ["analysis.json", "operation_manual.md|operation_manual.quality_failed.md", "manual_evidence.md"], "missing": [], "warnings": warnings}}
+        return {
+            "artifacts": {
+                "required": [
+                    "analysis.json",
+                    "operation_manual.md|operation_manual.quality_failed.md",
+                    "manual_evidence.md",
+                ],
+                "missing": [],
+                "warnings": warnings,
+                "manual_regeneration": regeneration.get("artifacts"),
+            },
+            "stdout_tail": regeneration.get("stdout_tail") or [],
+        }
 
     def stage_deep_v2(self, job: dict[str, Any], log_path: str, stage_info: dict[str, Any]) -> dict[str, Any]:
         run_dir = self.require_run_dir(job)
@@ -3142,7 +3840,7 @@ class VideoLinkStatusServer:
         log_path: str,
         stage_info: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if stage in {"study-guide", "multidoc", "deep-v2", "evidence-review", "web-evidence"}:
+        if stage in {"verify-core", "study-guide", "multidoc", "deep-v2", "evidence-review", "web-evidence"}:
             command = self.local_text_command(job, command)
         runtime_env = self.job_runtime_env(job)
         runtime_env.update(self.stage_failure_env(stage_info))
@@ -3415,6 +4113,17 @@ class VideoLinkStatusServer:
         command = ["tools/run_multidoc_analysis.sh", str(self.require_run_dir(job)), "--profile", job["options"]["profile"]]
         command.extend(["--chapter-concurrency", str(self.chapter_concurrency(job))])
         return command
+
+    def regenerate_operation_manual_command(self, job: dict[str, Any]) -> list[str]:
+        return [
+            sys.executable,
+            "tools/regenerate_operation_manual.py",
+            str(self.require_run_dir(job)),
+            "--profile",
+            job["options"].get("profile") or DEFAULT_PROFILE,
+            "--timeout-seconds",
+            "900",
+        ]
 
     def chapter_concurrency(self, job: dict[str, Any]) -> int:
         profile_name = str((job.get("options") or {}).get("profile") or DEFAULT_PROFILE)
@@ -4373,14 +5082,17 @@ class VideoLinkStatusServer:
                 }
             )
             return base
-        if video_id and ("bilibili.com" in host or "b23.tv" in host):
+        bvid, page = bilibili_url_parts(source_url)
+        if bvid and ("bilibili.com" in host or "b23.tv" in host):
+            embed_page = f"&page={page}" if page else ""
+            watch_page = f"?p={page}" if page else ""
             base.update(
                 {
                     "provider": "bilibili",
                     "can_embed": True,
                     "supports_timestamp": True,
-                    "embed_url": f"https://player.bilibili.com/player.html?bvid={quote(video_id)}",
-                    "watch_url": f"https://www.bilibili.com/video/{quote(video_id)}",
+                    "embed_url": f"https://player.bilibili.com/player.html?bvid={quote(bvid)}{embed_page}",
+                    "watch_url": f"https://www.bilibili.com/video/{quote(bvid)}{watch_page}",
                 }
             )
         return base
@@ -6119,6 +6831,13 @@ class VideoLinkStatusServer:
         public["failure_disposition"] = self.failure_disposition(job)
         public["dashboard_url"] = self.dashboard_url(job["job_id"])
         public["queue"] = self.queue_info(public)
+        schedule = job.get("schedule")
+        if isinstance(schedule, dict) and schedule.get("status") == "scheduled":
+            public_schedule = dict(schedule)
+            start_at = parse_schedule_datetime(schedule.get("start_at"))
+            if start_at is not None:
+                public_schedule["seconds_until_start"] = int(round(start_at.timestamp() - time.time()))
+            public["schedule"] = public_schedule
         public["core_progress"] = self.core_progress(public)
         public["stage_progress"] = self.stage_progress(public)
         public["core_diagnostics"] = self.core_diagnostics(public)
@@ -6130,6 +6849,7 @@ class VideoLinkStatusServer:
         public["result_resources"] = self.result_resources(public)
         public["document_preview"] = self.document_preview(public)
         public["execution_flow"] = self.execution_flow(public)
+        public["collection"] = self.public_job_collection(job)
         queued_stage = public["queue"].get("stage")
         if queued_stage and queued_stage in public["stages"]:
             public["stages"][queued_stage] = dict(public["stages"][queued_stage])
@@ -7321,7 +8041,13 @@ class VideoLinkStatusServer:
             return None
         return str(relative)
 
-    def public_job_summary(self, job: dict[str, Any]) -> dict[str, Any]:
+    def public_job_summary(
+        self,
+        job: dict[str, Any],
+        *,
+        queue_index: dict[str, dict[str, Any]] | None = None,
+        include_failure_disposition: bool = True,
+    ) -> dict[str, Any]:
         public = {
             "job_id": job["job_id"],
             "video_url": job.get("video_url"),
@@ -7332,13 +8058,22 @@ class VideoLinkStatusServer:
             "updated_at": job.get("updated_at"),
             "options": job.get("options") or {},
             "runner": job.get("runner") or {},
-            "stages": dict(job.get("stages") or {}),
+            "stages": self.public_stage_summaries(job),
             "resolved_mode": job.get("resolved_mode") or ((job.get("artifacts") or {}).get("resolved_mode") or {}).get("value"),
             "resolved_mode_reason": job.get("resolved_mode_reason")
             or ((job.get("artifacts") or {}).get("resolved_mode_reason") or {}).get("value"),
             "run_dir": job.get("run_dir"),
             "video_path": job.get("video_path"),
+            "schedule": job.get("schedule"),
+            "collection": self.public_job_collection(job),
         }
+        schedule = job.get("schedule")
+        if isinstance(schedule, dict) and schedule.get("status") == "scheduled":
+            public_schedule = dict(schedule)
+            start_at = parse_schedule_datetime(schedule.get("start_at"))
+            if start_at is not None:
+                public_schedule["seconds_until_start"] = int(round(start_at.timestamp() - time.time()))
+            public["schedule"] = public_schedule
         title = self.resolve_job_title(public)
         public["title"] = title
         public["display_title"] = title or job.get("source_name") or job.get("video_url") or job.get("job_id")
@@ -7347,21 +8082,61 @@ class VideoLinkStatusServer:
         public["current_stage"] = self.current_stage(job)
         public["next_stage"] = self.next_stage(job)
         public["error_summary"] = self.error_summary(job)
-        public["failure_disposition"] = self.failure_disposition(job)
+        public["failure_disposition"] = (
+            self.failure_disposition(job)
+            if include_failure_disposition
+            else None
+        )
         public["dashboard_url"] = self.dashboard_url(job["job_id"])
+        public["queue"] = (
+            queue_index.get(job["job_id"], {})
+            if queue_index is not None
+            else self.queue_info(public)
+        )
+        public["preview"] = self.preview_metadata(public)
         public["source_player"] = self.source_player_metadata(public)
         current_info = public["stages"].get(public.get("current_stage") or "", {})
         public["process"] = self.public_process_info(current_info.get("process"))
         return public
 
+    def public_stage_summaries(self, job: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        fields = (
+            "status",
+            "started_at",
+            "finished_at",
+            "duration_seconds",
+            "error",
+            "log_path",
+        )
+        return {
+            stage: {
+                key: info[key]
+                for key in fields
+                if key in info
+            }
+            for stage, info in (job.get("stages") or {}).items()
+            if isinstance(info, dict)
+        }
+
     def annotate_failure_dispositions(self, jobs: list[dict[str, Any]]) -> None:
+        recommended_profile = (
+            active_runtime_profile(runtime_profile_names())
+            if any(job.get("status") == "failed" for job in jobs)
+            else None
+        )
         for job in jobs:
-            job["failure_disposition"] = self.failure_disposition(job, jobs)
+            job["failure_disposition"] = self.failure_disposition(
+                job,
+                jobs,
+                recommended_profile=recommended_profile,
+            )
 
     def failure_disposition(
         self,
         job: dict[str, Any],
         peers: list[dict[str, Any]] | None = None,
+        *,
+        recommended_profile: str | None = None,
     ) -> dict[str, Any] | None:
         if job.get("status") != "failed":
             return None
@@ -7419,7 +8194,7 @@ class VideoLinkStatusServer:
                 "action": "直接验收现有文档；旧发布失败无需重跑",
             }
 
-        recommended_profile = active_runtime_profile(runtime_profile_names())
+        recommended_profile = recommended_profile or active_runtime_profile(runtime_profile_names())
         if "insufficient balance" in lowered or "402" in lowered:
             return {
                 "category": "external_block",
@@ -7619,6 +8394,39 @@ class VideoLinkStatusServer:
                 }
             )
         return info
+
+    def queue_index(self, jobs: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for job in jobs:
+            runner = job.get("runner") or {}
+            stage = runner.get("current_stage") or self.current_stage(job)
+            if runner.get("status") != "queued" or not stage:
+                continue
+            resource = runner.get("queued_for") or job_stage_resource(job, stage)
+            grouped.setdefault(resource, []).append(job)
+
+        index: dict[str, dict[str, Any]] = {}
+        for resource, queued in grouped.items():
+            queued.sort(key=lambda item: item.get("updated_at") or item.get("created_at") or "")
+            size = len(queued)
+            for position, job in enumerate(queued, start=1):
+                info = {
+                    "stage": (job.get("runner") or {}).get("current_stage") or self.current_stage(job),
+                    "resource": resource,
+                    "position": position,
+                    "size": size,
+                }
+                retry = self.auto_retry_info(job)
+                if retry.get("auto_retry"):
+                    info.update(
+                        {
+                            "auto_retry": True,
+                            "retry_after_seconds": retry.get("retry_after_seconds"),
+                            "retry_delay_seconds": retry.get("retry_delay_seconds"),
+                        }
+                    )
+                index[str(job.get("job_id") or "")] = info
+        return index
 
     def core_progress(self, job: dict[str, Any]) -> dict[str, Any] | None:
         stage_info = (job.get("stages") or {}).get("analyze-core") or {}
@@ -8162,6 +8970,103 @@ class VideoLinkStatusServer:
         tmp_path.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp_path.replace(path)
 
+    def load_collection(self, collection_id: str) -> dict[str, Any]:
+        if not COLLECTION_ID_PATTERN.fullmatch(collection_id):
+            raise BridgeError(HTTPStatus.NOT_FOUND, "collection not found")
+        path = self.collection_path(collection_id)
+        if not path.is_file():
+            raise BridgeError(HTTPStatus.NOT_FOUND, "collection not found")
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def save_collection(self, manifest: dict[str, Any]) -> None:
+        path = self.collection_path(str(manifest["id"]))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(
+            f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        tmp_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(path)
+
+    def public_collection(self, manifest: dict[str, Any]) -> dict[str, Any]:
+        children = []
+        completed = 0
+        total = int(manifest.get("total") or len(manifest.get("children") or []))
+        for child in manifest.get("children") or []:
+            item = dict(child)
+            child_job: dict[str, Any] = {}
+            try:
+                child_job = self.load_job(str(item.get("job_id") or ""))
+                item["status"] = child_job.get("status")
+                item["current_stage"] = self.current_stage(child_job)
+            except BridgeError:
+                item["status"] = "missing"
+                item["current_stage"] = None
+            item["is_current"] = (
+                str(item.get("job_id") or "")
+                == str(manifest.get("current_job_id") or "")
+            )
+            stopped_current = (
+                manifest.get("status") == "paused"
+                and item["is_current"]
+                and item["status"] == "failed"
+                and str((child_job.get("runner") or {}).get("error") or "")
+                == "stopped by user"
+            )
+            if (
+                item["status"] in {"succeeded", "failed", "no_speech"}
+                and not stopped_current
+            ):
+                completed += 1
+            children.append(item)
+        return {
+            "id": manifest.get("id"),
+            "provider": manifest.get("provider"),
+            "source_url": manifest.get("source_url"),
+            "bvid": manifest.get("bvid"),
+            "title": manifest.get("title"),
+            "status": manifest.get("status"),
+            "failure_policy": manifest.get("failure_policy"),
+            "execution": manifest.get("execution"),
+            "current_index": manifest.get("current_index"),
+            "current_job_id": manifest.get("current_job_id"),
+            "total": total,
+            "completed": (
+                total
+                if manifest.get("status") in {"succeeded", "completed_with_errors"}
+                else completed
+            ),
+            "failures": list(manifest.get("failures") or []),
+            "paused_reason": manifest.get("paused_reason"),
+            "children": children,
+        }
+
+    def public_job_collection(self, job: dict[str, Any]) -> dict[str, Any] | None:
+        collection = job.get("collection")
+        if not isinstance(collection, dict):
+            return None
+        try:
+            manifest = self.load_collection(str(collection.get("id") or ""))
+        except BridgeError:
+            return dict(collection)
+        public = dict(collection)
+        public.update(
+            {
+                "status": manifest.get("status"),
+                "current_index": manifest.get("current_index"),
+                "current_job_id": manifest.get("current_job_id"),
+                "completed": self.public_collection(manifest).get("completed"),
+                "failures": list(manifest.get("failures") or []),
+                "paused_reason": manifest.get("paused_reason"),
+                "is_current": (
+                    str(manifest.get("current_job_id") or "") == job.get("job_id")
+                ),
+            }
+        )
+        return public
+
     def write_runtime_snapshot(
         self,
         job: dict[str, Any],
@@ -8315,6 +9220,9 @@ class VideoLinkStatusServer:
     def job_dir(self, job_id: str) -> Path:
         return self.jobs_dir / job_id
 
+    def collection_path(self, collection_id: str) -> Path:
+        return self.collections_dir / f"{collection_id}.json"
+
     def upload_video_dir(self, job_id: str) -> Path:
         return self.resolve_output_path(str(Path(FALLBACK_OUTPUT_ROOT) / f"{UPLOAD_OUTPUT_PREFIX}{job_id}"))
 
@@ -8391,6 +9299,55 @@ def clean_display_title(value: Any) -> str:
 def is_youtube_url(url: str) -> bool:
     hostname = (urlparse(url).hostname or "").lower()
     return hostname == "youtu.be" or hostname.endswith(".youtube.com")
+
+
+def is_bilibili_url(url: str) -> bool:
+    hostname = (urlparse(url).hostname or "").lower()
+    return (
+        hostname == "b23.tv"
+        or hostname == "bilibili.com"
+        or hostname.endswith(".bilibili.com")
+    )
+
+
+def bilibili_url_parts(url: str) -> tuple[str, int | None]:
+    parsed = urlparse(url)
+    bvid = ""
+    for part in parsed.path.split("/"):
+        if part.startswith("BV") or part.startswith("av"):
+            bvid = part
+            break
+    page = None
+    raw_page = (parse_qs(parsed.query).get("p") or [""])[0]
+    if str(raw_page).isdigit() and int(raw_page) > 0:
+        page = int(raw_page)
+    return bvid, page
+
+
+def canonical_bilibili_url(url: str, page: int | None = None) -> str:
+    bvid, existing_page = bilibili_url_parts(url)
+    if not bvid:
+        return url
+    selected_page = page or existing_page
+    base = f"https://www.bilibili.com/video/{bvid}"
+    return f"{base}?p={selected_page}" if selected_page else base
+
+
+def clean_bilibili_part_title(
+    title: str,
+    collection_title: str,
+    index: int,
+) -> str:
+    cleaned = title.strip()
+    collection_prefix = collection_title.strip()
+    if collection_prefix and cleaned.startswith(collection_prefix):
+        cleaned = cleaned[len(collection_prefix) :].strip()
+    cleaned = re.sub(
+        rf"^[Pp]0*{index}(?:\s+|[._、:：-]\s*)",
+        "",
+        cleaned,
+    ).strip()
+    return cleaned or title.strip()
 
 
 def artifact_value(job: dict[str, Any], name: str) -> str:
@@ -10011,6 +10968,21 @@ def tail_lines(text: str, limit: int = 40) -> list[str]:
 
 def iso_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def parse_schedule_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    return parsed
 
 
 def iso_from_timestamp(value: float) -> str:

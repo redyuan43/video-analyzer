@@ -1,0 +1,6 @@
+# Generated from project.yml by bootstrap.sh — never commit the pbxproj.
+VideoAnalyzer.xcodeproj/
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/

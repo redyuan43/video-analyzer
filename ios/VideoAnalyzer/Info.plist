@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Xcode only injects these automatically when it generates the
+	     Info.plist itself. With a checked-in file they must be spelled out,
+	     or the built .app is rejected as "not a valid bundle" at install. -->
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>Video Analyzer</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+
+	<!-- Filled from Config/App.xcconfig so the bundle prefix and server
+	     address are configured in exactly one place. -->
+	<key>AppGroupIdentifier</key>
+	<string>group.$(PRODUCT_BUNDLE_PREFIX).videoanalyzer</string>
+	<key>DefaultServerScheme</key>
+	<string>$(DEFAULT_SERVER_SCHEME)</string>
+	<key>DefaultServerHost</key>
+	<string>$(DEFAULT_SERVER_HOST)</string>
+
+	<!--
+	  The default address is https:// behind `tailscale serve`, with a real
+	  ts.net certificate, so the normal path needs no exception at all.
+
+	  It stays because the server address is user-configurable: pointing the
+	  app straight at a tailnet IP (http://100.x.y.z:5000) has to keep working
+	  without a rebuild. That traffic is still inside Tailscale's WireGuard
+	  tunnel, so ATS would only be re-encrypting an encrypted link.
+	-->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
+
+	<!-- The console can upload local media for analysis, which on iOS means
+	     reaching into Photos or the camera from a web file input. -->
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>选择本机视频上传给 Video Analyzer 分析。</string>
+	<key>NSCameraUsageDescription</key>
+	<string>录制视频后直接上传给 Video Analyzer 分析。</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>录制视频时需要采集音频。</string>
+
+	<key>UILaunchScreen</key>
+	<dict>
+		<key>UIColorName</key>
+		<string>LaunchBackground</string>
+	</dict>
+
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+
+	<!-- Lets the share extension hand a URL back to the app. -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>$(PRODUCT_BUNDLE_PREFIX).videoanalyzer</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>videoanalyzer</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

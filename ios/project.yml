@@ -1,0 +1,78 @@
+# XcodeGen spec for the Video Analyzer iOS app.
+#
+# The .xcodeproj is generated, not committed: a pbxproj is unreviewable UUID
+# soup, while this file is the actual source of truth. Regenerate with:
+#
+#   cd ios && ./bootstrap.sh
+#
+# Team ID, bundle prefix and default server URL live in Config/App.xcconfig so
+# they are set once and never leak into this file.
+
+name: VideoAnalyzer
+
+options:
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "17.0"
+  # iPhone 15 ships iOS 17, so nothing older needs supporting.
+  groupSortPosition: top
+
+configFiles:
+  Debug: Config/App.xcconfig
+  Release: Config/App.xcconfig
+
+settings:
+  base:
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.9"
+    DEVELOPMENT_LANGUAGE: zh-Hans
+    # iPhone only. iPad would land on the desktop web layout and collide with
+    # the native chrome; nothing asked for it.
+    TARGETED_DEVICE_FAMILY: "1"
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    CODE_SIGN_STYLE: Automatic
+
+targets:
+  VideoAnalyzer:
+    type: application
+    platform: iOS
+    sources:
+      - path: VideoAnalyzer
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(PRODUCT_BUNDLE_PREFIX).videoanalyzer
+        PRODUCT_NAME: Video Analyzer
+        INFOPLIST_FILE: VideoAnalyzer/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+    dependencies:
+      - target: ShareExtension
+        embed: true
+
+  ShareExtension:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: ShareExtension
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(PRODUCT_BUNDLE_PREFIX).videoanalyzer.share
+        PRODUCT_NAME: Video Analyzer
+        # Pinned explicitly: the default would be derived from PRODUCT_NAME and
+        # silently become `Video_Analyzer`, which the NSExtensionPrincipalClass
+        # in Info.plist has to match exactly.
+        PRODUCT_MODULE_NAME: ShareExtension
+        INFOPLIST_FILE: ShareExtension/Info.plist
+
+schemes:
+  VideoAnalyzer:
+    build:
+      targets:
+        VideoAnalyzer: all
+    run:
+      config: Debug
+    archive:
+      config: Release

@@ -260,7 +260,7 @@ def main() -> int:
     else:
         try:
             info = fetch_metadata(args.url, args)
-            video_id = safe_slug(str(info.get("id") or info.get("display_id") or info.get("title") or "video"))
+            video_id = download_directory_id(args.url, info)
             video_dir = output_root / video_id
             video_dir.mkdir(parents=True, exist_ok=True)
         except subprocess.CalledProcessError:
@@ -383,7 +383,7 @@ def remote_download_video_dir(args: argparse.Namespace, output_root: Path) -> Pa
             check=True,
         )
         info = load_downloaded_info(local_pull_dir) or {}
-        video_id = safe_slug(str(info.get("id") or info.get("display_id") or infer_video_id_from_url(args.url) or info.get("title") or "video"))
+        video_id = download_directory_id(args.url, info)
         target_dir = output_root / video_id
         if target_dir.exists():
             shutil.rmtree(target_dir)
@@ -647,11 +647,26 @@ def infer_video_id_from_url(url: str) -> str:
         parts = [part for part in parsed.path.split("/") if part]
         for part in parts:
             if part.startswith("BV") or part.startswith("av"):
+                page = (parse_qs(parsed.query).get("p") or [""])[0]
+                if str(page).isdigit() and int(page) > 0:
+                    return f"{part}-p{int(page):03d}"
                 return part
     apple_parts = apple_podcasts_episode_parts(url)
     if apple_parts:
         return apple_parts[1]
     return ""
+
+
+def download_directory_id(url: str, info: dict[str, Any]) -> str:
+    return safe_slug(
+        str(
+            infer_video_id_from_url(url)
+            or info.get("id")
+            or info.get("display_id")
+            or info.get("title")
+            or "video"
+        )
+    )
 
 
 def is_youtube_url(url: str) -> bool:
@@ -882,7 +897,7 @@ def materialize_subtitle_transcript(video_dir: Path, info: dict[str, Any]) -> Pa
 def parse_cleaned_subtitle_segments(text: str) -> list[tuple[str, str, str]]:
     segments = []
     pattern = re.compile(
-        r"^\[(?P<start>\d\d:\d\d:\d\d)(?:\.\d+)?\s+(?:-->|-)\s+(?P<end>\d\d:\d\d:\d\d)(?:\.\d+)?\]\s+(?P<text>.*)$"
+        r"^\[(?P<start>\d\d:\d\d:\d\d)(?:\.\d+)?\s+(?:-->|-)\s+(?P<end>\d\d:\d\d:\d\d)(?:\.\d+)?(?:\s+[^\]]+)?\]\s+(?P<text>.*)$"
     )
     for line in text.splitlines():
         match = pattern.match(line.strip())

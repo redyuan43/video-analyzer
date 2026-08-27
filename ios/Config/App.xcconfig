@@ -1,0 +1,25 @@
+// Everything you need to configure for the Video Analyzer iOS app.
+// Set these once; no Swift file or project.yml edit is needed afterwards.
+
+// Your 10-character Apple Developer Team ID.
+// Xcode -> Settings -> Accounts -> your team, or
+// https://developer.apple.com/account -> Membership Details -> Team ID.
+// Shenzhen Wingto Digital Technology — the paid team. Read from the OU field
+// of the "Apple Development: Ivan feng" certificate; the DCLMUNT3WX shown in
+// the certificate's common name is not the team ID.
+DEVELOPMENT_TEAM = KWAT7HPTLT
+
+// Reverse-DNS prefix you control. Everything else derives from it:
+//   app             <prefix>.videoanalyzer
+//   share extension <prefix>.videoanalyzer.share
+//   app group       group.<prefix>.videoanalyzer
+PRODUCT_BUNDLE_PREFIX = com.wingto
+
+// Where the analyzer UI lives on your tailnet. The app ships with this as the
+// default and lets you change it at runtime under the in-app server settings.
+//
+// Scheme and host are kept apart on purpose: `//` opens a comment in xcconfig,
+// so a full URL written here silently loses its scheme separator and the app
+// ends up with an unparseable address. AppConfig joins the two at runtime.
+DEFAULT_SERVER_SCHEME = https
+DEFAULT_SERVER_HOST = ai-x10drg.taild500c8.ts.net:5443

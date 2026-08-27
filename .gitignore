@@ -138,6 +138,11 @@ venv.bak/
 # Local runtime overrides
 config/config.json
 
+# Local snapshots
+*.before-*
+*.backup-*
+*.bak-*
+
 # Spyder project settings
 .spyderproject
 .spyproject

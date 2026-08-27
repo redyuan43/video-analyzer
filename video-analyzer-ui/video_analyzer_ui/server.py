@@ -160,7 +160,9 @@ class VideoAnalyzerUI:
             try:
                 assets = [
                     static_root / 'js' / 'main.js',
+                    static_root / 'js' / 'mobile.js',
                     static_root / 'css' / 'styles.css',
+                    static_root / 'css' / 'mobile.css',
                     static_root / 'data' / 'audio_prompt_templates.json',
                     static_root / 'vendor' / 'markdown-it' / 'markdown-it.min.js',
                     static_root / 'vendor' / 'dompurify' / 'purify.min.js',
@@ -672,6 +674,8 @@ class VideoAnalyzerUI:
                         refresh_runtime_profile=str(
                             payload.get('refresh_runtime_profile', 'false')
                         ).lower() in {'1', 'true', 'yes', 'on'},
+                        enqueue=str(payload.get('enqueue', 'false')).lower()
+                        in {'1', 'true', 'yes', 'on'},
                     )
                 ), int(HTTPStatus.ACCEPTED)
             except BridgeError as exc:
