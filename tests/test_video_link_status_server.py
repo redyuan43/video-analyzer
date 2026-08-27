@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from video_analyzer import cli as cli_mod
+from video_analyzer import cli_helpers as cli_helpers_mod
 from video_analyzer import douyin_browser as douyin_browser_mod
 from video_analyzer import skill_distillation as skill_distill
 from video_analyzer.frame import Frame
@@ -35,6 +36,7 @@ def load_module(path: Path, name: str):
 
 
 server_mod = load_module(SERVER_PATH, "video_link_status_server")
+from video_analyzer.jobengine import stage_runner as stage_runner_mod  # noqa: E402
 url_context_mod = load_module(URL_CONTEXT_PATH, "video_analyzer_url_context")
 REAL_RUNTIME_CONFIG = server_mod.runtime_config
 
@@ -367,7 +369,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
     def test_ytdlp_maintenance_script_has_valid_shell_syntax(self):
         result = subprocess.run(
-            ["bash", "-n", str(REPO_ROOT / "tools" / "ytdlp_runtime_maintenance.sh")],
+            ["bash", "-n", str(REPO_ROOT / "tools" / "ops" / "ytdlp_runtime_maintenance.sh")],
             cwd=REPO_ROOT,
             capture_output=True,
             text=True,
@@ -654,7 +656,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             stdout=json.dumps({"streams": []}),
             stderr="",
         )
-        with patch.object(cli_mod.subprocess, "run", return_value=completed):
+        with patch.object(cli_helpers_mod.subprocess, "run", return_value=completed):
             self.assertFalse(cli_mod.media_has_video_stream(Path("/tmp/audio.m4a")))
 
     def test_media_has_video_stream_ignores_attached_picture(self):
@@ -670,7 +672,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             ),
             stderr="",
         )
-        with patch.object(cli_mod.subprocess, "run", return_value=completed):
+        with patch.object(cli_helpers_mod.subprocess, "run", return_value=completed):
             self.assertFalse(cli_mod.media_has_video_stream(Path("/tmp/audio-with-cover.mp3")))
 
     def test_media_has_video_stream_detects_video_input(self):
@@ -686,7 +688,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             ),
             stderr="",
         )
-        with patch.object(cli_mod.subprocess, "run", return_value=completed):
+        with patch.object(cli_helpers_mod.subprocess, "run", return_value=completed):
             self.assertTrue(cli_mod.media_has_video_stream(Path("/tmp/video.mp4")))
 
     def test_options_include_defaults_and_profiles(self):
@@ -1303,7 +1305,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
                 patch.object(server, "production_audio_local_busy", return_value=True),
                 patch.object(server, "save_job"),
                 patch.object(
-                    server_mod,
+                    stage_runner_mod,
                     "missing_tencent_credentials",
                     return_value=["TENCENTCLOUD_APP_ID"],
                 ),
