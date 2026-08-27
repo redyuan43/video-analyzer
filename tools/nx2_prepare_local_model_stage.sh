@@ -117,7 +117,7 @@ case "$stage" in
     start_background \
       "$runtime_dir/easyocr.pid" \
       "$runtime_dir/easyocr.log" \
-      "$ocr_python" "$root_dir/tools/nx2_easyocr_openai_server.py" \
+      "$ocr_python" "$root_dir/tools/ocr_servers/nx2_easyocr_openai_server.py" \
       --host 127.0.0.1 \
       --port "$ocr_port" \
       --model-storage-directory "$model_root/ocr/easyocr" \

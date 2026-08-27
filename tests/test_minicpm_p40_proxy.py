@@ -7,7 +7,7 @@ from unittest import TestCase
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MODULE_PATH = ROOT / "tools" / "minicpm_p40_proxy.py"
+MODULE_PATH = ROOT / "tools" / "ocr_servers" / "minicpm_p40_proxy.py"
 SPEC = importlib.util.spec_from_file_location("minicpm_p40_proxy", MODULE_PATH)
 minicpm_p40_proxy = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader

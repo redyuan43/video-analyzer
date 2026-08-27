@@ -125,7 +125,7 @@ stop_minicpm() {
     kill "$(cat "${PID_FILE}")" || true
     rm -f "${PID_FILE}"
   fi
-  stop_pattern "tools/minicpm_p40_proxy.py"
+  stop_pattern "tools/ocr_servers/minicpm_p40_proxy.py"
   stop_pattern "MiniCPM-V-4_5-gguf/ggml-model-Q4_K_M.gguf"
 }
 
@@ -159,7 +159,7 @@ start_minicpm() {
   NO_PROXY="${NO_PROXY:-127.0.0.1,localhost}" \
   no_proxy="${no_proxy:-127.0.0.1,localhost}" \
   CUDA_DEVICE_ORDER="${CUDA_DEVICE_ORDER:-PCI_BUS_ID}" \
-  setsid "${PYTHON_BIN}" tools/minicpm_p40_proxy.py \
+  setsid "${PYTHON_BIN}" tools/ocr_servers/minicpm_p40_proxy.py \
     --host "${PROXY_HOST}" \
     --port "${PROXY_PORT}" \
     --workers "${workers}" \
