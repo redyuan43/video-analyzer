@@ -111,6 +111,6 @@ curl -fsS "http://127.0.0.1:5000/api/video-link/jobs/<job_id>/logs/analyze-core?
 修改状态服务后运行：
 
 ```bash
-.venv/bin/python -m py_compile tools/video_link_status_server.py video-analyzer-ui/video_analyzer_ui/server.py tests/test_video_link_status_server.py tests/test_video_analyzer_ui.py
+.venv/bin/python -m py_compile video_analyzer/jobengine/video_link_status_server.py video-analyzer-ui/video_analyzer_ui/server.py tests/test_video_link_status_server.py tests/test_video_analyzer_ui.py
 .venv/bin/python -m unittest tests.test_video_link_status_server tests.test_video_analyzer_ui
 ```

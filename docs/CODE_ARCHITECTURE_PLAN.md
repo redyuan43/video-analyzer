@@ -144,7 +144,7 @@ web_debug_console/            # 并入 video_analyzer_ui 或独立发布包（�
 
 | 现有 | 目标归属 | 动作 |
 |---|---|---|
-| `tools/video_link_status_server.py`（引擎本体） | 新包 `video_analyzer_ui/video_link/` 或 `video_analyzer/jobengine/` | 迁移 + 修复 UI 依赖方向 |
+| `tools/video_link_status_server.py`（引擎本体） | `video_analyzer/jobengine/`（正式包） | 已迁入 ✅（Phase 3a） |
 | `tools/video_link_status_supervisor.py` | `tools/video_link/` 入口 | 迁移 |
 | `tools/run_audio_template_analysis.py`（逻辑） | `video_analyzer/pipeline/audio/template_analysis.py` | 下沉主包 |
 | `tools/run_multidoc_analysis.py` 等 re-export | 删除包装器，入口改用主包 | 去重 |
@@ -179,7 +179,8 @@ web_debug_console/            # 并入 video_analyzer_ui 或独立发布包（�
   - CI：新增 [.github/workflows/ci.yml](../.github/workflows/ci.yml)（ruff + 确定性单测门禁）
   - 测试统一：新增 `tests/__init__.py`；`test_operation_manual.py`、`test_prompt_loading.py` 迁入 `tests/`
   - 顺带修复：`tools/video_link_status_server.py` 缺失 `requests` 导入的潜在 NameError；清除 60+ 处未用导入/导入排序问题
-- ⏳ **Phase 3-6 待实施**（每阶段独立可回滚）
+- ✅ **Phase 3a 已完成**（2026-08-27）：引擎 `video_link_status_server.py` 迁入正式包 `video_analyzer/jobengine/`；UI 反向依赖改为 `from video_analyzer.jobengine... import`；修正 REPO_ROOT 解析（`parents[1]`→`parents[2]`）；同步测试/CI/文档路径引用
+- ⏳ **Phase 3b（tools/ 分目录）与 Phase 4-6 待实施**（每阶段独立可回滚）
 
 ### Phase 0 基线固化（低风险）
 - 运行全量测试并记录基线：`tests/` 604 + 根目录 82，当前全部通过

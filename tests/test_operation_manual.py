@@ -46,13 +46,13 @@ from video_analyzer.frame_selection import (
 from video_analyzer.jetson_frames import resolve_jetson_sample_fps, split_jetson_workers
 from video_analyzer.ocr import OCREvent
 
-RUNNER_PATH = Path(__file__).resolve().parent / "tools" / "run_operation_manual_from_url.py"
+RUNNER_PATH = Path(__file__).resolve().parents[1] / "tools" / "run_operation_manual_from_url.py"
 RUNNER_SPEC = importlib.util.spec_from_file_location("run_operation_manual_from_url", RUNNER_PATH)
 run_operation_manual_from_url = importlib.util.module_from_spec(RUNNER_SPEC)
 assert RUNNER_SPEC and RUNNER_SPEC.loader
 RUNNER_SPEC.loader.exec_module(run_operation_manual_from_url)
 
-MULTIDOC_PATH = Path(__file__).resolve().parent / "tools" / "run_multidoc_analysis.py"
+MULTIDOC_PATH = Path(__file__).resolve().parents[1] / "tools" / "run_multidoc_analysis.py"
 MULTIDOC_SPEC = importlib.util.spec_from_file_location("run_multidoc_analysis", MULTIDOC_PATH)
 run_multidoc_analysis = importlib.util.module_from_spec(MULTIDOC_SPEC)
 assert MULTIDOC_SPEC and MULTIDOC_SPEC.loader

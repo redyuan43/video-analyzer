@@ -26,9 +26,9 @@ def load_ui_module():
 
 
 ui_mod = load_ui_module()
-from tools import video_link_status_server as status_server
-from tools.video_link_status_supervisor import Supervisor
-from video_analyzer_ui.runtime_identity import RuntimeIdentity
+from tools.video_link_status_supervisor import Supervisor  # noqa: E402
+from video_analyzer.jobengine import video_link_status_server as status_server  # noqa: E402
+from video_analyzer_ui.runtime_identity import RuntimeIdentity  # noqa: E402
 
 
 class VideoAnalyzerUITests(unittest.TestCase):
@@ -1087,13 +1087,13 @@ class VideoAnalyzerUITests(unittest.TestCase):
             ui.video_link.save_job(loaded)
 
             fake_process = type("FakeProcess", (), {"pid": 12345})()
-            with patch("tools.video_link_status_server.find_code_server_binary", return_value={"server": "code-server", "command": ["/bin/true"]}), \
-                patch("tools.video_link_status_server.allocate_vscode_port", return_value=19000), \
-                patch("tools.video_link_status_server.discover_global_vscode_session", return_value=None), \
-                patch("tools.video_link_status_server.stop_managed_vscode_sessions", return_value=0), \
-                patch("tools.video_link_status_server.subprocess.Popen", return_value=fake_process), \
-                patch("tools.video_link_status_server.local_tailscale_host", return_value=None), \
-                patch("tools.video_link_status_server.process_alive", return_value=True):
+            with patch("video_analyzer.jobengine.video_link_status_server.find_code_server_binary", return_value={"server": "code-server", "command": ["/bin/true"]}), \
+                patch("video_analyzer.jobengine.video_link_status_server.allocate_vscode_port", return_value=19000), \
+                patch("video_analyzer.jobengine.video_link_status_server.discover_global_vscode_session", return_value=None), \
+                patch("video_analyzer.jobengine.video_link_status_server.stop_managed_vscode_sessions", return_value=0), \
+                patch("video_analyzer.jobengine.video_link_status_server.subprocess.Popen", return_value=fake_process), \
+                patch("video_analyzer.jobengine.video_link_status_server.local_tailscale_host", return_value=None), \
+                patch("video_analyzer.jobengine.video_link_status_server.process_alive", return_value=True):
                 response = client.post(f"/api/video-link/jobs/{job_id}/vscode-session", json={})
 
         self.assertEqual(response.status_code, 200)
@@ -1127,9 +1127,9 @@ class VideoAnalyzerUITests(unittest.TestCase):
                 "server": "code-server",
                 "started_at": "2026-05-29T00:00:00+0800",
             }
-            with patch("tools.video_link_status_server.discover_global_vscode_session", return_value=discovered), \
-                patch("tools.video_link_status_server.local_tailscale_host", return_value="100.91.42.28"), \
-                patch("tools.video_link_status_server.process_alive", return_value=True):
+            with patch("video_analyzer.jobengine.video_link_status_server.discover_global_vscode_session", return_value=discovered), \
+                patch("video_analyzer.jobengine.video_link_status_server.local_tailscale_host", return_value="100.91.42.28"), \
+                patch("video_analyzer.jobengine.video_link_status_server.process_alive", return_value=True):
                 response = client.get(f"/api/video-link/jobs/{job_id}")
 
         self.assertEqual(response.status_code, 200)
@@ -1148,7 +1148,7 @@ class VideoAnalyzerUITests(unittest.TestCase):
                 f"101 101 node /bin/code-server --bind-addr 0.0.0.0:19000 {run_dir}\n"
                 f"202 202 node /bin/code-server --bind-addr 0.0.0.0:19003 {sibling_dir}\n"
             )
-            with patch("tools.video_link_status_server.subprocess.check_output", return_value=ps_output):
+            with patch("video_analyzer.jobengine.video_link_status_server.subprocess.check_output", return_value=ps_output):
                 matches = status_server.discover_vscode_processes(run_dir)
 
         self.assertEqual([{key: matches[0][key] for key in ("pid", "pgid", "port")}], [{"pid": 101, "pgid": 101, "port": 19000}])
@@ -1202,7 +1202,7 @@ class VideoAnalyzerUITests(unittest.TestCase):
     def test_static_ui_marks_running_and_pending_states_visually(self):
         js = (UI_ROOT / "video_analyzer_ui" / "static" / "js" / "main.js").read_text(encoding="utf-8")
         css = (UI_ROOT / "video_analyzer_ui" / "static" / "css" / "styles.css").read_text(encoding="utf-8")
-        status_source = (REPO_ROOT / "tools" / "video_link_status_server.py").read_text(encoding="utf-8")
+        status_source = (REPO_ROOT / "video_analyzer" / "jobengine" / "video_link_status_server.py").read_text(encoding="utf-8")
 
         self.assertIn("status-spinner", js)
         self.assertIn(".doc-preview-body.audio", css)

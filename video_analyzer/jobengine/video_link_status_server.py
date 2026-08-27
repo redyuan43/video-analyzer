@@ -19,50 +19,51 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
-import tempfile
-import requests
-from email import policy
-from email.parser import BytesParser
-from urllib.parse import quote, unquote, urlencode
 import uuid
 from datetime import datetime
+from email import policy
+from email.parser import BytesParser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 from urllib.request import urlopen
 
-from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient
+import requests
+
 from video_analyzer.audio_workflow_snapshot import (
     AudioWorkflowSnapshotError,
     parse_audio_workflow_snapshot,
     resolve_audio_workflow_profile,
 )
+from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient
 from video_analyzer.config import (
     Config,
     build_openai_extra_body,
     deep_merge,
-    resolve_endpoint_config,
     resolve_api_key,
+    resolve_endpoint_config,
     resolve_temperature,
 )
 from video_analyzer.doc_chat import ask_video_docs_result
 from video_analyzer.failures import FAILURE_FILE_ENV, read_failure_envelope
 from video_analyzer.model_settings import (
-    AUDIO_WORKFLOW_ID,
     AUDIO_PROFILE_FLOW,
+    AUDIO_WORKFLOW_ID,
+    VIDEO_PROFILE_FLOW,
+    VIDEO_WORKFLOW_ID,
     RuntimeSettingsStore,
     SettingsValidationError,
-    VIDEO_WORKFLOW_ID,
-    VIDEO_PROFILE_FLOW,
     apply_disabled_runtime_profiles,
     build_settings_document,
     expand_runtime_profile,
 )
 from video_analyzer.qa_index import ANSWER_INDEX_NAME, CHUNKS_NAME, QA_DIR_NAME
+from video_analyzer.resource_locks import DEFAULT_LOCK_DIR
 from video_analyzer.skill_distillation import (
     DEFAULT_DISTILLATION_PROFILE,
     DistillationError,
@@ -71,7 +72,11 @@ from video_analyzer.skill_distillation import (
     enable_distilled_skills,
     initialize_distillation,
     load_evidence_records,
+)
+from video_analyzer.skill_distillation import (
     load_state as load_distillation_state,
+)
+from video_analyzer.skill_distillation import (
     save_state as save_distillation_state,
 )
 from video_analyzer.skill_projects import (
@@ -82,7 +87,6 @@ from video_analyzer.skill_projects import (
     capability_inventory,
 )
 from video_analyzer.tencent_hy_asr import missing_tencent_credentials
-from video_analyzer.resource_locks import DEFAULT_LOCK_DIR
 from video_analyzer.url_context import (
     AUDIO_MEDIA_EXTENSIONS,
     FALLBACK_OUTPUT_ROOT,
@@ -95,7 +99,7 @@ from video_analyzer.url_context import (
 logger = logging.getLogger(__name__)
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_JOBS_DIR = REPO_ROOT / "tmp" / "video-link-status" / "jobs"
 COLLECTION_ID_PATTERN = re.compile(r"^[a-f0-9]{32}$")
 AUDIO_TEMPLATE_CATALOG = (

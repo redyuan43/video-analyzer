@@ -22,7 +22,7 @@ from video_analyzer.frame_manifest import write_frame_manifest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SERVER_PATH = REPO_ROOT / "tools" / "video_link_status_server.py"
+SERVER_PATH = REPO_ROOT / "video_analyzer" / "jobengine" / "video_link_status_server.py"
 URL_CONTEXT_PATH = REPO_ROOT / "video_analyzer" / "url_context.py"
 
 
@@ -3365,7 +3365,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             log_path = Path(tmp) / "analyze-core.log"
 
             completed = subprocess.CompletedProcess(["tools/start_jetson_frame_ray.sh"], 0, stdout="cluster ready", stderr="")
-            with patch("tools.video_link_status_server.subprocess.run", return_value=completed) as run:
+            with patch("video_analyzer.jobengine.video_link_status_server.subprocess.run", return_value=completed) as run:
                 result = server.ensure_jetson_ray_ready(command, str(log_path))
             log_text = log_path.read_text(encoding="utf-8")
 
@@ -3378,7 +3378,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
             command = ["tools/run_operation_manual_from_url.sh", "https://example.com/video", "--jetson-frame-backend", "ssh"]
 
-            with patch("tools.video_link_status_server.subprocess.run") as run:
+            with patch("video_analyzer.jobengine.video_link_status_server.subprocess.run") as run:
                 result = server.ensure_jetson_ray_ready(command, str(Path(tmp) / "analyze-core.log"))
 
         self.assertIsNone(result)
@@ -3396,7 +3396,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
                 "ray",
             ]
 
-            with patch("tools.video_link_status_server.subprocess.run") as run:
+            with patch("video_analyzer.jobengine.video_link_status_server.subprocess.run") as run:
                 result = server.ensure_jetson_ray_ready(
                     command,
                     str(Path(tmp) / "analyze-core.log"),

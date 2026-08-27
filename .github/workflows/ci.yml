@@ -48,7 +48,7 @@ jobs:
       - name: Compile check (核心入口)
         run: |
           python -m py_compile \
-            tools/video_link_status_server.py \
+            video_analyzer/jobengine/video_link_status_server.py \
             video-analyzer-ui/video_analyzer_ui/server.py
       - name: Run deterministic unit tests
         # 与 AGENTS.md「Verification Commands」保持一致的项目级验证门禁。
