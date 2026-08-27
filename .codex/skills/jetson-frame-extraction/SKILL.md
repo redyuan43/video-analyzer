@@ -51,7 +51,7 @@ Core CLI flags for manual runs:
 Check Jetson prerequisites:
 
 ```bash
-tools/check_jetson_frame_workers.sh
+tools/ops/check_jetson_frame_workers.sh
 ```
 
 Manual check:

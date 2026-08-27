@@ -57,7 +57,7 @@ class JetsonRayScriptTests(unittest.TestCase):
             env.pop("JETSON_RAY_HEAD_SSH", None)
 
             result = subprocess.run(
-                ["bash", "tools/start_jetson_frame_ray.sh"],
+                ["bash", "tools/ops/start_jetson_frame_ray.sh"],
                 cwd=REPO_ROOT,
                 env=env,
                 text=True,

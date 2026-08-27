@@ -47,7 +47,7 @@ ensure_supported_node() {
 
 ensure_supported_node
 
-source "$ROOT_DIR/tools/operation_manual_no_proxy_env.sh"
+source "$ROOT_DIR/tools/ops/operation_manual_no_proxy_env.sh"
 
 YTDLP_RUNTIME_LOCK="${VIDEO_ANALYZER_YTDLP_RUNTIME_LOCK:-$ROOT_DIR/tmp/video-link-status/ytdlp-runtime.lock}"
 if command -v flock >/dev/null 2>&1; then

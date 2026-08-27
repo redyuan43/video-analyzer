@@ -1,9 +1,4 @@
 #!/usr/bin/env bash
-# Operation-manual runtime talks to LAN/Tailscale services directly.
-
-unset HTTP_PROXY HTTPS_PROXY ALL_PROXY
-unset http_proxy https_proxy all_proxy
-
-export NO_PROXY="*"
-export no_proxy="*"
-
+# Backward-compatible shim for tools/ops/operation_manual_no_proxy_env.sh.
+# shellcheck source=/dev/null
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ops/operation_manual_no_proxy_env.sh"

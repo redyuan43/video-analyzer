@@ -7,7 +7,7 @@
 - Do not commit or push unless the user explicitly asks for it.
 - Keep local runtime overrides in `config/config.json`; do not commit machine-specific endpoint or model configuration.
 - Prefer `rg` for code and documentation search.
-- Operation-manual run scripts must bypass local proxy variables for LAN/Tailscale endpoints. Source `tools/operation_manual_no_proxy_env.sh` instead of letting `HTTP_PROXY`/`ALL_PROXY` route local loopback services, AMD Fast, Jetson, or other LAN/Tailscale traffic through local proxies such as `127.0.0.1:10808`.
+- Operation-manual run scripts must bypass local proxy variables for LAN/Tailscale endpoints. Source `tools/ops/operation_manual_no_proxy_env.sh` instead of letting `HTTP_PROXY`/`ALL_PROXY` route local loopback services, AMD Fast, Jetson, or other LAN/Tailscale traffic through local proxies such as `127.0.0.1:10808`.
 - Keep runtime endpoints aligned with the current `ai` host by default. Do not switch ASR/OCR/VL work to Spark or Edge unless the user explicitly asks for a cross-machine comparison or fallback.
 - If the user's request is clearly part of an ongoing implementation or says to continue, keep executing the next required step instead of stopping at a status update. Report concise progress, then continue until the task is genuinely blocked or complete.
 
@@ -19,7 +19,7 @@
   `local-model-runtime` lock for the whole model-using stage. A second task
   must wait on that lock and must not unload or replace the currently active
   local model until the first task finishes its ASR/OCR/VL stage and releases
-  the lock. Stage switching uses `tools/prepare_ai_local_model_stage.sh` for
+  the lock. Stage switching uses `tools/ops/prepare_ai_local_model_stage.sh` for
   loopback endpoints only; remote endpoints should not trigger
   local service switching.
 - The default operation-manual ASR path should use local VibeVoice on the current `ai` machine:
@@ -148,14 +148,14 @@ A passing local response includes:
 - AGX can run two NVDEC sessions concurrently; a two-way `h264_nvv4l2dec` smoke improved two 300s segments from about 138s sequential to about 48s parallel. Keep the default at two AGX frame workers unless a dedicated benchmark proves a better count.
 - Hardware decode is mandatory for long-video Jetson extraction. Before claiming the AGX worker is healthy, verify its `health` result reports `decode_backend` containing `nvdec`. Do not silently fall back to software `ffmpeg` for long videos.
 - Jetson workers should use hardware low-res previews for frame-difference scoring when available: `nvv4l2decoder ! nvvidconv ! video/x-raw,format=GRAY8,width=320,height=180`. The selected candidate timestamps are then materialized as high-resolution JPEG stills for OCR/VL. This keeps OCR quality while moving grayscale/resize work to VIC.
-- The current validated long-talk transport is Ray. Use `tools/start_jetson_frame_ray.sh` before long-video runs; it verifies the AGX Ray head and all five host resources, and restarts the cluster only when the resource set is incomplete.
+- The current validated long-talk transport is Ray. Use `tools/ops/start_jetson_frame_ray.sh` before long-video runs; it verifies the AGX Ray head and all five host resources, and restarts the cluster only when the resource set is incomplete.
 - Ray worker subprocesses must not inherit an empty `CUDA_VISIBLE_DEVICES`. On AGX, `ffmpeg -c:v h264_nvv4l2dec` can SIGSEGV under Ray when `CUDA_VISIBLE_DEVICES=""`; remove that variable before launching the frame worker subprocess.
 - The SSH workers are on-demand, not daemons: the local pipeline pushes `worker.py`, syncs/caches the video, runs chunks, pulls candidates back, and merges locally.
 - For Ray conversion, do not rely on the local `.venv` as the driver because it uses Python 3.14 and Ray wheels may be unavailable. The Jetson devices use Python 3.10, so run the Ray head/driver on a device, preferably AGX when available, and have NX devices join as Ray workers. If the Ray head disappears during a job, expect the job to fail; scripts may choose a new head before a run, but Ray will not automatically keep the current job alive by electing a replacement head.
 - Human one-command path for the current long sample is:
   `OCR_CACHE=refresh tools/pipelines/run_s36ri23_fast_full.sh`
 - Check worker readiness with:
-  `tools/check_jetson_frame_workers.sh`
+  `tools/ops/check_jetson_frame_workers.sh`
 - Detailed operations, public CLI/API flags, maintenance commands, and the measured baseline live in `docs/JETSON_FRAME_WORKERS.md` and `.codex/skills/jetson-frame-extraction/SKILL.md`.
 
 ## Jetson LAN Sync
@@ -167,7 +167,7 @@ A passing local response includes:
   - `nx3`: `nx@192.168.31.35`, Tailscale `100.127.71.86`
   - `nx4`: `nx@192.168.31.10`, Tailscale `100.82.227.71`
   - `agx`: `agx@192.168.31.201`, Tailscale `100.103.199.121`
-- For AGX Ray startup, default to the `agx` control host and let `tools/start_jetson_frame_ray.sh` resolve the current private LAN IP from AGX before starting Ray. The video-link status launcher probes LAN device names (`agx-lan,agx.local,ubuntu.local` by default) and exports `JETSON_AGX_LAN_HOST` only when the name resolves and `ssh agx@<name>` works. Set `JETSON_AGX_LAN_HOST=agx-lan` only when a stable LAN DNS/DHCP hostname exists; customize probe names with `VIDEO_LINK_AGX_LAN_HOST_CANDIDATES`; set `JETSON_RAY_HEAD_IP` only as an explicit temporary override.
+- For AGX Ray startup, default to the `agx` control host and let `tools/ops/start_jetson_frame_ray.sh` resolve the current private LAN IP from AGX before starting Ray. The video-link status launcher probes LAN device names (`agx-lan,agx.local,ubuntu.local` by default) and exports `JETSON_AGX_LAN_HOST` only when the name resolves and `ssh agx@<name>` works. Set `JETSON_AGX_LAN_HOST=agx-lan` only when a stable LAN DNS/DHCP hostname exists; customize probe names with `VIDEO_LINK_AGX_LAN_HOST_CANDIDATES`; set `JETSON_RAY_HEAD_IP` only as an explicit temporary override.
 - All `nx*` device passwords are `nx`; AGX password is `agx`. Prefer using those only to bootstrap public-key auth, then keep automated runs passwordless.
 - Before large syncs, validate LAN mesh with direct device-to-device SSH, for example:
   `ssh nx1 "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new nx@192.168.31.10 hostname"`

@@ -44,7 +44,7 @@ The script already includes:
 Start or refresh the AGX Ray head with:
 
 ```bash
-tools/start_jetson_frame_ray.sh
+tools/ops/start_jetson_frame_ray.sh
 ```
 
 The default Ray resource shape is `frame_worker=2` on AGX. The startup script
@@ -108,7 +108,7 @@ Important fields:
 Run:
 
 ```bash
-tools/check_jetson_frame_workers.sh
+tools/ops/check_jetson_frame_workers.sh
 ```
 
 Expected minimum for the AGX long-talk path:

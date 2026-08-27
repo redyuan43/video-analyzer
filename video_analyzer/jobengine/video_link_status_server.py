@@ -3871,7 +3871,7 @@ class VideoLinkStatusServer:
     def local_text_command(self, job: dict[str, Any], command: list[str]) -> list[str]:
         return [
             sys.executable,
-            "tools/run_local_model_stage.py",
+            "tools/ops/run_local_model_stage.py",
             "--stage",
             "text",
             "--config",

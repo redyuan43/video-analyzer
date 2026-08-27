@@ -38,7 +38,7 @@ for ((index = 0; index < ${#extra_args[@]}; index++)); do
 done
 
 if [[ "$FRAME_EXTRACTOR" == "jetson" && "$JETSON_FRAME_BACKEND" == "ray" ]]; then
-  tools/start_jetson_frame_ray.sh
+  tools/ops/start_jetson_frame_ray.sh
 fi
 if [[ "$FRAME_EXTRACTOR" == "jetson" && "$JETSON_FRAME_BACKEND" == "ray" && -s "$ACTIVE_HOSTS_FILE" ]]; then
   JETSON_FRAME_HOSTS="$(<"$ACTIVE_HOSTS_FILE")"

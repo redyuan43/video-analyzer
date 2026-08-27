@@ -3364,7 +3364,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             ]
             log_path = Path(tmp) / "analyze-core.log"
 
-            completed = subprocess.CompletedProcess(["tools/start_jetson_frame_ray.sh"], 0, stdout="cluster ready", stderr="")
+            completed = subprocess.CompletedProcess(["tools/ops/start_jetson_frame_ray.sh"], 0, stdout="cluster ready", stderr="")
             with patch("video_analyzer.jobengine.video_link_status_server.subprocess.run", return_value=completed) as run:
                 result = server.ensure_jetson_ray_ready(command, str(log_path))
             log_text = log_path.read_text(encoding="utf-8")

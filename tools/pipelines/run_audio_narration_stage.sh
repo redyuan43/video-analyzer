@@ -38,7 +38,7 @@ restore_text_pool() {
   local restore_status
   trap - EXIT
   set +e
-  "$PYTHON_BIN" tools/run_local_model_stage.py \
+  "$PYTHON_BIN" tools/ops/run_local_model_stage.py \
     --stage text \
     --config "$CONFIG_DIR" \
     --profile "$PROFILE" \
@@ -52,7 +52,7 @@ restore_text_pool() {
 
 cd "$ROOT_DIR"
 trap restore_text_pool EXIT
-"$PYTHON_BIN" tools/run_local_model_stage.py \
+"$PYTHON_BIN" tools/ops/run_local_model_stage.py \
   --stage text \
   --config "$CONFIG_DIR" \
   --profile "$PROFILE" \
@@ -62,7 +62,7 @@ trap restore_text_pool EXIT
     --skip-tts
 
 if [[ "${VIDEO_ANALYZER_TTS_ROUTE:-local}" != "cloud_fallback" ]]; then
-  "$PYTHON_BIN" tools/run_local_model_stage.py \
+  "$PYTHON_BIN" tools/ops/run_local_model_stage.py \
     --stage tts \
     --config "$CONFIG_DIR" \
     --profile "$PROFILE" \

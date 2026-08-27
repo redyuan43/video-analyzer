@@ -211,13 +211,13 @@ EOF
 
 regenerate_docs() {
   echo "[docs] multidoc"
-  "$PYTHON_BIN" "$ROOT_DIR/tools/run_local_model_stage.py" \
+  "$PYTHON_BIN" "$ROOT_DIR/tools/ops/run_local_model_stage.py" \
     --stage text \
     --config config \
     --profile "$PROFILE" \
     -- "$ROOT_DIR/tools/pipelines/run_multidoc_analysis.sh" "$RUN_DIR" --profile "$PROFILE"
   echo "[docs] deep-v2"
-  "$PYTHON_BIN" "$ROOT_DIR/tools/run_local_model_stage.py" \
+  "$PYTHON_BIN" "$ROOT_DIR/tools/ops/run_local_model_stage.py" \
     --stage text \
     --config config \
     --profile "$PROFILE" \

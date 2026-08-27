@@ -156,8 +156,8 @@ more resilient than pinning a project-wide player client.
 Validate or update the local yt-dlp runtime with:
 
 ```bash
-tools/ytdlp_runtime_maintenance.sh check
-tools/ytdlp_runtime_maintenance.sh update
+tools/ops/ytdlp_runtime_maintenance.sh check
+tools/ops/ytdlp_runtime_maintenance.sh update
 ```
 
 The repository includes a daily user-systemd timer template. Install it only
@@ -165,8 +165,8 @@ after reviewing the local service change:
 
 ```bash
 mkdir -p ~/.config/systemd/user
-install -m 0644 tools/systemd/video-analyzer-ytdlp-maintenance.service ~/.config/systemd/user/
-install -m 0644 tools/systemd/video-analyzer-ytdlp-maintenance.timer ~/.config/systemd/user/
+install -m 0644 tools/ops/systemd/video-analyzer-ytdlp-maintenance.service ~/.config/systemd/user/
+install -m 0644 tools/ops/systemd/video-analyzer-ytdlp-maintenance.timer ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now video-analyzer-ytdlp-maintenance.timer
 ```
