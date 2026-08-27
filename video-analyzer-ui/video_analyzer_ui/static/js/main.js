@@ -2446,8 +2446,8 @@ async function refreshJobsNoSelect() {
 }
 
 function jobCollectionUrl() {
-    if (selectedJobSource === 'video') return '/api/video-link/jobs?limit=50';
-    return `/api/operator/audio-jobs?limit=50&tenant_id=${encodeURIComponent(selectedJobSource)}`;
+    if (selectedJobSource === 'video') return '/api/video-link/jobs?limit=200';
+    return `/api/operator/audio-jobs?limit=200&tenant_id=${encodeURIComponent(selectedJobSource)}`;
 }
 
 async function loadJobSources() {
@@ -7335,8 +7335,13 @@ function renderPreviewCard(job) {
     const scanning = job.status === 'running' && !failed;
     const percent = clampPercent(Number(job.progress?.percent || 0));
     const durationSeconds = Number(preview.duration_seconds || 0);
-    const video = ready
-        ? `<video class="preview-video" preload="metadata" playsinline data-src="${escapeHtml(preview.video_url)}"></video>`
+    const videoPlaceholder = ready
+        ? `<div class="preview-video-placeholder" data-job-id="${escapeHtml(job.job_id)}" data-video-url="${escapeHtml(preview.video_url)}" title="点击播放">
+             <svg class="preview-play-icon" viewBox="0 0 72 72" aria-hidden="true">
+                 <circle cx="36" cy="36" r="34" fill="rgba(16,24,40,.5)" stroke="rgba(255,255,255,.85)" stroke-width="2.5"></circle>
+                 <path d="M30.5 24.5 L52 36 L30.5 47.5 Z" fill="#fff"></path>
+             </svg>
+           </div>`
         : `<div class="preview-placeholder">${failed ? '加载停止' : '等待视频'}</div>`;
     const buttonLabel = ready ? '播放' : (failed ? '失败' : '等待');
     const sourceLink = job.video_url
@@ -7350,7 +7355,7 @@ function renderPreviewCard(job) {
         data-started-at="${escapeHtml(scanStartTime(job))}"
         data-progress="${escapeHtml(job.progress?.percent || 0)}">
         <div class="preview-frame" data-job-id="${escapeHtml(job.job_id)}" title="点击查看任务详情预览">
-            ${video}
+            ${videoPlaceholder}
             <div class="task-scanline" aria-hidden="true"></div>
             <div class="preview-status-row">
                 ${previewStatusControl(job)}
@@ -7388,7 +7393,16 @@ function bindPreviewControls() {
         video.addEventListener('error', () => markPreviewVideoError(video));
     });
     document.querySelectorAll('.preview-play').forEach(button => {
-        button.addEventListener('click', () => togglePreviewPlayback(button.dataset.jobId));
+        button.addEventListener('click', event => {
+            event.stopPropagation();
+            togglePreviewPlayback(button.dataset.jobId);
+        });
+    });
+    document.querySelectorAll('.preview-video-placeholder').forEach(placeholder => {
+        placeholder.addEventListener('click', event => {
+            event.stopPropagation();
+            togglePreviewPlayback(placeholder.dataset.jobId);
+        });
     });
     document.querySelectorAll('.task-run-dir-link').forEach(button => {
         button.addEventListener('click', event => {
@@ -7401,7 +7415,7 @@ function bindPreviewControls() {
     });
     document.querySelectorAll('.preview-frame').forEach(frame => {
         frame.addEventListener('click', event => {
-            if (event.target.closest('a, button')) return;
+            if (event.target.closest('a, button, .preview-video-placeholder')) return;
             openPreviewModal(frame.dataset.jobId);
         });
     });
@@ -7425,7 +7439,26 @@ function setPreviewButton(video, label) {
 }
 
 async function togglePreviewPlayback(jobId) {
-    const video = previewVideo(jobId);
+    let video = previewVideo(jobId);
+    if (!video) {
+        // 尝试将占位符替换为真实视频
+        const placeholder = document.querySelector(`.preview-video-placeholder[data-job-id="${CSS.escape(jobId)}"]`);
+        if (placeholder) {
+            const videoUrl = placeholder.dataset.videoUrl;
+            video = document.createElement('video');
+            video.className = 'preview-video';
+            video.playsInline = true;
+            video.dataset.src = videoUrl;
+            // 添加事件监听
+            video.addEventListener('loadedmetadata', () => updateVideoControls(video));
+            video.addEventListener('timeupdate', () => updateVideoControls(video));
+            video.addEventListener('play', () => setPreviewButton(video, '暂停'));
+            video.addEventListener('pause', () => setPreviewButton(video, '播放'));
+            video.addEventListener('error', () => markPreviewVideoError(video));
+            // 替换占位符
+            placeholder.replaceWith(video);
+        }
+    }
     if (!video) return;
     ensureTaskPreviewVideoSource(video);
     if (video.paused) {
@@ -7508,7 +7541,9 @@ function startScanAnimation() {
 }
 
 function updateScanFrames(now = Date.now()) {
-    document.querySelectorAll('[data-scan]').forEach(frame => {
+    const modalVisible = nodes.previewModal && !nodes.previewModal.hidden;
+    const root = modalVisible ? nodes.previewModal : document;
+    root.querySelectorAll('[data-scan]').forEach(frame => {
         const status = frame.dataset.status || 'created';
         const failed = frame.classList.contains('preview-failed');
         const baseProgress = clampPercent(Number(frame.dataset.progress || 0));
@@ -7640,8 +7675,8 @@ function renderPreviewModal(job) {
         nodes.pmVideoPlaceholder.hidden = true;
         if (nodes.pmVideo.dataset.src !== preview.video_url) {
             nodes.pmVideo.dataset.src = preview.video_url;
-            nodes.pmVideo.src = preview.video_url;
-            nodes.pmVideo.load();
+            // 不立即加载，只在用户点击播放时才加载
+            nodes.pmVideo.removeAttribute('src');
         }
     } else {
         nodes.pmVideo.hidden = true;

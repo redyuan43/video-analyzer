@@ -2945,6 +2945,10 @@ th {
     padding: 22px;
     color: #101828;
     background: #fff;
+    will-change: scroll-position;
+    contain: layout style paint;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
 }
 
 .doc-preview-body.pdf {
@@ -3202,11 +3206,13 @@ th {
 .doc-preview-body.markdown h4 {
     margin: 1.2em 0 0.5em;
     line-height: 1.25;
+    content-visibility: auto;
 }
 
 .doc-preview-body.markdown p,
 .doc-preview-body.markdown ul {
     margin: 0 0 0.85em;
+    content-visibility: auto;
 }
 
 .doc-preview-body.markdown hr {
@@ -3222,6 +3228,7 @@ th {
     border-left: 4px solid #2563eb;
     background: #f8fafc;
     color: #344054;
+    content-visibility: auto;
 }
 
 .doc-preview-body.markdown blockquote p {
@@ -3236,6 +3243,7 @@ th {
     max-width: 100%;
     margin: 0 0 1em;
     overflow-x: auto;
+    content-visibility: auto;
 }
 
 .doc-preview-body.markdown table {
@@ -3270,6 +3278,7 @@ th {
     border-radius: 6px;
     background: #0f172a;
     color: #e5e7eb;
+    content-visibility: auto;
 }
 
 .doc-preview-body.markdown code {
@@ -3293,6 +3302,8 @@ th {
     background: #f8fafc;
     object-fit: contain;
     cursor: zoom-in;
+    will-change: transform;
+    content-visibility: auto;
 }
 
 .doc-preview-body.markdown td img.markdown-image {
@@ -3315,6 +3326,8 @@ figure.markdown-image img {
     background: #f8fafc;
     object-fit: contain;
     cursor: zoom-in;
+    will-change: transform;
+    content-visibility: auto;
 }
 
 body.image-viewer-open {
@@ -5765,6 +5778,31 @@ button.danger {
     background: #101828;
 }
 
+.preview-video-placeholder {
+    display: grid;
+    place-items: center;
+    width: 100%;
+    height: 100%;
+    background:
+        linear-gradient(135deg, rgba(37, 99, 235, .18), transparent 42%),
+        linear-gradient(315deg, rgba(22, 163, 74, .16), transparent 46%),
+        #101828;
+    cursor: pointer;
+}
+
+.preview-video-placeholder .preview-play-icon {
+    width: 56px;
+    height: 56px;
+    filter: drop-shadow(0 2px 8px rgba(0, 0, 0, .35));
+    opacity: .9;
+    transition: transform .15s ease, opacity .15s ease;
+}
+
+.preview-video-placeholder:hover .preview-play-icon {
+    transform: scale(1.08);
+    opacity: 1;
+}
+
 .preview-placeholder {
     display: grid;
     place-items: center;
@@ -6017,6 +6055,9 @@ button.danger {
     min-height: 320px;
     padding: 14px;
     overflow: auto;
+    will-change: scroll-position;
+    contain: layout style paint;
+    overscroll-behavior: contain;
 }
 
 .pm-video-stage {

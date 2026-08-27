@@ -307,7 +307,7 @@ class VideoAnalyzerUI:
 
         @self.app.route('/api/video-link/jobs')
         def video_link_jobs():
-            limit = request.args.get('limit', default=50, type=int)
+            limit = request.args.get('limit', default=200, type=int)
             return jsonify(
                 self.video_link.list_jobs(limit, include_mobile_audio=False)
             )
