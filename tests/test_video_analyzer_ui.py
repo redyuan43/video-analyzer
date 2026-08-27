@@ -26,7 +26,7 @@ def load_ui_module():
 
 
 ui_mod = load_ui_module()
-from tools.video_link_status_supervisor import Supervisor  # noqa: E402
+from tools.video_link.video_link_status_supervisor import Supervisor  # noqa: E402
 from video_analyzer.jobengine import video_link_status_server as status_server  # noqa: E402
 from video_analyzer_ui.runtime_identity import RuntimeIdentity  # noqa: E402
 

@@ -145,7 +145,7 @@ web_debug_console/            # 并入 video_analyzer_ui 或独立发布包（�
 | 现有 | 目标归属 | 动作 |
 |---|---|---|
 | `tools/video_link_status_server.py`（引擎本体） | `video_analyzer/jobengine/`（正式包） | 已迁入 ✅（Phase 3a） |
-| `tools/video_link_status_supervisor.py` | `tools/video_link/` 入口 | 迁移 |
+| `tools/video_link_status_supervisor.py` | `tools/video_link/` 入口 | 已迁入 ✅（Phase 3b） |
 | `tools/pipelines/run_audio_template_analysis.py`（逻辑） | `video_analyzer/pipeline/audio/template_analysis.py` | 下沉主包 |
 | `tools/pipelines/run_multidoc_analysis.py` 等 re-export | 删除包装器，入口改用主包 | 去重 |
 | 根目录 `test_operation_manual.py` / `test_prompt_loading.py` | `tests/` | 迁移统一 |

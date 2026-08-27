@@ -5,7 +5,7 @@
 ## 启动
 
 ```bash
-tools/run_video_link_status_server.sh restart
+tools/video_link/run_video_link_status_server.sh restart
 ```
 
 打开：
