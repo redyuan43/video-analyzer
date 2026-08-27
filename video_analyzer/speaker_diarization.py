@@ -296,7 +296,7 @@ def run_pyannote_assignment(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     config = config or {}
     python = str(config.get("external_python") or "/home/ai/pyannote-community-venv/bin/python")
-    helper = Path(__file__).resolve().parents[1] / "tools" / "run_diarization_benchmark.py"
+    helper = Path(__file__).resolve().parents[1] / "tools" / "benchmarks" / "run_diarization_benchmark.py"
     with tempfile.TemporaryDirectory(prefix="pyannote_assignment_") as temp:
         output = Path(temp) / "result.json"
         command = [

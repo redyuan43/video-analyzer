@@ -123,7 +123,7 @@ AUDIO_PIPELINE_PROFILE_ALIASES = {
     AUDIO_PIPELINE_PROFILE_NX1: AUDIO_PIPELINE_PROFILE_NX1,
     AUDIO_PIPELINE_KIND_TRANSCRIPTION: AUDIO_PIPELINE_KIND_TRANSCRIPTION,
 }
-BAOYU_PROMPT_SCRIPT = REPO_ROOT / "tools" / "prepare_baoyu_image_prompts.py"
+BAOYU_PROMPT_SCRIPT = REPO_ROOT / "tools" / "publish" / "prepare_baoyu_image_prompts.py"
 ALLOWED_ANALYSIS_MODES = ("auto", "fast", "balanced", "deep", "operation-fast", "long-talk-fast")
 ALLOWED_ANALYSIS_DEPTHS = ("light", "full")
 ALLOWED_COOKIE_BROWSERS = ("", "chrome", "none", "edge", "firefox", "chromium", "brave")
@@ -4139,7 +4139,7 @@ class VideoLinkStatusServer:
     def deep_v2_command(self, job: dict[str, Any]) -> list[str]:
         return [
             sys.executable,
-            "tools/generate_chapter_deep_report.py",
+            "tools/publish/generate_chapter_deep_report.py",
             str(self.require_run_dir(job)),
             "--profile",
             job["options"]["profile"],
@@ -4192,7 +4192,7 @@ class VideoLinkStatusServer:
 
     def export_command(self, job: dict[str, Any]) -> list[str]:
         return [
-            "tools/export_video_docs.sh",
+            "tools/publish/export_video_docs.sh",
             str(self.require_run_dir(job)),
             "--final-only",
             "--jobs",
@@ -4212,7 +4212,7 @@ class VideoLinkStatusServer:
                 )
             raise BridgeError(HTTPStatus.CONFLICT, f"missing final operation manual: {manual_path}")
         command = [
-            "tools/run_video_doc_final_publish.sh",
+            "tools/publish/run_video_doc_final_publish.sh",
             str(run_dir),
             "--profile",
             job["options"].get("profile") or DEFAULT_PROFILE,

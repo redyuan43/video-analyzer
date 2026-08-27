@@ -118,7 +118,7 @@ Apple ID it expires after 7 days and needs a re-run from Xcode.
 Generated, not hand-drawn:
 
 ```bash
-.venv/bin/python tools/generate_app_icons.py
+.venv/bin/python tools/publish/generate_app_icons.py
 ```
 
 That script writes both the iOS `AppIcon-1024.png` and the web

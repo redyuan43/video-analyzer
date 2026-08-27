@@ -118,19 +118,19 @@ A passing local response includes:
 - For publisher resume after operation-manual artifacts already exist, use:
   `~/.codex/skills/video-link/scripts/run_video_link_analysis_publisher.sh URL --profile deepseek_v4_pro --run-dir "$RUN_DIR" --skip-operation`
 - Current final publish is Markdown-first and does not generate PDF by default. The four final documents are `operation_manual.md`, `docs_analysis_chapters/knowledge_notes_v2.md`, `docs_analysis_chapters/deep_report_v2.md`, and `manual_evidence.md`.
-- PDF export is opt-in only. Use `tools/run_video_doc_final_publish.sh RUN_DIR --pdf` or `tools/export_video_docs.sh` only when the user explicitly requests PDF delivery.
-- The optional PDF backend is `tools/md_to_mobile_pdf.py` through `tools/export_video_docs.sh`. It renders prepared Markdown to narrow mobile-readable PDF with WeasyPrint. Simple acyclic `flowchart TB/TD` and `graph TB/TD/LR/RL` Mermaid blocks should render as native mobile HTML flowcharts, including branch/merge flows and `<br/>` label breaks; more complex Mermaid blocks rely on `@mermaid-js/mermaid-cli` plus Chrome/Chromium PNG rendering.
+- PDF export is opt-in only. Use `tools/publish/run_video_doc_final_publish.sh RUN_DIR --pdf` or `tools/publish/export_video_docs.sh` only when the user explicitly requests PDF delivery.
+- The optional PDF backend is `tools/publish/md_to_mobile_pdf.py` through `tools/publish/export_video_docs.sh`. It renders prepared Markdown to narrow mobile-readable PDF with WeasyPrint. Simple acyclic `flowchart TB/TD` and `graph TB/TD/LR/RL` Mermaid blocks should render as native mobile HTML flowcharts, including branch/merge flows and `<br/>` label breaks; more complex Mermaid blocks rely on `@mermaid-js/mermaid-cli` plus Chrome/Chromium PNG rendering.
 - If final publish appears stuck during PDF export, first identify the exact document being rendered. Check the stage log, live process, and export directory before suspecting OCR/GPU/model work:
   `tail -n 160 tmp/video-link-status/jobs/<job_id>/logs/final-publish.log`,
   `pgrep -af 'run_video_doc_final_publish|export_video_docs|md_to_mobile_pdf'`,
   and `ls -lh <run_dir>/exports`.
   A common failure mode is `md_to_mobile_pdf.py ... manual_evidence.pdf` consuming 100% CPU with no output PDF. This is usually WeasyPrint/Pango struggling with `manual_evidence.md` evidence tables on the narrow mobile page, not a DeepSeek/OCR/VL/GPU issue.
-- For `manual_evidence.pdf`, keep the source Markdown/JSON evidence complete, but make the export-prepared Markdown PDF-friendly. `tools/prepare_video_doc_export.py` should summarize or card-ify pathological evidence tables and avoid passing huge OCR/VL cells, inline HTML tables, and dense frame evidence maps directly to WeasyPrint. Validate with a focused smoke before rerunning final publish:
-  `.venv/bin/python tools/prepare_video_doc_export.py RUN_DIR RUN_DIR/manual_evidence.md /tmp/manual_evidence_test.md`
-  then `timeout 60 .venv/bin/python tools/md_to_mobile_pdf.py /tmp/manual_evidence_test.md /tmp/manual_evidence_test.pdf --title manual_evidence`.
+- For `manual_evidence.pdf`, keep the source Markdown/JSON evidence complete, but make the export-prepared Markdown PDF-friendly. `tools/publish/prepare_video_doc_export.py` should summarize or card-ify pathological evidence tables and avoid passing huge OCR/VL cells, inline HTML tables, and dense frame evidence maps directly to WeasyPrint. Validate with a focused smoke before rerunning final publish:
+  `.venv/bin/python tools/publish/prepare_video_doc_export.py RUN_DIR RUN_DIR/manual_evidence.md /tmp/manual_evidence_test.md`
+  then `timeout 60 .venv/bin/python tools/publish/md_to_mobile_pdf.py /tmp/manual_evidence_test.md /tmp/manual_evidence_test.pdf --title manual_evidence`.
 - If `final-publish` was interrupted, verify the four final Markdown documents and `final_publish_summary.json`; incomplete final documents must leave the stage and top-level runner failed.
-- Optional long-image delivery requires explicit PDF export and uses `tools/export_video_docs.sh --long-png` or `tools/run_video_doc_final_publish.sh --pdf --long-png`.
-- Final publish should generate the configured Baoyu final images when `skip_images` is false and run `tools/augment_video_docs_images.py`; it must not generate PDFs unless explicitly requested.
+- Optional long-image delivery requires explicit PDF export and uses `tools/publish/export_video_docs.sh --long-png` or `tools/publish/run_video_doc_final_publish.sh --pdf --long-png`.
+- Final publish should generate the configured Baoyu final images when `skip_images` is false and run `tools/publish/augment_video_docs_images.py`; it must not generate PDFs unless explicitly requested.
 - Before reporting video-link completion, verify the four final Markdown documents exist and are non-empty, and verify configured final image PNGs exist unless `skip_images` is true.
   Keep `knowledge_notes`, `deep_report`, and `deep_report_v2.review` as intermediate or QA artifacts unless the user explicitly asks for them.
 

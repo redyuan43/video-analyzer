@@ -257,7 +257,7 @@ should not become main operation steps unless confirmed by stronger evidence.
 For a completed publishing pass, use:
 
 ```bash
-tools/run_video_doc_final_publish.sh output/manual-run --profile deepseek_v4_flash --jobs 3
+tools/publish/run_video_doc_final_publish.sh output/manual-run --profile deepseek_v4_flash --jobs 3
 ```
 
 This resumes from existing analysis artifacts, generates final visual summaries

@@ -53,8 +53,8 @@ tmp/video-link-status/
 - 资源忙时阶段会显示 `queued`，而不是返回锁冲突失败。
 - 服务重启后如果发现旧任务停在 `running`/`queued`，会检查记录的阶段进程：进程仍在则保持 `running`，进程已退出且产物不完整则标记 `failed`，最终 Markdown 文档和发布摘要完整则标记 `succeeded`。
 - 核心分析完成后，首页摘要必须分开展示扫描帧、OCR 候选帧、实际 OCR 帧、OCR 文本事件和 VL 帧，避免把长视频误读为只抽少量固定帧。
-- 最终发布阶段默认生成并校验 Markdown，不主动生成 PDF。只有用户明确要求时才使用 `tools/run_video_doc_final_publish.sh RUN_DIR --pdf` 导出 PDF。
-- 如需连续阅读长图，使用 `tools/run_video_doc_final_publish.sh RUN_DIR --pdf --long-png`。
+- 最终发布阶段默认生成并校验 Markdown，不主动生成 PDF。只有用户明确要求时才使用 `tools/publish/run_video_doc_final_publish.sh RUN_DIR --pdf` 导出 PDF。
+- 如需连续阅读长图，使用 `tools/publish/run_video_doc_final_publish.sh RUN_DIR --pdf --long-png`。
 
 ## API
 

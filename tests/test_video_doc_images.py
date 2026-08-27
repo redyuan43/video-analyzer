@@ -5,14 +5,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from video_analyzer.multidoc import parse_chapters
-from tools.augment_video_docs_images import main as augment_main
-from tools.md_to_mobile_pdf import main as mobile_pdf_main
-from tools.md_to_mobile_pdf import render_markdown
-from tools.md_to_mobile_pdf import render_mermaid_blocks
-from tools.md_to_mobile_pdf import wrap_final_images
-from tools.pdf_to_long_png import main as long_png_main
-from tools.prepare_baoyu_image_prompts import main as prepare_prompts_main
-from tools.prepare_video_doc_export import rewrite_image_paths
+from tools.publish.augment_video_docs_images import main as augment_main
+from tools.publish.md_to_mobile_pdf import main as mobile_pdf_main
+from tools.publish.md_to_mobile_pdf import render_markdown
+from tools.publish.md_to_mobile_pdf import render_mermaid_blocks
+from tools.publish.md_to_mobile_pdf import wrap_final_images
+from tools.publish.pdf_to_long_png import main as long_png_main
+from tools.publish.prepare_baoyu_image_prompts import main as prepare_prompts_main
+from tools.publish.prepare_video_doc_export import rewrite_image_paths
 
 
 class VideoDocImageTests(unittest.TestCase):
@@ -425,7 +425,7 @@ class VideoDocImageTests(unittest.TestCase):
             def fake_run(command, check):
                 Path(command[command.index("-o") + 1]).write_bytes(b"png")
 
-            with patch("tools.md_to_mobile_pdf.subprocess.run", side_effect=fake_run):
+            with patch("tools.publish.md_to_mobile_pdf.subprocess.run", side_effect=fake_run):
                 rendered = render_mermaid_blocks("```mermaid\nsequenceDiagram\nA->>B: Hi\n```\n", work_dir)
 
             self.assertIn("![Mermaid diagram 1](file://", rendered)

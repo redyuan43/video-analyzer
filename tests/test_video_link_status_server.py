@@ -2382,7 +2382,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
             command = server.final_publish_command(loaded)
 
-        self.assertEqual(command[0], "tools/run_video_doc_final_publish.sh")
+        self.assertEqual(command[0], "tools/publish/run_video_doc_final_publish.sh")
         self.assertIn("--finalize-only", command)
         self.assertIn("--skip-send", command)
         self.assertIn("--skip-pdf", command)
@@ -2608,7 +2608,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertIn("--skip-images", command)
 
     def test_final_publish_script_requires_explicit_pdf_opt_in(self):
-        text = (REPO_ROOT / "tools" / "run_video_doc_final_publish.sh").read_text(encoding="utf-8")
+        text = (REPO_ROOT / "tools" / "publish" / "run_video_doc_final_publish.sh").read_text(encoding="utf-8")
 
         self.assertIn("SKIP_PDF=1", text)
         self.assertIn("--pdf)", text)
@@ -2713,7 +2713,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             command = server.image_prompts_command(loaded)
 
         self.assertEqual(command[0], server_mod.sys.executable)
-        self.assertEqual(command[1], str(REPO_ROOT / "tools" / "prepare_baoyu_image_prompts.py"))
+        self.assertEqual(command[1], str(REPO_ROOT / "tools" / "publish" / "prepare_baoyu_image_prompts.py"))
         self.assertEqual(command[2], str(run_dir))
 
     def test_failed_stage_can_be_retried(self):
