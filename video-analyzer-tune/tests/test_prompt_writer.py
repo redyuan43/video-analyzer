@@ -1,9 +1,7 @@
 """Tests for prompt_writer.py."""
 
-from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
 
 from video_analyzer_tune.prompt_writer import (
     extract_optimized_instructions,

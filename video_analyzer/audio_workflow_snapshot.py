@@ -13,7 +13,6 @@ from urllib.parse import urlparse
 
 from .model_settings import build_settings_document, expand_runtime_profile
 
-
 SCHEMA_VERSION = 1
 WORKFLOW_IDS = {"audio_short_v1", "audio_long_v1"}
 ROUTE_POLICIES = {"auto", "local_only", "cloud_only", "background_local"}

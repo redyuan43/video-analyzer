@@ -1271,14 +1271,14 @@ class VideoAnalyzerUI:
                     process.wait()
                     if process.returncode == 0:
                         logger.info("Analysis completed successfully")
-                        yield f"data: Analysis completed successfully\n\n"
+                        yield "data: Analysis completed successfully\n\n"
                     else:
                         logger.error(f"Analysis failed with code {process.returncode}")
                         yield f"data: Analysis failed with code {process.returncode}\n\n"
                 except Exception as e:
                     logger.error(f"Error during analysis: {e}")
                     yield f"data: Error during analysis: {str(e)}\n\n"
-                    yield f"data: Analysis failed\n\n"
+                    yield "data: Analysis failed\n\n"
                     
             return Response(
                 generate_output(),

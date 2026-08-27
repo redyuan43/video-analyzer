@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import hmac
 import ipaddress
@@ -22,9 +23,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
-import fcntl
 from flask import Blueprint, Flask, jsonify, request
-
 
 ContextProvider = Callable[[str | None], dict[str, Any]]
 MAX_BUFFER_BYTES = 2 * 1024 * 1024

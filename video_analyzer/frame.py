@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, List, Optional
 import logging
 import subprocess
 import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, List, Optional
 
 try:
     import cv2

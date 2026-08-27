@@ -1,7 +1,10 @@
-import requests
 import json
-from typing import Optional, Dict, Any, List
+from typing import Any, Dict, List, Optional
+
+import requests
+
 from .llm_client import LLMClient
+
 
 class OllamaClient(LLMClient):
     def __init__(self, base_url: str = "http://localhost:11434"):

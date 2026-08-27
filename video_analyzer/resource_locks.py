@@ -12,7 +12,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-
 DEFAULT_LOCK_DIR = Path("tmp/video-link-status/resource-locks")
 DEFAULT_LIMITS = {
     "asr": 1,

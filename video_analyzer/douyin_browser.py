@@ -19,10 +19,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 import requests
-
 
 DOUYIN_ID_RE = re.compile(r"/video/(?P<id>\d+)")
 DOUYIN_HOST_MARKERS = ("douyin.com", "douyinvod.com")

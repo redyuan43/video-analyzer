@@ -5,9 +5,9 @@ import logging
 import sys
 from pathlib import Path
 
+from .prompt_writer import extract_optimized_instructions, print_config_snippet, write_prompt_files
 from .training_data import load_training_data
 from .tuner import PromptTuner
-from .prompt_writer import extract_optimized_instructions, write_prompt_files, print_config_snippet
 
 logger = logging.getLogger(__name__)
 

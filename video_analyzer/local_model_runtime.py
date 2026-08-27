@@ -17,7 +17,6 @@ from urllib.parse import urlparse
 
 from .config import normalize_string_list
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 DEFAULT_LOCK_PATH = REPO_ROOT / "tmp" / "video-link-status" / "resource-locks" / "local-model-runtime.lock"

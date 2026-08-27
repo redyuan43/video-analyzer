@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 import tempfile
+import requests
 from email import policy
 from email.parser import BytesParser
 from urllib.parse import quote, unquote, urlencode
@@ -86,10 +87,7 @@ from video_analyzer.url_context import (
     AUDIO_MEDIA_EXTENSIONS,
     FALLBACK_OUTPUT_ROOT,
     MEDIA_EXTENSIONS,
-    apply_runtime_profile,
-    build_analyzer_command,
     infer_video_id_from_url,
-    materialize_analysis_context,
     safe_slug,
     ytdlp_site_headers,
 )

@@ -7,16 +7,13 @@ import argparse
 import json
 import os
 import re
-import sys
 from pathlib import Path
 from typing import Any
 
 from video_analyzer.artifacts import first_present, format_speaker_label
-
 from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient
 from video_analyzer.config import Config, build_openai_extra_body, resolve_api_key, resolve_temperature
 from video_analyzer.multidoc import parse_chapters, timestamp_to_seconds
-
 
 CORE_SOURCE_TYPES = {"asr", "subtitle", "ocr", "vl", "manual"}
 LEARNING_SOURCE_TYPES = {"asr", "subtitle", "ocr", "vl"}

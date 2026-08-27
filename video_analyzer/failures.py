@@ -5,7 +5,6 @@ import os
 from pathlib import Path
 from typing import Any
 
-
 FAILURE_FILE_ENV = "VIDEO_ANALYZER_FAILURE_FILE"
 TRANSIENT_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 

@@ -1,6 +1,5 @@
 import argparse
 import contextlib
-from pathlib import Path
 import json
 import logging
 import re
@@ -9,16 +8,22 @@ import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
-from datetime import datetime
+from pathlib import Path
 from statistics import median
 from typing import Any
 
-from .artifacts import write_json, write_orin_artifacts, write_transcript_markdown
-from .analysis_progress import PROGRESS_FILENAME, write_analysis_progress
+from .analysis_progress import write_analysis_progress
+from .analyzer import VideoAnalyzer
+from .artifacts import write_orin_artifacts, write_transcript_markdown
+from .asr_providers import ASRStrategyResult, extract_audio_to_wav
+from .audio_processor import AudioTranscript
 from .candidate_frame_strategies import parse_candidate_frame_strategy
+from .clients.generic_openai_api import GenericOpenAIAPIClient
+from .clients.ollama import OllamaClient
 from .config import Config, build_openai_extra_body, get_client, get_model, resolve_api_key, resolve_temperature
 from .frame import VideoProcessor
 from .frame_dedup_audit import select_audited_frames, write_frame_dedup_audit
+from .frame_manifest import MANIFEST_NAME, read_frames_from_manifest, write_frame_manifest
 from .frame_selection import (
     AUTO,
     FrameDecision,
@@ -31,18 +36,12 @@ from .frame_selection import (
     resolve_vl_context_gap_seconds,
     select_vl_frames,
 )
-from .frame_manifest import MANIFEST_NAME, read_frames_from_manifest, write_frame_manifest
 from .jetson_frames import (
     extract_frames_with_jetson_workers,
     extract_frames_with_local_gpu_workers,
     extract_local_screen_keyframes,
 )
-from .prompt import PromptLoader
-from .analyzer import VideoAnalyzer
-from .audio_processor import AudioTranscript
-from .asr_providers import ASRStrategyResult, extract_audio_to_wav
-from .clients.ollama import OllamaClient
-from .clients.generic_openai_api import GenericOpenAIAPIClient
+from .local_model_runtime import local_model_runtime_session, local_model_stage
 from .manual import (
     embed_step_images,
     generate_operation_manual,
@@ -55,22 +54,24 @@ from .manual import (
 from .ocr import OCREvent, run_ocr
 from .ocr_keyframes import (
     AUTO as OCR_AUTO,
+)
+from .ocr_keyframes import (
     build_ocr_text_events,
     resolve_ocr_scan_sample_fps,
     select_ocr_keyframes,
 )
-from .local_model_runtime import local_model_runtime_session, local_model_stage
+from .prompt import PromptLoader
 from .resource_locks import analyzer_resource_lock
 from .review_artifacts import write_run_manifest, write_visual_review
+from .transcription_pipeline import (
+    speaker_diarization_can_run_parallel,
+    transcribe_and_diarize_configured_audio,
+)
 from .vl_checkpoint import (
     analysis_signature,
     frame_sha256,
     load_vl_checkpoint,
     write_vl_checkpoint,
-)
-from .transcription_pipeline import (
-    speaker_diarization_can_run_parallel,
-    transcribe_and_diarize_configured_audio,
 )
 
 # Initialize logger at module level

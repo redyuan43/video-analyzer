@@ -8,7 +8,6 @@ import cgi
 import gc
 import json
 import logging
-import os
 import tempfile
 import threading
 import time

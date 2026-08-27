@@ -1,0 +1,45 @@
+# 项目级配置：代码规范（ruff）+ 测试发现
+# 注意：本文件仅包含工具链配置，不声明 [project]。
+# 包元数据与安装仍由 setup.py 负责，避免与现有打包流程冲突。
+
+[tool.ruff]
+# 统一目标 Python 版本（与 setup.py 的 python_requires >=3.11 保持一致）
+target-version = "py311"
+# 统一行宽（与现有代码风格对齐）
+line-length = 120
+# 排除生成物/第三方资源目录
+extend-exclude = [
+    ".venv",
+    "build",
+    "dist",
+    "*.egg-info",
+    "video_analyzer/config",
+    "docs",
+    "ios",
+]
+
+[tool.ruff.lint]
+# 渐进式规则集：
+#   E4/E7/E9 语法与运行时安全、F pyflakes、I import 排序
+# 后续阶段（巨型模块拆分时）再按模块批量开启 UP/B/SIM 等规则并逐步清零。
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# tools/ 脚本依赖“注入仓库根目录到 sys.path 后延迟导入”模式，
+# 且大量脚本的导入在文件中部（sys.path 引导之后）。
+# E402/I001 的清理延后到“目录与依赖方向修正”阶段统一处理。
+# F403：少量薄包装器脚本有意使用 `from x import *` 透传入口函数。
+"tools/*.py" = ["E402", "I001", "F403"]
+
+# UI 服务端同样使用 sys.path 引导延迟导入（server.py），import 排序延后处理。
+"video-analyzer-ui/video_analyzer_ui/*.py" = ["I001"]
+
+# 测试文件允许宽松的 import 与断言写法
+"tests/*.py" = ["E402", "I001"]
+"test_*.py" = ["E402", "I001"]
+"video-analyzer-*/**/test_*.py" = ["E402", "I001"]
+
+[tool.pytest.ini_options]
+# 兼容 unittest 风格（pytest 非必需，仅作统一入口参考）
+testpaths = ["tests"]
+python_files = ["test_*.py"]

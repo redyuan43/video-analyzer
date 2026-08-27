@@ -1,9 +1,7 @@
 """Tests for PromptTuner."""
 
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import dspy
 import pytest
 
 from video_analyzer_tune.training_data import TrainingExample, TrainingFrame

@@ -1,0 +1,55 @@
+name: CI
+
+# 代码规范与回归验证：ruff 静态检查 + 确定性单元测试。
+# 与 pr-review.yml（AI PR Review）互补：前者做质量门禁，后者做人工审查辅助。
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# 同一分支新提交自动取消进行中的旧运行。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Ruff lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5.5.0
+        with:
+          python-version: '3.11'
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      - name: Install ruff
+        run: pip install ruff
+      - name: Ruff check (pyproject.toml 规则)
+        run: ruff check .
+
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5.5.0
+        with:
+          python-version: '3.11'
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile check (核心入口)
+        run: |
+          python -m py_compile \
+            tools/video_link_status_server.py \
+            video-analyzer-ui/video_analyzer_ui/server.py
+      - name: Run deterministic unit tests
+        # 与 AGENTS.md「Verification Commands」保持一致的项目级验证门禁。
+        run: python -m unittest tests.test_video_link_status_server tests.test_video_analyzer_ui

@@ -6,14 +6,12 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
 from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient
 from video_analyzer.config import Config, build_openai_extra_body, resolve_api_key, resolve_temperature
-
 
 DEFAULT_TEXT_MODEL = "redhatai_qwen3.6-35b-a3b-nvfp4"
 DEFAULT_DOC_TYPES = ["knowledge_notes", "deep_report", "operation_manual_review"]

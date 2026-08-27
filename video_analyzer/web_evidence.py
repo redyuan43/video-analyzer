@@ -10,13 +10,12 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote_plus, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 
 from video_analyzer.clients.generic_openai_api import GenericOpenAIAPIClient
 from video_analyzer.config import Config, build_openai_extra_body, resolve_api_key, resolve_temperature
-
 
 DEFAULT_TEXT_MODEL = "redhatai_qwen3.6-35b-a3b-nvfp4"
 DEFAULT_TIMEOUT_SECONDS = 12

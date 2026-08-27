@@ -11,7 +11,6 @@ The default runtime policy matches the current tested setup:
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
 import json
 import re
 import shutil
@@ -19,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
@@ -30,7 +30,6 @@ from video_analyzer.douyin_browser import (
     download_douyin_with_browser,
     is_douyin_url,
 )
-
 
 FALLBACK_OUTPUT_ROOT = "downloads/url-videos"
 FALLBACK_RUN_NAME = "operation-manual"

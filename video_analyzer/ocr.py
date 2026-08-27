@@ -1,8 +1,8 @@
 import base64
 import hashlib
 import html
-import ipaddress
 import io
+import ipaddress
 import json
 import logging
 import re

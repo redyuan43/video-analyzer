@@ -1,10 +1,11 @@
-from typing import List, Dict, Any, Optional
 import logging
+from typing import Any, Dict, List, Optional
+
+from .audio_processor import AudioTranscript
 from .clients.llm_client import LLMClient
-from .prompt import PromptLoader
 from .frame import Frame
 from .frame_selection import FrameContextItem
-from .audio_processor import AudioTranscript
+from .prompt import PromptLoader
 
 logger = logging.getLogger(__name__)
 

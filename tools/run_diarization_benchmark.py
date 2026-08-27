@@ -8,7 +8,6 @@ import functools
 import json
 import os
 import subprocess
-import sys
 import time
 from collections import defaultdict
 from pathlib import Path

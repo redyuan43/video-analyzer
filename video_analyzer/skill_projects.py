@@ -12,7 +12,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
-
 PROJECT_FILE = "project.json"
 SOURCES_DIR = "sources"
 FROZEN_SOURCES_FILE = "source_snapshot.json"
@@ -772,7 +771,6 @@ def build_source_bundle(
                     "reference_documents": list(source.get("reference_documents") or []),
                 }
             )
-    canonical = json.dumps(records, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return {
         "project_revision": project.get("revision"),
         "records": records,

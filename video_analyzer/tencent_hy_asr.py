@@ -23,7 +23,6 @@ from websockets.sync.client import connect
 
 from .audio_processor import AudioTranscript
 
-
 logger = logging.getLogger(__name__)
 
 DEFAULT_ENDPOINT = "wss://asr.cloud.tencent.com/asr/v2"

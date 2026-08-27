@@ -8,7 +8,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tools import firered_3dspeaker_http_server as server
-from video_analyzer.audio_processor import AudioTranscript
 
 
 class FireRed3DSpeakerServerTests(unittest.TestCase):

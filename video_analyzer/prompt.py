@@ -1,7 +1,7 @@
-from pathlib import Path
 import logging
-from typing import List, Dict
 from importlib import resources
+from pathlib import Path
+from typing import Dict, List
 
 logger = logging.getLogger(__name__)
 

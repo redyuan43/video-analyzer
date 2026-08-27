@@ -1,6 +1,7 @@
-from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any, List
 import base64
+from abc import ABC, abstractmethod
+from typing import Any, Dict, List, Optional
+
 
 class LLMClient(ABC):
     def encode_image(self, image_path: str) -> str:

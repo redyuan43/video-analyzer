@@ -23,7 +23,6 @@ from .local_model_runtime import local_model_runtime_lock, local_model_stage, lo
 from .resource_locks import analyzer_resource_lock
 from .speaker_diarization import prepare_speaker_assignment, process_transcript_speakers
 
-
 RAY_TRANSCRIPTION_LOCK = threading.Lock()
 
 

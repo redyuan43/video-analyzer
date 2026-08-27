@@ -21,9 +21,9 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import yaml
-from openai import OpenAI
 from github import Github
 from github.PullRequest import PullRequest
+from openai import OpenAI
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 DEFAULT_MAX_DIFF_LINES = 800

@@ -6,7 +6,6 @@ import re
 from pathlib import Path
 from typing import Any, Iterable
 
-
 CHECKPOINT_VERSION = 2
 LEGACY_FRAME_RE = re.compile(r"^(?:Frame\s+|Error analyzing frame\s+)(\d+)\b", re.IGNORECASE)
 

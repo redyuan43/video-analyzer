@@ -7,7 +7,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 import time
@@ -15,7 +14,6 @@ import wave
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from statistics import median
 from typing import Any
 
 import requests

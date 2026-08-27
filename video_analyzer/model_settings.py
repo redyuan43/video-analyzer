@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import copy
 import base64
 import contextlib
+import copy
 import hashlib
 import io
 import ipaddress
@@ -11,7 +11,6 @@ import logging
 import math
 import os
 import re
-import socket
 import struct
 import tempfile
 import threading
@@ -21,11 +20,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
 
 import requests
 from PIL import Image, ImageDraw
-
 
 MODEL_KIND_PROTOCOLS = {
     "asr": {

@@ -1,15 +1,15 @@
 """MIPROv2 optimization orchestration."""
 
 import logging
-from typing import List, Dict, Any, Tuple
+from typing import Any, Dict, List, Tuple
 
 import dspy
 from dspy.evaluate import Evaluate
 from dspy.teleprompt import MIPROv2
 
-from .training_data import TrainingExample
-from .pipeline import VideoAnalysisPipeline
 from .metrics import VideoAnalysisMetric
+from .pipeline import VideoAnalysisPipeline
+from .training_data import TrainingExample
 
 logger = logging.getLogger(__name__)
 

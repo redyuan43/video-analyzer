@@ -25,7 +25,6 @@ from video_analyzer.asr_providers import (
     default_capswriter_url,
     default_vibevoice_urls,
     merge_asr_transcripts,
-    transcribe_with_provider,
     transcribe_with_provider_result,
     transcribe_with_remote_http,
     transcribe_with_vibevoice_remote,
@@ -59,7 +58,7 @@ run_multidoc_analysis = importlib.util.module_from_spec(MULTIDOC_SPEC)
 assert MULTIDOC_SPEC and MULTIDOC_SPEC.loader
 MULTIDOC_SPEC.loader.exec_module(run_multidoc_analysis)
 
-NARRATION_PATH = Path(__file__).resolve().parent / "tools" / "generate_audio_narration.py"
+NARRATION_PATH = Path(__file__).resolve().parents[1] / "tools" / "generate_audio_narration.py"
 NARRATION_SPEC = importlib.util.spec_from_file_location("generate_audio_narration", NARRATION_PATH)
 generate_audio_narration = importlib.util.module_from_spec(NARRATION_SPEC)
 assert NARRATION_SPEC and NARRATION_SPEC.loader
