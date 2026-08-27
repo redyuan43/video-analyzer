@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Thin CLI wrapper for multi-round video document analysis."""
+"""Backward-compatible shim for tools/pipelines/run_multidoc_analysis.py.
 
-from pathlib import Path
+Both `python tools/run_multidoc_analysis.py ...` and
+`from tools.run_multidoc_analysis import ...` keep working after the Phase 3b move.
+"""
+
+import importlib
 import sys
+from pathlib import Path
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
-
-from video_analyzer.multidoc import *  # re-exported for legacy tests/imports
-from video_analyzer.multidoc import main
-
+_REAL = "tools.pipelines.run_multidoc_analysis"
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from runpy import run_path
+
+    sys.exit(run_path(str(Path(__file__).resolve().parent / "pipelines" / "run_multidoc_analysis.py"), run_name="__main__"))
+else:
+    sys.modules[__name__] = importlib.import_module(_REAL)

@@ -659,8 +659,8 @@ class OperationManualTests(unittest.TestCase):
     def test_start_example_runs_followup_steps(self):
         text = Path("start_example.sh").read_text(encoding="utf-8")
 
-        self.assertIn("tools/run_multidoc_analysis.sh \"$RUN_DIR\" --profile \"$PROFILE\"", text)
-        self.assertIn("tools/generate_audio_narration.sh \"$RUN_DIR\" --profile \"$PROFILE\"", text)
+        self.assertIn("tools/pipelines/run_multidoc_analysis.sh \"$RUN_DIR\" --profile \"$PROFILE\"", text)
+        self.assertIn("tools/pipelines/generate_audio_narration.sh \"$RUN_DIR\" --profile \"$PROFILE\"", text)
         self.assertIn("[done] run_dir: ", text)
         self.assertIn("Using canonical Bilibili URL", text)
         self.assertIn("quote full share URLs that contain &", text)

@@ -61,7 +61,7 @@
 
 ### P1 巨型单文件（可维护性差）
 - `tools/video_link_status_server.py` 12,091 行：job 生命周期 + 移动音频任务 + 设置管理 + 资源队列 + 阶段编排全部混在一个类
-- `tools/run_audio_template_analysis.py` 3,196 行：独立流水线未进入主包
+- `tools/pipelines/run_audio_template_analysis.py` 3,196 行：独立流水线未进入主包
 - `video_analyzer/cli.py` 1,982 行：入口函数 `main()` 单函数承载全流程
 
 ### P2 目录组织与职责边界混乱
@@ -75,7 +75,7 @@
 - 无统一 import 排序、常量命名、类型注解约定
 
 ### P4 代码冗余与重复逻辑
-- `tools/run_multidoc_analysis.py`、`run_study_guide.py`、`run_operation_manual_from_url.py` 为 re-export 包装器，与 `video_analyzer.multidoc`/`study_guide`/`url_context` 重复
+- `tools/pipelines/run_multidoc_analysis.py`、`run_study_guide.py`、`run_operation_manual_from_url.py` 为 re-export 包装器，与 `video_analyzer.multidoc`/`study_guide`/`url_context` 重复
 - 大量脚本重复“注入仓库根目录到 sys.path”样板
 - 根目录测试与 `tests/` 测试职责重叠
 
@@ -146,8 +146,8 @@ web_debug_console/            # 并入 video_analyzer_ui 或独立发布包（�
 |---|---|---|
 | `tools/video_link_status_server.py`（引擎本体） | `video_analyzer/jobengine/`（正式包） | 已迁入 ✅（Phase 3a） |
 | `tools/video_link_status_supervisor.py` | `tools/video_link/` 入口 | 迁移 |
-| `tools/run_audio_template_analysis.py`（逻辑） | `video_analyzer/pipeline/audio/template_analysis.py` | 下沉主包 |
-| `tools/run_multidoc_analysis.py` 等 re-export | 删除包装器，入口改用主包 | 去重 |
+| `tools/pipelines/run_audio_template_analysis.py`（逻辑） | `video_analyzer/pipeline/audio/template_analysis.py` | 下沉主包 |
+| `tools/pipelines/run_multidoc_analysis.py` 等 re-export | 删除包装器，入口改用主包 | 去重 |
 | 根目录 `test_operation_manual.py` / `test_prompt_loading.py` | `tests/` | 迁移统一 |
 | `web_debug_console/` | 并入 UI 包 | 迁移 |
 

@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Thin CLI wrapper for the URL operation-manual pipeline."""
+"""Backward-compatible shim for tools/pipelines/run_operation_manual_from_url.py.
 
-from pathlib import Path
+Both `python tools/run_operation_manual_from_url.py ...` and
+`from tools.run_operation_manual_from_url import ...` keep working after the Phase 3b move.
+"""
+
+import importlib
 import sys
+from pathlib import Path
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
-
-from video_analyzer.url_context import *  # re-exported for legacy tests/imports
-from video_analyzer.url_context import main
-
+_REAL = "tools.pipelines.run_operation_manual_from_url"
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from runpy import run_path
+
+    sys.exit(run_path(str(Path(__file__).resolve().parent / "pipelines" / "run_operation_manual_from_url.py"), run_name="__main__"))
+else:
+    sys.modules[__name__] = importlib.import_module(_REAL)

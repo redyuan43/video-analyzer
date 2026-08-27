@@ -215,7 +215,7 @@ regenerate_docs() {
     --stage text \
     --config config \
     --profile "$PROFILE" \
-    -- "$ROOT_DIR/tools/run_multidoc_analysis.sh" "$RUN_DIR" --profile "$PROFILE"
+    -- "$ROOT_DIR/tools/pipelines/run_multidoc_analysis.sh" "$RUN_DIR" --profile "$PROFILE"
   echo "[docs] deep-v2"
   "$PYTHON_BIN" "$ROOT_DIR/tools/run_local_model_stage.py" \
     --stage text \

@@ -109,7 +109,7 @@ A passing local response includes:
 
 ## Video Link Resume And Publishing Notes
 
-- `tools/run_operation_manual_from_url.py` deletes the target `run_dir` before launching analyzer work, even when `--keep-existing` reuses the downloaded video and page context. Do not resume by passing `--transcript-file` that points inside the same target `run_dir`; the wrapper can delete the transcript before the analyzer reads it.
+- `tools/pipelines/run_operation_manual_from_url.py` deletes the target `run_dir` before launching analyzer work, even when `--keep-existing` reuses the downloaded video and page context. Do not resume by passing `--transcript-file` that points inside the same target `run_dir`; the wrapper can delete the transcript before the analyzer reads it.
 - If a URL run is interrupted after ASR succeeds, first check whether `transcript.md` survived. If it exists, resume with absolute paths and skip ASR:
   `python -m video_analyzer.cli VIDEO.mp4 --output NEW_RUN_DIR --context-file PAGE_CONTEXT.md --asr-provider none --transcript-file /abs/path/transcript.md ...`
   Prefer a new resume output directory when in doubt, so existing ASR/transcript artifacts are not destroyed.
@@ -138,7 +138,7 @@ A passing local response includes:
 
 - For long operation-manual videos, prefer Jetson candidate-frame extraction instead of local CPU/OpenCV scanning.
 - For long podcast/talk videos, do not scan at `1fps` by default. Use the scripted fast path with subtitles and a sparse visual scan:
-  `tools/run_long_talk_fast_from_url.sh URL --keep-existing`
+  `tools/pipelines/run_long_talk_fast_from_url.sh URL --keep-existing`
   This path should use subtitles as transcript when available, skip audio ASR with `--asr-provider none`, disable VL with `--vl-frame-policy none`, use Jetson workers, require hardware decode, and sample at `--jetson-sample-fps 0.5` (one preview frame every 2 seconds).
 - The current validated long-talk worker set is one physical AGX exposed as two
   logical frame workers:
@@ -153,7 +153,7 @@ A passing local response includes:
 - The SSH workers are on-demand, not daemons: the local pipeline pushes `worker.py`, syncs/caches the video, runs chunks, pulls candidates back, and merges locally.
 - For Ray conversion, do not rely on the local `.venv` as the driver because it uses Python 3.14 and Ray wheels may be unavailable. The Jetson devices use Python 3.10, so run the Ray head/driver on a device, preferably AGX when available, and have NX devices join as Ray workers. If the Ray head disappears during a job, expect the job to fail; scripts may choose a new head before a run, but Ray will not automatically keep the current job alive by electing a replacement head.
 - Human one-command path for the current long sample is:
-  `OCR_CACHE=refresh tools/run_s36ri23_fast_full.sh`
+  `OCR_CACHE=refresh tools/pipelines/run_s36ri23_fast_full.sh`
 - Check worker readiness with:
   `tools/check_jetson_frame_workers.sh`
 - Detailed operations, public CLI/API flags, maintenance commands, and the measured baseline live in `docs/JETSON_FRAME_WORKERS.md` and `.codex/skills/jetson-frame-extraction/SKILL.md`.

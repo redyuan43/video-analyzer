@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Thin CLI wrapper for study-guide artifact generation."""
+"""Backward-compatible shim for tools/pipelines/run_study_guide.py.
 
-from pathlib import Path
+Both `python tools/run_study_guide.py ...` and
+`from tools.run_study_guide import ...` keep working after the Phase 3b move.
+"""
+
+import importlib
 import sys
+from pathlib import Path
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
-
-from video_analyzer.study_guide import main
-
+_REAL = "tools.pipelines.run_study_guide"
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from runpy import run_path
+
+    sys.exit(run_path(str(Path(__file__).resolve().parent / "pipelines" / "run_study_guide.py"), run_name="__main__"))
+else:
+    sys.modules[__name__] = importlib.import_module(_REAL)

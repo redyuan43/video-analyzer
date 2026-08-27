@@ -9,7 +9,7 @@ Run the `video-analyzer` operation-manual pipeline end to end from either an onl
 
 ## Default Runtime Policy
 
-- URL input: use `tools/run_operation_manual_from_url.sh`.
+- URL input: use `tools/pipelines/run_operation_manual_from_url.sh`.
 - URL context: default to `page_context.md`, which combines description,
   metadata, subtitles, and selected comments.
 - Local file input: call `.venv/bin/python -m video_analyzer.cli` directly.
@@ -35,23 +35,23 @@ Run the `video-analyzer` operation-manual pipeline end to end from either an onl
 3. For URL input, run:
 
    ```bash
-   tools/run_operation_manual_from_url.sh "URL" --profile local_lan
+   tools/pipelines/run_operation_manual_from_url.sh "URL" --profile local_lan
    ```
 
    Useful options:
 
    ```bash
-   tools/run_operation_manual_from_url.sh "URL" --cookies-from-browser chrome
-   tools/run_operation_manual_from_url.sh "URL" --max-frames 48
-   tools/run_operation_manual_from_url.sh "URL" --download-only
-   tools/run_operation_manual_from_url.sh "URL" --no-include-comments
-   tools/run_operation_manual_from_url.sh "URL" --subtitle-langs zh-CN,zh-Hans,zh,en
+   tools/pipelines/run_operation_manual_from_url.sh "URL" --cookies-from-browser chrome
+   tools/pipelines/run_operation_manual_from_url.sh "URL" --max-frames 48
+   tools/pipelines/run_operation_manual_from_url.sh "URL" --download-only
+   tools/pipelines/run_operation_manual_from_url.sh "URL" --no-include-comments
+   tools/pipelines/run_operation_manual_from_url.sh "URL" --subtitle-langs zh-CN,zh-Hans,zh,en
    ```
 
    After the manual run, optional multi-document analysis can be generated with:
 
    ```bash
-   tools/run_multidoc_analysis.sh RUN_DIR --profile local_lan
+   tools/pipelines/run_multidoc_analysis.sh RUN_DIR --profile local_lan
    ```
 
 4. For local video input, create or reuse a context file if provided by the user, then run:

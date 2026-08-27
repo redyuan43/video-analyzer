@@ -88,7 +88,7 @@ pip install .  # For regular installation
 pip install -e .  # For development installation
 ```
 
-4. Install URL workflow dependencies when using `tools/run_operation_manual_from_url.sh`:
+4. Install URL workflow dependencies when using `tools/pipelines/run_operation_manual_from_url.sh`:
 ```bash
 pip install yt-dlp
 ```
@@ -204,7 +204,7 @@ images, PDF/long-PNG exports, and WeChat delivery status.
 One-command URL workflow:
 
 ```bash
-tools/run_operation_manual_from_url.sh "https://www.bilibili.com/video/BVxxxx"
+tools/pipelines/run_operation_manual_from_url.sh "https://www.bilibili.com/video/BVxxxx"
 ```
 
 For Bilibili share URLs, either use the canonical URL without query parameters

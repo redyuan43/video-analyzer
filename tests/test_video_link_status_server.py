@@ -216,7 +216,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertIn("youtube:player_client=mweb,web", command)
 
     def test_url_runner_uses_automatic_youtube_client_unless_explicitly_overridden(self):
-        script = REPO_ROOT / "tools" / "run_operation_manual_from_url.sh"
+        script = REPO_ROOT / "tools" / "pipelines" / "run_operation_manual_from_url.sh"
         with tempfile.TemporaryDirectory() as tmp:
             env = {
                 **os.environ,
@@ -1614,11 +1614,11 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
         self.assertEqual(created["pipeline_kind"], "transcription")
         self.assertEqual(loaded["audio_pipeline_kind"], "transcription")
-        self.assertIn("tools/run_audio_transcription.py", command)
+        self.assertIn("tools/pipelines/run_audio_transcription.py", command)
         provider_index = command.index("--asr-provider")
         self.assertEqual(command[provider_index + 1], "firered_3dspeaker")
         self.assertEqual(created["asr_provider"], "firered_3dspeaker")
-        self.assertNotIn("tools/run_audio_template_analysis.py", command)
+        self.assertNotIn("tools/pipelines/run_audio_template_analysis.py", command)
         self.assertNotIn("--template-id", command)
         self.assertNotIn("--focus-prompt", command)
 
@@ -1651,7 +1651,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(
             mobile_command[mobile_command.index("--asr-provider") + 1], "vibevoice"
         )
-        self.assertNotIn("tools/run_audio_transcription.py", video_command)
+        self.assertNotIn("tools/pipelines/run_audio_transcription.py", video_command)
         self.assertNotIn("firered_3dspeaker", video_command)
 
     def test_mobile_audio_transcription_result_has_no_summary(self):
@@ -2059,7 +2059,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
             command = server.operation_command(loaded)
 
-        self.assertIn("tools/run_audio_template_analysis.py", command)
+        self.assertIn("tools/pipelines/run_audio_template_analysis.py", command)
         self.assertIn("--template-id", command)
         self.assertEqual(command[command.index("--template-id") + 1], "tmpl-meeting")
         self.assertIn("--focus-prompt", command)
@@ -2128,7 +2128,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
         command = server.operation_command(loaded)
 
-        self.assertEqual(command[0], "tools/run_operation_manual_from_url.sh")
+        self.assertEqual(command[0], "tools/pipelines/run_operation_manual_from_url.sh")
         self.assertEqual(command[command.index("--pipeline-mode") + 1], "deep")
         self.assertEqual(command[command.index("--frame-extractor") + 1], "local_gpu")
         self.assertEqual(command[command.index("--local-frame-gpus") + 1], "auto")
@@ -2324,7 +2324,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
         command = server.operation_command(loaded)
 
-        self.assertEqual(command[0], "tools/run_long_talk_fast_from_url.sh")
+        self.assertEqual(command[0], "tools/pipelines/run_long_talk_fast_from_url.sh")
         self.assertIn("--profile", command)
         self.assertEqual(command[command.index("--profile") + 1], "deepseek_v4_flash")
         self.assertNotIn("--pipeline-mode", command)
@@ -2360,7 +2360,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(command[command.index("--frame-extractor") + 1], "jetson")
 
     def test_long_talk_wrapper_defaults_to_local_gpu_and_keeps_jetson_override(self):
-        text = (REPO_ROOT / "tools" / "run_long_talk_fast_from_url.sh").read_text(encoding="utf-8")
+        text = (REPO_ROOT / "tools" / "pipelines" / "run_long_talk_fast_from_url.sh").read_text(encoding="utf-8")
 
         self.assertIn('FRAME_EXTRACTOR="${VIDEO_LINK_FRAME_EXTRACTOR:-local_gpu}"', text)
         self.assertIn('JETSON_FRAME_HOSTS="${JETSON_FRAME_HOSTS:-agx,agx}"', text)
@@ -2452,11 +2452,11 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             command = server.audio_narration_command(loaded)
 
         self.assertTrue(server.tts_narration_enabled(loaded))
-        self.assertEqual(command[0], "tools/run_audio_narration_stage.sh")
+        self.assertEqual(command[0], "tools/pipelines/run_audio_narration_stage.sh")
         self.assertEqual(command[1], str(run_dir))
         self.assertEqual(command[command.index("--profile") + 1], "local_six_gpu")
         self.assertEqual(command[command.index("--config") + 1], "/tmp/video-analyzer-config")
-        wrapper = (REPO_ROOT / "tools" / "run_audio_narration_stage.sh").read_text(encoding="utf-8")
+        wrapper = (REPO_ROOT / "tools" / "pipelines" / "run_audio_narration_stage.sh").read_text(encoding="utf-8")
         self.assertIn("--stage tts", wrapper)
         self.assertIn("--prepare-only", wrapper)
         self.assertIn("trap restore_text_pool EXIT", wrapper)
@@ -3009,7 +3009,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
             def regenerate(_job, stage, command, _log_path, _stage_info):
                 self.assertEqual(stage, "verify-core")
-                self.assertIn("tools/regenerate_operation_manual.py", command)
+                self.assertIn("tools/pipelines/regenerate_operation_manual.py", command)
                 (run_dir / "operation_manual.md").write_text(
                     "# Manual\n",
                     encoding="utf-8",
@@ -3032,7 +3032,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
 
         self.assertEqual(result["artifacts"]["missing"], [])
         self.assertIn(
-            "tools/regenerate_operation_manual.py",
+            "tools/pipelines/regenerate_operation_manual.py",
             result["artifacts"]["manual_regeneration"]["command"],
         )
 
@@ -3355,7 +3355,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
             command = [
-                "tools/run_operation_manual_from_url.sh",
+                "tools/pipelines/run_operation_manual_from_url.sh",
                 "https://example.com/video",
                 "--frame-extractor",
                 "jetson",
@@ -3376,7 +3376,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
     def test_core_stage_skips_ray_preflight_for_ssh_backend(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
-            command = ["tools/run_operation_manual_from_url.sh", "https://example.com/video", "--jetson-frame-backend", "ssh"]
+            command = ["tools/pipelines/run_operation_manual_from_url.sh", "https://example.com/video", "--jetson-frame-backend", "ssh"]
 
             with patch("video_analyzer.jobengine.video_link_status_server.subprocess.run") as run:
                 result = server.ensure_jetson_ray_ready(command, str(Path(tmp) / "analyze-core.log"))
@@ -3388,7 +3388,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
             command = [
-                "tools/run_operation_manual_from_url.sh",
+                "tools/pipelines/run_operation_manual_from_url.sh",
                 "https://example.com/video",
                 "--frame-extractor",
                 "local_gpu",
@@ -3463,7 +3463,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             command = server.evidence_review_command(loaded)
 
         self.assertNotIn("--skip-review", command)
-        self.assertEqual(command[1], "tools/run_study_guide.py")
+        self.assertEqual(command[1], "tools/pipelines/run_study_guide.py")
 
     def test_qa_index_command_builds_existing_run_index(self):
         with tempfile.TemporaryDirectory() as tmp:

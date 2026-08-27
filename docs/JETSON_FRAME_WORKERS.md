@@ -28,7 +28,7 @@ For current long teaching/talk samples:
 
 ```bash
 cd /home/ai/github/video-analyzer
-tools/run_long_talk_fast_from_url.sh URL --keep-existing
+tools/pipelines/run_long_talk_fast_from_url.sh URL --keep-existing
 ```
 
 The script already includes:

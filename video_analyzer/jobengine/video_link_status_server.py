@@ -2743,7 +2743,7 @@ class VideoLinkStatusServer:
             self.job_dir(job_id) / "logs" / "tts-summary-background.log"
         )
         command = [
-            "tools/run_audio_narration_stage.sh",
+            "tools/pipelines/run_audio_narration_stage.sh",
             str(run_dir),
             "--profile",
             os.environ.get("VIDEO_ANALYZER_AUDIO_TTS_PROFILE", "local_new"),
@@ -3948,7 +3948,7 @@ class VideoLinkStatusServer:
         resolved_mode = job.get("resolved_mode") or opts["analysis_mode"]
         if resolved_mode == "long-talk-fast":
             command = [
-                "tools/run_long_talk_fast_from_url.sh",
+                "tools/pipelines/run_long_talk_fast_from_url.sh",
                 job["video_url"],
                 "--profile",
                 opts["profile"],
@@ -3958,7 +3958,7 @@ class VideoLinkStatusServer:
             self.append_default_frame_extractor_options(command, job)
         else:
             command = [
-                "tools/run_operation_manual_from_url.sh",
+                "tools/pipelines/run_operation_manual_from_url.sh",
                 job["video_url"],
                 "--profile",
                 opts["profile"],
@@ -3991,7 +3991,7 @@ class VideoLinkStatusServer:
         ) == AUDIO_PIPELINE_KIND_TRANSCRIPTION:
             return [
                 os.environ.get("PYTHON") or sys.executable,
-                "tools/run_audio_transcription.py",
+                "tools/pipelines/run_audio_transcription.py",
                 str(media_path),
                 "--output",
                 str(run_dir),
@@ -4006,7 +4006,7 @@ class VideoLinkStatusServer:
             ]
         command = [
             os.environ.get("PYTHON") or sys.executable,
-            "tools/run_audio_template_analysis.py",
+            "tools/pipelines/run_audio_template_analysis.py",
             str(media_path),
             "--output",
             str(run_dir),
@@ -4032,7 +4032,7 @@ class VideoLinkStatusServer:
         opts = job["options"]
         resolved_mode = job.get("resolved_mode") or opts["analysis_mode"]
         command = [
-            "tools/run_operation_manual_from_url.sh",
+            "tools/pipelines/run_operation_manual_from_url.sh",
             job["video_url"],
             "--profile",
             opts["profile"],
@@ -4112,14 +4112,14 @@ class VideoLinkStatusServer:
         )
 
     def multidoc_command(self, job: dict[str, Any]) -> list[str]:
-        command = ["tools/run_multidoc_analysis.sh", str(self.require_run_dir(job)), "--profile", job["options"]["profile"]]
+        command = ["tools/pipelines/run_multidoc_analysis.sh", str(self.require_run_dir(job)), "--profile", job["options"]["profile"]]
         command.extend(["--chapter-concurrency", str(self.chapter_concurrency(job))])
         return command
 
     def regenerate_operation_manual_command(self, job: dict[str, Any]) -> list[str]:
         return [
             sys.executable,
-            "tools/regenerate_operation_manual.py",
+            "tools/pipelines/regenerate_operation_manual.py",
             str(self.require_run_dir(job)),
             "--profile",
             job["options"].get("profile") or DEFAULT_PROFILE,
@@ -4153,7 +4153,7 @@ class VideoLinkStatusServer:
     def study_guide_command(self, job: dict[str, Any]) -> list[str]:
         return [
             sys.executable,
-            "tools/run_study_guide.py",
+            "tools/pipelines/run_study_guide.py",
             str(self.require_run_dir(job)),
             "--profile",
             job["options"].get("profile") or DEFAULT_PROFILE,
@@ -4163,7 +4163,7 @@ class VideoLinkStatusServer:
     def evidence_review_command(self, job: dict[str, Any]) -> list[str]:
         return [
             sys.executable,
-            "tools/run_study_guide.py",
+            "tools/pipelines/run_study_guide.py",
             str(self.require_run_dir(job)),
             "--profile",
             job["options"].get("profile") or DEFAULT_PROFILE,
@@ -4235,7 +4235,7 @@ class VideoLinkStatusServer:
         config_dir = str(snapshot.get("config_dir") or "config")
         profile = str(snapshot.get("profile") or job["options"].get("profile") or DEFAULT_PROFILE)
         return [
-            "tools/run_audio_narration_stage.sh",
+            "tools/pipelines/run_audio_narration_stage.sh",
             str(self.require_run_dir(job)),
             "--profile",
             profile,
@@ -6526,7 +6526,7 @@ class VideoLinkStatusServer:
                 self.skill_projects.save(project)
                 command = [
                     sys.executable,
-                    "tools/run_skill_project_worker.py",
+                    "tools/pipelines/run_skill_project_worker.py",
                     "--repo-root",
                     str(self.repo_root),
                     "--project-id",

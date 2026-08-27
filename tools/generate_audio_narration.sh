@@ -1,11 +1,5 @@
 #!/usr/bin/env bash
+# Backward-compatible shim for tools/pipelines/generate_audio_narration.sh.
+# Kept so existing callers using tools/generate_audio_narration.sh keep working.
 set -euo pipefail
-
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PYTHON_BIN="${PYTHON:-$ROOT_DIR/.venv/bin/python}"
-if [[ ! -x "$PYTHON_BIN" ]]; then
-  PYTHON_BIN="$(command -v python3)"
-fi
-
-cd "$ROOT_DIR"
-exec "$PYTHON_BIN" tools/generate_audio_narration.py "$@"
+exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipelines/generate_audio_narration.sh" "$@"

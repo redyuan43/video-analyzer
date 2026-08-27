@@ -30,13 +30,13 @@ The directory may contain:
 Run:
 
 ```bash
-tools/ask_video_docs.sh RUN_DIR "QUESTION" --profile local_lan
+tools/pipelines/ask_video_docs.sh RUN_DIR "QUESTION" --profile local_lan
 ```
 
 Example:
 
 ```bash
-tools/ask_video_docs.sh downloads/url-videos/BVxxxx/operation-manual "这个视频的核心观点是什么？" --profile local_lan
+tools/pipelines/ask_video_docs.sh downloads/url-videos/BVxxxx/operation-manual "这个视频的核心观点是什么？" --profile local_lan
 ```
 
 ## Multi-turn chat
@@ -44,7 +44,7 @@ tools/ask_video_docs.sh downloads/url-videos/BVxxxx/operation-manual "这个视�
 Run:
 
 ```bash
-tools/chat_with_video_docs.sh RUN_DIR --profile local_lan
+tools/pipelines/chat_with_video_docs.sh RUN_DIR --profile local_lan
 ```
 
 Then ask questions interactively. Use `/exit` to quit.
@@ -64,7 +64,7 @@ The tool defaults to `--tts-concurrency 2` so the Ivan gateway can use both read
 If the user names an exported PDF, pass that file or basename with `--source`; the tool maps `*.pdf` to the matching Markdown file before writing narration:
 
 ```bash
-tools/generate_audio_narration.sh RUN_DIR --source knowledge_notes_v2.pdf --profile local_lan
+tools/pipelines/generate_audio_narration.sh RUN_DIR --source knowledge_notes_v2.pdf --profile local_lan
 ```
 
 Outputs are written under `RUN_DIR/audio_narration/`:
@@ -75,7 +75,7 @@ Outputs are written under `RUN_DIR/audio_narration/`:
 - `audio_output/narration_full.wav`
 - `audio_output/manifest.json`
 
-Do not call `tools/generate_30s_agx_tts.sh` for audio narration requests. That script is now only a deprecated compatibility wrapper and forwards to `tools/generate_audio_narration.sh`.
+Do not call `tools/generate_30s_agx_tts.sh` for audio narration requests. That script is now only a deprecated compatibility wrapper and forwards to `tools/pipelines/generate_audio_narration.sh`.
 
 ## Evidence policy
 

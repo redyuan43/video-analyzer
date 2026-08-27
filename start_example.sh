@@ -29,7 +29,7 @@ if [[ "$URL" != "$RAW_URL" ]]; then
 fi
 
 # Full Spark operation-manual pipeline: download, page context, ASR, OCR, VL, manual.
-tools/run_operation_manual_from_url.sh \
+tools/pipelines/run_operation_manual_from_url.sh \
   "$URL" \
   --profile "$PROFILE" \
   --cookies-from-browser chrome | tee "$LOG_FILE"
@@ -57,7 +57,7 @@ if [[ -z "$RUN_DIR" ]]; then
 fi
 
 # Follow-up multi-round document analysis from the generated operation-manual run.
-tools/run_multidoc_analysis.sh "$RUN_DIR" --profile "$PROFILE"
+tools/pipelines/run_multidoc_analysis.sh "$RUN_DIR" --profile "$PROFILE"
 
 # Final full narration script and WAV synthesized by the Ivan Qwen3-TTS gateway.
-tools/generate_audio_narration.sh "$RUN_DIR" --profile "$PROFILE"
+tools/pipelines/generate_audio_narration.sh "$RUN_DIR" --profile "$PROFILE"

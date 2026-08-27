@@ -32,7 +32,7 @@ For YouTube, Bilibili, or any URL supported by `yt-dlp`, run from the
 repository root:
 
 ```bash
-tools/run_operation_manual_from_url.sh "https://www.bilibili.com/video/BVxxxx"
+tools/pipelines/run_operation_manual_from_url.sh "https://www.bilibili.com/video/BVxxxx"
 ```
 
 For Bilibili, prefer the canonical video URL without share parameters:
@@ -59,18 +59,18 @@ Useful URL-runner variants:
 
 ```bash
 # Use browser cookies for Bilibili/YouTube login or age-gated content.
-tools/run_operation_manual_from_url.sh "URL" --cookies-from-browser chrome
+tools/pipelines/run_operation_manual_from_url.sh "URL" --cookies-from-browser chrome
 
 # Choose pipeline depth. balanced is the default.
-tools/run_operation_manual_from_url.sh "URL" --pipeline-mode fast
-tools/run_operation_manual_from_url.sh "URL" --pipeline-mode balanced
-tools/run_operation_manual_from_url.sh "URL" --pipeline-mode deep
+tools/pipelines/run_operation_manual_from_url.sh "URL" --pipeline-mode fast
+tools/pipelines/run_operation_manual_from_url.sh "URL" --pipeline-mode balanced
+tools/pipelines/run_operation_manual_from_url.sh "URL" --pipeline-mode deep
 
 # Override dynamic frame budgets only when you need a hard cap or fixed pool.
-tools/run_operation_manual_from_url.sh "URL" --candidate-frames auto --max-vl-frames 80
+tools/pipelines/run_operation_manual_from_url.sh "URL" --candidate-frames auto --max-vl-frames 80
 
 # Use two DotsMOCR endpoints and keep OCR cache enabled.
-tools/run_operation_manual_from_url.sh "URL" \
+tools/pipelines/run_operation_manual_from_url.sh "URL" \
   --ocr-base-url http://spark-31d6.taild500c8.ts.net:8000/v1 \
   --ocr-base-url http://edge.taild500c8.ts.net:8000/v1 \
   --ocr-concurrency auto \
@@ -86,14 +86,14 @@ tools/run_operation_manual_from_url.sh "URL" \
   --jetson-sample-fps 0.5
 
 # Only download video and page context.
-tools/run_operation_manual_from_url.sh "URL" --download-only
+tools/pipelines/run_operation_manual_from_url.sh "URL" --download-only
 
 # Disable low-trust community comments, or tune the comment budget.
-tools/run_operation_manual_from_url.sh "URL" --no-include-comments
-tools/run_operation_manual_from_url.sh "URL" --max-comments 10
+tools/pipelines/run_operation_manual_from_url.sh "URL" --no-include-comments
+tools/pipelines/run_operation_manual_from_url.sh "URL" --max-comments 10
 
 # Override subtitle language priority.
-tools/run_operation_manual_from_url.sh "URL" --subtitle-langs zh-CN,zh-Hans,zh,en
+tools/pipelines/run_operation_manual_from_url.sh "URL" --subtitle-langs zh-CN,zh-Hans,zh,en
 ```
 
 To switch or customize endpoints/models, use a runtime profile:
@@ -145,7 +145,7 @@ python3.11 -m venv .venv
 sudo apt-get update && sudo apt-get install -y ffmpeg
 ```
 
-`tools/run_operation_manual_from_url.sh` adds `.venv/bin` to `PATH` before
+`tools/pipelines/run_operation_manual_from_url.sh` adds `.venv/bin` to `PATH` before
 starting Python, so commands such as `yt-dlp` are found even when the shell has
 not manually activated the virtual environment.
 

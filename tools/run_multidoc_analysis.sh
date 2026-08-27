@@ -1,19 +1,5 @@
 #!/usr/bin/env bash
+# Backward-compatible shim for tools/pipelines/run_multidoc_analysis.sh.
+# Kept so existing callers using tools/run_multidoc_analysis.sh keep working.
 set -euo pipefail
-
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PYTHON_BIN="${PYTHON:-$ROOT_DIR/.venv/bin/python}"
-if [[ ! -x "$PYTHON_BIN" ]]; then
-  PYTHON_BIN="$(command -v python3)"
-fi
-
-DEEPSEEK_ENV="${VIDEO_ANALYZER_DEEPSEEK_ENV:-$HOME/.config/video-analyzer/deepseek.env}"
-if [[ -f "$DEEPSEEK_ENV" ]]; then
-  set -a
-  # shellcheck disable=SC1090
-  source "$DEEPSEEK_ENV"
-  set +a
-fi
-
-cd "$ROOT_DIR"
-exec "$PYTHON_BIN" tools/run_multidoc_analysis.py "$@"
+exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pipelines/run_multidoc_analysis.sh" "$@"
