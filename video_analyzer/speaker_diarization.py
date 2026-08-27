@@ -347,7 +347,7 @@ def run_wespeaker_assignment(
     python = str(config.get("external_python") or DEFAULT_EXTERNAL_PYTHON)
     if python == "/home/ai/wespeaker-venv/bin/python" and not Path(python).exists():
         python = DEFAULT_EXTERNAL_PYTHON
-    helper = Path(__file__).resolve().parents[1] / "tools" / "run_wespeaker_diarization.py"
+    helper = Path(__file__).resolve().parents[1] / "tools" / "asr_servers" / "run_wespeaker_diarization.py"
     command = [
         python,
         str(helper),
@@ -395,7 +395,7 @@ def run_3dspeaker_assignment(
         return [], report
 
     project_root = Path(str(project_root_value)).expanduser().resolve()
-    helper_path = Path(__file__).resolve().parents[1] / "tools" / "run_3dspeaker_turns.py"
+    helper_path = Path(__file__).resolve().parents[1] / "tools" / "asr_servers" / "run_3dspeaker_turns.py"
     if not project_root.is_dir():
         report["error"] = f"missing diarization project root: {project_root}"
         return [], report

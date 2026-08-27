@@ -1,140 +1,19 @@
 #!/usr/bin/env python3
-"""Single-GPU FireRedASR2-AED HTTP worker."""
+"""Backward-compatible shim for tools/asr_servers/firered_asr2_worker.py.
 
-from __future__ import annotations
+Both `python tools/firered_asr2_worker.py ...` and
+`from tools.firered_asr2_worker import ...` keep working after the Phase 3b move.
+"""
 
-import os
-import subprocess
-import tempfile
-import threading
-from functools import wraps
+import importlib
+import sys
 from pathlib import Path
 
-from flask import Flask, jsonify, request
-
-
-app = Flask("firered_asr2_worker")
-MODEL = None
-MODEL_LOCK = threading.Lock()
-MODEL_DIR = os.environ.get("FIRERED_ASR2_MODEL", "/home/ai/models/firered/FireRedASR2-AED")
-
-
-def install_forced_align_dtype_compat() -> None:
-    import torch
-    import torchaudio
-
-    original = torchaudio.functional.forced_align
-    if getattr(original, "_firered_dtype_compat", False):
-        return
-
-    @wraps(original)
-    def compatible_forced_align(log_probs, *args, **kwargs):
-        if log_probs.dtype not in {torch.float16, torch.float32, torch.float64}:
-            log_probs = log_probs.float()
-        return original(log_probs, *args, **kwargs)
-
-    compatible_forced_align._firered_dtype_compat = True
-    torchaudio.functional.forced_align = compatible_forced_align
-
-
-def load_model():
-    global MODEL
-    with MODEL_LOCK:
-        if MODEL is None:
-            install_forced_align_dtype_compat()
-            from fireredasr2s.fireredasr2 import FireRedAsr2, FireRedAsr2Config
-
-            MODEL = FireRedAsr2.from_pretrained(
-                "aed",
-                MODEL_DIR,
-                FireRedAsr2Config(
-                    use_gpu=True,
-                    use_half=True,
-                    beam_size=3,
-                    nbest=1,
-                    return_timestamp=True,
-                ),
-            )
-    return MODEL
-
-
-def normalize_audio(source: Path, target: Path) -> None:
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-v",
-            "error",
-            "-i",
-            str(source),
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            "-c:a",
-            "pcm_s16le",
-            "-y",
-            str(target),
-        ],
-        check=True,
-        timeout=120,
-    )
-
-
-@app.get("/api/health")
-def health():
-    return jsonify(
-        {
-            "status": "ok",
-            "ready": True,
-            "model_loaded": MODEL is not None,
-            "model": "FireRedTeam/FireRedASR2-AED",
-        }
-    )
-
-
-@app.post("/api/asr/transcribe")
-def transcribe():
-    audio = request.files.get("audio")
-    if audio is None or not audio.filename:
-        return jsonify({"success": False, "error": "audio file is required"}), 400
-    suffix = Path(audio.filename).suffix or ".wav"
-    with tempfile.TemporaryDirectory(prefix="firered_asr2_") as temp:
-        source = Path(temp) / f"input{suffix}"
-        target = Path(temp) / "audio.wav"
-        audio.save(source)
-        normalize_audio(source, target)
-        result = load_model().transcribe(["audio"], [str(target)])[0]
-    text = str(result.get("text") or "")
-    duration = float(result.get("dur_s") or 0)
-    words = [
-        {"text": str(item[0]), "start": float(item[1]), "end": float(item[2])}
-        for item in (result.get("timestamp") or [])
-        if isinstance(item, (list, tuple)) and len(item) >= 3
-    ]
-    return jsonify(
-        {
-            "success": True,
-            "provider": "firered_asr2",
-            "text": text,
-            "segments": [
-                {
-                    "start": 0.0,
-                    "end": duration,
-                    "text": text,
-                    "confidence": result.get("confidence"),
-                    "timestamp_source": "chunk_bounds",
-                }
-            ] if text else [],
-            "words": words,
-            "language": "zh-CN",
-            "rtf": result.get("rtf"),
-        }
-    )
-
+_REAL = "tools.asr_servers.firered_asr2_worker"
 
 if __name__ == "__main__":
-    app.run(
-        host=os.environ.get("FIRERED_ASR2_WORKER_HOST", "127.0.0.1"),
-        port=int(os.environ.get("FIRERED_ASR2_WORKER_PORT", "18400")),
-        threaded=True,
-    )
+    from runpy import run_path
+
+    sys.exit(run_path(str(Path(__file__).resolve().parent / "asr_servers" / "firered_asr2_worker.py"), run_name="__main__"))
+else:
+    sys.modules[__name__] = importlib.import_module(_REAL)

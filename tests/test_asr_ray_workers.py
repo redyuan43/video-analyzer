@@ -3,8 +3,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tools import asr_ray_workers
-from tools.asr_ray_workers import AsrChunk, ChunkResult
+from tools.asr_servers import asr_ray_workers
+from tools.asr_servers.asr_ray_workers import AsrChunk, ChunkResult
 
 
 class AsrRayWorkerTests(unittest.TestCase):

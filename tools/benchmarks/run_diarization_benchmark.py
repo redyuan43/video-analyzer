@@ -52,7 +52,7 @@ def normalize_turns(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def run_3d_speaker(args: argparse.Namespace) -> list[dict[str, Any]]:
     command = [
         str(args.three_d_speaker_python),
-        str(REPO_ROOT / "tools" / "run_3dspeaker_turns.py"),
+        str(REPO_ROOT / "tools" / "asr_servers" / "run_3dspeaker_turns.py"),
         str(args.audio_path),
         "--project-root",
         str(args.three_d_speaker_root),

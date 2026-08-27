@@ -103,7 +103,7 @@ case "$stage" in
     start_background \
       "$runtime_dir/funasr.pid" \
       "$runtime_dir/funasr.log" \
-      "$asr_python" "$root_dir/tools/nx2_sensevoice_http_server.py" \
+      "$asr_python" "$root_dir/tools/asr_servers/nx2_sensevoice_http_server.py" \
       --host 127.0.0.1 \
       --port "$asr_port" \
       --model "$model_root/asr/modelscope/models/iic--SenseVoiceSmall/snapshots/master" \

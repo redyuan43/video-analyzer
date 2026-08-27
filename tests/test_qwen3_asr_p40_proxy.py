@@ -3,8 +3,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tools import qwen3_asr_p40_proxy as proxy
-from tools.asr_ray_workers import AsrChunk, ChunkResult
+from tools.asr_servers import qwen3_asr_p40_proxy as proxy
+from tools.asr_servers.asr_ray_workers import AsrChunk, ChunkResult
 
 
 class Qwen3AsrP40ProxyTests(unittest.TestCase):

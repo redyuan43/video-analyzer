@@ -3,8 +3,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tools import firered_asr2_p40_proxy as proxy
-from tools.asr_ray_workers import AsrChunk, ChunkResult
+from tools.asr_servers import firered_asr2_p40_proxy as proxy
+from tools.asr_servers.asr_ray_workers import AsrChunk, ChunkResult
 
 
 class FireRedAsr2ProxyTests(unittest.TestCase):

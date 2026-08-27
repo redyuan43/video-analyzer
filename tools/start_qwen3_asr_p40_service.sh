@@ -37,7 +37,7 @@ stop_service() {
     kill "$(cat "${PID_FILE}")" >/dev/null 2>&1 || true
     rm -f "${PID_FILE}"
   fi
-  stop_python_script "tools/qwen3_asr_p40_proxy.py"
+  stop_python_script "tools/asr_servers/qwen3_asr_p40_proxy.py"
   stop_python_script "http_api_server.py --qwen3-asr-worker"
 }
 
@@ -71,7 +71,7 @@ start_service() {
   PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}" \
   NO_PROXY="${NO_PROXY:-127.0.0.1,localhost}" \
   no_proxy="${no_proxy:-127.0.0.1,localhost}" \
-    setsid "${PROXY_PYTHON}" "${ROOT_DIR}/tools/qwen3_asr_p40_proxy.py" \
+    setsid "${PROXY_PYTHON}" "${ROOT_DIR}/tools/asr_servers/qwen3_asr_p40_proxy.py" \
       >"${LOG_DIR}/proxy.log" 2>&1 < /dev/null &
   echo "$!" >"${PID_FILE}"
   for _ in $(seq 1 90); do

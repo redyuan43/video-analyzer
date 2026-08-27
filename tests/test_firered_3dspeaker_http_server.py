@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from tools import firered_3dspeaker_http_server as server
+from tools.asr_servers import firered_3dspeaker_http_server as server
 
 
 class FireRed3DSpeakerServerTests(unittest.TestCase):

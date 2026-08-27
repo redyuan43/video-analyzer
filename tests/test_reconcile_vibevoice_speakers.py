@@ -1,6 +1,6 @@
 import unittest
 
-from tools.reconcile_vibevoice_speakers import find_vibevoice_metadata, update_vibevoice_metadata
+from tools.asr_servers.reconcile_vibevoice_speakers import find_vibevoice_metadata, update_vibevoice_metadata
 
 
 class ReconcileVibeVoiceSpeakersToolTests(unittest.TestCase):

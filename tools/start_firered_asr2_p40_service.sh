@@ -34,8 +34,8 @@ stop_python_script() {
 }
 
 stop_service() {
-  stop_python_script "tools/firered_asr2_p40_proxy.py"
-  stop_python_script "tools/firered_asr2_worker.py"
+  stop_python_script "tools/asr_servers/firered_asr2_p40_proxy.py"
+  stop_python_script "tools/asr_servers/firered_asr2_worker.py"
 }
 
 start_service() {
@@ -62,7 +62,7 @@ start_service() {
     PYTHONPATH="${SOURCE_ROOT}:${ROOT_DIR}" \
     FIRERED_ASR2_WORKER_PORT="${port}" \
     NO_PROXY="127.0.0.1,localhost" no_proxy="127.0.0.1,localhost" \
-      setsid "${PYTHON}" "${ROOT_DIR}/tools/firered_asr2_worker.py" \
+      setsid "${PYTHON}" "${ROOT_DIR}/tools/asr_servers/firered_asr2_worker.py" \
         >"${LOG_DIR}/worker-gpu${gpu}.log" 2>&1 < /dev/null &
   done
   local port_list
@@ -83,7 +83,7 @@ start_service() {
   fi
   PYTHONPATH="${SOURCE_ROOT}:${ROOT_DIR}" FIRERED_ASR2_WORKER_PORTS="${port_list}" FIRERED_ASR2_PROXY_PORT="${PROXY_PORT}" \
   NO_PROXY="127.0.0.1,localhost" no_proxy="127.0.0.1,localhost" \
-    setsid "${PROXY_PYTHON}" "${ROOT_DIR}/tools/firered_asr2_p40_proxy.py" \
+    setsid "${PROXY_PYTHON}" "${ROOT_DIR}/tools/asr_servers/firered_asr2_p40_proxy.py" \
       >"${LOG_DIR}/proxy.log" 2>&1 < /dev/null &
   for _ in $(seq 1 30); do
     curl --noproxy "*" -fsS "http://127.0.0.1:${PROXY_PORT}/api/health" >/dev/null 2>&1 && {

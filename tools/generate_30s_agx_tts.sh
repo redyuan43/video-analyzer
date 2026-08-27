@@ -1,11 +1,5 @@
 #!/usr/bin/env bash
+# Backward-compatible shim for tools/asr_servers/generate_30s_agx_tts.sh.
+# Kept so existing callers using tools/generate_30s_agx_tts.sh keep working.
 set -euo pipefail
-
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-
-cat >&2 <<'EOF'
-[deprecated] tools/generate_30s_agx_tts.sh no longer generates a 30-second AGX recap.
-[deprecated] Forwarding to tools/generate_audio_narration.sh for full Markdown narration + Ivan TTS WAV.
-EOF
-
-exec "$ROOT_DIR/tools/generate_audio_narration.sh" "$@"
+exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/asr_servers/generate_30s_agx_tts.sh" "$@"
