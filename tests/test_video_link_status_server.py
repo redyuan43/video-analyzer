@@ -37,6 +37,7 @@ def load_module(path: Path, name: str):
 
 server_mod = load_module(SERVER_PATH, "video_link_status_server")
 from video_analyzer.jobengine import stage_runner as stage_runner_mod  # noqa: E402
+from video_analyzer.jobengine import repair as repair_mod  # noqa: E402
 url_context_mod = load_module(URL_CONTEXT_PATH, "video_analyzer_url_context")
 REAL_RUNTIME_CONFIG = server_mod.runtime_config
 
@@ -104,9 +105,9 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             (root / "video_analyzer" / "config" / "default_config.json").write_text(
                 json.dumps(
                     {
-                        "active_runtime_profile": "deepseek_v4_pro",
+                        "active_runtime_profile": "deepseek_v4_flash",
                         "runtime_profiles": {
-                            "deepseek_v4_pro": {
+                            "deepseek_v4_flash": {
                                 "text_model": "deepseek-v4-pro",
                                 "review_model": "deepseek-v4-pro",
                                 "ocr_concurrency": 5,
@@ -120,7 +121,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
                 json.dumps(
                     {
                         "runtime_profiles": {
-                            "deepseek_v4_pro": {
+                            "deepseek_v4_flash": {
                                 "ocr_concurrency": 6,
                             }
                         }
@@ -131,7 +132,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             with patch.object(server_mod, "REPO_ROOT", root):
                 merged = REAL_RUNTIME_CONFIG()
 
-        profile = merged["runtime_profiles"]["deepseek_v4_pro"]
+        profile = merged["runtime_profiles"]["deepseek_v4_flash"]
         self.assertEqual(profile["text_model"], "deepseek-v4-pro")
         self.assertEqual(profile["review_model"], "deepseek-v4-pro")
         self.assertEqual(profile["ocr_concurrency"], 6)
@@ -718,7 +719,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             config = {
                 "active_runtime_profile": "nx2_fallback",
                 "runtime_profiles": {
-                    "deepseek_v4_pro": {},
+                    "deepseek_v4_flash": {},
                     "nx2_fallback": {},
                 },
             }
@@ -730,7 +731,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
     def test_balance_failure_recommends_resume_with_active_profile(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
-            job = server.create_job({"video_url": "https://example.com/video", "profile": "deepseek_v4_pro"})
+            job = server.create_job({"video_url": "https://example.com/video", "profile": "local_q4"})
             loaded = server.load_job(job["job_id"])
             run_dir = Path(tmp) / "run"
             run_dir.mkdir()
@@ -810,7 +811,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
     def test_job_runtime_profile_is_locked_to_creation_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
-            job = server.create_job({"video_url": "https://example.com/video", "profile": "deepseek_v4_pro"})
+            job = server.create_job({"video_url": "https://example.com/video", "profile": "local_q4"})
             saved = server.load_job(job["job_id"])
             snapshot = saved["runtime_profile_snapshot"]
             snapshot_path = Path(snapshot["config_dir"]) / "config.json"
@@ -819,10 +820,10 @@ class VideoLinkStatusServerTests(unittest.TestCase):
                 server.start_run(job["job_id"], profile="deepseek_v4_flash")
 
             self.assertEqual(raised.exception.status, 409)
-            self.assertEqual(snapshot["profile"], "deepseek_v4_pro")
+            self.assertEqual(snapshot["profile"], "local_q4")
             self.assertTrue(snapshot_path.is_file())
             snapshot_payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
-            self.assertEqual(snapshot_payload["active_runtime_profile"], "deepseek_v4_pro")
+            self.assertEqual(snapshot_payload["active_runtime_profile"], "local_q4")
             self.assertIn("endpoints", snapshot_payload)
             self.assertIn("local_model_runtime", snapshot_payload)
             self.assertIn("resource_limits", snapshot_payload)
@@ -917,7 +918,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
                 {
                     "videoUrl": "https://example.com/video",
                     "analysisMode": "deep",
-                    "profile": "deepseek_v4_pro",
+                    "profile": "deepseek_v4_flash",
                     "runName": "../operation manual!",
                     "cookiesFromBrowser": "none",
                     "downloadDevice": "mi",
@@ -1012,7 +1013,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
                     {
                         "external_attempt_id": "asset-1-attempt-1",
                         "source_device": "xnote",
-                        "profile": "deepseek_v4_pro",
+                        "profile": "deepseek_v4_flash",
                     },
                     source,
                     "demo.mp3",
@@ -1021,7 +1022,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
                     {
                         "external_attempt_id": "asset-1-attempt-1",
                         "source_device": "xnote",
-                        "profile": "deepseek_v4_pro",
+                        "profile": "deepseek_v4_flash",
                     },
                     source,
                     "demo.mp3",
@@ -1507,7 +1508,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             "source_transcript_sha256": transcript_sha256,
             "template_id": "tmpl-001",
             "focus_prompt": "focus",
-            "profile": "deepseek_v4_pro",
+            "profile": "deepseek_v4_flash",
         }
         chunks = []
         for name, value in fields.items():
@@ -2050,7 +2051,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             job = server.create_uploaded_media_job(
                 {
                     "analysis_mode": "auto",
-                    "profile": "deepseek_v4_pro",
+                    "profile": "deepseek_v4_flash",
                     "focus_prompt": "会议纪要",
                     "template_id": "tmpl-meeting",
                 },
@@ -2067,7 +2068,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertIn("--focus-prompt", command)
         self.assertIn("会议纪要", command)
         self.assertIn("--output", command)
-        self.assertEqual(command[command.index("--profile") + 1], "deepseek_v4_pro")
+        self.assertEqual(command[command.index("--profile") + 1], "deepseek_v4_flash")
         self.assertNotIn("video_analyzer.cli", " ".join(command))
 
     def test_command_mapping_for_collection_options(self):
@@ -2077,7 +2078,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
                 {
                     "video_url": "https://example.com/video",
                     "analysis_mode": "fast",
-                    "profile": "deepseek_v4_pro",
+                    "profile": "deepseek_v4_flash",
                     "cookies_from_browser": "none",
                     "download_device": "mi",
                     "keep_existing": False,
@@ -3472,7 +3473,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
             run_dir = Path(tmp) / "run"
             run_dir.mkdir()
-            job = server.create_job({"video_url": "https://example.com/video", "profile": "deepseek_v4_pro"})
+            job = server.create_job({"video_url": "https://example.com/video", "profile": "deepseek_v4_flash"})
             loaded = server.load_job(job["job_id"])
             loaded["run_dir"] = str(run_dir)
 
@@ -3482,14 +3483,14 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertIn(str(run_dir), command)
         self.assertIn("--build-index", command)
         self.assertIn("--profile", command)
-        self.assertIn("deepseek_v4_pro", command)
+        self.assertIn("deepseek_v4_flash", command)
 
     def test_web_evidence_command_uses_existing_run_and_profile(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
             run_dir = Path(tmp) / "run"
             run_dir.mkdir()
-            job = server.create_job({"video_url": "https://example.com/video", "profile": "deepseek_v4_pro"})
+            job = server.create_job({"video_url": "https://example.com/video", "profile": "deepseek_v4_flash"})
             loaded = server.load_job(job["job_id"])
             loaded["run_dir"] = str(run_dir)
 
@@ -3498,7 +3499,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertEqual(command[:3], [sys.executable, "-m", "video_analyzer.web_evidence"])
         self.assertIn(str(run_dir), command)
         self.assertIn("--profile", command)
-        self.assertIn("deepseek_v4_pro", command)
+        self.assertIn("deepseek_v4_flash", command)
 
     def test_qa_summary_reports_index_files(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3525,7 +3526,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             server = server_mod.VideoLinkStatusServer(Path(tmp), REPO_ROOT)
             run_dir = Path(tmp) / "run"
             run_dir.mkdir()
-            job = server.create_job({"video_url": "https://example.com/video", "profile": "deepseek_v4_pro"})
+            job = server.create_job({"video_url": "https://example.com/video", "profile": "deepseek_v4_flash"})
             loaded = server.load_job(job["job_id"])
             loaded["run_dir"] = str(run_dir)
             server.save_job(loaded)
@@ -3568,7 +3569,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
                 generated = server.generate_skill_candidate(job["job_id"])
 
             snapshot = loaded["runtime_profile_snapshot"]
-            self.assertEqual(generated["profile"], "deepseek_v4_pro")
+            self.assertEqual(generated["profile"], "deepseek_v4_flash")
             init.assert_called_once_with(
                 run_dir.resolve(),
                 profile_name="deepseek_v4_flash",
@@ -3795,7 +3796,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
             ):
                 workspace = server.start_skill_project_distillation(
                     project["id"],
-                    {"profile": "deepseek_v4_pro"},
+                    {"profile": "deepseek_v4_flash"},
                 )
 
             kwargs = initialize.call_args.kwargs
@@ -3931,7 +3932,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
                 server.start_skill_project_distillation(
                     project["id"],
                     {
-                        "profile": "deepseek_v4_pro",
+                        "profile": "deepseek_v4_flash",
                         "accept_limitations": assessed["assessment"]["verdict"] == "ready_limited",
                     },
                 )
@@ -5278,7 +5279,12 @@ class VideoLinkStatusServerTests(unittest.TestCase):
                 loaded["stages"]["analyze-core"] = {"status": "running", "process": {"pid": process.pid}}
                 server.save_job(loaded)
 
-                result = server.stop_job(job["job_id"])
+                with patch.object(
+                    server_mod,
+                    "cancel_local_vibevoice_request",
+                    return_value={"ok": True, "cancelled_requests": 1},
+                ):
+                    result = server.stop_job(job["job_id"])
                 stopped = server.load_job(job["job_id"])
 
             process.wait(timeout=5)
@@ -5288,6 +5294,7 @@ class VideoLinkStatusServerTests(unittest.TestCase):
                 process.wait(timeout=5)
 
         self.assertTrue(result["stopped"])
+        self.assertEqual(result["vibevoice_cancel"]["cancelled_requests"], 1)
         self.assertIn(process.pid, result["stopped_pids"])
         self.assertEqual(stopped["status"], "failed")
         self.assertEqual(stopped["runner"]["error"], "stopped by user")
@@ -6437,6 +6444,431 @@ class VideoLinkStatusServerTests(unittest.TestCase):
         self.assertIn('document.execCommand("copy")', html)
         self.assertIn("查看日志", html)
 
+    def test_incident_repair_is_default_enabled_only_when_model_is_configured(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            server_mod,
+            "runtime_config",
+            return_value={
+                "active_runtime_profile": "local_q4",
+                "runtime_profiles": {"local_q4": {}},
+                "incident_repair": {
+                    "enabled": True,
+                    "enabled_by_default": True,
+                    "base_url": "http://ivan.test:18104/v1",
+                    "model": "qwen-repair",
+                },
+            },
+        ):
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+
+        self.assertTrue(job["options"]["auto_repair"])
+        self.assertTrue(job["repair"]["enabled"])
+        self.assertEqual(job["repair"]["status"], "idle")
+
+    def test_incident_repair_default_is_off_when_globally_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            server_mod,
+            "runtime_config",
+            return_value={
+                "active_runtime_profile": "local_q4",
+                "runtime_profiles": {"local_q4": {}},
+                "incident_repair": {
+                    "enabled": False,
+                    "enabled_by_default": True,
+                    "base_url": "http://ivan.test:18104/v1",
+                    "model": "qwen-repair",
+                },
+            },
+        ):
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+
+        self.assertFalse(job["options"]["auto_repair"])
+        self.assertFalse(job["repair"]["enabled"])
+        self.assertEqual(job["repair"]["status"], "disabled")
+
+    def test_terminal_failure_queues_incident_repair(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            server_mod,
+            "runtime_config",
+            return_value={
+                "active_runtime_profile": "local_q4",
+                "runtime_profiles": {"local_q4": {}},
+                "incident_repair": {
+                    "enabled": True,
+                    "base_url": "http://ivan.test:18104/v1",
+                    "model": "qwen-repair",
+                },
+            },
+        ):
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            loaded["status"] = "failed"
+            loaded["stages"]["probe"] = {
+                "status": "failed",
+                "error": "HTTP 503",
+                "failure": {"kind": "transient_http", "retryable": True},
+            }
+            loaded["runner"] = {
+                "status": "failed",
+                "current_stage": "probe",
+                "error": "probe failed",
+            }
+            server.save_job(loaded)
+
+            queued = server.queue_repair_after_failure(loaded, "probe failed")
+            refreshed = server.load_job(job["job_id"])
+
+        self.assertTrue(queued)
+        self.assertEqual(refreshed["status"], "repairing")
+        self.assertEqual(refreshed["runner"]["status"], "repairing")
+        self.assertEqual(refreshed["repair"]["status"], "queued")
+        self.assertEqual(refreshed["repair"]["trigger_stage"], "probe")
+
+    def test_collection_does_not_advance_while_child_is_repairing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            first = server.create_job({"video_url": "https://example.com/video/1"})
+            second = server.create_job({"video_url": "https://example.com/video/2"})
+            collection_id = "a" * 32
+            first_job = server.load_job(first["job_id"])
+            first_job["collection"] = {
+                "id": collection_id,
+                "index": 1,
+                "part_title": "P1",
+            }
+            first_job["status"] = "repairing"
+            first_job["repair"] = {"enabled": True, "status": "queued"}
+            server.save_job(first_job)
+            server.save_collection(
+                {
+                    "id": collection_id,
+                    "status": "running",
+                    "current_index": 1,
+                    "current_job_id": first["job_id"],
+                    "children": [
+                        {"index": 1, "job_id": first["job_id"]},
+                        {"index": 2, "job_id": second["job_id"]},
+                    ],
+                    "failures": [],
+                }
+            )
+
+            server.advance_collection_after_job(first["job_id"])
+            manifest = server.load_collection(collection_id)
+
+        self.assertEqual(manifest["current_job_id"], first["job_id"])
+        self.assertEqual(manifest["current_index"], 1)
+        self.assertEqual(manifest["failures"], [])
+
+    def test_repair_cycle_executes_only_deterministic_stage_rerun(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            server_mod,
+            "runtime_config",
+            return_value={
+                "active_runtime_profile": "local_q4",
+                "runtime_profiles": {"local_q4": {}},
+                "incident_repair": {
+                    "enabled": True,
+                    "base_url": "http://ivan.test:18104/v1",
+                    "model": "qwen-repair",
+                },
+            },
+        ):
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            loaded["status"] = "failed"
+            loaded["stages"]["probe"] = {
+                "status": "failed",
+                "error": "temporary failure",
+                "failure": {"kind": "transient_http", "retryable": True},
+            }
+            loaded["runner"] = {"status": "failed", "current_stage": "probe", "error": "temporary failure"}
+            server.save_job(loaded)
+            server.queue_repair_after_failure(loaded, "temporary failure")
+            decision = {
+                "diagnosis": {
+                    "summary": "temporary endpoint failure",
+                    "category": "transient",
+                    "confidence": 0.9,
+                    "evidence_refs": ["stage_error"],
+                },
+                "action": {
+                    "type": "retry_failed_stage",
+                    "stage": "probe",
+                    "delay_seconds": 1,
+                    "reason": "retry the failed stage",
+                    "service_id": "",
+                    "proposal": "",
+                },
+            }
+            with patch.object(
+                server,
+                "request_repair_decision",
+                return_value=(decision, json.dumps(decision)),
+            ), patch.object(
+                server,
+                "rerun_from_stage",
+                return_value={"job_id": job["job_id"], "status": "queued"},
+            ) as rerun:
+                result = server.run_repair_cycle(job["job_id"])
+
+        rerun.assert_called_once_with(job["job_id"], "probe", enqueue=True)
+        self.assertEqual(result["status"], "queued")
+
+    def test_wait_and_retry_runs_failed_stage_after_delay(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            server_mod,
+            "runtime_config",
+            return_value={
+                "active_runtime_profile": "local_q4",
+                "runtime_profiles": {"local_q4": {}},
+                "incident_repair": {
+                    "enabled": True,
+                    "base_url": "http://ivan.test:18104/v1",
+                    "model": "qwen-repair",
+                },
+            },
+        ):
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            loaded["status"] = "repairing"
+            loaded["stages"]["probe"] = {
+                "status": "failed",
+                "error": "HTTP 503",
+                "failure": {"kind": "transient_http", "retryable": True},
+            }
+            loaded["runner"] = {
+                "status": "repairing",
+                "current_stage": "probe",
+                "error": "HTTP 503",
+            }
+            loaded["repair"].update(
+                {
+                    "status": "queued",
+                    "trigger_stage": "probe",
+                    "scheduled_action": {
+                        "type": "wait_and_retry",
+                        "stage": "probe",
+                        "delay_seconds": 1,
+                        "reason": "wait for endpoint recovery",
+                    },
+                    "next_attempt_at": server_mod.iso_now(),
+                }
+            )
+            server.save_job(loaded)
+
+            with patch.object(
+                server,
+                "request_repair_decision",
+            ) as request_decision, patch.object(
+                server,
+                "rerun_from_stage",
+                return_value={"job_id": job["job_id"], "status": "queued"},
+            ) as rerun:
+                result = server.run_repair_cycle(job["job_id"])
+
+        request_decision.assert_not_called()
+        rerun.assert_called_once_with(job["job_id"], "probe", enqueue=True)
+        self.assertEqual(result["status"], "queued")
+
+    def test_same_failure_fingerprint_stops_on_second_cycle(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            server_mod,
+            "runtime_config",
+            return_value={
+                "active_runtime_profile": "local_q4",
+                "runtime_profiles": {"local_q4": {}},
+                "incident_repair": {
+                    "enabled": True,
+                    "base_url": "http://ivan.test:18104/v1",
+                    "model": "qwen-repair",
+                    "same_fingerprint_limit": 2,
+                },
+            },
+        ):
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            job = server.create_job({"video_url": "https://example.com/video"})
+            loaded = server.load_job(job["job_id"])
+            loaded["status"] = "failed"
+            loaded["stages"]["probe"] = {"status": "failed", "error": "same fatal error"}
+            loaded["runner"] = {"status": "failed", "current_stage": "probe", "error": "same fatal error"}
+            server.save_job(loaded)
+            server.queue_repair_after_failure(loaded, "same fatal error")
+            decision = {
+                "diagnosis": {
+                    "summary": "unknown",
+                    "category": "unknown",
+                    "confidence": 0.5,
+                    "evidence_refs": ["stage_error"],
+                },
+                "action": {
+                    "type": "manual_review",
+                    "stage": "probe",
+                    "delay_seconds": 60,
+                    "reason": "review",
+                    "service_id": "",
+                    "proposal": "",
+                },
+            }
+            with patch.object(
+                server,
+                "request_repair_decision",
+                return_value=(decision, json.dumps(decision)),
+            ) as request:
+                server.run_repair_cycle(job["job_id"])
+                server.retry_repair(job["job_id"])
+                result = server.run_repair_cycle(job["job_id"])
+
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(result["repair"]["status"], "exhausted")
+
+    def test_repair_evidence_redacts_credentials(self):
+        redacted = repair_mod.redact_value(
+            {
+                "Authorization": "Bearer secret-token",
+                "message": "api_key=abc123 Cookie: session=private",
+            }
+        )
+
+        self.assertEqual(redacted["Authorization"], "<redacted>")
+        self.assertNotIn("abc123", redacted["message"])
+        self.assertNotIn("session=private", redacted["message"])
+
+    def test_permanent_failure_rejects_automatic_repair_action(self):
+        evidence = {
+            "stage": "multidoc",
+            "next_stage": "multidoc",
+            "failure": {"kind": "permanent_billing"},
+            "failure_disposition": {"category": "external_block"},
+        }
+        decision = {
+            "diagnosis": {"summary": "no balance", "category": "external", "confidence": 1},
+            "action": {"type": "retry_failed_stage", "stage": "multidoc"},
+        }
+
+        with self.assertRaisesRegex(ValueError, "manual review"):
+            repair_mod.validate_repair_decision(decision, evidence)
+
+    def test_invalid_model_decision_gets_one_correction_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            evidence = {
+                "stage": "probe",
+                "next_stage": "probe",
+                "failure": {"kind": "transient_http"},
+                "failure_disposition": {"category": "rerun_core"},
+                "service_actions": [],
+            }
+            corrected = json.dumps(
+                {
+                    "diagnosis": {
+                        "summary": "temporary error",
+                        "category": "transient",
+                        "confidence": 0.8,
+                    },
+                    "action": {
+                        "type": "retry_failed_stage",
+                        "stage": "probe",
+                        "reason": "retry",
+                    },
+                }
+            )
+            with patch.object(
+                server,
+                "call_repair_model",
+                side_effect=["{}", corrected],
+            ) as call:
+                decision, raw = server.request_repair_decision(
+                    evidence,
+                    {
+                        "base_url": "http://ivan.test:18104/v1",
+                        "model": "qwen-repair",
+                        "timeout_seconds": 10,
+                    },
+                )
+
+        self.assertEqual(call.call_count, 2)
+        self.assertEqual(decision["action"]["type"], "retry_failed_stage")
+        self.assertEqual(raw, corrected)
+
+    def test_approved_service_action_uses_only_allowlisted_command(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            server_mod,
+            "runtime_config",
+            return_value={
+                "active_runtime_profile": "local_q4",
+                "runtime_profiles": {"local_q4": {}},
+                "incident_repair": {
+                    "enabled": True,
+                    "base_url": "http://ivan.test:18104/v1",
+                    "model": "qwen-repair",
+                    "service_actions": {
+                        "ivan-qwen38": {
+                            "kind": "ssh_systemd_user",
+                            "host": "ivan",
+                            "unit": "qwen38-huihui-nvfp4.service",
+                        }
+                    },
+                },
+            },
+        ):
+            server = server_mod.VideoLinkStatusServer(Path(tmp) / "jobs", REPO_ROOT)
+            with patch.object(repair_mod.subprocess, "run") as run:
+                server.run_approved_service_action("ivan-qwen38")
+
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command,
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=8",
+                "ivan",
+                "systemctl",
+                "--user",
+                "restart",
+                "qwen38-huihui-nvfp4.service",
+            ],
+        )
+        self.assertTrue(run.call_args.kwargs["check"])
+
+    def test_code_patch_validator_limits_paths_files_and_changed_lines(self):
+        files, changed = repair_mod.validate_patch_text(
+            "\n".join(
+                [
+                    "diff --git a/video_analyzer/sample.py b/video_analyzer/sample.py",
+                    "--- a/video_analyzer/sample.py",
+                    "+++ b/video_analyzer/sample.py",
+                    "@@ -1 +1 @@",
+                    "-VALUE = 1",
+                    "+VALUE = 2",
+                ]
+            )
+        )
+
+        self.assertEqual(files, ["video_analyzer/sample.py"])
+        self.assertEqual(changed, 2)
+        with self.assertRaisesRegex(ValueError, "not allowed"):
+            repair_mod.validate_patch_text(
+                "\n".join(
+                    [
+                        "diff --git a/config/config.json b/config/config.json",
+                        "--- a/config/config.json",
+                        "+++ b/config/config.json",
+                        "@@ -1 +1 @@",
+                        "-{}",
+                        "+{\"changed\": true}",
+                    ]
+                )
+            )
+
 
 def write_skill_distillation_state(run_dir: Path, *, status: str) -> None:
     state = {
@@ -6445,7 +6877,7 @@ def write_skill_distillation_state(run_dir: Path, *, status: str) -> None:
         "run_dir": str(run_dir),
         "status": status,
         "current_stage": "source" if status == "ready" else None,
-        "profile": "deepseek_v4_pro",
+        "profile": "deepseek_v4_flash",
         "generation_model": "deepseek-v4-pro",
         "review_model": "deepseek-v4-pro",
         "created_at": skill_distill.utc_now(),

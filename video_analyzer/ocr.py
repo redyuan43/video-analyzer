@@ -20,6 +20,7 @@ from PIL import Image
 
 from .config import Config, normalize_string_list
 from .frame import Frame
+from .runtime_capacity import resolve_endpoint_concurrency
 
 logger = logging.getLogger(__name__)
 
@@ -752,12 +753,6 @@ def _resolve_dots_endpoints(base_url: str, base_urls: Optional[List[str]] = None
     return normalized
 
 
-def _resolve_ocr_concurrency(value: int | str) -> int:
-    if value == "auto":
-        return 1
-    return max(1, int(value))
-
-
 def _probe_dots_providers(
     endpoints: List[str],
     model: str,
@@ -1010,8 +1005,18 @@ def run_ocr(
         pending_frames = list(frames)
 
     results: Dict[int, OCREvent] = dict(cached_by_number)
-    concurrency = _resolve_ocr_concurrency(ocr_concurrency)
-    max_workers = max(1, len(dots_providers) * concurrency)
+    if str(ocr_concurrency).strip().lower() == "auto":
+        max_workers = resolve_endpoint_concurrency(
+            ocr_concurrency,
+            [provider.base_url for provider in dots_providers],
+        )
+    else:
+        max_workers = max(1, len(dots_providers) * int(ocr_concurrency))
+    logger.info(
+        "OCR concurrency resolved to %s across %s endpoint(s)",
+        max_workers,
+        len(dots_providers),
+    )
 
     def analyze_with_endpoint_retry(index: int, frame: Frame) -> OCREvent:
         attempts = len(dots_providers) if retry_endpoints else 1

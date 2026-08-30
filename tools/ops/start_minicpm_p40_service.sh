@@ -8,8 +8,9 @@ PID_FILE="${MINICPM_PID_FILE:-${RUNTIME_DIR}/proxy.pid}"
 PROXY_HOST="${MINICPM_PROXY_HOST:-0.0.0.0}"
 PROXY_PORT="${MINICPM_PROXY_PORT:-18082}"
 BASE_BACKEND_PORT="${MINICPM_BASE_BACKEND_PORT:-18182}"
-WORKER_COUNT="${MINICPM_WORKER_COUNT:-5}"
-GPU_IDS="${MINICPM_GPU_IDS:-0,1,2,4,5}"
+WORKER_COUNT="${MINICPM_WORKER_COUNT:-auto}"
+GPU_IDS="${MINICPM_GPU_IDS:-auto}"
+GPU_SELECTION="${MINICPM_GPU_SELECTION:-auto}"
 PYTHON_BIN="${MINICPM_PYTHON:-${ROOT_DIR}/.venv/bin/python}"
 STOP_CONFLICTS="${MINICPM_STOP_CONFLICTS:-1}"
 VISION_ENGINE="${VISION_ENGINE:-minicpm_v45}"
@@ -23,7 +24,8 @@ fi
 
 usage() {
   echo "Usage: $0 start|stop|restart|status [worker-count]" >&2
-  echo "Set MINICPM_GPU_IDS to choose physical GPUs; default: ${GPU_IDS}" >&2
+  echo "worker-count and MINICPM_GPU_IDS default to auto discovery." >&2
+  echo "Set MINICPM_GPU_SELECTION=manual to honor explicit values." >&2
 }
 
 is_running() {
@@ -39,6 +41,36 @@ clear_stale_pid() {
 join_by_comma() {
   local IFS=,
   echo "$*"
+}
+
+resolve_gpu_selection() {
+  local requested_count="$1"
+  if [[ "${GPU_IDS}" == "auto" || -z "${GPU_IDS}" ]]; then
+    local max_count="auto"
+    if [[ "${requested_count}" != "auto" ]]; then
+      max_count="${requested_count}"
+    fi
+    GPU_IDS="$(
+      "${PYTHON_BIN}" "${ROOT_DIR}/tools/ops/discover_idle_gpus.py" \
+        --allowed-name "Tesla P40" \
+        --allowed-name "Tesla V100" \
+        --min-total-mib "${MINICPM_MIN_TOTAL_MIB:-12000}" \
+        --min-free-mib "${MINICPM_MIN_FREE_MIB:-10000}" \
+        --max-count "${max_count}" \
+        --format csv
+    )"
+  fi
+  local gpu_ids=()
+  IFS=, read -r -a gpu_ids <<<"${GPU_IDS}"
+  if (( ${#gpu_ids[@]} == 0 )); then
+    echo "No compatible idle GPU is available for ${VISION_ENGINE}" >&2
+    exit 1
+  fi
+  if [[ "${requested_count}" == "auto" ]]; then
+    WORKER_COUNT="${#gpu_ids[@]}"
+  else
+    WORKER_COUNT="${requested_count}"
+  fi
 }
 
 configure_model() {
@@ -79,10 +111,6 @@ worker_spec() {
     local gpu="${gpu_ids[index]}"
     if ! [[ "${gpu}" =~ ^[0-9]+$ ]]; then
       echo "invalid GPU id in MINICPM_GPU_IDS: ${gpu}" >&2
-      exit 2
-    fi
-    if [[ "${gpu}" == "3" ]]; then
-      echo "GPU 3 is reserved for the Foundation-Sec security model" >&2
       exit 2
     fi
     specs+=("${gpu}:$((BASE_BACKEND_PORT + index))")
@@ -131,8 +159,12 @@ stop_minicpm() {
 
 start_minicpm() {
   local count="${1:-${WORKER_COUNT}}"
-  if ! [[ "${count}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "worker-count must be a positive integer" >&2
+  if [[ "${GPU_SELECTION}" != "manual" ]]; then
+    count="auto"
+    GPU_IDS="auto"
+  fi
+  if [[ "${count}" != "auto" ]] && ! [[ "${count}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "worker-count must be auto or a positive integer" >&2
     exit 2
   fi
   clear_stale_pid
@@ -147,6 +179,8 @@ start_minicpm() {
     stop_conflicting_gpu_services
   fi
   stop_minicpm
+  resolve_gpu_selection "${count}"
+  count="${WORKER_COUNT}"
 
   cd "${ROOT_DIR}"
   local workers

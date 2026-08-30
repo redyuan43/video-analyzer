@@ -14,6 +14,8 @@ const stageNames = {
 };
 
 const consoleFlowTimerPlaceholder = '阶段耗时 00:00:00';
+const JOB_LIST_PAGE_SIZE = 12;
+const JOB_LIST_MAX_LIMIT = 200;
 
 const skillStageNames = {
     source: '整理原始证据',
@@ -49,6 +51,9 @@ let refreshTimer = null;
 let refreshRequest = null;
 let currentJob = null;
 let latestJobs = [];
+let jobListLimit = JOB_LIST_PAGE_SIZE;
+let jobListTotal = 0;
+let jobListLoadingMore = false;
 let selectedJobSource = window.localStorage.getItem('video-analyzer-job-source') || 'video';
 let showNonRerunFailures = false;
 let previewFilterStatus = 'all';
@@ -264,6 +269,7 @@ const nodes = {
     videoUrls: document.getElementById('videoUrls'),
     urlList: document.getElementById('urlList'),
     expandBilibiliParts: document.getElementById('expandBilibiliParts'),
+    autoRepair: document.getElementById('autoRepair'),
     intentCards: Array.from(document.querySelectorAll('.intent-card')),
     templatePanel: document.getElementById('templatePanel'),
     templateSearch: document.getElementById('templateSearch'),
@@ -280,6 +286,8 @@ const nodes = {
     jobSource: document.getElementById('jobSource'),
     showNonRerunFailures: document.getElementById('showNonRerunFailures'),
     jobList: document.getElementById('jobList'),
+    jobListPagination: document.getElementById('jobListPagination'),
+    jobListLoadMore: document.getElementById('jobListLoadMore'),
     runButton: document.getElementById('runButton'),
     selectedTitle: document.getElementById('selectedTitle'),
     selectedSubtitle: document.getElementById('selectedSubtitle'),
@@ -292,6 +300,16 @@ const nodes = {
     errorPanel: document.getElementById('errorPanel'),
     errorTitle: document.getElementById('errorTitle'),
     errorMessage: document.getElementById('errorMessage'),
+    repairPanel: document.getElementById('repairPanel'),
+    repairTitle: document.getElementById('repairTitle'),
+    repairSummary: document.getElementById('repairSummary'),
+    repairStatus: document.getElementById('repairStatus'),
+    repairAction: document.getElementById('repairAction'),
+    repairActions: document.getElementById('repairActions'),
+    approveRepairButton: document.getElementById('approveRepairButton'),
+    rejectRepairButton: document.getElementById('rejectRepairButton'),
+    retryRepairButton: document.getElementById('retryRepairButton'),
+    disableRepairButton: document.getElementById('disableRepairButton'),
     consoleFlowPanel: document.getElementById('consoleFlowPanel'),
     consoleFlowSummary: document.getElementById('consoleFlowSummary'),
     consoleFlowPrevious: document.getElementById('consoleFlowPrevious'),
@@ -1003,7 +1021,7 @@ async function loadOptions() {
     fillObjectSelect(
         nodes.skillProfile,
         choices.skill_distillation_profiles,
-        defaults.skill_distillation_profile || 'deepseek_v4_pro'
+        defaults.skill_distillation_profile || 'deepseek_v4_flash'
     );
     document.getElementById('runName').value = defaults.run_name || 'operation-manual';
     document.getElementById('skipImages').checked = Boolean(defaults.skip_images);
@@ -1014,6 +1032,7 @@ async function loadOptions() {
     document.getElementById('preferSubtitleTranscript').checked = Boolean(defaults.prefer_subtitle_transcript);
     document.getElementById('includeComments').checked = Boolean(defaults.include_comments);
     document.getElementById('refreshContext').checked = Boolean(defaults.refresh_context);
+    nodes.autoRepair.checked = Boolean(defaults.auto_repair);
     nodes.focusPrompt.value = defaults.focus_prompt || '';
     selectedTemplate = null;
     renderSelectedTemplate();
@@ -1059,6 +1078,10 @@ function settingsModels(kind = '') {
     return (settingsData?.models || []).filter(item => !kind || item.kind === kind);
 }
 
+function visibleSettingsModels(kind = '') {
+    return settingsModels(kind).filter(item => !['control', 'derived'].includes(item.source));
+}
+
 function syncModelProtocolOptions(selected = '') {
     const protocols = settingsData?.schema?.kinds?.[nodes.modelKind.value] || [];
     fillSelect('modelProtocol', protocols, selected || protocols[0] || '');
@@ -1067,7 +1090,7 @@ function syncModelProtocolOptions(selected = '') {
 function renderSettingsModelList() {
     const kind = nodes.settingsModelKindFilter.value;
     const query = nodes.settingsModelSearch.value.trim().toLowerCase();
-    const items = settingsModels(kind).filter(item => (
+    const items = visibleSettingsModels(kind).filter(item => (
         !query
         || `${item.id} ${item.name} ${item.model || ''} ${item.protocol}`.toLowerCase().includes(query)
     ));
@@ -1136,18 +1159,29 @@ function selectSettingsModel(modelId) {
     renderSettingsModelList();
 }
 
+function parseAutoPositiveInteger(input, label, { allowEmpty = true } = {}) {
+    const raw = String(input?.value || '').trim().toLowerCase();
+    if (!raw && allowEmpty) return null;
+    if (!raw || raw === 'auto') return 'auto';
+    const value = Number(raw);
+    if (!Number.isInteger(value) || value < 1) {
+        throw new Error(`${label}必须是 auto 或正整数`);
+    }
+    return value;
+}
+
 async function saveModelSettings(event) {
     event.preventDefault();
     const modelId = nodes.modelId.value.trim();
     const options = parseJsonField(nodes.modelOptions, '高级参数');
     const deployment = nodes.modelDeployment.value;
-    const workerCount = Number(nodes.modelWorkerCount.value || 0);
-    const concurrency = Number(nodes.modelConcurrency.value || 0);
+    const workerCount = parseAutoPositiveInteger(nodes.modelWorkerCount, 'Worker 数');
+    const concurrency = parseAutoPositiveInteger(nodes.modelConcurrency, '并发数');
     if (deployment) options.deployment = deployment;
     else delete options.deployment;
-    if (workerCount > 0) options.worker_count = workerCount;
+    if (workerCount != null) options.worker_count = workerCount;
     else delete options.worker_count;
-    if (concurrency > 0) options.concurrency = concurrency;
+    if (concurrency != null) options.concurrency = concurrency;
     else delete options.concurrency;
     const payload = {
         id: modelId,
@@ -1226,7 +1260,8 @@ function profileAdvancedSettings(profile) {
         'vad_max_segment_sec', 'single_pass_max_duration_sec',
         'chunk_duration_sec', 'chunk_overlap_sec',
         'speaker_diarization', 'ocr_provider', 'ocr_base_url', 'ocr_base_urls', 'ocr_model',
-        'vision_base_url', 'vision_model', 'vision_api_key_env',
+        'ocr_engine', 'ocr_worker_count', 'ocr_min_gpu_memory_mib', 'ocr_min_gpu_free_mib',
+        'vision_base_url', 'vision_model', 'vision_api_key_env', 'vision_runtime',
         'llm_base_url', 'text_base_url', 'text_model', 'text_api_key_env',
         'review_base_url', 'review_model', 'review_api_key_env',
         'study_card_llm_base_url', 'study_card_model', 'study_card_api_key_env',
@@ -1370,7 +1405,7 @@ function asrChunkEditorMarkup(model) {
             </label>
             <label>
                 <span>Ray Worker 数</span>
-                <input data-asr-chunk-field="workerCount" type="number" min="1" max="5" step="1" value="${escapeHtml(String(profileAsrChunkSettings.workerCount || defaults.workerCount || 1))}">
+                <input data-asr-chunk-field="workerCount" type="number" min="1" max="6" step="1" value="${escapeHtml(String(profileAsrChunkSettings.workerCount || defaults.workerCount || 1))}">
             </label>
             ${vadMode ? `<label>
                 <span>最大语音段秒数</span>
@@ -1390,7 +1425,7 @@ function asrChunkEditorMarkup(model) {
                 </label>`}
         </div>
         <p>${vadMode
-            ? 'FireRedVAD 在 CPU 上生成自然语音段，再由 Ray 动态分发到五张 P40。'
+            ? 'FireRedVAD 在 CPU 上生成自然语音段，再由 Ray 动态分发到可用 GPU。'
             : '固定分块由 Ray 动态分发；统一自定义值会随运行方案保存。'}</p>
     </section>`;
 }
@@ -1875,7 +1910,7 @@ function resetProfileEditor(source = null) {
     loadProfileAsrChunkSettings(source);
     selectedProfileFlowNodeId = profileFlowSchema().nodes[0]?.id || '';
     nodes.profilePipelineMode.value = source?.pipeline_mode || 'balanced';
-    nodes.profileVlConcurrency.value = source?.vl_concurrency ?? 5;
+    nodes.profileVlConcurrency.value = source?.vl_concurrency ?? 'auto';
     nodes.profileOcrConcurrency.value = source?.ocr_concurrency ?? 'auto';
     nodes.profileChapterConcurrency.value = source?.multidoc_chapter_concurrency ?? 10;
     nodes.profileTextTimeout.value = source?.text_timeout_seconds ?? 600;
@@ -1909,7 +1944,7 @@ function selectSettingsProfile(profileName) {
     loadProfileAsrChunkSettings(profile);
     selectedProfileFlowNodeId = profileFlowSchema().nodes[0]?.id || '';
     nodes.profilePipelineMode.value = profile.pipeline_mode || 'balanced';
-    nodes.profileVlConcurrency.value = profile.vl_concurrency ?? 5;
+    nodes.profileVlConcurrency.value = profile.vl_concurrency ?? 'auto';
     nodes.profileOcrConcurrency.value = profile.ocr_concurrency ?? 'auto';
     nodes.profileChapterConcurrency.value = profile.multidoc_chapter_concurrency ?? 10;
     nodes.profileTextTimeout.value = profile.text_timeout_seconds ?? 600;
@@ -1930,7 +1965,11 @@ async function saveProfileSettings(event) {
     const profileName = nodes.profileId.value.trim();
     const settings = parseJsonField(nodes.profileSettingsJson, '运行参数');
     settings.pipeline_mode = nodes.profilePipelineMode.value;
-    settings.vl_concurrency = Number(nodes.profileVlConcurrency.value || 1);
+    settings.vl_concurrency = parseAutoPositiveInteger(
+        nodes.profileVlConcurrency,
+        'VL 并发',
+        { allowEmpty: false }
+    );
     settings.ocr_concurrency = nodes.profileOcrConcurrency.value.trim() || 'auto';
     settings.multidoc_chapter_concurrency = Number(nodes.profileChapterConcurrency.value || 1);
     settings.text_timeout_seconds = Number(nodes.profileTextTimeout.value || 600);
@@ -2006,7 +2045,7 @@ async function loadSettings(selection = {}) {
         ...kinds.map(kind => `<option value="${escapeHtml(kind)}">${escapeHtml(kind)}</option>`)
     ].join('');
     nodes.modelKind.innerHTML = kinds.map(kind => `<option value="${escapeHtml(kind)}">${escapeHtml(kind)}</option>`).join('');
-    nodes.settingsSummary.textContent = `${settingsData.models.length} 个模型资源 · ${settingsData.profiles.length} 个运行方案 · 默认 ${settingsData.active_runtime_profile || '-'}`;
+    nodes.settingsSummary.textContent = `${visibleSettingsModels().length} 个模型资源 · ${settingsData.profiles.length} 个运行方案 · 默认 ${settingsData.active_runtime_profile || '-'}`;
     renderSettingsModelList();
     renderSettingsProfileList();
     const modelId = selection.modelId || selectedSettingsModelId;
@@ -2041,6 +2080,7 @@ function jobPayload() {
         prefer_subtitle_transcript: document.getElementById('preferSubtitleTranscript').checked,
         include_comments: document.getElementById('includeComments').checked,
         refresh_context: document.getElementById('refreshContext').checked,
+        auto_repair: nodes.autoRepair.checked,
         max_comments: Number(document.getElementById('maxComments').value || 0),
         subtitle_langs: document.getElementById('subtitleLangs').value.trim(),
         schedule_time: nodes.scheduleTime?.value?.trim() || '',
@@ -2061,6 +2101,7 @@ function appendCommonJobFields(formData) {
     formData.append('run_name', document.getElementById('runName').value.trim());
     formData.append('skip_images', document.getElementById('skipImages').checked ? 'true' : 'false');
     formData.append('keep_existing', document.getElementById('keepExisting').checked ? 'true' : 'false');
+    formData.append('auto_repair', nodes.autoRepair.checked ? 'true' : 'false');
     formData.append('auto_start', 'true');
 }
 
@@ -2310,7 +2351,12 @@ function jobScheduleInfo(job) {
 }
 
 function renderJobList(jobs) {
-    const visibleJobs = jobs.filter(job => (
+    const listedJobs = currentJob
+        && selectedJobId
+        && !jobs.some(job => job.job_id === selectedJobId)
+        ? [currentJob, ...jobs]
+        : jobs;
+    const visibleJobs = listedJobs.filter(job => (
         showNonRerunFailures
         || Boolean(job.collection)
         || job.status !== 'failed'
@@ -2344,6 +2390,38 @@ function renderJobList(jobs) {
         </div>`;
     }).join('') : '<div class="empty">当前没有需要续跑的失败任务</div>';
     bindJobButtons();
+    updateJobListPagination();
+}
+
+function updateJobListPagination() {
+    if (!nodes.jobListPagination || !nodes.jobListLoadMore) return;
+    const loaded = Math.min(latestJobs.length, jobListTotal);
+    const hasMore = loaded < jobListTotal && jobListLimit < JOB_LIST_MAX_LIMIT;
+    nodes.jobListPagination.hidden = !hasMore;
+    nodes.jobListLoadMore.disabled = jobListLoadingMore;
+    nodes.jobListLoadMore.textContent = jobListLoadingMore
+        ? '加载中…'
+        : `加载更多 · ${loaded}/${jobListTotal}`;
+}
+
+async function loadMoreJobs() {
+    if (
+        jobListLoadingMore
+        || latestJobs.length >= jobListTotal
+        || jobListLimit >= JOB_LIST_MAX_LIMIT
+    ) return;
+    if (refreshRequest) {
+        await refreshRequest.catch(() => {});
+    }
+    jobListLoadingMore = true;
+    jobListLimit = Math.min(jobListLimit + JOB_LIST_PAGE_SIZE, JOB_LIST_MAX_LIMIT);
+    updateJobListPagination();
+    try {
+        await refreshJobs();
+    } finally {
+        jobListLoadingMore = false;
+        updateJobListPagination();
+    }
 }
 
 function mergeSelectedJobSnapshot(snapshot) {
@@ -2400,6 +2478,7 @@ async function refreshJobsNow() {
     renderGlobal(data);
     const jobs = data.jobs || [];
     latestJobs = jobs;
+    jobListTotal = Number(data.total ?? jobs.length);
     updateProfileTestAvailability();
     renderJobList(jobs);
     if (currentView === 'preview' && (!selectedJobId || currentJob)) {
@@ -2438,6 +2517,7 @@ async function refreshJobsNoSelect() {
     renderGlobal(data);
     const jobs = data.jobs || [];
     latestJobs = jobs;
+    jobListTotal = Number(data.total ?? jobs.length);
     updateProfileTestAvailability();
     renderJobList(jobs);
     if (currentView === 'preview') renderTaskPreviewGrid(latestJobs);
@@ -2445,9 +2525,10 @@ async function refreshJobsNoSelect() {
     renderSelectedJobSnapshot(jobs);
 }
 
-function jobCollectionUrl() {
-    if (selectedJobSource === 'video') return '/api/video-link/jobs?limit=200';
-    return `/api/operator/audio-jobs?limit=200&tenant_id=${encodeURIComponent(selectedJobSource)}`;
+function jobCollectionUrl(limit = jobListLimit) {
+    const boundedLimit = Math.max(1, Math.min(Number(limit) || JOB_LIST_PAGE_SIZE, JOB_LIST_MAX_LIMIT));
+    if (selectedJobSource === 'video') return `/api/video-link/jobs?limit=${boundedLimit}`;
+    return `/api/operator/audio-jobs?limit=${boundedLimit}&tenant_id=${encodeURIComponent(selectedJobSource)}`;
 }
 
 async function loadJobSources() {
@@ -2558,6 +2639,7 @@ function renderEmpty() {
     nodes.selectedTitle.textContent = '未选择任务';
     nodes.selectedSubtitle.textContent = '创建或选择一个任务后查看进度。';
     nodes.stageDurationSummary.textContent = '原视频长度：- · 阶段总耗时：-';
+    nodes.repairPanel.hidden = true;
     renderConsoleEmptyState('选择任务后显示执行流程');
     renderConsoleNarration(null);
     renderQaPanel(null);
@@ -2582,6 +2664,7 @@ function renderServiceOffline(error) {
     setText(nodes.nextStageValue, '-');
     setText(nodes.queueValue, '-');
     nodes.stageDurationSummary.textContent = '原视频长度：- · 阶段总耗时：-';
+    nodes.repairPanel.hidden = true;
     nodes.progressText.textContent = '0/0 · 0%';
     nodes.progressBar.style.width = '0%';
     renderConsoleEmptyState('服务恢复连接后显示执行流程');
@@ -2596,13 +2679,70 @@ function activeProcess(job) {
 
 function runDisabledReason(job) {
     const process = activeProcess(job);
-    if (process?.alive || job.runner?.status === 'running' || job.runner?.status === 'queued' || job.status === 'running' || job.status === 'queued') return '';
+    if (process?.alive || ['running', 'queued', 'repairing'].includes(job.runner?.status) || ['running', 'queued', 'repairing'].includes(job.status)) return '';
     return '';
 }
 
 function jobIsActive(job) {
     const process = activeProcess(job);
-    return Boolean(process?.alive || job.runner?.status === 'running' || job.runner?.status === 'queued' || job.status === 'running' || job.status === 'queued');
+    return Boolean(process?.alive || ['running', 'queued', 'repairing'].includes(job.runner?.status) || ['running', 'queued', 'repairing'].includes(job.status));
+}
+
+function repairStatusLabel(status) {
+    return {
+        idle: '待命',
+        queued: '等待诊断',
+        analyzing: '正在诊断',
+        executing: '正在恢复',
+        verifying: '正在验证',
+        waiting_approval: '等待确认',
+        succeeded: '修复成功',
+        blocked: '需要人工处理',
+        exhausted: '修复次数已用完',
+        disabled: '已关闭'
+    }[status] || status || '待命';
+}
+
+function renderRepairPanel(job) {
+    const repair = job?.repair || {};
+    const visible = Boolean(
+        repair.enabled
+        && repair.status
+        && !['idle', 'disabled'].includes(repair.status)
+    );
+    nodes.repairPanel.hidden = !visible;
+    if (!visible) return;
+    const diagnosis = repair.diagnosis || {};
+    const action = repair.pending_action || repair.executed_action || {};
+    nodes.repairTitle.textContent = `自动修复 · 第 ${repair.cycle || 0}/${repair.max_cycles || 3} 轮`;
+    nodes.repairStatus.textContent = repairStatusLabel(repair.status);
+    nodes.repairSummary.textContent = diagnosis.summary || repair.reason || repair.last_error || '正在收集失败证据';
+    nodes.repairAction.textContent = [
+        action.type ? `动作：${action.type}` : '',
+        action.reason || '',
+        action.files?.length ? `文件：${action.files.join(', ')}` : '',
+        action.proposal || ''
+    ].filter(Boolean).join('；');
+    const waiting = repair.status === 'waiting_approval';
+    nodes.approveRepairButton.hidden = !waiting;
+    nodes.rejectRepairButton.hidden = !waiting;
+    nodes.retryRepairButton.hidden = !['blocked', 'waiting_approval'].includes(repair.status);
+    nodes.disableRepairButton.hidden = repair.status === 'disabled';
+}
+
+async function runRepairAction(action) {
+    if (!selectedJobId || !currentJob?.repair) return;
+    if (action === 'approve' && !window.confirm('确认执行当前修复建议？服务操作可能中断对应模型请求。')) return;
+    if (action === 'disable' && !window.confirm('关闭这个任务的自动修复？当前任务将保持失败状态。')) return;
+    const payload = {
+        incident_id: currentJob.repair.incident_id || ''
+    };
+    await getJson(`/api/video-link/jobs/${selectedJobId}/repair/${action}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+    });
+    await refreshSelectedJob();
 }
 
 function renderJob(job) {
@@ -2710,6 +2850,7 @@ function renderJob(job) {
     } else {
         nodes.errorPanel.hidden = true;
     }
+    renderRepairPanel(job);
     renderStages(job, stageProgress);
     renderStageProgress(stageProgress);
     renderConsoleSummary(job);
@@ -2730,6 +2871,7 @@ function stageStatusLabel(status) {
         succeeded: '成功',
         skipped: '跳过',
         failed: '失败',
+        repairing: '自动修复',
         stopped: '已停止',
         created: '待启动'
     }[status] || status || '等待';
@@ -4832,7 +4974,7 @@ async function startSkillProjectDistillation() {
         await getJson(`/api/skill-projects/${selectedSkillProjectId}/distillation/start`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ profile: 'deepseek_v4_pro', accept_limitations: limited })
+            body: JSON.stringify({ profile: 'deepseek_v4_flash', accept_limitations: limited })
         });
         await loadSkillProjects(selectedSkillProjectId);
     } finally {
@@ -5464,7 +5606,7 @@ async function generateSkillCandidate() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                profile: nodes.skillProfile.value || 'deepseek_v4_pro',
+                profile: nodes.skillProfile.value || 'deepseek_v4_flash',
                 force
             })
         });
@@ -8478,6 +8620,18 @@ async function boot() {
     nodes.settingsTab.addEventListener('click', () => setView('settings'));
     nodes.scheduleTime?.addEventListener('input', updateCreateButtonLabel);
     nodes.scheduleTime?.addEventListener('change', updateCreateButtonLabel);
+    nodes.approveRepairButton?.addEventListener('click', () => runRepairAction('approve').catch(error => {
+        nodes.repairSummary.textContent = error.message;
+    }));
+    nodes.rejectRepairButton?.addEventListener('click', () => runRepairAction('reject').catch(error => {
+        nodes.repairSummary.textContent = error.message;
+    }));
+    nodes.retryRepairButton?.addEventListener('click', () => runRepairAction('retry').catch(error => {
+        nodes.repairSummary.textContent = error.message;
+    }));
+    nodes.disableRepairButton?.addEventListener('click', () => runRepairAction('disable').catch(error => {
+        nodes.repairSummary.textContent = error.message;
+    }));
     nodes.refreshPreviewButton.addEventListener('click', () => {
         refreshJobs().catch(error => renderServiceOffline(error));
     });
@@ -8662,9 +8816,17 @@ async function boot() {
     });
     renderUrlList();
     nodes.refreshJobsButton.addEventListener('click', refreshJobs);
+    nodes.jobListLoadMore?.addEventListener('click', () => {
+        loadMoreJobs().catch(error => {
+            nodes.formError.textContent = error.message;
+        });
+    });
     nodes.jobSource?.addEventListener('change', async event => {
         selectedJobSource = event.target.value || 'video';
         window.localStorage.setItem('video-analyzer-job-source', selectedJobSource);
+        jobListLimit = JOB_LIST_PAGE_SIZE;
+        jobListTotal = 0;
+        latestJobs = [];
         selectedJobId = null;
         currentJob = null;
         renderEmpty();

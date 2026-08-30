@@ -18,12 +18,12 @@ SPEC.loader.exec_module(run_audio_template_analysis)
 
 
 class AudioTemplateAnalysisModelTests(unittest.TestCase):
-    def test_template_selector_uses_study_cards_qwen_model(self):
+    def test_template_selector_inherits_local_q4_model(self):
         config = Config('config')
         _client, model, base_url, temperature = run_audio_template_analysis.build_template_selector_client(config)
 
-        self.assertEqual(model, 'qwen3:4b-instruct')
-        self.assertEqual(base_url, 'http://agx.taild500c8.ts.net:11434/v1')
+        self.assertEqual(model, 'huihui/Qwen3.8-27B-Q4-DFlash2')
+        self.assertEqual(base_url, 'http://127.0.0.1:18103/v1')
         self.assertEqual(temperature, 0.1)
 
     def test_content_analysis_uses_deepseek_runtime_profile(self):
@@ -40,7 +40,7 @@ class AudioTemplateAnalysisModelTests(unittest.TestCase):
     def test_audio_deepseek_flash_profile_uses_audio_workflow(self):
         config = Config('config')
         profile = config.get_runtime_profile('audio_nx1_deepseek_flash')
-        with patch.dict('os.environ', {'TRAE_LOCAL_API_KEY': 'test-key'}):
+        with patch.dict('os.environ', {'DEEPSEEK_API_KEY': 'test-key'}):
             _client, model, base_url, temperature = (
                 run_audio_template_analysis.build_content_analysis_client(
                     config,
@@ -49,27 +49,27 @@ class AudioTemplateAnalysisModelTests(unittest.TestCase):
             )
 
         self.assertEqual(profile['workflow_id'], 'audio_nx1')
-        self.assertEqual(model, 'DeepSeek-V4-Flash-Official')
-        self.assertEqual(base_url, 'http://127.0.0.1:19220/v1')
+        self.assertEqual(model, 'deepseek-v4-flash')
+        self.assertEqual(base_url, 'https://api.deepseek.com')
         self.assertEqual(temperature, 1.0)
 
-    def test_audio_local_quality_profile_uses_tuned_bonsai_settings(self):
+    def test_audio_local_profile_uses_q4_pool(self):
         config = Config('config')
-        profile = config.get_runtime_profile('audio_nx1_local_quality')
+        profile = config.get_runtime_profile('audio_nx1')
         client, model, base_url, temperature = (
             run_audio_template_analysis.build_content_analysis_client(
                 config,
-                'audio_nx1_local_quality',
+                'audio_nx1',
             )
         )
 
         self.assertEqual(profile['workflow_id'], 'audio_nx1')
-        self.assertEqual(model, 'Qwen/Qwen3.8-27B-Q2-MTP4')
+        self.assertEqual(model, 'huihui/Qwen3.8-27B-Q4-DFlash2')
         self.assertEqual(base_url, 'http://127.0.0.1:18103/v1')
         self.assertEqual(temperature, 0.7)
         self.assertEqual(client.extra_body['top_k'], 20)
-        self.assertEqual(profile['summary_single_pass_chars'], 12000)
-        self.assertEqual(profile['summary_map_chunk_chars'], 8000)
+        self.assertEqual(profile['text_context_length'], 65536)
+        self.assertEqual(profile['orchestration'], 'ray_actor')
 
     def test_recording_time_from_source_filename(self):
         self.assertEqual(

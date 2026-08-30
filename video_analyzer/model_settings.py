@@ -521,7 +521,7 @@ def _add_builtin_model_resources(
     services = (config.get("endpoints") or {}).get("services") or {}
     resources = {
         "asr-vibevoice-local": {
-            "name": "VibeVoice ASR（本地 P40）",
+            "name": "VibeVoice ASR（本地 P40 自动发现）",
             "kind": "asr",
             "protocol": "vibevoice_http",
             "model": "microsoft/VibeVoice-ASR",
@@ -531,7 +531,9 @@ def _add_builtin_model_resources(
             ),
             "options": {
                 "deployment": "local",
-                "worker_count": 5,
+                "worker_count": "auto",
+                "concurrency": "auto",
+                "gpu_selection": "auto",
                 **ASR_CHUNK_DEFAULTS["vibevoice_http"],
             },
         },
@@ -547,6 +549,7 @@ def _add_builtin_model_resources(
             "options": {
                 "deployment": "local",
                 "worker_count": 5,
+                "gpu_selection": "auto",
                 **ASR_CHUNK_DEFAULTS["qwen3_asr_http"],
             },
         },
@@ -563,7 +566,7 @@ def _add_builtin_model_resources(
                 "deployment": "local",
                 "worker_count": 5,
                 "concurrency": 5,
-                "gpu_ids": [0, 1, 2, 4, 5],
+                "gpu_selection": "auto",
                 "dispatch_mode": "ray",
                 **ASR_CHUNK_DEFAULTS["firered_asr2_http"],
             },
@@ -597,7 +600,9 @@ def _add_builtin_model_resources(
                 "deployment": "local",
                 "backend": "3dspeaker",
                 "device": "P40",
-                "gpu_id": 0,
+                "gpu_selection": "auto",
+                "min_gpu_memory_mib": 12000,
+                "min_gpu_free_mib": 4000,
                 "dispatch_mode": "ray_actor",
             },
         },
@@ -624,6 +629,9 @@ def _add_builtin_model_resources(
                 "external_python": "/home/ai/diarization-ab-venv/bin/python",
                 "model_id": "chinese",
                 "device": "cuda",
+                "gpu_selection": "auto",
+                "min_gpu_memory_mib": 12000,
+                "min_gpu_free_mib": 4000,
             },
         },
         "ocr-unlimited-local": {
@@ -638,9 +646,10 @@ def _add_builtin_model_resources(
             "options": {
                 "deployment": "local",
                 "engine": "unlimited",
-                "worker_count": 5,
-                "concurrency": 5,
-                "gpu_ids": [0, 1, 2, 4, 5],
+                "worker_count": "auto",
+                "concurrency": "auto",
+                "min_gpu_memory_mib": 20000,
+                "min_gpu_free_mib": 12000,
                 "cache": "on",
                 "max_tokens": 8192,
                 "max_image_long_side": 0,
@@ -660,8 +669,10 @@ def _add_builtin_model_resources(
             "options": {
                 "deployment": "local",
                 "engine": "dots",
-                "worker_count": 5,
-                "concurrency": 5,
+                "worker_count": "auto",
+                "concurrency": "auto",
+                "min_gpu_memory_mib": 22000,
+                "min_gpu_free_mib": 12000,
                 "cache": "on",
                 "max_tokens": 1024,
                 "max_image_long_side": 1280,
@@ -669,7 +680,7 @@ def _add_builtin_model_resources(
             },
         },
         "vision-minicpm-v45-local": {
-            "name": "MiniCPM-V 4.5（本地 P40）",
+            "name": "MiniCPM-V 4.5（本地自动 GPU）",
             "kind": "vision",
             "protocol": "openai_compatible",
             "model": "minicpm-v-4.5-v100",
@@ -680,12 +691,14 @@ def _add_builtin_model_resources(
             "options": {
                 "deployment": "local",
                 "engine": "minicpm_v45",
-                "worker_count": 5,
-                "concurrency": 5,
+                "worker_count": "auto",
+                "concurrency": "auto",
+                "min_gpu_memory_mib": 12000,
+                "min_gpu_free_mib": 10000,
             },
         },
         "vision-qwen3-vl-4b-local": {
-            "name": "Qwen3-VL-4B-Instruct Q4_K_M（本地 P40）",
+            "name": "Qwen3-VL-4B-Instruct Q4_K_M（本地自动 GPU）",
             "kind": "vision",
             "protocol": "openai_compatible",
             "model": "qwen3-vl-4b-instruct",
@@ -696,56 +709,57 @@ def _add_builtin_model_resources(
             "options": {
                 "deployment": "local",
                 "engine": "qwen3_vl_4b",
-                "worker_count": 5,
-                "concurrency": 5,
+                "worker_count": "auto",
+                "concurrency": "auto",
+                "min_gpu_memory_mib": 12000,
+                "min_gpu_free_mib": 10000,
                 "model_path_env": "QWEN3_VL_MODEL_PATH",
                 "mmproj_path_env": "QWEN3_VL_MMPROJ_PATH",
             },
         },
-        "text-amd-lmstudio-bonsai-27b": {
-            "name": "LM Studio · Bonsai 27B（AMD）",
+        "text-local-qwen38-huihui-q4-dflash2": {
+            "name": "Qwen3.8 27B Q4 DFlash2（本地 Ray 自动 GPU 池）",
             "kind": "text",
             "protocol": "openai_compatible",
-            "model": "prism-ml/bonsai-27b",
-            "endpoints": [
-                _builtin_service_url(
-                    config,
-                    "amd_fast_base_url",
-                    "http://100.90.114.26:18081/v1",
-                )
-            ],
-            "options": {
-                "deployment": "remote",
-                "runtime": "lm_studio",
-                "device": "AMD",
-                "quantization": "Q1_0",
-                "context_length": 65792,
-                "reasoning_effort": "none",
-                "text_temperature": 0.2,
-                "text_timeout_seconds": 900,
-            },
-        },
-        "text-local-bonsai-27b-6gpu": {
-            "name": "Qwen3.8 27B Q2 MTP4（本地六卡按需池）",
-            "kind": "text",
-            "protocol": "openai_compatible",
-            "model": "Qwen/Qwen3.8-27B-Q2-MTP4",
+            "model": "huihui/Qwen3.8-27B-Q4-DFlash2",
             "endpoints": ["http://127.0.0.1:18103/v1"],
             "options": {
                 "deployment": "local",
                 "runtime": "llama.cpp",
-                "text_gpu_ids": [3, 0, 1, 2, 4, 5],
-                "text_worker_count": 6,
-                "text_concurrency": 6,
-                "worker_count": 6,
-                "concurrency": 6,
-                "quantization": "Q2_K_XL",
+                "orchestration": "ray_actor",
+                "text_gpu_selection": "auto",
+                "text_worker_count": "auto",
+                "text_concurrency": "auto",
+                "worker_count": "auto",
+                "concurrency": "auto",
+                "quantization": "Q4_K",
                 "context_length": 65536,
                 "text_context_length": 65536,
-                "cache_type_k": "q8_0",
-                "cache_type_v": "q8_0",
-                "speculative_type": "draft-mtp",
-                "speculative_draft_n_max": 4,
+                "text_model_path": (
+                    "/home/ai/model-sources/"
+                    "huihui-ai-Huihui-Qwen3.8-27B-abliterated-GGUF/"
+                    "Huihui-Qwen3.8-27B-abliterated-Q4_K.gguf"
+                ),
+                "text_draft_model_path": (
+                    "/home/ai/model-sources/"
+                    "Qwen3.8-27B-DFlash2-Q4_K_M.gguf"
+                ),
+                "text_llama_server": (
+                    "/home/ai/llama.cpp-github/"
+                    "build-cuda-dflash2-pr27342/bin/llama-server"
+                ),
+                "text_model_alias": "huihui/Qwen3.8-27B-Q4-DFlash2",
+                "text_spec_draft_n_max": 5,
+                "text_v100_32_cache_type": "f16",
+                "text_v100_16_p40_cache_type": "q8_0",
+                "text_p40_cache_type": "q8_0",
+                "text_v100_16_p40_tensor_split": "2,3",
+                "text_v100_32_min_free_mib": 30000,
+                "text_v100_16_min_free_mib": 15000,
+                "text_p40_min_free_mib": 22000,
+                "text_reconcile_seconds": 10,
+                "speculative_type": "draft-dflash",
+                "speculative_draft_n_max": 5,
                 "text_temperature": 0.7,
                 "top_k": 20,
                 "top_p": 0.8,
@@ -761,20 +775,6 @@ def _add_builtin_model_resources(
                 "enable_thinking": False,
                 "preserve_thinking": False,
                 "text_timeout_seconds": 1800,
-            },
-        },
-        "text-deepseek-v4-pro": {
-            "name": "DeepSeek V4 Pro（云端）",
-            "kind": "text",
-            "protocol": "openai_compatible",
-            "model": "deepseek-v4-pro",
-            "endpoints": ["https://api.deepseek.com"],
-            "api_key_env": "DEEPSEEK_API_KEY",
-            "options": {
-                "deployment": "cloud",
-                "text_temperature": 1.0,
-                "deepseek_thinking": "disabled",
-                "text_timeout_seconds": 900,
             },
         },
         "text-deepseek-v4-flash": {
@@ -1184,8 +1184,10 @@ def expand_runtime_profile(config: dict[str, Any], profile: dict[str, Any]) -> d
         if expanded.get("asr_worker_count") is not None:
             options["worker_count"] = expanded["asr_worker_count"]
             options["concurrency"] = expanded["asr_worker_count"]
+        if options.get("worker_count") is not None:
+            expanded["asr_worker_count"] = options["worker_count"]
             if protocol == "vibevoice_http":
-                options["chunk_parallel_workers"] = expanded["asr_worker_count"]
+                options["chunk_parallel_workers"] = options["worker_count"]
         if protocol == "firered_asr2_http":
             if expanded.get("asr_segmentation_mode"):
                 options["segmentation_mode"] = expanded["asr_segmentation_mode"]
@@ -1246,6 +1248,16 @@ def expand_runtime_profile(config: dict[str, Any], profile: dict[str, Any]) -> d
         if protocol == "three_d_speaker_http":
             options["endpoints"] = endpoints
             options["endpoint"] = endpoints[0] if endpoints else ""
+        if backend in {"3dspeaker", "wespeaker"} and str(
+            options.get("assignment_device")
+            or options.get("device")
+            or "cuda"
+        ).lower() == "cuda":
+            options.setdefault("gpu_selection", "auto")
+            options.setdefault("min_gpu_memory_mib", 12000)
+            options.setdefault("min_gpu_free_mib", 4000)
+        if options.get("gpu_selection") != "manual":
+            options.pop("gpu_id", None)
         options["enabled"] = backend is not None
         options["assignment_enabled"] = backend is not None
         if backend:
@@ -1338,6 +1350,10 @@ def expand_runtime_profile(config: dict[str, Any], profile: dict[str, Any]) -> d
             expanded["ocr_max_image_long_side"] = options["max_image_long_side"]
         if options.get("image_mode") is not None:
             expanded["ocr_image_mode"] = options["image_mode"]
+        if options.get("min_gpu_memory_mib") is not None:
+            expanded["ocr_min_gpu_memory_mib"] = options["min_gpu_memory_mib"]
+        if options.get("min_gpu_free_mib") is not None:
+            expanded["ocr_min_gpu_free_mib"] = options["min_gpu_free_mib"]
         expanded["ocr_engine"] = options.get("engine")
         expanded["ocr_worker_count"] = options.get("worker_count")
 
@@ -1359,13 +1375,23 @@ def expand_runtime_profile(config: dict[str, Any], profile: dict[str, Any]) -> d
     if text and text.get("protocol") != "none":
         profile_text_overrides = {
             key: copy.deepcopy(expanded[key])
-            for key in (
-                "text_worker_count",
-                "text_gpu_ids",
-                "text_context_length",
-            )
+            for key in ("text_context_length",)
             if expanded.get(key) is not None
         }
+        if expanded.get("text_gpu_selection") == "manual":
+            profile_text_overrides.update(
+                {
+                    key: copy.deepcopy(expanded[key])
+                    for key in (
+                        "text_gpu_selection",
+                        "text_worker_count",
+                        "text_gpu_ids",
+                    )
+                    if expanded.get(key) is not None
+                }
+            )
+        for key in ("provider", "deployment", "runtime"):
+            expanded.pop(key, None)
         endpoints = normalize_string_list(text.get("endpoints"))
         expanded["text_base_url"] = endpoints[0] if endpoints else ""
         expanded["llm_base_url"] = expanded["text_base_url"]
@@ -1374,6 +1400,8 @@ def expand_runtime_profile(config: dict[str, Any], profile: dict[str, Any]) -> d
         for key, value in (text.get("options") or {}).items():
             expanded[key] = value
         expanded.update(profile_text_overrides)
+        if expanded.get("text_gpu_selection") != "manual":
+            expanded.pop("text_gpu_ids", None)
         if expanded.get("text_worker_count") is not None:
             expanded["text_concurrency"] = expanded["text_worker_count"]
         if expanded.get("text_context_length") is not None:
@@ -1461,25 +1489,29 @@ def validate_profile(
     if not workflow:
         raise SettingsValidationError(f"unknown workflow: {workflow_id}")
     cleaned["workflow_id"] = workflow_id
-    try:
-        asr_worker_count = int(cleaned.get("asr_worker_count") or 5)
-    except (TypeError, ValueError) as exc:
-        raise SettingsValidationError("asr_worker_count must be an integer") from exc
-    if not 1 <= asr_worker_count <= 5:
-        raise SettingsValidationError("asr_worker_count must be between 1 and 5")
-    cleaned["asr_worker_count"] = asr_worker_count
-    if cleaned.get("text_worker_count") is not None:
+    if cleaned.get("asr_worker_count") is not None:
         try:
-            text_worker_count = int(cleaned["text_worker_count"])
+            asr_worker_count = int(cleaned["asr_worker_count"])
         except (TypeError, ValueError) as exc:
-            raise SettingsValidationError(
-                "text_worker_count must be an integer"
-            ) from exc
-        if not 1 <= text_worker_count <= 6:
-            raise SettingsValidationError(
-                "text_worker_count must be between 1 and 6"
-            )
-        cleaned["text_worker_count"] = text_worker_count
+            raise SettingsValidationError("asr_worker_count must be an integer") from exc
+        if not 1 <= asr_worker_count <= 6:
+            raise SettingsValidationError("asr_worker_count must be between 1 and 6")
+        cleaned["asr_worker_count"] = asr_worker_count
+    if cleaned.get("text_worker_count") is not None:
+        if str(cleaned["text_worker_count"]).strip().lower() == "auto":
+            cleaned["text_worker_count"] = "auto"
+        else:
+            try:
+                text_worker_count = int(cleaned["text_worker_count"])
+            except (TypeError, ValueError) as exc:
+                raise SettingsValidationError(
+                    "text_worker_count must be auto or an integer"
+                ) from exc
+            if not 1 <= text_worker_count <= 32:
+                raise SettingsValidationError(
+                    "text_worker_count must be auto or between 1 and 32"
+                )
+            cleaned["text_worker_count"] = text_worker_count
     if cleaned.get("text_context_length") is not None:
         try:
             text_context_length = int(cleaned["text_context_length"])
@@ -1819,6 +1851,8 @@ class RuntimeSettingsStore:
             ("ocr_max_tokens", "max_tokens"),
             ("ocr_max_image_long_side", "max_image_long_side"),
             ("ocr_image_mode", "image_mode"),
+            ("ocr_min_gpu_memory_mib", "min_gpu_memory_mib"),
+            ("ocr_min_gpu_free_mib", "min_gpu_free_mib"),
         ):
             if expanded.get(expanded_key) is not None:
                 ocr[runtime_key] = copy.deepcopy(expanded[expanded_key])
@@ -1886,6 +1920,8 @@ class RuntimeSettingsStore:
                 "max_tokens",
                 "max_image_long_side",
                 "image_mode",
+                "min_gpu_memory_mib",
+                "min_gpu_free_mib",
             ):
                 if options.get(key) is not None:
                     ocr[key] = copy.deepcopy(options[key])

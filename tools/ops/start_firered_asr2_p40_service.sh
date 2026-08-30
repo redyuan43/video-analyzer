@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUNTIME_DIR="${FIRERED_ASR2_RUNTIME_DIR:-${ROOT_DIR}/tmp/firered-asr2-p40}"
 LOG_DIR="${FIRERED_ASR2_LOG_DIR:-${RUNTIME_DIR}/logs}"
-GPU_IDS="${FIRERED_ASR2_GPU_IDS:-0,1,2,4,5}"
+GPU_IDS="${FIRERED_ASR2_GPU_IDS:-auto}"
+GPU_SELECTION="${FIRERED_ASR2_GPU_SELECTION:-auto}"
 WORKER_COUNT="${FIRERED_ASR2_WORKER_COUNT:-5}"
 BASE_PORT="${FIRERED_ASR2_BASE_WORKER_PORT:-18400}"
 PROXY_PORT="${FIRERED_ASR2_PROXY_PORT:-18014}"
@@ -40,9 +41,34 @@ stop_service() {
 
 start_service() {
   local count="${1:-${WORKER_COUNT}}"
+  if [[ "${count}" != "auto" ]] && ! [[ "${count}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "worker-count must be auto or a positive integer" >&2
+    exit 2
+  fi
+  stop_service
+  if [[ "${GPU_SELECTION}" != "manual" ]]; then
+    GPU_IDS="$(
+      "${ROOT_DIR}/.venv/bin/python" "${ROOT_DIR}/tools/ops/discover_idle_gpus.py" \
+        --allowed-name "Tesla P40" \
+        --min-total-mib "${FIRERED_ASR2_MIN_TOTAL_MIB:-22000}" \
+        --min-free-mib "${FIRERED_ASR2_MIN_FREE_MIB:-10000}" \
+        --max-count "${count}" \
+        --format csv
+    )"
+  fi
   local ids=()
   IFS=, read -r -a ids <<<"${GPU_IDS}"
-  (( count >= 1 && count <= ${#ids[@]} )) || { echo "invalid worker count" >&2; exit 2; }
+  if (( ${#ids[@]} == 0 )); then
+    echo "No compatible idle Tesla P40 is available for FireRedASR2" >&2
+    exit 1
+  fi
+  if [[ "${count}" == "auto" ]]; then
+    count="${#ids[@]}"
+  elif (( count > ${#ids[@]} )); then
+    echo "Requested ${count} FireRedASR2 worker(s); reducing to ${#ids[@]} based on usable P40 GPUs." >&2
+    count="${#ids[@]}"
+  fi
+  (( count >= 1 )) || { echo "invalid worker count" >&2; exit 2; }
   for ((index = 0; index < count; index++)); do
     local gpu_name
     gpu_name="$(nvidia-smi --query-gpu=name --format=csv,noheader -i "${ids[index]}" 2>/dev/null || true)"
@@ -52,7 +78,6 @@ start_service() {
     }
   done
   mkdir -p "${LOG_DIR}"
-  stop_service
   local ports=()
   for ((index = 0; index < count; index++)); do
     local gpu="${ids[index]}"

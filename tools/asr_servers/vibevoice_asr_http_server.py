@@ -115,8 +115,19 @@ def health():
     }
 
 
+@app.post("/api/load")
+def load():
+    get_model_pair()
+    return {
+        "success": True,
+        "status": _status,
+        "ready": _model is not None,
+        "loaded_at": _loaded_at,
+    }
+
+
 @app.post("/api/asr/transcribe")
-async def transcribe(
+def transcribe(
     audio: UploadFile = File(...),
     hotword: str = Form(default=""),
     use_native_chunking: bool = Form(default=True),
@@ -129,7 +140,7 @@ async def transcribe(
     suffix = Path(audio.filename or "audio.wav").suffix or ".wav"
     with tempfile.NamedTemporaryFile(prefix="vibevoice_asr_", suffix=suffix, delete=False) as temp:
         temp_path = Path(temp.name)
-        temp.write(await audio.read())
+        temp.write(audio.file.read())
     started = time.time()
     try:
         audio_array, sample_rate = load_audio_array(str(temp_path))

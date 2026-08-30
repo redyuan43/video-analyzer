@@ -11,6 +11,7 @@ from video_analyzer.config import Config, get_runtime_profile
 from video_analyzer.model_settings import (
     RuntimeSettingsStore,
     SettingsValidationError,
+    build_settings_document,
     expand_runtime_profile,
 )
 
@@ -44,6 +45,44 @@ class ModelSettingsTests(unittest.TestCase):
             encoding="utf-8",
         )
         return RuntimeSettingsStore(root)
+
+    def test_default_catalog_exposes_only_q4_and_deepseek_flash_text_models(self):
+        default_path = (
+            Path(__file__).resolve().parents[1]
+            / "video_analyzer"
+            / "config"
+            / "default_config.json"
+        )
+        config = json.loads(default_path.read_text(encoding="utf-8"))
+        settings = build_settings_document(config)
+        selectable_text_ids = {
+            model_id
+            for model_id, model in settings["models"].items()
+            if model.get("kind") == "text"
+            and model.get("source") not in {"control", "derived"}
+        }
+
+        self.assertEqual(
+            selectable_text_ids,
+            {
+                "text-local-qwen38-huihui-q4-dflash2",
+                "text-deepseek-v4-flash",
+            },
+        )
+        self.assertEqual(
+            set(settings["profiles"]),
+            {
+                "local_q4",
+                "deepseek_v4_flash",
+                "audio_nx1",
+                "audio_nx1_deepseek_flash",
+            },
+        )
+        self.assertEqual(settings["active_runtime_profile"], "local_q4")
+        local_profile = get_runtime_profile(config, "local_q4")
+        self.assertEqual(local_profile["asr_worker_count"], "auto")
+        self.assertEqual(local_profile["chunk_parallel_workers"], "auto")
+        self.assertEqual(local_profile["worker_count"], "auto")
 
     def test_legacy_profile_is_exposed_as_reusable_model_resources(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -141,6 +180,36 @@ class ModelSettingsTests(unittest.TestCase):
         self.assertEqual(profile["text_model"], "text-model")
         self.assertEqual(profile["speaker_diarization"]["enabled"], True)
         self.assertEqual(profile["multidoc_chapter_concurrency"], 10)
+
+    def test_local_text_model_clears_stale_remote_runtime_ownership(self):
+        config = {
+            "model_catalog": {
+                "local-text": {
+                    "name": "Local text",
+                    "kind": "text",
+                    "protocol": "openai_compatible",
+                    "model": "local-model",
+                    "endpoints": ["http://127.0.0.1:18103/v1"],
+                    "options": {
+                        "deployment": "local",
+                        "runtime": "llama.cpp",
+                    },
+                }
+            }
+        }
+        profile = {
+            "workflow_id": "video_operation_manual",
+            "text_model_id": "local-text",
+            "provider": "trae_local_api",
+            "deployment": "remote",
+            "runtime": "trae",
+        }
+
+        expanded = expand_runtime_profile(config, profile)
+
+        self.assertNotIn("provider", expanded)
+        self.assertEqual(expanded["deployment"], "local")
+        self.assertEqual(expanded["runtime"], "llama.cpp")
 
     def test_profile_rejects_chapter_concurrency_above_ten(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -261,8 +330,8 @@ class ModelSettingsTests(unittest.TestCase):
         self.assertEqual(models["vision-disabled"]["protocol"], "none")
         self.assertEqual(models["text-disabled"]["protocol"], "none")
         self.assertEqual(
-            models["text-deepseek-v4-pro"]["model"],
-            "deepseek-v4-pro",
+            models["text-deepseek-v4-flash"]["model"],
+            "deepseek-v4-flash",
         )
         self.assertEqual(models["review-inherit-text"]["protocol"], "inherit_text")
         self.assertEqual(models["image-disabled"]["protocol"], "none")
@@ -275,6 +344,15 @@ class ModelSettingsTests(unittest.TestCase):
         models = {item["id"]: item for item in settings["models"]}
         self.assertEqual(models["asr-qwen3-1_7b-local"]["protocol"], "qwen3_asr_http")
         self.assertEqual(models["asr-qwen3-1_7b-local"]["options"]["worker_count"], 5)
+        self.assertEqual(models["asr-vibevoice-local"]["options"]["worker_count"], "auto")
+        self.assertEqual(
+            models["asr-vibevoice-local"]["options"]["chunk_duration_sec"],
+            370,
+        )
+        self.assertEqual(
+            models["asr-qwen3-1_7b-local"]["options"]["gpu_selection"],
+            "auto",
+        )
         self.assertEqual(models["asr-firered2-local"]["protocol"], "firered_asr2_http")
         self.assertEqual(
             models["asr-firered2-local"]["endpoints"],
@@ -289,10 +367,21 @@ class ModelSettingsTests(unittest.TestCase):
             models["diarization-wespeaker-cn-local"]["protocol"],
             "wespeaker_diarization",
         )
+        self.assertEqual(
+            models["diarization-3dspeaker-local"]["options"]["gpu_selection"],
+            "auto",
+        )
+        self.assertNotIn(
+            "gpu_id",
+            models["diarization-3dspeaker-local"]["options"],
+        )
         self.assertEqual(models["ocr-unlimited-local"]["protocol"], "unlimited_ocr_openai")
         self.assertEqual(models["ocr-unlimited-local"]["options"]["max_tokens"], 8192)
         self.assertEqual(models["ocr-unlimited-local"]["options"]["max_image_long_side"], 0)
         self.assertEqual(models["ocr-unlimited-local"]["options"]["image_mode"], "gundam")
+        self.assertEqual(models["ocr-unlimited-local"]["options"]["worker_count"], "auto")
+        self.assertEqual(models["ocr-unlimited-local"]["options"]["concurrency"], "auto")
+        self.assertEqual(models["ocr-unlimited-local"]["options"]["min_gpu_memory_mib"], 20000)
         self.assertEqual(models["ocr-dots-local"]["protocol"], "dots_ocr_openai")
         self.assertEqual(models["ocr-unlimited-local"]["model"], "baidu/Unlimited-OCR")
         self.assertEqual(models["ocr-dots-local"]["model"], "rednote-hilab/dots.ocr")
@@ -300,21 +389,34 @@ class ModelSettingsTests(unittest.TestCase):
             models["vision-qwen3-vl-4b-local"]["options"]["engine"],
             "qwen3_vl_4b",
         )
-        amd_text = models["text-amd-lmstudio-bonsai-27b"]
-        self.assertEqual(amd_text["protocol"], "openai_compatible")
-        self.assertEqual(amd_text["model"], "prism-ml/bonsai-27b")
         self.assertEqual(
-            amd_text["endpoints"],
-            ["http://100.90.114.26:18081/v1"],
+            models["vision-minicpm-v45-local"]["options"]["worker_count"],
+            "auto",
         )
-        self.assertEqual(amd_text["options"]["runtime"], "lm_studio")
-        self.assertEqual(amd_text["options"]["reasoning_effort"], "none")
-        local_text = models["text-local-bonsai-27b-6gpu"]
-        self.assertEqual(local_text["model"], "Qwen/Qwen3.8-27B-Q2-MTP4")
-        self.assertEqual(local_text["options"]["text_gpu_ids"], [3, 0, 1, 2, 4, 5])
-        self.assertEqual(local_text["options"]["text_worker_count"], 6)
-        self.assertEqual(local_text["options"]["text_concurrency"], 6)
+        self.assertEqual(
+            models["vision-minicpm-v45-local"]["options"]["concurrency"],
+            "auto",
+        )
+        local_text = models["text-local-qwen38-huihui-q4-dflash2"]
+        self.assertEqual(
+            local_text["model"],
+            "huihui/Qwen3.8-27B-Q4-DFlash2",
+        )
+        self.assertNotIn("text_gpu_ids", local_text["options"])
+        self.assertEqual(local_text["options"]["text_gpu_selection"], "auto")
+        self.assertEqual(local_text["options"]["text_worker_count"], "auto")
+        self.assertEqual(local_text["options"]["text_concurrency"], "auto")
         self.assertEqual(local_text["options"]["text_context_length"], 65536)
+        self.assertEqual(local_text["options"]["orchestration"], "ray_actor")
+        self.assertEqual(local_text["options"]["quantization"], "Q4_K")
+        self.assertEqual(
+            local_text["options"]["text_v100_16_p40_tensor_split"],
+            "2,3",
+        )
+        self.assertEqual(
+            local_text["options"]["text_spec_draft_n_max"],
+            5,
+        )
         self.assertEqual(local_text["options"]["text_temperature"], 0.7)
         self.assertEqual(
             local_text["options"]["extra_body"],
@@ -338,19 +440,23 @@ class ModelSettingsTests(unittest.TestCase):
         config = {}
         profile = {
             "workflow_id": "video_operation_manual",
-            "text_model_id": "text-local-bonsai-27b-6gpu",
+            "text_model_id": "text-local-qwen38-huihui-q4-dflash2",
+            "text_gpu_selection": "manual",
+            "text_gpu_ids": [1],
             "text_worker_count": 1,
             "text_context_length": 8192,
         }
 
         expanded = expand_runtime_profile(config, profile)
 
+        self.assertEqual(expanded["text_gpu_selection"], "manual")
+        self.assertEqual(expanded["text_gpu_ids"], [1])
         self.assertEqual(expanded["text_worker_count"], 1)
         self.assertEqual(expanded["text_concurrency"], 1)
         self.assertEqual(expanded["text_context_length"], 8192)
         self.assertEqual(expanded["context_length"], 8192)
 
-    def test_local_text_profile_rejects_invalid_card_count(self):
+    def test_local_text_profile_accepts_auto_and_rejects_invalid_card_count(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = self.make_repo(Path(tmp))
             settings = store.public_settings()
@@ -359,11 +465,25 @@ class ModelSettingsTests(unittest.TestCase):
                 kind: source[field]
                 for kind, field in settings["schema"]["profile_model_fields"].items()
             }
-            models["text"] = "text-local-bonsai-27b-6gpu"
+            models["text"] = "text-local-qwen38-huihui-q4-dflash2"
+
+            saved = store.save_profile(
+                "auto-local-text",
+                {
+                    "label": "Auto local text",
+                    "models": models,
+                    "settings": {
+                        "text_worker_count": "auto",
+                        "text_context_length": 65536,
+                    },
+                },
+            )
+            self.assertEqual(saved["text_worker_count"], "auto")
+            self.assertNotIn("text_gpu_ids", saved)
 
             with self.assertRaisesRegex(
                 SettingsValidationError,
-                "text_worker_count must be between 1 and 6",
+                "text_worker_count must be auto or between 1 and 32",
             ):
                 store.save_profile(
                     "invalid-local-text",
@@ -371,7 +491,7 @@ class ModelSettingsTests(unittest.TestCase):
                         "label": "Invalid local text",
                         "models": models,
                         "settings": {
-                            "text_worker_count": 7,
+                            "text_worker_count": 33,
                             "text_context_length": 65536,
                         },
                     },
@@ -418,7 +538,7 @@ class ModelSettingsTests(unittest.TestCase):
         )
         self.assertEqual(tencent["options"]["parallel_chunks"], 6)
 
-    def test_amd_lmstudio_text_model_expands_to_runtime_profile(self):
+    def test_local_q4_text_model_expands_to_runtime_profile(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store = self.make_repo(root)
@@ -428,18 +548,22 @@ class ModelSettingsTests(unittest.TestCase):
                 kind: source[field]
                 for kind, field in settings["schema"]["profile_model_fields"].items()
             }
-            models["text"] = "text-amd-lmstudio-bonsai-27b"
+            models["text"] = "text-local-qwen38-huihui-q4-dflash2"
             store.save_profile(
-                "amd-lmstudio",
-                {"label": "AMD LM Studio", "models": models, "settings": {}},
+                "local-q4",
+                {"label": "Local Q4", "models": models, "settings": {}},
             )
             _defaults, _user, merged = store.load()
-            profile = get_runtime_profile(merged, "amd-lmstudio")
+            profile = get_runtime_profile(merged, "local-q4")
 
-        self.assertEqual(profile["text_base_url"], "http://100.90.114.26:18081/v1")
-        self.assertEqual(profile["text_model"], "prism-ml/bonsai-27b")
-        self.assertEqual(profile["reasoning_effort"], "none")
-        self.assertEqual(profile["text_timeout_seconds"], 900)
+        self.assertEqual(profile["text_base_url"], "http://127.0.0.1:18103/v1")
+        self.assertEqual(
+            profile["text_model"],
+            "huihui/Qwen3.8-27B-Q4-DFlash2",
+        )
+        self.assertEqual(profile["orchestration"], "ray_actor")
+        self.assertEqual(profile["text_context_length"], 65536)
+        self.assertEqual(profile["text_timeout_seconds"], 1800)
 
     def test_video_profile_can_enable_or_disable_text_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -454,7 +578,7 @@ class ModelSettingsTests(unittest.TestCase):
                 ]["model_fields"].items()
                 if spec["field"] in source
             }
-            models["text_fallback"] = "text-deepseek-v4-pro"
+            models["text_fallback"] = "text-deepseek-v4-flash"
             store.save_profile(
                 "with-fallback",
                 {"label": "With fallback", "models": models, "settings": {}},
@@ -471,7 +595,7 @@ class ModelSettingsTests(unittest.TestCase):
             disabled = get_runtime_profile(merged, "without-fallback")
 
         self.assertTrue(enabled["text_fallback_enabled"])
-        self.assertEqual(enabled["text_fallback_model"], "deepseek-v4-pro")
+        self.assertEqual(enabled["text_fallback_model"], "deepseek-v4-flash")
         self.assertEqual(
             enabled["text_fallback_api_key_env"],
             "DEEPSEEK_API_KEY",
@@ -502,7 +626,11 @@ class ModelSettingsTests(unittest.TestCase):
             "http://127.0.0.1:18014/api/asr/transcribe",
         )
         self.assertEqual(profile["firered_asr2_options"]["worker_count"], 5)
-        self.assertEqual(profile["firered_asr2_options"]["gpu_ids"], [0, 1, 2, 4, 5])
+        self.assertEqual(
+            profile["firered_asr2_options"]["gpu_selection"],
+            "auto",
+        )
+        self.assertNotIn("gpu_ids", profile["firered_asr2_options"])
         self.assertEqual(
             profile["firered_asr2_options"]["segmentation_mode"],
             "vad",

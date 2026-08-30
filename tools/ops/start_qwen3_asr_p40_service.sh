@@ -5,7 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUNTIME_DIR="${QWEN3_ASR_RUNTIME_DIR:-${ROOT_DIR}/tmp/qwen3-asr-p40}"
 LOG_DIR="${QWEN3_ASR_LOG_DIR:-${RUNTIME_DIR}/logs}"
 PID_FILE="${QWEN3_ASR_PID_FILE:-${RUNTIME_DIR}/proxy.pid}"
-GPU_IDS="${QWEN3_ASR_GPU_IDS:-0,1,2,4,5}"
+GPU_IDS="${QWEN3_ASR_GPU_IDS:-auto}"
+GPU_SELECTION="${QWEN3_ASR_GPU_SELECTION:-auto}"
 WORKER_COUNT="${QWEN3_ASR_WORKER_COUNT:-5}"
 BASE_PORT="${QWEN3_ASR_BASE_WORKER_PORT:-18300}"
 PROXY_PORT="${QWEN3_ASR_PROXY_PORT:-18013}"
@@ -43,11 +44,36 @@ stop_service() {
 
 start_service() {
   local count="${1:-${WORKER_COUNT}}"
+  if [[ "${count}" != "auto" ]] && ! [[ "${count}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "worker-count must be auto or a positive integer" >&2
+    exit 2
+  fi
+  stop_service
+  if [[ "${GPU_SELECTION}" != "manual" ]]; then
+    GPU_IDS="$(
+      "${ROOT_DIR}/.venv/bin/python" "${ROOT_DIR}/tools/ops/discover_idle_gpus.py" \
+        --allowed-name "Tesla P40" \
+        --min-total-mib "${QWEN3_ASR_MIN_TOTAL_MIB:-22000}" \
+        --min-free-mib "${QWEN3_ASR_MIN_FREE_MIB:-10000}" \
+        --max-count "${count}" \
+        --format csv
+    )"
+  fi
   local ids=()
   local gpu_name
   IFS=, read -r -a ids <<<"${GPU_IDS}"
-  if (( count < 1 || count > ${#ids[@]} )); then
-    echo "worker-count ${count} exceeds QWEN3_ASR_GPU_IDS (${GPU_IDS})" >&2
+  if (( ${#ids[@]} == 0 )); then
+    echo "No compatible idle Tesla P40 is available for Qwen3-ASR" >&2
+    exit 1
+  fi
+  if [[ "${count}" == "auto" ]]; then
+    count="${#ids[@]}"
+  elif (( count > ${#ids[@]} )); then
+    echo "Requested ${count} Qwen3-ASR worker(s); reducing to ${#ids[@]} based on usable P40 GPUs." >&2
+    count="${#ids[@]}"
+  fi
+  if (( count < 1 )); then
+    echo "worker-count must be positive" >&2
     exit 2
   fi
   for ((index = 0; index < count; index++)); do
@@ -64,7 +90,6 @@ start_service() {
   local worker_spec
   worker_spec="$(IFS=,; echo "${specs[*]}")"
   mkdir -p "${LOG_DIR}"
-  stop_service
   QWEN3_ASR_WORKERS="${worker_spec}" \
   QWEN3_ASR_LOG_DIR="${LOG_DIR}" \
   QWEN3_ASR_PROXY_PORT="${PROXY_PORT}" \

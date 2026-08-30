@@ -5,7 +5,49 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGE="${1:-}"
 
 usage() {
-  echo "Usage: $0 asr|ocr|vl|text|tts|stop" >&2
+  echo "Usage: $0 asr|ocr|vl|text|tts|stop|release" >&2
+}
+
+gpu_reclaim_state() {
+  echo "${VIDEO_ANALYZER_GPU_RECLAIM_STATE:-${ROOT_DIR}/tmp/video-link-status/resource-locks/reclaimed-gpu-services.json}"
+}
+
+reclaim_idle_gpu_services() {
+  local services
+  if [[ -n "${VIDEO_ANALYZER_RECLAIMABLE_GPU_SERVICES_JSON+x}" ]]; then
+    services="${VIDEO_ANALYZER_RECLAIMABLE_GPU_SERVICES_JSON:-[]}"
+  else
+    services="$(
+      "${ROOT_DIR}/.venv/bin/python" - "${ROOT_DIR}/config/config.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    config = json.loads(path.read_text(encoding="utf-8"))
+except (FileNotFoundError, json.JSONDecodeError):
+    config = {}
+services = (config.get("local_model_runtime") or {}).get(
+    "reclaimable_gpu_services", []
+)
+print(json.dumps(services, ensure_ascii=False))
+PY
+    )"
+  fi
+  [[ "${services}" == "[]" ]] && return 0
+  "${ROOT_DIR}/.venv/bin/python" \
+    "${ROOT_DIR}/tools/ops/reclaim_idle_gpu_services.py" \
+    reclaim \
+    --state "$(gpu_reclaim_state)" \
+    --services-json "${services}"
+}
+
+restore_reclaimed_gpu_services() {
+  "${ROOT_DIR}/.venv/bin/python" \
+    "${ROOT_DIR}/tools/ops/reclaim_idle_gpu_services.py" \
+    restore \
+    --state "$(gpu_reclaim_state)"
 }
 
 stop_pids() {
@@ -46,7 +88,8 @@ stop_ocr() {
 stop_vibevoice() {
   systemctl --user stop vibevoice-p40-asr.service >/dev/null 2>&1 || true
   stop_matching "[v]ibevoice_vllm_p40_http_server.py"
-  stop_matching "[v]llm.entrypoints.openai.api_server --host 127.0.0.1 --port 1800[0-4]"
+  stop_matching "[v]ibevoice_asr_http_server.py"
+  stop_matching "[v]llm.entrypoints.openai.api_server --host 127.0.0.1 --port 1800[0-5]"
 }
 
 stop_qwen3_asr() {
@@ -153,9 +196,23 @@ keys = (
     "BONSAI_LOCAL_HOST",
     "BONSAI_LOCAL_PORT",
     "BONSAI_LOCAL_BACKEND_BASE_PORT",
+    "BONSAI_LOCAL_GPU_SELECTION",
     "BONSAI_LOCAL_GPU_IDS",
     "BONSAI_LOCAL_WORKER_COUNT",
+    "BONSAI_LOCAL_MODEL",
+    "BONSAI_LOCAL_DRAFT_MODEL",
+    "BONSAI_LOCAL_LLAMA_SERVER",
+    "BONSAI_LOCAL_MODEL_ALIAS",
     "BONSAI_LOCAL_CONTEXT_SIZE",
+    "BONSAI_LOCAL_SPEC_DRAFT_N_MAX",
+    "BONSAI_LOCAL_V100_32_CACHE_TYPE",
+    "BONSAI_LOCAL_V100_16_P40_CACHE_TYPE",
+    "BONSAI_LOCAL_P40_CACHE_TYPE",
+    "BONSAI_LOCAL_V100_16_P40_TENSOR_SPLIT",
+    "BONSAI_LOCAL_V100_32_MIN_FREE_MIB",
+    "BONSAI_LOCAL_V100_16_MIN_FREE_MIB",
+    "BONSAI_LOCAL_P40_MIN_FREE_MIB",
+    "BONSAI_LOCAL_RECONCILE_SECONDS",
 )
 payload = {key: os.environ[key] for key in keys if os.environ.get(key)}
 current = None
@@ -177,7 +234,23 @@ PY
 }
 
 start_vibevoice() {
-  local workers="${VIBEVOICE_WORKER_COUNT:-5}"
+  local workers="${VIBEVOICE_WORKER_COUNT:-auto}"
+  if [[ -z "${VIBEVOICE_P40_GPUS:-}" ]]; then
+    VIBEVOICE_P40_GPUS="$(
+      "${ROOT_DIR}/.venv/bin/python" "${ROOT_DIR}/tools/ops/discover_idle_gpus.py" \
+        --allowed-name "Tesla P40" \
+        --min-total-mib "${VIBEVOICE_MIN_TOTAL_MIB:-22000}" \
+        --min-free-mib "${VIBEVOICE_MIN_FREE_MIB:-20000}" \
+        --max-count "${workers}" \
+        --format csv
+    )"
+  fi
+  if [[ -z "${VIBEVOICE_P40_GPUS}" ]]; then
+    echo "No compatible idle Tesla P40 is available for VibeVoice" >&2
+    return 1
+  fi
+  export VIBEVOICE_P40_GPUS
+  unset VIBEVOICE_GPU_IDS
   stop_vibevoice
   if ! "/home/ai/github/VibeVoice-bench/start_vibevoice_p40_workers.sh" "${workers}"; then
     stop_vibevoice
@@ -213,15 +286,36 @@ start_ocr() {
   local engine="${OCR_ENGINE:-unlimited}"
   case "${engine}" in
     unlimited|unlimited-ocr)
-      local workers="${UNLIMITED_OCR_WORKER_COUNT:-5}"
+      local workers="${UNLIMITED_OCR_WORKER_COUNT:-auto}"
       local model="${UNLIMITED_OCR_MODEL:-/home/ai/ocr-deploy/models/unlimited-ocr-f799-p40-runtime}"
       UNLIMITED_OCR_MODEL="${model}" \
-      UNLIMITED_OCR_GPU_IDS="${UNLIMITED_OCR_GPU_IDS:-0,1,2,4,5}" \
       UNLIMITED_OCR_PROXY_PORT="${UNLIMITED_OCR_PROXY_PORT:-18088}" \
         "/home/ai/ocr-deploy/start_unlimited_ocr_p40_service.sh" "${workers}"
       ;;
     dots|dotsmocr|dots-mocr)
-      local workers="${DOTS_MOCR_WORKER_COUNT:-5}"
+      local workers="${DOTS_MOCR_WORKER_COUNT:-auto}"
+      if [[ "${DOTS_MOCR_GPU_SELECTION:-auto}" != "manual" ]]; then
+        DOTS_MOCR_GPU_IDS="$(
+          "${ROOT_DIR}/.venv/bin/python" "${ROOT_DIR}/tools/ops/discover_idle_gpus.py" \
+            --allowed-name "Tesla P40" \
+            --min-total-mib "${DOTS_MOCR_MIN_TOTAL_MIB:-22000}" \
+            --min-free-mib "${DOTS_MOCR_MIN_FREE_MIB:-12000}" \
+            --max-count auto \
+            --format csv
+        )"
+        local dots_gpu_ids=()
+        IFS=, read -r -a dots_gpu_ids <<<"${DOTS_MOCR_GPU_IDS}"
+        workers="${#dots_gpu_ids[@]}"
+        export DOTS_MOCR_GPU_IDS
+      elif [[ "${workers}" == "auto" ]]; then
+        local dots_gpu_ids=()
+        IFS=, read -r -a dots_gpu_ids <<<"${DOTS_MOCR_GPU_IDS:-}"
+        workers="${#dots_gpu_ids[@]}"
+      fi
+      if [[ "${workers}" == "auto" || "${workers}" == "0" ]]; then
+        echo "No compatible idle Tesla P40 is available for DotsOCR" >&2
+        return 1
+      fi
       DOTS_MOCR_PROXY_PORT="${DOTS_MOCR_PROXY_PORT:-18088}" \
         "/home/ai/ocr-deploy/start_dots_mocr_p40_service.sh" "${workers}"
       ;;
@@ -233,7 +327,7 @@ start_ocr() {
 }
 
 start_minicpm() {
-  "${ROOT_DIR}/tools/ops/start_minicpm_p40_service.sh" start "${MINICPM_WORKER_COUNT:-5}"
+  "${ROOT_DIR}/tools/ops/start_minicpm_p40_service.sh" start "${MINICPM_WORKER_COUNT:-auto}"
 }
 
 case "${STAGE}" in
@@ -242,6 +336,7 @@ case "${STAGE}" in
     stop_bonsai
     stop_minicpm
     stop_ocr
+    reclaim_idle_gpu_services
     start_asr
     ;;
   ocr)
@@ -251,6 +346,7 @@ case "${STAGE}" in
     stop_vibevoice
     stop_qwen3_asr
     stop_firered_asr2
+    reclaim_idle_gpu_services
     start_ocr
     ;;
   vl)
@@ -260,6 +356,7 @@ case "${STAGE}" in
     stop_vibevoice
     stop_qwen3_asr
     stop_firered_asr2
+    reclaim_idle_gpu_services
     start_minicpm
     ;;
   text)
@@ -269,6 +366,7 @@ case "${STAGE}" in
     stop_qwen3_asr
     stop_firered_asr2
     stop_minicpm
+    reclaim_idle_gpu_services
     start_bonsai
     ;;
   tts)
@@ -278,6 +376,7 @@ case "${STAGE}" in
     stop_qwen3_asr
     stop_firered_asr2
     stop_minicpm
+    reclaim_idle_gpu_services
     ;;
   stop)
     stop_indextts
@@ -287,6 +386,15 @@ case "${STAGE}" in
     stop_qwen3_asr
     stop_firered_asr2
     stop_minicpm
+    ;;
+  release)
+    stop_bonsai
+    stop_ocr
+    stop_vibevoice
+    stop_qwen3_asr
+    stop_firered_asr2
+    stop_minicpm
+    restore_reclaimed_gpu_services
     ;;
   *)
     usage

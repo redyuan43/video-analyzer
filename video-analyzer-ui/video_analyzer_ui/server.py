@@ -631,6 +631,44 @@ class VideoAnalyzerUI:
             except BridgeError as exc:
                 return jsonify({'error': exc.message}), int(exc.status)
 
+        @self.app.route('/api/video-link/jobs/<job_id>/repair/approve', methods=['POST'])
+        def video_link_approve_repair(job_id):
+            try:
+                return jsonify(
+                    self.video_link.approve_repair(
+                        job_id,
+                        request.get_json(silent=True) or {},
+                    )
+                ), int(HTTPStatus.ACCEPTED)
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>/repair/reject', methods=['POST'])
+        def video_link_reject_repair(job_id):
+            try:
+                return jsonify(
+                    self.video_link.reject_repair(
+                        job_id,
+                        request.get_json(silent=True) or {},
+                    )
+                )
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>/repair/retry', methods=['POST'])
+        def video_link_retry_repair(job_id):
+            try:
+                return jsonify(self.video_link.retry_repair(job_id)), int(HTTPStatus.ACCEPTED)
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
+        @self.app.route('/api/video-link/jobs/<job_id>/repair/disable', methods=['POST'])
+        def video_link_disable_repair(job_id):
+            try:
+                return jsonify(self.video_link.disable_repair(job_id))
+            except BridgeError as exc:
+                return jsonify({'error': exc.message}), int(exc.status)
+
         @self.app.route('/api/video-link/jobs/<job_id>/open-run-dir', methods=['POST'])
         def video_link_open_run_dir(job_id):
             try:

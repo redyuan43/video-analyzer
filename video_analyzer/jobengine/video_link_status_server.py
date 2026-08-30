@@ -80,6 +80,7 @@ from video_analyzer.jobengine._shared import (
 from video_analyzer.jobengine.background_loops import BackgroundLoopsMixin
 from video_analyzer.jobengine.errors import BridgeError
 from video_analyzer.jobengine.mobile_audio import MobileAudioMixin
+from video_analyzer.jobengine.repair import RepairMixin
 from video_analyzer.jobengine.settings import SettingsMixin
 from video_analyzer.jobengine.stage_runner import StageRunnerMixin
 from video_analyzer.model_settings import (
@@ -530,7 +531,7 @@ STAGE_PROGRESS_STEPS = {
 }
 
 
-class VideoLinkStatusServer(SettingsMixin, MobileAudioMixin, BackgroundLoopsMixin, StageRunnerMixin):
+class VideoLinkStatusServer(SettingsMixin, MobileAudioMixin, RepairMixin, BackgroundLoopsMixin, StageRunnerMixin):
     def __init__(self, jobs_dir: Path = DEFAULT_JOBS_DIR, repo_root: Path = REPO_ROOT, auto_resume: bool = False):
         self.jobs_dir = jobs_dir
         self.repo_root = repo_root
@@ -550,6 +551,12 @@ class VideoLinkStatusServer(SettingsMixin, MobileAudioMixin, BackgroundLoopsMixi
         self.vscode_lock = threading.Lock()
         self.auto_retry_stop = threading.Event()
         self.auto_retry_thread: threading.Thread | None = None
+        self.repair_stop = threading.Event()
+        self.repair_thread: threading.Thread | None = None
+        self.repair_lock = threading.Lock()
+        self.repair_last_error = ""
+        self.repair_model_last_error = ""
+        self.repair_model_last_success_at = ""
         self.schedule_stop = threading.Event()
         self.schedule_thread: threading.Thread | None = None
         self.audio_tts_stop = threading.Event()
@@ -569,6 +576,8 @@ class VideoLinkStatusServer(SettingsMixin, MobileAudioMixin, BackgroundLoopsMixi
             self.recover_interrupted_skill_distillations()
             self.recover_interrupted_skill_projects()
             self.start_auto_retry_loop()
+            self.recover_interrupted_repairs()
+            self.start_repair_loop()
             self.recover_interrupted_audio_tts()
             self.start_audio_tts_loop()
         self.start_schedule_loop()
@@ -592,12 +601,16 @@ class VideoLinkStatusServer(SettingsMixin, MobileAudioMixin, BackgroundLoopsMixi
                 if process.poll() is None
             )
         active_count = len(video_jobs) + len(skill_distillations) + len(skill_projects)
+        repair_status = self.repair_worker_status()
+        if repair_status.get("active_job_id"):
+            active_count += 1
         return {
             "busy": active_count > 0,
             "active_count": active_count,
             "video_jobs": video_jobs,
             "skill_distillations": skill_distillations,
             "skill_projects": skill_projects,
+            "repair_job": repair_status.get("active_job_id") or "",
         }
 
     def background_worker_status(self) -> dict[str, Any]:
@@ -620,8 +633,13 @@ class VideoLinkStatusServer(SettingsMixin, MobileAudioMixin, BackgroundLoopsMixi
                 "current_job_id": self.audio_tts_current_job_id,
                 "heartbeat_age_seconds": heartbeat_age,
                 "last_error": self.audio_tts_last_error,
-            }
+            },
+            "incident_repair": self.repair_worker_status(),
         }
+
+    def incident_repair_config(self) -> dict[str, Any]:
+        config = runtime_config().get("incident_repair") or {}
+        return dict(config) if isinstance(config, dict) else {}
 
     def options(self) -> dict[str, Any]:
         profiles = runtime_profile_names(VIDEO_WORKFLOW_ID)
@@ -645,6 +663,7 @@ class VideoLinkStatusServer(SettingsMixin, MobileAudioMixin, BackgroundLoopsMixi
                 "subtitle_langs": DEFAULT_SUBTITLE_LANGS,
                 "refresh_context": True,
                 "focus_prompt": "",
+                "auto_repair": self.repair_default_enabled(),
             },
             "choices": {
                 "analysis_modes": list(ALLOWED_ANALYSIS_MODES),
@@ -777,6 +796,12 @@ class VideoLinkStatusServer(SettingsMixin, MobileAudioMixin, BackgroundLoopsMixi
         )
         include_comments = False if source_type == UPLOAD_SOURCE_TYPE else parse_bool_option(payload, "include_comments", "includeComments", defaults["include_comments"])
         refresh_context = False if source_type == UPLOAD_SOURCE_TYPE else parse_bool_option(payload, "refresh_context", "refreshContext", defaults["refresh_context"])
+        auto_repair = parse_bool_option(
+            payload,
+            "auto_repair",
+            "autoRepair",
+            defaults["auto_repair"],
+        )
         max_comments = parse_int_option(payload.get("max_comments") if "max_comments" in payload else payload.get("maxComments"), defaults["max_comments"])
         subtitle_langs = str(payload.get("subtitle_langs") or payload.get("subtitleLangs") or defaults["subtitle_langs"]).strip()
         focus_prompt = normalize_focus_prompt(payload.get("focus_prompt") if "focus_prompt" in payload else payload.get("focusPrompt", ""))
@@ -814,6 +839,7 @@ class VideoLinkStatusServer(SettingsMixin, MobileAudioMixin, BackgroundLoopsMixi
                 "max_comments": max_comments,
                 "subtitle_langs": subtitle_langs,
                 "refresh_context": refresh_context,
+                "auto_repair": auto_repair,
                 "focus_prompt": focus_prompt,
                 "template_id": template_id,
                 "template_title": template_title,
@@ -828,6 +854,13 @@ class VideoLinkStatusServer(SettingsMixin, MobileAudioMixin, BackgroundLoopsMixi
             "modules": {},
             "warnings": [],
             "runner": {"status": "idle", "current_stage": None, "error": None},
+            "repair": {
+                "enabled": auto_repair,
+                "status": "idle" if auto_repair else "disabled",
+                "cycle": 0,
+                "history": [],
+                "updated_at": iso_now(),
+            },
         }
         collection = payload.get("_collection")
         if isinstance(collection, dict):
@@ -1602,7 +1635,10 @@ class VideoLinkStatusServer(SettingsMixin, MobileAudioMixin, BackgroundLoopsMixi
         }
 
     def jobs_summary(self, jobs: list[dict[str, Any]]) -> dict[str, Any]:
-        counts = {status: 0 for status in ("created", "running", "queued", "succeeded", "failed")}
+        counts = {
+            status: 0
+            for status in ("created", "running", "queued", "repairing", "succeeded", "failed")
+        }
         failure_counts: dict[str, int] = {}
         rerun_required = 0
         progress_values = []
@@ -1841,7 +1877,13 @@ class VideoLinkStatusServer(SettingsMixin, MobileAudioMixin, BackgroundLoopsMixi
         process_info = dict(stage_info.get("process") or job.get("process") or {})
         pid = process_info.get("pid")
         stopped_pids: list[int] = []
-        if pid and process_alive(pid):
+        running_process = bool(pid and process_alive(pid))
+        vibevoice_cancel = (
+            cancel_local_vibevoice_request()
+            if stage == "analyze-core" and running_process
+            else None
+        )
+        if running_process:
             stopped_pids = terminate_process_tree(pid)
         now = iso_now()
         if stage:
@@ -1857,6 +1899,8 @@ class VideoLinkStatusServer(SettingsMixin, MobileAudioMixin, BackgroundLoopsMixi
                 process_info["alive"] = False
                 process_info["stopped_at"] = now
                 process_info["stopped_pids"] = stopped_pids
+                if vibevoice_cancel is not None:
+                    process_info["vibevoice_cancel"] = vibevoice_cancel
                 stage_info["process"] = process_info
             job.setdefault("stages", {})[stage] = stage_info
         job["status"] = "failed"
@@ -1874,7 +1918,14 @@ class VideoLinkStatusServer(SettingsMixin, MobileAudioMixin, BackgroundLoopsMixi
         )
         job["runner"] = runner
         self.save_job(job)
-        return {"stopped": True, "job_id": job_id, "stage": stage, "pid": pid, "stopped_pids": stopped_pids}
+        return {
+            "stopped": True,
+            "job_id": job_id,
+            "stage": stage,
+            "pid": pid,
+            "stopped_pids": stopped_pids,
+            "vibevoice_cancel": vibevoice_cancel,
+        }
 
     def recover_interrupted_jobs(self, auto_start: bool = False) -> None:
         recovered_jobs: list[dict[str, Any]] = []
@@ -6384,6 +6435,7 @@ class VideoLinkStatusServer(SettingsMixin, MobileAudioMixin, BackgroundLoopsMixi
             "video_path": job.get("video_path"),
             "schedule": job.get("schedule"),
             "collection": self.public_job_collection(job),
+            "repair": job.get("repair") or {},
         }
         schedule = job.get("schedule")
         if isinstance(schedule, dict) and schedule.get("status") == "scheduled":
@@ -7756,6 +7808,24 @@ def terminate_process_tree(root_pid: Any, grace_seconds: float = 3.0) -> list[in
     return pids
 
 
+def cancel_local_vibevoice_request() -> dict[str, Any]:
+    url = "http://127.0.0.1:18012/api/asr/cancel"
+    session = requests.Session()
+    session.trust_env = False
+    try:
+        response = session.post(url, timeout=2)
+        payload = response.json()
+        return {
+            "ok": response.ok,
+            "status_code": response.status_code,
+            "cancelled_requests": int(payload.get("cancelled_requests") or 0),
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    finally:
+        session.close()
+
+
 def parse_core_progress(text: str, stage_status: str) -> dict[str, Any]:
     return parse_progress_steps(text, stage_status, CORE_PROGRESS_STEPS, CORE_PROGRESS_WEIGHTS)
 
@@ -9093,10 +9163,11 @@ def runtime_profile_names(workflow_id: str | None = None) -> list[str]:
 
 
 def runtime_profile_choices() -> list[dict[str, Any]]:
-    profiles = runtime_config().get("runtime_profiles") or {}
+    config = runtime_config()
+    profiles = build_settings_document(config).get("profiles") or {}
     choices = []
     for name in sorted(profiles):
-        profile = profiles.get(name) or {}
+        profile = expand_runtime_profile(config, profiles.get(name) or {})
         text_model = str(profile.get("text_model") or "")
         review_model = str(profile.get("review_model") or text_model)
         label = f"{name} · {text_model}"
@@ -9963,6 +10034,26 @@ class StatusRequestHandler(BaseHTTPRequestHandler):
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/stop", path)
             if match:
                 self.write_json(self.server_app.stop_job(match.group(1)), HTTPStatus.ACCEPTED)
+                return
+            match = re.fullmatch(
+                r"/api/video-link/jobs/([a-f0-9]{32})/repair/(approve|reject|retry|disable)",
+                path,
+            )
+            if match:
+                job_id, action = match.groups()
+                if action == "approve":
+                    result = self.server_app.approve_repair(job_id, payload)
+                    status = HTTPStatus.ACCEPTED
+                elif action == "reject":
+                    result = self.server_app.reject_repair(job_id, payload)
+                    status = HTTPStatus.OK
+                elif action == "retry":
+                    result = self.server_app.retry_repair(job_id)
+                    status = HTTPStatus.ACCEPTED
+                else:
+                    result = self.server_app.disable_repair(job_id)
+                    status = HTTPStatus.OK
+                self.write_json(result, status)
                 return
             match = re.fullmatch(r"/api/video-link/jobs/([a-f0-9]{32})/open-run-dir", path)
             if match:

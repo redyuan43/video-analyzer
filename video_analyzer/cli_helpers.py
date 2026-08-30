@@ -12,7 +12,7 @@ import re
 import shutil
 import subprocess
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
 from statistics import median
@@ -641,5 +641,4 @@ def read_page_context_metadata(context_file: str, page_context: str) -> dict:
     metadata.update(payload)
     metadata["text_length"] = len(page_context or "")
     return metadata
-
 

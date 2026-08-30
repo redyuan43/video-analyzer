@@ -355,7 +355,7 @@ class OperationManualTests(unittest.TestCase):
                 ["http://127.0.0.1:18012/api/asr/transcribe"],
             )
 
-    def test_endpoint_host_override_updates_runtime_services(self):
+    def test_endpoint_host_override_does_not_replace_local_profile_services(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_dir = Path(temp_dir)
             (config_dir / "config.json").write_text(
@@ -374,25 +374,22 @@ class OperationManualTests(unittest.TestCase):
             )
 
             config = Config(str(config_dir))
-            profile = config.get_runtime_profile("deepseek_v4_pro")
+            profile = config.get_runtime_profile("deepseek_v4_flash")
 
             self.assertEqual(
                 profile["vibevoice_urls"],
+                ["http://127.0.0.1:18012/api/asr/transcribe"],
+            )
+            self.assertEqual(
+                profile["ocr_base_urls"],
+                ["http://127.0.0.1:18088/v1"],
+            )
+            self.assertEqual(
+                config.get("asr")["vibevoice"]["deep_remote_urls"],
                 [
                     "http://edge-new.taild500c8.ts.net:8012/api/asr/transcribe",
                     "http://spark-new.taild500c8.ts.net:8012/api/asr/transcribe",
                 ],
-            )
-            self.assertEqual(
-                profile["ocr_base_urls"],
-                [
-                    "http://spark-new.taild500c8.ts.net:8000/v1",
-                    "http://edge-new.taild500c8.ts.net:8000/v1",
-                ],
-            )
-            self.assertEqual(
-                config.get("asr")["vibevoice"]["deep_remote_urls"],
-                profile["vibevoice_urls"],
             )
             self.assertEqual(
                 default_vibevoice_urls(config.config),

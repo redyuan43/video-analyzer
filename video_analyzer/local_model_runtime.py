@@ -22,6 +22,13 @@ LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 DEFAULT_LOCK_PATH = REPO_ROOT / "tmp" / "video-link-status" / "resource-locks" / "local-model-runtime.lock"
 DEFAULT_POLL_SECONDS = 5.0
 DEFAULT_LOG_INTERVAL_SECONDS = 30.0
+DEFAULT_RECLAIM_STATE_PATH = (
+    REPO_ROOT
+    / "tmp"
+    / "video-link-status"
+    / "resource-locks"
+    / "reclaimed-gpu-services.json"
+)
 _SESSION_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar("local_model_session_depth", default=0)
 
 
@@ -56,7 +63,9 @@ def remote_runtime_profile_owns_endpoint(
         return False
     deployment = str(profile.get("deployment") or "").strip().lower()
     provider = str(profile.get("provider") or "").strip().lower()
-    return deployment == "remote" or provider == "trae_local_api"
+    if deployment:
+        return deployment == "remote"
+    return provider == "trae_local_api"
 
 
 def local_model_stage_needed(stage: str, config: dict) -> bool:
@@ -112,7 +121,10 @@ def local_model_runtime_session(config: dict, logger: logging.Logger, owner: str
         try:
             yield
         finally:
-            _SESSION_DEPTH.reset(token)
+            try:
+                release_reclaimed_gpu_services(config, logger)
+            finally:
+                _SESSION_DEPTH.reset(token)
 
 
 @contextlib.contextmanager
@@ -195,7 +207,10 @@ def local_model_stage(stage: str, config: dict, logger: logging.Logger, owner: s
         try:
             yield
         finally:
-            unload_local_model_stage(config, logger)
+            try:
+                unload_local_model_stage(config, logger)
+            finally:
+                release_reclaimed_gpu_services(config, logger)
 
 
 @contextlib.contextmanager
@@ -260,8 +275,26 @@ def _write_lock_metadata(fd: int, stage: str, owner: str) -> None:
     os.fsync(fd)
 
 
+def _reclaim_state_path(config: dict) -> Path:
+    runtime = config.get("local_model_runtime") or {}
+    return Path(
+        runtime.get("reclaim_state_path")
+        or DEFAULT_RECLAIM_STATE_PATH
+    ).expanduser()
+
+
+def _apply_reclaim_environment(env: dict[str, str], config: dict) -> None:
+    runtime = config.get("local_model_runtime") or {}
+    services = runtime.get("reclaimable_gpu_services") or []
+    env["VIDEO_ANALYZER_RECLAIMABLE_GPU_SERVICES_JSON"] = json.dumps(
+        services,
+        ensure_ascii=False,
+    )
+    env["VIDEO_ANALYZER_GPU_RECLAIM_STATE"] = str(_reclaim_state_path(config))
+
+
 def prepare_local_model_stage(stage: str, config: dict, logger: logging.Logger) -> None:
-    if stage != "stop" and not local_model_stage_needed(stage, config):
+    if stage not in {"stop", "release"} and not local_model_stage_needed(stage, config):
         return
 
     runtime = config.get("local_model_runtime") or {}
@@ -279,6 +312,7 @@ def prepare_local_model_stage(stage: str, config: dict, logger: logging.Logger) 
     env = os.environ.copy()
     env.setdefault("NO_PROXY", "127.0.0.1,localhost")
     env.setdefault("no_proxy", "127.0.0.1,localhost")
+    _apply_reclaim_environment(env, config)
     if stage == "asr":
         asr = config.get("asr") or {}
         provider = str(asr.get("provider") or "vibevoice")
@@ -288,7 +322,7 @@ def prepare_local_model_stage(stage: str, config: dict, logger: logging.Logger) 
             env["VIBEVOICE_WORKER_COUNT"] = str(
                 vibevoice.get("worker_count")
                 or vibevoice.get("chunk_parallel_workers")
-                or 5
+                or "auto"
             )
             if vibevoice.get("single_pass_max_duration_sec") is not None:
                 env["VIBEVOICE_SINGLE_PASS_MAX_DURATION_SEC"] = str(
@@ -306,7 +340,8 @@ def prepare_local_model_stage(stage: str, config: dict, logger: logging.Logger) 
             options = vibevoice.get("qwen3_asr_options") or {}
             env["QWEN3_ASR_WORKER_COUNT"] = str(options.get("worker_count") or 5)
             gpu_ids = options.get("gpu_ids")
-            if gpu_ids:
+            if options.get("gpu_selection") == "manual" and gpu_ids:
+                env["QWEN3_ASR_GPU_SELECTION"] = "manual"
                 env["QWEN3_ASR_GPU_IDS"] = ",".join(str(item) for item in gpu_ids)
             configured_model_path = options.get("model_path")
             if not configured_model_path:
@@ -329,7 +364,8 @@ def prepare_local_model_stage(stage: str, config: dict, logger: logging.Logger) 
             options = vibevoice.get("firered_asr2_options") or {}
             env["FIRERED_ASR2_WORKER_COUNT"] = str(options.get("worker_count") or 5)
             gpu_ids = options.get("gpu_ids")
-            if gpu_ids:
+            if options.get("gpu_selection") == "manual" and gpu_ids:
+                env["FIRERED_ASR2_GPU_SELECTION"] = "manual"
                 env["FIRERED_ASR2_GPU_IDS"] = ",".join(str(item) for item in gpu_ids)
             env["FIRERED_ASR2_CHUNK_SECONDS"] = str(options.get("chunk_duration_sec") or 30)
             env["FIRERED_ASR2_CHUNK_OVERLAP_SECONDS"] = str(
@@ -352,33 +388,60 @@ def prepare_local_model_stage(stage: str, config: dict, logger: logging.Logger) 
     elif stage == "ocr":
         ocr = config.get("ocr") or {}
         env["OCR_ENGINE"] = str(ocr.get("engine") or ocr.get("provider") or "unlimited")
-        if ocr.get("worker_count"):
+        worker_count = ocr.get("worker_count")
+        if worker_count not in {None, "", "auto"}:
+            env["UNLIMITED_OCR_GPU_SELECTION"] = "manual"
             env["UNLIMITED_OCR_WORKER_COUNT"] = str(ocr["worker_count"])
             env["DOTS_MOCR_WORKER_COUNT"] = str(ocr["worker_count"])
         gpu_ids = ocr.get("gpu_ids")
-        if gpu_ids:
+        if gpu_ids and gpu_ids != "auto":
+            env["UNLIMITED_OCR_GPU_SELECTION"] = "manual"
             env["UNLIMITED_OCR_GPU_IDS"] = ",".join(str(item) for item in gpu_ids)
+            env["DOTS_MOCR_GPU_SELECTION"] = "manual"
+            env["DOTS_MOCR_GPU_IDS"] = ",".join(str(item) for item in gpu_ids)
+        if ocr.get("min_gpu_memory_mib") is not None:
+            env["UNLIMITED_OCR_MIN_TOTAL_MIB"] = str(ocr["min_gpu_memory_mib"])
+            env["DOTS_MOCR_MIN_TOTAL_MIB"] = str(ocr["min_gpu_memory_mib"])
+        if ocr.get("min_gpu_free_mib") is not None:
+            env["UNLIMITED_OCR_MIN_FREE_MIB"] = str(ocr["min_gpu_free_mib"])
+            env["DOTS_MOCR_MIN_FREE_MIB"] = str(ocr["min_gpu_free_mib"])
     elif stage == "vl":
         runtime_options = (config.get("operation_manual") or {}).get("vision_runtime") or {}
         env["VISION_ENGINE"] = str(runtime_options.get("engine") or "minicpm_v45")
-        if runtime_options.get("worker_count"):
+        worker_count = runtime_options.get("worker_count")
+        if worker_count not in {None, "", "auto"}:
+            env["MINICPM_GPU_SELECTION"] = "manual"
             env["MINICPM_WORKER_COUNT"] = str(runtime_options["worker_count"])
         gpu_ids = runtime_options.get("gpu_ids")
-        if gpu_ids:
+        if gpu_ids and gpu_ids != "auto":
+            env["MINICPM_GPU_SELECTION"] = "manual"
             env["MINICPM_GPU_IDS"] = ",".join(str(item) for item in gpu_ids)
+        if runtime_options.get("min_gpu_memory_mib") is not None:
+            env["MINICPM_MIN_TOTAL_MIB"] = str(runtime_options["min_gpu_memory_mib"])
+        if runtime_options.get("min_gpu_free_mib") is not None:
+            env["MINICPM_MIN_FREE_MIB"] = str(runtime_options["min_gpu_free_mib"])
     elif stage == "text":
         manual = config.get("operation_manual") or {}
         env["BONSAI_LOCAL_PORT"] = str(manual.get("text_port") or 18103)
-        worker_count = int(manual.get("text_worker_count") or 6)
-        if not 1 <= worker_count <= 6:
-            raise ValueError("text_worker_count must be between 1 and 6")
-        gpu_ids = list(manual.get("text_gpu_ids") or [3, 0, 1, 2, 4, 5])
-        if worker_count > len(gpu_ids):
-            raise ValueError("text_worker_count exceeds configured text_gpu_ids")
-        env["BONSAI_LOCAL_WORKER_COUNT"] = str(worker_count)
-        env["BONSAI_LOCAL_GPU_IDS"] = ",".join(
-            str(item) for item in gpu_ids[:worker_count]
-        )
+        if manual.get("text_gpu_selection") == "manual":
+            gpu_ids = list(manual.get("text_gpu_ids") or [])
+            configured_worker_count = manual.get("text_worker_count")
+            worker_count = (
+                len(gpu_ids)
+                if str(configured_worker_count or "auto").strip().lower() == "auto"
+                else int(configured_worker_count)
+            )
+            if not 1 <= worker_count <= len(gpu_ids):
+                raise ValueError(
+                    "manual text_worker_count must fit configured text_gpu_ids"
+                )
+            env["BONSAI_LOCAL_GPU_SELECTION"] = "manual"
+            env["BONSAI_LOCAL_WORKER_COUNT"] = str(worker_count)
+            env["BONSAI_LOCAL_GPU_IDS"] = ",".join(
+                str(item) for item in gpu_ids[:worker_count]
+            )
+        else:
+            env["BONSAI_LOCAL_GPU_SELECTION"] = "auto"
         context_length = int(
             manual.get("text_context_length")
             or manual.get("context_length")
@@ -387,6 +450,33 @@ def prepare_local_model_stage(stage: str, config: dict, logger: logging.Logger) 
         if not 1024 <= context_length <= 262144:
             raise ValueError("text_context_length must be between 1024 and 262144")
         env["BONSAI_LOCAL_CONTEXT_SIZE"] = str(context_length)
+        text_runtime_env = {
+            "BONSAI_LOCAL_MODEL": "text_model_path",
+            "BONSAI_LOCAL_DRAFT_MODEL": "text_draft_model_path",
+            "BONSAI_LOCAL_LLAMA_SERVER": "text_llama_server",
+            "BONSAI_LOCAL_MODEL_ALIAS": "text_model_alias",
+            "BONSAI_LOCAL_SPEC_DRAFT_N_MAX": "text_spec_draft_n_max",
+            "BONSAI_LOCAL_V100_32_CACHE_TYPE": "text_v100_32_cache_type",
+            "BONSAI_LOCAL_V100_16_P40_CACHE_TYPE": (
+                "text_v100_16_p40_cache_type"
+            ),
+            "BONSAI_LOCAL_P40_CACHE_TYPE": "text_p40_cache_type",
+            "BONSAI_LOCAL_V100_16_P40_TENSOR_SPLIT": (
+                "text_v100_16_p40_tensor_split"
+            ),
+            "BONSAI_LOCAL_V100_32_MIN_FREE_MIB": (
+                "text_v100_32_min_free_mib"
+            ),
+            "BONSAI_LOCAL_V100_16_MIN_FREE_MIB": (
+                "text_v100_16_min_free_mib"
+            ),
+            "BONSAI_LOCAL_P40_MIN_FREE_MIB": "text_p40_min_free_mib",
+            "BONSAI_LOCAL_RECONCILE_SECONDS": "text_reconcile_seconds",
+        }
+        for environment_name, config_name in text_runtime_env.items():
+            value = manual.get(config_name)
+            if value not in {None, ""}:
+                env[environment_name] = str(value)
     elif stage == "tts":
         tts = config.get("tts") or {}
         endpoint = str(tts.get("base_url") or tts.get("endpoint") or "")
@@ -403,3 +493,17 @@ def unload_local_model_stage(config: dict, logger: logging.Logger) -> None:
     if not runtime.get("unload_on_stage_exit", False):
         return
     prepare_local_model_stage("stop", config, logger)
+
+
+def release_reclaimed_gpu_services(config: dict, logger: logging.Logger) -> None:
+    state_path = _reclaim_state_path(config)
+    if not state_path.is_file():
+        return
+    logger.info("Releasing dynamic GPU workers and restoring reclaimed services")
+    try:
+        prepare_local_model_stage("release", config, logger)
+    except Exception:
+        logger.exception(
+            "Could not restore one or more reclaimed GPU services; state kept at %s",
+            state_path,
+        )

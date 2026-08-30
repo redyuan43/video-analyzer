@@ -21,7 +21,11 @@ from .asr_providers import ASRStrategyResult, transcribe_with_provider_result, t
 from .audio_processor import AudioProcessor, AudioTranscript
 from .local_model_runtime import local_model_runtime_lock, local_model_stage, local_model_stage_needed
 from .resource_locks import analyzer_resource_lock
-from .speaker_diarization import prepare_speaker_assignment, process_transcript_speakers
+from .speaker_diarization import (
+    prepare_speaker_assignment,
+    process_transcript_speakers,
+    resolve_diarization_gpu_id,
+)
 
 RAY_TRANSCRIPTION_LOCK = threading.Lock()
 
@@ -411,9 +415,13 @@ def run_parallel_transcription_branches(
             if not ray.is_initialized():
                 previous_cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
                 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-                os.environ["CUDA_VISIBLE_DEVICES"] = str(
-                    speaker_config.get("gpu_id") or 0
-                )
+                if not remote_diarization:
+                    diarization_gpu = resolve_diarization_gpu_id(speaker_config)
+                    if diarization_gpu is None:
+                        raise RuntimeError(
+                            "No compatible idle GPU is available for speaker diarization"
+                        )
+                    os.environ["CUDA_VISIBLE_DEVICES"] = diarization_gpu
                 try:
                     ray_options = {
                         "namespace": "video-analyzer-transcription",

@@ -92,8 +92,57 @@ class VideoAnalyzerUITests(unittest.TestCase):
                 "video_jobs": [],
                 "skill_distillations": [],
                 "skill_projects": [],
+                "repair_job": "",
             },
         )
+        self.assertIn("incident_repair", payload["background_workers"])
+
+    def test_incident_repair_routes_and_ui_controls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = ui_mod.VideoAnalyzerUI(jobs_dir=Path(tmp), video_link_auto_resume=False)
+            job = ui.video_link.create_job({"video_url": "https://example.com/video"})
+            expected = {
+                "job_id": job["job_id"],
+                "status": "repairing",
+                "repair": {"status": "waiting_approval"},
+            }
+            with patch.object(ui.video_link, "approve_repair", return_value=expected) as approve, \
+                patch.object(ui.video_link, "reject_repair", return_value=expected) as reject, \
+                patch.object(ui.video_link, "retry_repair", return_value=expected) as retry, \
+                patch.object(ui.video_link, "disable_repair", return_value=expected) as disable:
+                client = ui.app.test_client()
+                approved = client.post(
+                    f"/api/video-link/jobs/{job['job_id']}/repair/approve",
+                    json={"incident_id": "incident-1"},
+                )
+                rejected = client.post(
+                    f"/api/video-link/jobs/{job['job_id']}/repair/reject",
+                    json={"incident_id": "incident-1"},
+                )
+                retried = client.post(
+                    f"/api/video-link/jobs/{job['job_id']}/repair/retry",
+                    json={},
+                )
+                disabled = client.post(
+                    f"/api/video-link/jobs/{job['job_id']}/repair/disable",
+                    json={},
+                )
+
+        self.assertEqual(approved.status_code, 202)
+        self.assertEqual(rejected.status_code, 200)
+        self.assertEqual(retried.status_code, 202)
+        self.assertEqual(disabled.status_code, 200)
+        approve.assert_called_once_with(job["job_id"], {"incident_id": "incident-1"})
+        reject.assert_called_once_with(job["job_id"], {"incident_id": "incident-1"})
+        retry.assert_called_once_with(job["job_id"])
+        disable.assert_called_once_with(job["job_id"])
+
+        html = (UI_ROOT / "video_analyzer_ui" / "templates" / "index.html").read_text(encoding="utf-8")
+        js = (UI_ROOT / "video_analyzer_ui" / "static" / "js" / "main.js").read_text(encoding="utf-8")
+        self.assertIn('id="autoRepair"', html)
+        self.assertIn('id="repairPanel"', html)
+        self.assertIn("auto_repair: nodes.autoRepair.checked", js)
+        self.assertIn("/repair/${action}", js)
 
     def test_supervisor_defers_source_reload_while_background_work_is_active(self):
         self.assertTrue(
@@ -225,7 +274,7 @@ class VideoAnalyzerUITests(unittest.TestCase):
                         "source_transcript_sha256": "b" * 64,
                         "template_id": "tmpl-1",
                         "focus_prompt": "focus",
-                        "profile": "deepseek_v4_pro",
+                        "profile": "deepseek_v4_flash",
                     },
                     content_type="multipart/form-data",
                 )
@@ -580,8 +629,14 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertIn("let refreshRequest = null;", main_js)
         self.assertIn("if (refreshRequest) return refreshRequest;", main_js)
         self.assertIn("if (currentView === 'preview') renderTaskPreviewGrid(latestJobs);", main_js)
-        self.assertIn("/api/video-link/jobs?limit=50", main_js)
+        self.assertIn("const JOB_LIST_PAGE_SIZE = 12;", main_js)
+        self.assertIn("jobListLimit + JOB_LIST_PAGE_SIZE", main_js)
+        self.assertIn("function loadMoreJobs()", main_js)
+        self.assertIn("jobListTotal = Number(data.total ?? jobs.length);", main_js)
+        self.assertIn("`/api/video-link/jobs?limit=${boundedLimit}`", main_js)
         self.assertNotIn("/api/video-link/jobs?limit=200", main_js)
+        self.assertIn('id="jobListPagination"', html)
+        self.assertIn('id="jobListLoadMore"', html)
         self.assertIn("const frameTimeMapRequests = {};", main_js)
         self.assertIn("loadedStudyKey = jobId;", main_js)
         self.assertIn("window.setTimeout(tick, 250)", main_js)
@@ -791,7 +846,7 @@ class VideoAnalyzerUITests(unittest.TestCase):
             started_payload = {
                 "available": False,
                 "status": "running",
-                "profile": "deepseek_v4_pro",
+                "profile": "deepseek_v4_flash",
             }
             enabled_payload = {
                 "available": True,
@@ -813,7 +868,7 @@ class VideoAnalyzerUITests(unittest.TestCase):
                 before = client.get(f"/api/video-link/jobs/{job['job_id']}/skill-distillation")
                 generated = client.post(
                     f"/api/video-link/jobs/{job['job_id']}/skill-distillation/start",
-                    json={"profile": "deepseek_v4_pro"},
+                    json={"profile": "deepseek_v4_flash"},
                 )
                 enabled = client.post(
                     f"/api/video-link/jobs/{job['job_id']}/skill-distillation/enable",
@@ -823,10 +878,10 @@ class VideoAnalyzerUITests(unittest.TestCase):
         self.assertEqual(before.status_code, 200)
         self.assertFalse(before.get_json()["available"])
         self.assertEqual(generated.status_code, 202)
-        self.assertEqual(generated.get_json()["profile"], "deepseek_v4_pro")
+        self.assertEqual(generated.get_json()["profile"], "deepseek_v4_flash")
         self.assertEqual(enabled.status_code, 200)
         self.assertTrue(enabled.get_json()["enabled"])
-        start.assert_called_once_with(job["job_id"], {"profile": "deepseek_v4_pro"})
+        start.assert_called_once_with(job["job_id"], {"profile": "deepseek_v4_flash"})
         enable.assert_called_once_with(job["job_id"], {"overwrite": False})
 
     def test_skill_project_routes_create_assess_and_update(self):

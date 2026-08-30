@@ -617,12 +617,14 @@ def local_text_capacity_ready(profile: dict[str, Any]) -> bool:
     ).rstrip("/")
     if not base_url.startswith(("http://127.0.0.1", "http://localhost")):
         return False
-    required = max(
+    configured_workers = (
+        profile.get("text_worker_count")
+        or profile.get("worker_count")
+        or 1
+    )
+    required = 1 if str(configured_workers).strip().lower() == "auto" else max(
         1,
-        min(
-            TEMPLATE_SELECTOR_SHARD_COUNT,
-            int(profile.get("text_worker_count") or profile.get("worker_count") or 1),
-        ),
+        min(TEMPLATE_SELECTOR_SHARD_COUNT, int(configured_workers)),
     )
     try:
         response = requests.get(

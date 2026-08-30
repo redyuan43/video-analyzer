@@ -63,6 +63,7 @@ from .ocr_keyframes import (
 from .prompt import PromptLoader
 from .resource_locks import analyzer_resource_lock
 from .review_artifacts import write_run_manifest, write_visual_review
+from .runtime_capacity import resolve_endpoint_concurrency
 from .transcription_pipeline import (
     speaker_diarization_can_run_parallel,
     transcribe_and_diarize_configured_audio,
@@ -784,7 +785,10 @@ def main():
                     checkpoint_path,
                     frames,
                     checkpoint_signature,
-                    allow_legacy_ordered=max(args.vl_concurrency, 1) == 1,
+                    allow_legacy_ordered=(
+                        str(args.vl_concurrency).strip().lower() != AUTO
+                        and max(int(args.vl_concurrency), 1) == 1
+                    ),
                 )
                 checkpoint_durations = [
                     float(item.get("duration_seconds"))
@@ -889,13 +893,28 @@ def main():
                 if frames:
                     with analyzer_resource_lock(config.config, "vl", str(output_dir), logger):
                         with local_model_stage("vl", config.config, logger, str(output_dir)):
+                            vision_endpoint = (
+                                config.get("operation_manual", {}).get("vision_base_url")
+                                or args.vision_base_url
+                                or config.get("operation_manual", {}).get("llm_base_url")
+                                or ""
+                            )
+                            resolved_vl_concurrency = resolve_endpoint_concurrency(
+                                args.vl_concurrency,
+                                [vision_endpoint],
+                            )
+                            logger.info(
+                                "VL concurrency resolved to %s for %s",
+                                resolved_vl_concurrency,
+                                vision_endpoint,
+                            )
                             frame_analyses = analyze_frames_for_vl(
                                 analyzer=analyzer,
                                 frames=frames,
                                 ocr_events=ocr_events,
                                 selected_frame_numbers=selected_frame_numbers,
                                 decisions=frame_decisions,
-                                concurrency=max(args.vl_concurrency, 1),
+                                concurrency=resolved_vl_concurrency,
                                 context_before=context_before,
                                 context_after=context_after,
                                 context_max_gap=args.vl_context_max_gap,
@@ -934,8 +953,6 @@ def main():
                 },
             )
 
-        release_local_runtime()
-                
         # Stage 3: Video Reconstruction
         if args.start_stage <= 3:
             if task == "operation_manual":

@@ -24,6 +24,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
+from video_analyzer.cli_helpers import parse_auto_int_arg
 from video_analyzer.config import Config
 from video_analyzer.douyin_browser import (
     DouyinBrowserDownloadError,
@@ -65,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-vl-frames", help="auto or minimum frames sent to VL")
     parser.add_argument("--max-vl-frames", help="auto or maximum frames sent to VL")
     parser.add_argument("--vl-frame-policy", choices=["auto", "all", "none"])
-    parser.add_argument("--vl-concurrency", type=int)
+    parser.add_argument("--vl-concurrency", type=parse_auto_int_arg)
     parser.add_argument("--vl-context-before", type=int)
     parser.add_argument("--vl-context-after", type=int)
     parser.add_argument("--vl-context-max-gap")

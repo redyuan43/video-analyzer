@@ -410,8 +410,6 @@ def parse_workers(value: str, log_dir: Path) -> list[WorkerSpec]:
         gpu_text, port_text = item.split(":", 1)
         gpu = int(gpu_text)
         port = int(port_text)
-        if gpu == 3:
-            raise ValueError("GPU 3 is reserved for the Foundation-Sec security model")
         workers.append(WorkerSpec(gpu=gpu, port=port, log_path=log_dir / f"worker-gpu{gpu}-port{port}.log"))
     if not workers:
         raise ValueError("at least one worker is required")

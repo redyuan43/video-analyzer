@@ -59,6 +59,9 @@ class StageRunnerMixin:
                 stage = self.next_stage(job)
                 if not stage:
                     job["status"] = "succeeded"
+                    complete_repair = getattr(self, "complete_repair_if_active", None)
+                    if complete_repair:
+                        complete_repair(job)
                     self.update_runner(job, "succeeded", current_stage=None, finished=True)
                     self.queue_audio_tts(job_id)
                     return
@@ -90,6 +93,11 @@ class StageRunnerMixin:
                 self.add_warning(job, "runner", exc.message)
                 job["status"] = "succeeded"
                 self.update_runner(job, "succeeded", error=None, current_stage=None, finished=True)
+            elif getattr(self, "queue_repair_after_failure", None) and self.queue_repair_after_failure(
+                job,
+                exc.message,
+            ):
+                return
             else:
                 job["status"] = "failed"
                 self.update_runner(job, "failed", error=exc.message, finished=True)
@@ -99,6 +107,11 @@ class StageRunnerMixin:
                 self.add_warning(job, "runner", str(exc))
                 job["status"] = "succeeded"
                 self.update_runner(job, "succeeded", error=None, current_stage=None, finished=True)
+            elif getattr(self, "queue_repair_after_failure", None) and self.queue_repair_after_failure(
+                job,
+                str(exc),
+            ):
+                return
             else:
                 job["status"] = "failed"
                 self.update_runner(job, "failed", error=str(exc), finished=True)
@@ -866,4 +879,3 @@ class StageRunnerMixin:
         job["runner"] = runner
         job["updated_at"] = now
         self.save_job(job)
-

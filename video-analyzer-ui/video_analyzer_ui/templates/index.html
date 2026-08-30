@@ -127,6 +127,7 @@
                             <label class="check"><input id="includeSubtitles" type="checkbox"><span>纳入字幕</span></label>
                             <label class="check"><input id="includeComments" type="checkbox"><span>纳入评论</span></label>
                             <label class="check"><input id="refreshContext" type="checkbox"><span>刷新上下文</span></label>
+                            <label class="check"><input id="autoRepair" type="checkbox"><span>自动修复失败</span></label>
                         </div>
                         <label>
                             <span>定时启动</span>
@@ -165,6 +166,9 @@
                         </div>
                     </div>
                     <div id="jobList" class="job-list"></div>
+                    <div id="jobListPagination" class="job-list-pagination" hidden>
+                        <button id="jobListLoadMore" class="secondary" type="button">加载更多</button>
+                    </div>
                 </section>
 
                 <section class="panel">
@@ -203,6 +207,23 @@
                 <section id="errorPanel" class="panel error-panel" hidden>
                     <h2 id="errorTitle">流程失败</h2>
                     <p id="errorMessage"></p>
+                </section>
+
+                <section id="repairPanel" class="panel repair-panel" hidden>
+                    <div class="panel-head">
+                        <div>
+                            <h2 id="repairTitle">自动修复</h2>
+                            <p id="repairSummary"></p>
+                        </div>
+                        <span id="repairStatus" class="status-pill">-</span>
+                    </div>
+                    <p id="repairAction"></p>
+                    <div id="repairActions" class="actions">
+                        <button id="approveRepairButton" type="button" hidden>确认执行</button>
+                        <button id="rejectRepairButton" class="secondary" type="button" hidden>拒绝</button>
+                        <button id="retryRepairButton" class="secondary" type="button" hidden>重新诊断</button>
+                        <button id="disableRepairButton" class="secondary" type="button">关闭自动修复</button>
+                    </div>
                 </section>
 
                 <section id="consoleFlowPanel" class="panel console-flow-panel">
@@ -458,8 +479,8 @@
                             <option value="cloud">云端</option>
                             <option value="remote">远程设备</option>
                         </select></label>
-                        <label><span>Worker 数</span><input id="modelWorkerCount" type="number" min="1" max="64" placeholder="5"></label>
-                        <label><span>并发数</span><input id="modelConcurrency" type="number" min="1" max="256" placeholder="5"></label>
+                        <label><span>Worker 数</span><input id="modelWorkerCount" type="text" inputmode="numeric" placeholder="auto"></label>
+                        <label><span>并发数</span><input id="modelConcurrency" type="text" inputmode="numeric" placeholder="auto"></label>
                         <label><span>API Key 环境变量</span><input id="modelApiKeyEnv" placeholder="DEEPSEEK_API_KEY"></label>
                         <label><span>健康检查 URL</span><input id="modelHealthUrl" type="url" placeholder="http://127.0.0.1:18012/api/health"></label>
                         <label class="wide"><span>高级参数 JSON</span><textarea id="modelOptions" rows="9">{}</textarea></label>
@@ -548,7 +569,7 @@
                                 <option value="deep">deep</option>
                             </select>
                         </label>
-                        <label><span>VL 并发</span><input id="profileVlConcurrency" type="number" min="1" max="32"></label>
+                        <label><span>VL 并发</span><input id="profileVlConcurrency" type="text" inputmode="numeric" placeholder="auto"></label>
                         <label><span>OCR 并发</span><input id="profileOcrConcurrency" type="text" placeholder="auto"></label>
                         <label><span>章节并发上限</span><input id="profileChapterConcurrency" type="number" min="1" max="10"></label>
                         <label><span>文本超时秒数</span><input id="profileTextTimeout" type="number" min="1"></label>

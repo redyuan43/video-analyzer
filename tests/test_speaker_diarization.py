@@ -141,11 +141,54 @@ def test_3dspeaker_assignment_uses_native_helper_inside_branch_actor(tmp_path):
             {
                 "external_python": str(external_python),
                 "diarization_project_root": str(project_root),
+                "gpu_selection": "manual",
+                "gpu_id": 0,
             },
         )
 
     command = run.call_args.args[0]
     assert command[1].endswith("run_3dspeaker_turns.py")
+
+
+def test_diarization_gpu_selection_uses_live_inventory():
+    from video_analyzer import speaker_diarization
+
+    with patch.object(speaker_diarization.subprocess, "run") as run:
+        run.return_value.returncode = 0
+        run.return_value.stdout = "6\n"
+
+        selected = speaker_diarization.resolve_diarization_gpu_id(
+            {"gpu_selection": "auto"}
+        )
+
+    assert selected == "6"
+    command = run.call_args.args[0]
+    assert "discover_idle_gpus.py" in command[1]
+    assert command[command.index("--max-count") + 1] == "1"
+
+
+def test_wespeaker_assignment_uses_dynamic_gpu_selection(tmp_path):
+    from video_analyzer import speaker_diarization
+
+    audio_path = tmp_path / "audio.wav"
+    audio_path.touch()
+    with (
+        patch.object(
+            speaker_diarization,
+            "resolve_diarization_gpu_id",
+            return_value="5",
+        ),
+        patch.object(speaker_diarization.subprocess, "run") as run,
+    ):
+        run.return_value.returncode = 0
+        run.return_value.stdout = '{"turns":[]}'
+        run.return_value.stderr = ""
+        speaker_diarization.run_wespeaker_assignment(
+            audio_path,
+            {"device": "cuda", "external_python": "/bin/true"},
+        )
+
+    assert run.call_args.kwargs["env"]["CUDA_VISIBLE_DEVICES"] == "5"
 
 
 def test_remote_3dspeaker_streams_audio_with_token(tmp_path, monkeypatch):

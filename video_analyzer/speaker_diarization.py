@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import time
 import wave
@@ -29,6 +30,46 @@ DEFAULT_MAX_WINDOWS = 2
 DEFAULT_TIMEOUT_SECONDS = 240.0
 DEFAULT_MERGE_MIN_SCORE = 0.78
 DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS = 900.0
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def resolve_diarization_gpu_id(config: dict[str, Any] | None = None) -> str | None:
+    config = config or {}
+    if str(config.get("assignment_device") or "cuda").lower() != "cuda":
+        return None
+    if str(config.get("gpu_selection") or "auto").lower() == "manual":
+        value = config.get("gpu_id")
+        return str(value) if value not in (None, "") else None
+    command = [
+        sys.executable,
+        str(REPO_ROOT / "tools" / "ops" / "discover_idle_gpus.py"),
+        "--allowed-name",
+        "Tesla P40",
+        "--allowed-name",
+        "Tesla V100",
+        "--min-total-mib",
+        str(config.get("min_gpu_memory_mib") or 12000),
+        "--min-free-mib",
+        str(config.get("min_gpu_free_mib") or 4000),
+        "--max-count",
+        "1",
+        "--format",
+        "csv",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    selected = completed.stdout.strip().split(",", 1)[0].strip()
+    return selected if selected.isdigit() else None
 
 
 @dataclass(frozen=True)
@@ -236,10 +277,29 @@ def _run_assignment_command(
     command: list[str],
     backend: str,
     timeout: float,
+    gpu_config: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     started = time.perf_counter()
     env = os.environ.copy()
-    env.setdefault("CUDA_VISIBLE_DEVICES", str(env.get("DIARIZATION_GPU_ID") or "0"))
+    gpu_config = gpu_config or {}
+    device = str(
+        gpu_config.get("assignment_device")
+        or gpu_config.get("device")
+        or "cpu"
+    ).lower()
+    if device == "cuda" and not env.get("CUDA_VISIBLE_DEVICES"):
+        selection_config = {
+            **gpu_config,
+            "assignment_device": "cuda",
+        }
+        gpu_id = resolve_diarization_gpu_id(selection_config)
+        if gpu_id is None:
+            return [], {
+                "backend": backend,
+                "error": f"no compatible idle GPU is available for {backend}",
+                "elapsed_seconds": round(time.perf_counter() - started, 3),
+            }
+        env["CUDA_VISIBLE_DEVICES"] = gpu_id
     env.setdefault("NO_PROXY", "127.0.0.1,localhost")
     env.setdefault("no_proxy", "127.0.0.1,localhost")
     try:
@@ -317,6 +377,7 @@ def run_pyannote_assignment(
             command,
             "pyannote_community",
             float(config.get("assignment_timeout_seconds") or DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS),
+            config,
         )
         if not turns and output.is_file():
             payload = json.loads(output.read_text(encoding="utf-8"))
@@ -364,6 +425,7 @@ def run_wespeaker_assignment(
         command,
         "wespeaker",
         float(config.get("assignment_timeout_seconds") or DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS),
+        config,
     )
 
 
@@ -419,9 +481,12 @@ def run_3dspeaker_assignment(
     started = time.perf_counter()
     env = os.environ.copy()
     env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    env["CUDA_VISIBLE_DEVICES"] = str(
-        config.get("gpu_id") or env.get("DIARIZATION_GPU_ID") or "0"
-    )
+    if not env.get("CUDA_VISIBLE_DEVICES"):
+        gpu_id = resolve_diarization_gpu_id(config)
+        if gpu_id is None:
+            report["error"] = "no compatible idle GPU is available for 3D-Speaker"
+            return [], report
+        env["CUDA_VISIBLE_DEVICES"] = gpu_id
     env.setdefault("NO_PROXY", "127.0.0.1,localhost")
     env.setdefault("no_proxy", "127.0.0.1,localhost")
     try:

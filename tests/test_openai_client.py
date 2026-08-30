@@ -52,11 +52,13 @@ class GenericOpenAIAPIClientTests(unittest.TestCase):
 
     def test_runtime_profile_keeps_key_env_for_openai_compatible_endpoint(self):
         config = Config()
-        profile = dict(config.config["runtime_profiles"]["deepseek_v4_pro"])
+        profile = dict(config.config["runtime_profiles"]["deepseek_v4_flash"])
+        profile.pop("text_model_id", None)
         profile.update(
             {
                 "text_base_url": "https://ivan-superai.taild500c8.ts.net/v1",
                 "llm_base_url": "https://ivan-superai.taild500c8.ts.net/v1",
+                "text_model": "test-model",
                 "text_api_key_env": "TRAE_LOCAL_API_KEY",
             }
         )
@@ -85,7 +87,8 @@ class GenericOpenAIAPIClientTests(unittest.TestCase):
 
     def test_runtime_profile_forwards_vibevoice_chunk_settings(self):
         config = Config()
-        profile = dict(config.config["runtime_profiles"]["deepseek_v4_pro"])
+        profile = dict(config.config["runtime_profiles"]["deepseek_v4_flash"])
+        profile.pop("text_model_id", None)
         profile.update(
             {
                 "asr_chunk_mode": "custom",
@@ -111,7 +114,8 @@ class GenericOpenAIAPIClientTests(unittest.TestCase):
 
     def test_runtime_profile_overrides_default_operation_manual_text_settings(self):
         config = Config()
-        profile = dict(config.config["runtime_profiles"]["deepseek_v4_pro"])
+        profile = dict(config.config["runtime_profiles"]["deepseek_v4_flash"])
+        profile.pop("text_model_id", None)
         profile.update(
             {
                 "text_base_url": "http://127.0.0.1:18103/v1",

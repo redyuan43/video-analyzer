@@ -54,7 +54,7 @@ MODEL_ALIASES = {
     "ai-3dspeaker": "diarization-3dspeaker-local",
     "ai-asr-embedded-speaker": "diarization-asr-embedded",
     "ai-local-selector": "selector-inherit-text",
-    "ai-local-text": "text-local-bonsai-27b-6gpu",
+    "ai-local-text": "text-local-qwen38-huihui-q4-dflash2",
     "ai-cloud-text": "text-deepseek-v4-flash",
     "nano-cloud-text": "text-deepseek-v4-flash",
     "ai-indextts": "tts-indextts25-ray-p40",

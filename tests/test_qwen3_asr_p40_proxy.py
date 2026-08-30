@@ -66,10 +66,9 @@ class Qwen3AsrP40ProxyTests(unittest.TestCase):
             ],
         )
 
-    def test_gpu_three_is_rejected(self):
+    def test_worker_gpu_indices_are_not_tied_to_historical_topology(self):
         with patch.object(proxy, "WORKER_SPECS", ["3:18300"]):
-            with self.assertRaisesRegex(ValueError, "GPU 3 is reserved"):
-                proxy.parsed_workers()
+            self.assertEqual(proxy.parsed_workers(), [(3, 18300)])
 
 
 if __name__ == "__main__":

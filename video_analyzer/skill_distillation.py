@@ -28,7 +28,7 @@ from .local_model_runtime import (
     unload_local_model_stage,
 )
 
-DEFAULT_DISTILLATION_PROFILE = "deepseek_v4_pro"
+DEFAULT_DISTILLATION_PROFILE = "deepseek_v4_flash"
 PACK_DIR = Path("skills") / "cangjie_pack"
 STATE_NAME = "PIPELINE_STATE.json"
 STATE_MD_NAME = "PIPELINE_STATE.md"

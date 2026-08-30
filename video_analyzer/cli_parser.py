@@ -138,7 +138,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-vl-frames", type=parse_auto_int_arg, default=AUTO, help="auto or minimum frames sent to VL")
     parser.add_argument("--max-vl-frames", type=parse_auto_int_arg, default=AUTO, help="auto or maximum frames sent to VL")
     parser.add_argument("--vl-frame-policy", choices=["auto", "all", "none"], default="auto", help="VL frame execution policy")
-    parser.add_argument("--vl-concurrency", type=int, default=3, help="Concurrent VL frame analysis requests")
+    parser.add_argument(
+        "--vl-concurrency",
+        type=parse_auto_int_arg,
+        default=AUTO,
+        help="Concurrent VL frame analysis requests, or auto",
+    )
     parser.add_argument("--vl-context-before", type=int, default=0, help="Previous candidate frames to include as VL image context")
     parser.add_argument("--vl-context-after", type=int, default=0, help="Next candidate frames to include as VL image context")
     parser.add_argument("--vl-context-max-gap", type=parse_auto_float_arg, default=AUTO, help="auto or max adjacent seconds for VL context frames")

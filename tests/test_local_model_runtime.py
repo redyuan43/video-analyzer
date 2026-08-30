@@ -72,6 +72,23 @@ class LocalModelRuntimeTests(unittest.TestCase):
 
         self.assertFalse(local_model_stage_needed("text", config))
 
+    def test_explicit_local_profile_ignores_stale_remote_provider(self):
+        config = {
+            "active_runtime_profile": "local-bonsai",
+            "runtime_profiles": {
+                "local-bonsai": {
+                    "deployment": "local",
+                    "provider": "trae_local_api",
+                    "text_base_url": "http://127.0.0.1:18103/v1",
+                }
+            },
+            "operation_manual": {
+                "text_base_url": "http://127.0.0.1:18103/v1",
+            },
+        }
+
+        self.assertTrue(local_model_stage_needed("text", config))
+
     def test_remote_profile_does_not_mask_explicit_local_text_override(self):
         config = {
             "active_runtime_profile": "trae-api",
@@ -167,7 +184,17 @@ class LocalModelRuntimeTests(unittest.TestCase):
                 "text_port": 18103,
                 "text_worker_count": 3,
                 "text_gpu_ids": [3, 0, 1, 2, 4, 5],
+                "text_gpu_selection": "manual",
                 "text_context_length": 65536,
+                "text_model_path": "/models/qwen38-q4.gguf",
+                "text_draft_model_path": "/models/qwen38-dflash2-q4.gguf",
+                "text_llama_server": "/opt/llama-server",
+                "text_model_alias": "huihui/Qwen3.8-27B-Q4-DFlash2",
+                "text_spec_draft_n_max": 5,
+                "text_v100_32_cache_type": "f16",
+                "text_v100_16_p40_cache_type": "q8_0",
+                "text_p40_cache_type": "q8_0",
+                "text_v100_16_p40_tensor_split": "2,3",
             },
             "local_model_runtime": {
                 "stage_commands": {"text": ["/bin/echo", "text"]},
@@ -185,6 +212,107 @@ class LocalModelRuntimeTests(unittest.TestCase):
         self.assertEqual(env["BONSAI_LOCAL_WORKER_COUNT"], "3")
         self.assertEqual(env["BONSAI_LOCAL_GPU_IDS"], "3,0,1")
         self.assertEqual(env["BONSAI_LOCAL_CONTEXT_SIZE"], "65536")
+        self.assertEqual(env["BONSAI_LOCAL_MODEL"], "/models/qwen38-q4.gguf")
+        self.assertEqual(
+            env["BONSAI_LOCAL_DRAFT_MODEL"],
+            "/models/qwen38-dflash2-q4.gguf",
+        )
+        self.assertEqual(env["BONSAI_LOCAL_LLAMA_SERVER"], "/opt/llama-server")
+        self.assertEqual(
+            env["BONSAI_LOCAL_MODEL_ALIAS"],
+            "huihui/Qwen3.8-27B-Q4-DFlash2",
+        )
+        self.assertEqual(env["BONSAI_LOCAL_SPEC_DRAFT_N_MAX"], "5")
+        self.assertEqual(env["BONSAI_LOCAL_V100_32_CACHE_TYPE"], "f16")
+        self.assertEqual(
+            env["BONSAI_LOCAL_V100_16_P40_TENSOR_SPLIT"],
+            "2,3",
+        )
+
+    @patch("video_analyzer.local_model_runtime.subprocess.run")
+    def test_text_stage_defaults_to_runtime_gpu_discovery(self, run):
+        config = {
+            "operation_manual": {
+                "text_base_url": "http://127.0.0.1:18103/v1",
+                "text_worker_count": 6,
+                "text_gpu_ids": [3, 0, 1, 2, 4, 5],
+                "text_gpu_selection": "auto",
+            },
+            "local_model_runtime": {
+                "stage_commands": {"text": ["/bin/echo", "text"]},
+            },
+        }
+
+        prepare_local_model_stage(
+            "text",
+            config,
+            logger=__import__("logging").getLogger(__name__),
+        )
+
+        env = run.call_args.kwargs["env"]
+        self.assertEqual(env["BONSAI_LOCAL_GPU_SELECTION"], "auto")
+        self.assertNotIn("BONSAI_LOCAL_WORKER_COUNT", env)
+        self.assertNotIn("BONSAI_LOCAL_GPU_IDS", env)
+
+    @patch("video_analyzer.local_model_runtime.subprocess.run")
+    def test_auto_ocr_topology_is_discovered_by_startup_script(self, run):
+        config = {
+            "ocr": {
+                "base_url": "http://127.0.0.1:18088/v1",
+                "engine": "unlimited",
+                "worker_count": "auto",
+                "gpu_ids": "auto",
+                "min_gpu_memory_mib": 20000,
+                "min_gpu_free_mib": 12000,
+            },
+            "local_model_runtime": {
+                "stage_commands": {"ocr": ["/bin/echo", "ocr"]},
+            },
+        }
+
+        prepare_local_model_stage(
+            "ocr",
+            config,
+            logger=__import__("logging").getLogger(__name__),
+        )
+
+        env = run.call_args.kwargs["env"]
+        self.assertNotIn("UNLIMITED_OCR_WORKER_COUNT", env)
+        self.assertNotIn("UNLIMITED_OCR_GPU_IDS", env)
+        self.assertNotIn("UNLIMITED_OCR_GPU_SELECTION", env)
+        self.assertEqual(env["UNLIMITED_OCR_MIN_TOTAL_MIB"], "20000")
+        self.assertEqual(env["UNLIMITED_OCR_MIN_FREE_MIB"], "12000")
+
+    @patch("video_analyzer.local_model_runtime.subprocess.run")
+    def test_auto_vl_topology_is_discovered_by_startup_script(self, run):
+        config = {
+            "operation_manual": {
+                "vision_base_url": "http://127.0.0.1:18082/v1",
+                "vision_runtime": {
+                    "engine": "minicpm_v45",
+                    "worker_count": "auto",
+                    "gpu_ids": "auto",
+                    "min_gpu_memory_mib": 12000,
+                    "min_gpu_free_mib": 10000,
+                },
+            },
+            "local_model_runtime": {
+                "stage_commands": {"vl": ["/bin/echo", "vl"]},
+            },
+        }
+
+        prepare_local_model_stage(
+            "vl",
+            config,
+            logger=__import__("logging").getLogger(__name__),
+        )
+
+        env = run.call_args.kwargs["env"]
+        self.assertNotIn("MINICPM_WORKER_COUNT", env)
+        self.assertNotIn("MINICPM_GPU_IDS", env)
+        self.assertNotIn("MINICPM_GPU_SELECTION", env)
+        self.assertEqual(env["MINICPM_MIN_TOTAL_MIB"], "12000")
+        self.assertEqual(env["MINICPM_MIN_FREE_MIB"], "10000")
 
     @patch("video_analyzer.local_model_runtime.subprocess.run")
     def test_qwen3_asr_model_id_does_not_override_local_model_path(self, run):
@@ -383,6 +511,31 @@ class LocalModelRuntimeTests(unittest.TestCase):
                     "second-core-acquired",
                 ],
             )
+
+    @patch("video_analyzer.local_model_runtime.release_reclaimed_gpu_services")
+    @patch("video_analyzer.local_model_runtime.subprocess.run")
+    def test_runtime_session_restores_reclaimed_services_only_after_core(self, run, release):
+        with TemporaryDirectory() as tmp:
+            config = {
+                "ocr": {"base_url": "http://127.0.0.1:18088/v1"},
+                "operation_manual": {"vision_base_url": "http://127.0.0.1:18082/v1"},
+                "local_model_runtime": {
+                    "lock_path": str(Path(tmp) / "local.lock"),
+                    "stage_commands": {
+                        "ocr": ["/bin/echo", "ocr"],
+                        "vl": ["/bin/echo", "vl"],
+                    },
+                },
+            }
+            logger = __import__("logging").getLogger(__name__)
+
+            with local_model_runtime_session(config, logger, "core"):
+                with local_model_stage("ocr", config, logger, "core"):
+                    release.assert_not_called()
+                with local_model_stage("vl", config, logger, "core"):
+                    release.assert_not_called()
+
+            release.assert_called_once_with(config, logger)
 
     def test_runtime_session_allows_nested_diarization_lock(self):
         with TemporaryDirectory() as tmp:

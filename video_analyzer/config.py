@@ -184,8 +184,10 @@ class Config:
                 ("ocr_max_tokens", "max_tokens", "ocr_max_tokens"),
                 ("ocr_max_image_long_side", "max_image_long_side", "ocr_max_image_long_side"),
                 ("ocr_image_mode", "image_mode", "ocr_image_mode"),
+                ("ocr_min_gpu_memory_mib", "min_gpu_memory_mib", None),
+                ("ocr_min_gpu_free_mib", "min_gpu_free_mib", None),
             ):
-                if getattr(args, cli_key, None) is not None:
+                if cli_key and getattr(args, cli_key, None) is not None:
                     continue
                 if runtime_key in user_ocr_config:
                     continue
@@ -313,8 +315,6 @@ class Config:
                 vibevoice["chunk_parallel_workers"] = copy.deepcopy(
                     profile["asr_worker_count"]
                 )
-            elif profile.get("worker_count") is not None:
-                vibevoice["worker_count"] = copy.deepcopy(profile["worker_count"])
             profile_remote_urls = normalize_string_list(profile.get("remote_asr_urls") or profile.get("remote_asr_url"))
             if profile_remote_urls and not getattr(args, "remote_asr_url", None):
                 vibevoice["remote_urls"] = profile_remote_urls

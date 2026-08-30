@@ -202,7 +202,7 @@ class SkillDistillationTests(unittest.TestCase):
                 final = pipeline.run_until_pause()
 
             self.assertEqual(final["status"], "succeeded")
-            self.assertEqual(final["profile"], "deepseek_v4_pro")
+            self.assertEqual(final["profile"], "deepseek_v4_flash")
             self.assertEqual(final["skills"]["passed"], 1)
             self.assertEqual(final["skills"]["test_progress"]["phase"], "completed")
             self.assertEqual(final["skills"]["test_progress"]["stage_percent"], 100)
@@ -680,7 +680,7 @@ class SkillDistillationTests(unittest.TestCase):
 def fake_runtime():
     client = FakeClient()
     return distill.ModelRuntime(
-        profile_name="deepseek_v4_pro",
+        profile_name="deepseek_v4_flash",
         base_url="https://api.deepseek.com",
         generation_model="deepseek-v4-pro",
         review_model="deepseek-v4-pro",
@@ -778,7 +778,7 @@ def write_completed_pack(run_dir):
         "run_dir": str(run_dir),
         "status": "succeeded",
         "current_stage": None,
-        "profile": "deepseek_v4_pro",
+        "profile": "deepseek_v4_flash",
         "generation_model": "deepseek-v4-pro",
         "review_model": "deepseek-v4-pro",
         "created_at": distill.utc_now(),

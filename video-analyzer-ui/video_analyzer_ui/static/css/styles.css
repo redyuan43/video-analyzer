@@ -516,6 +516,28 @@ button:disabled {
     color: #9f1239;
 }
 
+.repair-panel {
+    border-left: 3px solid #2563eb;
+}
+
+.repair-panel .panel-head {
+    align-items: flex-start;
+}
+
+.repair-panel p {
+    margin: 6px 0 0;
+    color: #475467;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.repair-panel .actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 12px;
+}
+
 .row-warning {
     color: #a16207;
 }
@@ -528,6 +550,18 @@ button:disabled {
 .job-list {
     display: grid;
     gap: 8px;
+}
+
+.job-list-pagination {
+    margin-top: 10px;
+}
+
+.job-list-pagination[hidden] {
+    display: none;
+}
+
+.job-list-pagination button {
+    width: 100%;
 }
 
 .summary-grid {

@@ -52,8 +52,6 @@ def parsed_workers() -> list[tuple[int, int]]:
     for raw in WORKER_SPECS:
         gpu_text, port_text = raw.strip().split(":", 1)
         gpu, port = int(gpu_text), int(port_text)
-        if gpu == 3:
-            raise ValueError("GPU 3 is reserved and must not run Qwen3-ASR")
         workers.append((gpu, port))
     if not workers:
         raise ValueError("at least one Qwen3-ASR worker is required")
