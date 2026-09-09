@@ -236,15 +236,24 @@ def transcribe_with_qwen3_asr(
     url: str,
     model: str = "",
     options: Optional[Dict[str, object]] = None,
+    urls: Optional[List[str]] = None,
 ) -> Optional[AudioTranscript]:
-    request_options = dict(options or {})
-    if model:
-        request_options["model"] = model
-    return transcribe_with_http_asr(
+    # QWEN3_FANOUT_WIRED
+    """Qwen3-ASR over plain HTTP fan-out - no worker orchestrator required.
+
+    vLLM serving the native ``Qwen3ASRForConditionalGeneration`` architecture
+    does the fine audio chunking (<=30 s at energy minima) and continuous
+    batching server side, so the client only fans coarse shards out over the
+    local GPU instances. See ``qwen3_asr_fanout`` for the measured numbers.
+    """
+    from .qwen3_asr_fanout import transcribe_qwen3_asr
+
+    return transcribe_qwen3_asr(
         audio_path,
-        url,
-        extra_data=request_options,
-        timeout=_http_timeout_for_audio(_wav_duration(audio_path)),
+        url=url,
+        urls=list(urls or []) or None,
+        model=model,
+        options=dict(options or {}),
     )
 
 
@@ -302,6 +311,50 @@ def transcribe_with_remote_http(audio_path: Path, urls: Optional[list[str]] = No
     return None
 
 
+def _looks_like_vibevoice_streaming(url: str) -> bool:
+    """vLLM 流式 server 端点（asr_streaming_server）以 /v1/transcribe 结尾。"""
+    return url.rstrip("/").endswith("/v1/transcribe")
+
+
+def _transcribe_vibevoice_streaming(
+    audio_path: Path,
+    url: str,
+    options: Dict[str, object],
+    timeout,
+) -> Optional[AudioTranscript]:
+    """POST base64 JSON 到 vLLM 流式 server /v1/transcribe（P40 pascal fork 实测 16.24x）。"""
+    import base64
+
+    try:
+        data = {
+            "audio_base64": base64.b64encode(audio_path.read_bytes()).decode(),
+            "temperature": float(options.get("temperature") or 0.0),
+        }
+        response = requests.post(url, json=data, timeout=timeout)
+        response.raise_for_status()
+        payload = response.json()
+        text = str(payload.get("text") or "")
+        if not text.strip():
+            return None
+        duration = float(payload.get("audio_duration") or _wav_duration(audio_path))
+        return AudioTranscript(
+            text=text,
+            segments=[],
+            language="unknown",
+            metadata={
+                "provider": "vibevoice_vllm_streaming",
+                "provider_url": url,
+                "audio_duration_seconds": duration,
+                "rtf": payload.get("rtf"),
+                "generate_time": payload.get("generate_time"),
+                "total_chunks": payload.get("total_chunks"),
+            },
+        )
+    except Exception as exc:
+        logger.warning("VibeVoice streaming endpoint failed from %s: %s", url, exc)
+        return None
+
+
 def transcribe_with_vibevoice_remote(
     audio_path: Path,
     urls: Optional[list[str]] = None,
@@ -333,13 +386,18 @@ def transcribe_with_vibevoice_remote(
                 duration,
                 request_timeout[1],
             )
-            transcript = transcribe_with_http_asr(
-                audio_path,
-                url,
-                extra_data=request_options,
-                timeout=request_timeout,
-                max_attempts=1,
-            )
+            if _looks_like_vibevoice_streaming(url):
+                transcript = _transcribe_vibevoice_streaming(
+                    audio_path, url, request_options, request_timeout
+                )
+            else:
+                transcript = transcribe_with_http_asr(
+                    audio_path,
+                    url,
+                    extra_data=request_options,
+                    timeout=request_timeout,
+                    max_attempts=1,
+                )
             if transcript and transcript.text.strip():
                 transcript.segments = transcript.segments or []
                 transcript.segments.append(
@@ -497,6 +555,16 @@ def transcribe_with_provider_result(
                     url=str(vibevoice_config.get("qwen3_asr_url") or ""),
                     model=str(vibevoice_config.get("qwen3_asr_model") or ""),
                     options=dict(vibevoice_config.get("qwen3_asr_options") or {}),
+                    urls=[
+                        str(item)
+                        for item in (
+                            vibevoice_config.get("qwen3_asr_urls")
+                            or ([vibevoice_config.get("qwen3_asr_url")]
+                                if vibevoice_config.get("qwen3_asr_url") else [])
+                            or []
+                        )
+                        if item
+                    ],
                 ),
             )
         elif candidate == "openai_audio":
